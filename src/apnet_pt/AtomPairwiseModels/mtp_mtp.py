@@ -1813,22 +1813,60 @@ units angstrom
             for name, param in self.model.named_parameters():
                 if param.grad is not None:
                     if 'guess_layer' in name:
+                        # Debug: Print gradient statistics before clipping
+                        grad_min = param.grad.data.min().item()
+                        grad_max = param.grad.data.max().item()
+                        grad_mean = param.grad.data.mean().item()
+                        grad_std = param.grad.data.std().item()
+                        has_nan = torch.isnan(param.grad.data).any().item()
+                        has_inf = torch.isinf(param.grad.data).any().item()
+
+                        # print(f"[{name}] Gradients - Min: {grad_min:.6f}, Max: {grad_max:.6f}, "
+                        #       f"Mean: {grad_mean:.6f}, Std: {grad_std:.6f}, "
+                        #       f"NaN: {has_nan}, Inf: {has_inf}")
+
                         # More aggressive clipping for embeddings
-                        param.grad.data.clamp_(-0.01, 0.01)
+                        param.grad.data.clamp_(-0.001, 0.001)
+
+                        # Debug: Print after clipping
+                        # if has_nan or has_inf or abs(grad_max) > 0.01 or abs(grad_min) > 0.01:
+                        #     print(f"[{name}] After clipping - Min: {param.grad.data.min().item():.6f}, "
+                        #           f"Max: {param.grad.data.max().item():.6f}")
                     else:
                         # Standard clipping for other parameters
                         param.grad.data.clamp_(-1.0, 1.0)
 
             # More aggressive gradient clipping to prevent NaN in embeddings
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
+
+            # Debug: Print parameter values before optimizer step
+            # for name, param in self.model.named_parameters():
+            #     if 'guess_layer' in name:
+            #         param_min = param.data.min().item()
+            #         param_max = param.data.max().item()
+            #         param_mean = param.data.mean().item()
+            #         param_has_nan = torch.isnan(param.data).any().item()
+            #         param_has_inf = torch.isinf(param.data).any().item()
+            #         print(f"[{name}] Before step - Min: {param_min:.6f}, Max: {param_max:.6f}, "
+            #               f"Mean: {param_mean:.6f}, NaN: {param_has_nan}, Inf: {param_has_inf}")
+            #
             optimizer.step()
 
+            # Debug: Print parameter values after optimizer step
+            # for name, param in self.model.named_parameters():
+            #     if 'guess_layer' in name:
+            #         param_min = param.data.min().item()
+            #         param_max = param.data.max().item()
+            #         param_mean = param.data.mean().item()
+            #         param_has_nan = torch.isnan(param.data).any().item()
+            #         param_has_inf = torch.isinf(param.data).any().item()
+            #         print(f"[{name}] After step - Min: {param_min:.6f}, Max: {param_max:.6f}, "
+            #               f"Mean: {param_mean:.6f}, NaN: {param_has_nan}, Inf: {param_has_inf}")
+            #
             # NaN detection and recovery for embedding weights
             for name, param in self.model.named_parameters():
                 if 'guess_layer' in name and torch.isnan(param).any():
-                    print(f"NaN detected in {name}, resetting to initial values")
-                    with torch.no_grad():
-                        param.copy_(torch.randn_like(param) * 0.01 + param.mean())
+                    print(f"NaN detected in {name}, {param=}")
 
             total_loss += batch_loss.item()
             comp_errors_t.append(comp_errors.detach().cpu())
@@ -2020,22 +2058,22 @@ units angstrom
                 f" MAE: {no_damping_MAE_t: > 7.3f}/{no_damping_MAE_v: < 7.3f}",
                 flush=True,
             )
+        lowest_test_loss = float("inf")
         t0 = time.time()
-        t_out = __evaluate_batch(train_loader, criterion, rank_device, y_ind=y_ind)
-        v_out = __evaluate_batch(test_loader, criterion, rank_device, y_ind=y_ind)
-        train_loss, total_MAE_t = t_out
-        test_loss, total_MAE_v = v_out
-        if isinstance(y_ind, torch.Tensor):
-            mae_string = " ".join([f"{mae_t: > 7.3f}/{mae_v: < 7.3f}" for mae_t, mae_v in zip(total_MAE_t, total_MAE_v)])
-        else:
-            mae_string = f"{total_MAE_t: > 7.3f}/{total_MAE_v: < 7.3f}"
-        print(
-            f" (Pre-training)({time.time() - t0: < 7.2f}s)"
-            f" MAE: {mae_string}",
-            flush=True,
-        )
-        lowest_test_loss = test_loss
-        # lowest_test_loss = float("inf")
+        # t_out = __evaluate_batch(train_loader, criterion, rank_device, y_ind=y_ind)
+        # v_out = __evaluate_batch(test_loader, criterion, rank_device, y_ind=y_ind)
+        # train_loss, total_MAE_t = t_out
+        # test_loss, total_MAE_v = v_out
+        # if isinstance(y_ind, torch.Tensor):
+        #     mae_string = " ".join([f"{mae_t: > 7.3f}/{mae_v: < 7.3f}" for mae_t, mae_v in zip(total_MAE_t, total_MAE_v)])
+        # else:
+        #     mae_string = f"{total_MAE_t: > 7.3f}/{total_MAE_v: < 7.3f}"
+        # print(
+        #     f" (Pre-training)({time.time() - t0: < 7.2f}s)"
+        #     f" MAE: {mae_string}",
+        #     flush=True,
+        # )
+        # lowest_test_loss = test_loss
         cpu_model = self.model.to("cpu")
         for epoch in range(n_epochs):
             t1 = time.time()
