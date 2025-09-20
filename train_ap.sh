@@ -39,9 +39,9 @@ python3 -u ./train_models.py \
     --random_seed $iter \
     --ap_model_path ./models/ap_atomTypeParamModel_elst_ind_1/am_$iter.pt \
     --n_epochs 50 \
-    --n_neuron 32 \
+    --n_neuron 64 \
     --data_dir ./data_dimer_$iter \
-    --spec_type_ap 7 \
+    --spec_type_ap 6 \
     --lr 5e-4 \
     --dimer_eval_type elst_damping__induced_dipole \
     --param_start_mean "1.3,1.0" \

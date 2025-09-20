@@ -46,19 +46,11 @@ class NoisyConstantEmbedding(nn.Embedding):
     def __init__(self, num_embeddings, embedding_dim, mean=3.0, std=0.01):
         super().__init__(num_embeddings, embedding_dim)
         with torch.no_grad():
-            if isinstance(mean, (list, tuple)):
-                # If mean is a list, use it directly (assuming it's the right shape)
-                mean_tensor = torch.tensor(mean, dtype=self.weight.dtype, device=self.weight.device)
-                if len(mean_tensor) == 1:
-                    mean_tensor = mean_tensor.expand_as(self.weight)
-                elif len(mean_tensor) == self.weight.shape[0]:
-                    mean_tensor = mean_tensor.unsqueeze(-1).expand_as(self.weight)
-                else:
-                    raise ValueError(f"mean list length {len(mean_tensor)} doesn't match num_embeddings {num_embeddings}")
-                self.weight.copy_(mean_tensor + std * torch.randn_like(self.weight))
-            else:
-                # Scalar case
-                self.weight.copy_(mean + std * torch.randn_like(self.weight))
+            # Use smaller, more controlled noise and clamp to reasonable bounds
+            noise = torch.randn_like(self.weight) * min(std, 0.01)
+            self.weight.copy_(mean + noise)
+            # Clamp to prevent extreme values that could cause NaN
+            self.weight.clamp_(min=mean-1.0, max=mean+1.0)
 
 
 class DimerProp(nn.Module):
@@ -395,6 +387,8 @@ class AtomTypeParamNN(nn.Module):
         am_out = self.atom_model(batch)
         charge, dipole, qpole, h_list = am_out[0], am_out[1], am_out[2], am_out[self.h_list_ind]
         Z = x
+        # print(self.guess_layer[0].weight)
+        # print(self.guess_layer[1].weight)
         K_list = [self.guess_layer[p](Z) for p in range(self.n_params)]
         K = torch.cat(K_list, dim=-1)  # shape (n_atoms, n_params)
         atoms_with_edges = torch.cat([edge_index[0], edge_index[1]]).unique()
@@ -402,6 +396,8 @@ class AtomTypeParamNN(nn.Module):
             torch.arange(len(molecule_ind), device=molecule_ind.device),
             atoms_with_edges,
         )
+        # Clamp K values to prevent extreme values that could lead to NaN
+        K = torch.clamp(K, min=-10.0, max=10.0)
         if K.isnan().any():
             print("K has NaN values before readouts, debugging info:")
             print(f"{K =}")
@@ -1805,14 +1801,35 @@ units angstrom
                 dim_size=torch.tensor(batch.total_charge_A.size(0), dtype=torch.long),
             )
             comp_errors = preds - ref
+            # print(f" {preds = }\n {ref = }\n {comp_errors = }")
             batch_loss = (
                 torch.mean(torch.square(comp_errors))
                 if (loss_fn is None)
                 else loss_fn(preds, ref)
             )
             batch_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.dimer_model.parameters(), max_norm=0.2)
+
+            # Embedding-specific gradient clipping
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    if 'guess_layer' in name:
+                        # More aggressive clipping for embeddings
+                        param.grad.data.clamp_(-0.01, 0.01)
+                    else:
+                        # Standard clipping for other parameters
+                        param.grad.data.clamp_(-1.0, 1.0)
+
+            # More aggressive gradient clipping to prevent NaN in embeddings
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
             optimizer.step()
+
+            # NaN detection and recovery for embedding weights
+            for name, param in self.model.named_parameters():
+                if 'guess_layer' in name and torch.isnan(param).any():
+                    print(f"NaN detected in {name}, resetting to initial values")
+                    with torch.no_grad():
+                        param.copy_(torch.randn_like(param) * 0.01 + param.mean())
+
             total_loss += batch_loss.item()
             comp_errors_t.append(comp_errors.detach().cpu())
         if scheduler is not None:
@@ -1931,7 +1948,31 @@ units angstrom
         )
 
         # (3) Optim/Scheduler
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        # Separate parameter groups for embeddings vs other parameters
+        embedding_params = []
+        other_params = []
+        for name, param in self.model.named_parameters():
+            if 'guess_layer' in name:
+                embedding_params.append(param)
+            else:
+                other_params.append(param)
+
+        # Use lower learning rate and weight decay for embeddings
+        param_groups = []
+        if embedding_params:
+            param_groups.append({
+                'params': embedding_params,
+                'lr': lr * 0.01,  # 100x lower learning rate for embeddings
+                'weight_decay': 1e-6  # L2 regularization for embeddings
+            })
+        if other_params:
+            param_groups.append({
+                'params': other_params,
+                'lr': lr,
+                'weight_decay': 1e-6  # L2 regularization for other parameters
+            })
+
+        optimizer = torch.optim.Adam(param_groups)
         scheduler = None
         # criterion = None  # defaults to MSE
         criterion = torch.nn.MSELoss()
