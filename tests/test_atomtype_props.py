@@ -327,13 +327,6 @@ def test_AtomTypeParamNN_Dimer():
     )
     print(param_mod)
     monA_props, monB_props = param_mod.predict_qcel_mols_monomer_props([mol])
-    dimer_batch = apnet_pt.pt_datasets.ap2_fused_ds.ap2_fused_collate_update_no_target(
-        [
-            apnet_pt.pt_datasets.ap2_fused_ds.qcel_dimer_to_fused_data(
-                mol, r_cut_im=99999.0, dimer_ind=0
-            )
-        ]
-    )
     pred = param_mod.predict_qcel_mols_dimer([mol, mol])
     print(pred)
     print(r["SAPT0 ELST ENERGY adz"])
