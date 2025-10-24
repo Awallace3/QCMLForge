@@ -1222,12 +1222,13 @@ units angstrom
     ########################################################################
 
     def __setup(self, rank, world_size):
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
-        if torch.cuda.is_available():
-            dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        else:
-            dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        if not dist.is_initialized():
+            os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+            os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
+            if torch.cuda.is_available():
+                dist.init_process_group("nccl", rank=rank, world_size=world_size)
+            else:
+                dist.init_process_group("gloo", rank=rank, world_size=world_size)
         torch.manual_seed(43)
 
     def __cleanup(self):
@@ -1517,6 +1518,9 @@ units angstrom
                 break
             self.model = DDP(
                 self.model,
+                device_ids=[rank] if rank_device != "cpu" else None,
+                output_device=rank if rank_device != "cpu" else None,
+                find_unused_parameters=True,
             )
 
         if rank == 0:
@@ -1568,7 +1572,7 @@ units angstrom
             scheduler = None
         criterion = None
         lowest_test_loss = torch.tensor(float("inf"))
-        self.model = self.model.to(rank_device)
+        # self.model = self.model.to(rank_device)  # Redundant: already moved to device at line 1501
 
         if rank == 0:
             print(
@@ -1590,6 +1594,8 @@ units angstrom
                     flush=True,
                 )
         for epoch in range(n_epochs):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             t1 = time.time()
             test_lowered = False
             train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
@@ -1910,8 +1916,25 @@ units angstrom
             self.dimer_prop_model.set_forward("ap3_atomMPNN")
             self.dimer_prop_model.to(self.device)
 
-        if world_size > 1:
-            print("Running multi-process training", flush=True)
+        if os.environ.get("RANK") is not None:
+            print("Running torchrun DDP training", flush=True)
+            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            rank = int(os.environ["RANK"])
+            world_size = int(os.environ["WORLD_SIZE"])
+            self.ddp_train(
+                rank=rank,
+                world_size=world_size,
+                train_dataset=train_dataset,
+                test_dataset=test_dataset,
+                n_epochs=n_epochs,
+                batch_size=batch_size,
+                lr=lr,
+                pin_memory=pin_memory,
+                num_workers=dataloader_num_workers,
+                lr_decay=lr_decay,
+            )
+        elif world_size > 1:
+            print("Running mp.spawn DDP training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
             mp.spawn(
                 self.ddp_train,

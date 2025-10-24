@@ -93,6 +93,7 @@ def train_pairwise_model(
     ds_class_type="pt",
     DimerProp_model_type="AtomTypeParamNN",
     ap2_pretrained_model_only=None,
+    world_size=1,
 ):
     # Ensure param_start_mean and param_start_std are lists
     if not isinstance(param_start_mean, (list, tuple)):
@@ -130,9 +131,12 @@ def train_pairwise_model(
     else:
         raise ValueError("Invalid Atom Model Type")
     print("Training {}...".format(apnet_model_type))
-    if torch.cuda.is_available():
-        world_size = torch.cuda.device_count()
-    else:
+    # if torch.cuda.is_available():
+    #     world_size = torch.cuda.device_count()
+    # else:
+    #     world_size = 1
+    if os.environ.get("RANK") is not None:
+        print("Detected torchrun environment - DDP handled by torchrun")
         world_size = 1
     print("World Size", world_size)
 
@@ -541,6 +545,7 @@ def main():
             ds_class_type=args.ds_class_type,
             DimerProp_model_type=args.DimerProp_model_type,
             ap2_pretrained_model_only=args.ap2_pretrained_model_only,
+            world_size=args.world_size_ddp,
         )
     return
 
