@@ -1442,7 +1442,7 @@ def test_intramolecular_induced_dipole():
 if __name__ == "__main__":
     test_intramolecular_induced_dipole()
     # test_induced_dipole_torch_intramolecular()
-    # test_elst_damping_dipole_torch_df()
+    test_elst_damping_dipole_torch_df()
     # test_elst_multipoles_MTP_torch_damping()
     # test_elst_damping_dipole_torch_df()
     # test_elst_charge_dipole_qpole()

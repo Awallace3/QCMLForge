@@ -850,12 +850,20 @@ class APNet2_AM_Model:
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 
-        checkpoint = torch.load(ap2_model_path)
+        checkpoint_am = torch.load(am_model_path, weights_only=False)
+        checkpoint = torch.load(ap2_model_path, weights_only=False)
         if "_orig_mod" not in list(self.model.state_dict().keys())[0]:
             model_state_dict = {
                 k.replace("_orig_mod.", ""): v
                 for k, v in checkpoint["model_state_dict"].items()
             }
+            # Add atom_model state dict undert atom_model.key.etc
+            atom_model_state_dict = {
+                k.replace("_orig_mod.", ""): v
+                for k, v in checkpoint_am["model_state_dict"].items()
+            }
+            for k, v in atom_model_state_dict.items():
+                model_state_dict[f"atom_model.{k}"] = v
             self.model.load_state_dict(model_state_dict)
         else:
             self.model.load_state_dict(checkpoint["model_state_dict"])
