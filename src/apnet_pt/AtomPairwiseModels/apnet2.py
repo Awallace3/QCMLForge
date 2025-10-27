@@ -179,6 +179,7 @@ class APNet2_MPNN(nn.Module):
         self.readout_layer_elst = self._make_layers(
             layer_nodes_readout, layer_activations
         )
+        print(f"{self.readout_layer_elst = }")
         self.readout_layer_exch = self._make_layers(
             layer_nodes_readout, layer_activations
         )
@@ -364,7 +365,30 @@ class APNet2_MPNN(nn.Module):
         dRA_unit = dRA_xyz / dRA.unsqueeze(1)
         dRB_unit = dRB_xyz / dRB.unsqueeze(1)
 
+        # compare frequencies
+        with open("distance_layer_im_frequencies.json", "r") as f:
+            import json
+
+            freq_debug = torch.tensor(json.load(f))
+            print(torch.allclose(self.distance_layer_im.frequencies, freq_debug, atol=1e-2), f"distance_layer_im frequencies {self.distance_layer_im.frequencies - freq_debug}")
+            print(self.distance_layer_im.frequencies)
+            print(freq_debug)
+            # print param name for frequencies
+            # print(f"distance_layer_im frequencies param name: {list(self.distance_layer_im.named_parameters())}")
+        with open("distance_layer_frequencies.json", "r") as f:
+            import json
+
+            freq_debug = torch.tensor(json.load(f))
+            print(torch.allclose(self.distance_layer.frequencies, freq_debug, atol=1e-2), f"distance_layer frequencies {self.distance_layer.frequencies - freq_debug}")
+            print(self.distance_layer.frequencies)
+            print(freq_debug)
+
         # distance encodings
+        with open("dR_sr_debug.json", "r") as f:
+            import json
+
+            dR_sr_debug = torch.tensor(json.load(f))
+            print(torch.allclose(dR_sr, dR_sr_debug, atol=1e-2), f"dR_sr dR_sr_debug.json {dR_sr - dR_sr_debug}")
         rbf_sr = self.distance_layer_im(dR_sr)
         rbfA = self.distance_layer(dRA)
         rbfB = self.distance_layer(dRB)
@@ -378,6 +402,11 @@ class APNet2_MPNN(nn.Module):
         hB_list = [self.embed_layer(ZB).view(ZB.size(0), -1)]
         print(f"{hA_list = }")
         print(f"{hB_list = }")
+        with open("hA_list_debug0.json", "r") as f:
+            import json
+
+            hA_init_debug = torch.tensor(json.load(f))
+        print(torch.allclose(hA_list[0], hA_init_debug, atol=1e-2), f"hA_list[0] hA_init_debug.json {hA_list[0] - hA_init_debug}")
 
         # directional hidden state lists
         hA_dir_list = []
@@ -385,10 +414,13 @@ class APNet2_MPNN(nn.Module):
 
         # TODO: need to determine how to handle all monA in batch having no
         # monomer edges (single atoms)
+        # Disagreement is in message passing steps below because hA_list agree but not
+        # hA_list after message passing
         for i in range(self.n_message):
             mA_ij = self.get_messages(
                 hA_list[0], hA_list[-1], rbfA, e_AA_source, e_AA_target
             )
+            # messages are correct...
             mB_ij = self.get_messages(
                 hB_list[0], hB_list[-1], rbfB, e_BB_source, e_BB_target
             )
@@ -405,11 +437,22 @@ class APNet2_MPNN(nn.Module):
             # sum each atom's messages
             mA_i = scatter(mA_ij, e_AA_source, dim=0,
                            reduce="sum", dim_size=natomA)
+            with open(f"mA_i_debug_iter{i}.json", "r") as f:
+                import json
+
+                mA_i_debug = torch.tensor(json.load(f))
+            print(torch.allclose(mA_i, mA_i_debug, atol=1e-2), f"mA_i mA_i_debug_iter{i}.json {mA_i - mA_i_debug}")
+            
             mB_i = scatter(mB_ij, e_BB_source, dim=0,
                            reduce="sum", dim_size=natomB)
 
             # get the next hidden state of the atom
             hA_next = self.update_layers[i](mA_i)
+            with open(f"hA_next_debug_iter{i}.json", "r") as f:
+                import json
+                hA_next_debug = torch.tensor(json.load(f))
+            print(torch.allclose(hA_next, hA_next_debug, atol=1e-2), f"hA_next hA_next_debug_iter{i}.json {hA_next - hA_next_debug}")
+
             hB_next = self.update_layers[i](mB_i)
 
             hA_list.append(hA_next)
@@ -419,11 +462,33 @@ class APNet2_MPNN(nn.Module):
             ### directional ###
             ###################
 
+            with open(f"mA_ij_debug_iter{i}.json", "r") as f:
+                import json
+
+                mA_ij_debug = torch.tensor(json.load(f))
+            print(torch.allclose(mA_ij, mA_ij_debug, atol=1e-2), f"mA_ij mA_ij_debug_iter{i}.json {mA_ij - mA_ij_debug}")
+            print(f"{mA_ij.shape = }")
+            print(f"{mA_ij_debug.shape = }")
+
             mA_ij_dir = self.directional_layers[i](mA_ij)
+            with open(f"mA_ij_dir_debug_iter{i}.json", "r") as f:
+                import json
+
+                mA_ij_dir_debug = torch.tensor(json.load(f))
+                print(f"{mA_ij_dir_debug.shape = }")
+                print(f"{mA_ij_dir.shape = }")
+            print(torch.allclose(mA_ij_dir, mA_ij_dir_debug, atol=1e-2), f"mA_ij_dir mA_ij_dir_debug_iter{i}.json {mA_ij_dir - mA_ij_dir_debug}")
             mB_ij_dir = self.directional_layers[i](mB_ij)
             mA_ij_dir = torch.einsum("ex,em->exm", dRA_unit, mA_ij_dir)
             mB_ij_dir = torch.einsum("ex,em->exm", dRB_unit, mB_ij_dir)
 
+            with open(f"mA_ij_dir_ein_debug_iter{i}.json", "r") as f:
+                import json
+
+                mA_ij_dir_debug = torch.tensor(json.load(f))
+                print(f"{mA_ij_dir_debug.shape = }")
+                print(f"{mA_ij_dir.shape = }")
+            print(torch.allclose(mA_ij_dir, mA_ij_dir_debug, atol=1e-2), f"mA_ij_dir mA_ij_dir_debug_iter{i}.json {mA_ij_dir - mA_ij_dir_debug}")
             # sum directional messages to get directional atomic hidden states
             # NOTE: this summation must be linear to guarantee equivariance.
             #       because of this constraint, we applied a dense net before
@@ -431,6 +496,12 @@ class APNet2_MPNN(nn.Module):
             hA_dir = scatter(
                 mA_ij_dir, e_AA_source, dim=0, reduce="sum", dim_size=natomA
             )
+            with open(f"hA_dir_debug_iter{i}.json", "r") as f:
+                import json
+
+                hA_dir_debug = torch.tensor(json.load(f))
+            print(torch.allclose(hA_dir, hA_dir_debug, atol=1e-2), f"hA_dir hA_dir_debug_iter{i}.json {hA_dir - hA_dir_debug}")
+
             hB_dir = scatter(
                 mB_ij_dir, e_BB_source, dim=0, reduce="sum", dim_size=natomB
             )
@@ -444,19 +515,38 @@ class APNet2_MPNN(nn.Module):
         print(f"{hA = }")
         print(f"{hB = }")
 
+        with open("hA_debug0.json", "r") as f:
+            hA_debug = torch.tensor(json.load(f))
+        print(torch.allclose(hA, hA_debug, atol=1e-2), f"hA hA_debug0.json {hA - hA_debug}")
+
         # mock right sized output with N_dimer, 4 components
 
         # atom-pair features are a combo of atomic hidden states and the interatomic distance
+        
+        with open("rbf_sr_debug.json", "r") as f:
+            import json
+
+            rbf_sr_debug = torch.tensor(json.load(f))
+        print(torch.allclose(rbf_sr, rbf_sr_debug, atol=1e-2), f"rbf_sr rbf_sr_debug0.json {rbf_sr - rbf_sr_debug}")
+        print(f"{rbf_sr = }")
+        print(f"{rbf_sr_debug = }")
         hAB = self.get_pair(hA, hB, qA, qB, rbf_sr,
                             e_ABsr_source, e_ABsr_target)
         hBA = self.get_pair(hB, hA, qB, qA, rbf_sr,
                             e_ABsr_target, e_ABsr_source)
+
+        with open("hAB_debug0.json", "r") as f:
+            import json
+
+            hAB_debug = torch.tensor(json.load(f))
+        print(torch.allclose(hAB, hAB_debug, atol=1e-2), f"hAB hAB_debug.json {hAB - hAB_debug}")
         # print(f"{hAB = }")
         # print(f"{hBA = }")
 
         # project the directional atomic hidden states along the interatomic axis
         hA_dir = torch.cat(hA_dir_list, dim=-1)
         hB_dir = torch.cat(hB_dir_list, dim=-1)
+
         # hA_dir = torch.cat(hA_dir_list, dim=-1) if len(hA_dir_list) > 0 else None
         # hB_dir = torch.cat(hB_dir_list, dim=-1) if len(hB_dir_list) > 0 else None
         # if (hA_dir is not None) and (hB_dir is not None):
@@ -479,9 +569,20 @@ class APNet2_MPNN(nn.Module):
         hAB = torch.cat([hAB, hA_dir_blah, hB_dir_blah], dim=1)
         hBA = torch.cat([hBA, hB_dir_blah, hA_dir_blah], dim=1)
 
+        # torch print full tensors
+        # torch.set_printoptions(profile="full")
         print(f"{hAB = }")
         print(f"{hBA = }")
+        # read hAB_debug.json as tensor to compare
+        with open("hAB_debug.json", "r") as f:
+            import json
 
+            hAB_debug = torch.tensor(json.load(f))
+        print(torch.allclose(hAB, hAB_debug, atol=1e-2), f"hAB hAB_debug.json {hAB - hAB_debug}")
+        print(hAB.shape, hAB_debug.shape)
+        # find elements where they differ
+        diff = hAB - hAB_debug
+        print(f"Max difference: {diff.abs().max()}")
         # run atom-pair features through a dense net to predict SAPT components
         EAB_sr = torch.cat(
             [
@@ -503,6 +604,11 @@ class APNet2_MPNN(nn.Module):
         )
 
         # TODO: the different between TF and PT is from the read_out_layers!
+        # Print read_out_layer_elst weights
+        for name, param in self.readout_layer_elst.named_parameters():
+            if param.requires_grad:
+                print(f"{name} - {param.data}")
+                print(f"{param.data.shape = }")
         print(f"{EAB_sr = }")
         print(f"{EBA_sr = }")
         E_sr = EAB_sr + EBA_sr
@@ -850,9 +956,9 @@ class APNet2Model:
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
         # have to do an inference to initialize lazy layers
-        batch = self.example_input()
-        batch.to(self.device)
-        self.model(**batch)
+        # batch = self.example_input()
+        # batch.to(self.device)
+        # self.model(**batch)
 
         checkpoint = torch.load(ap2_model_path, weights_only=False)
         if "_orig_mod" not in list(self.model.state_dict().keys())[0]:

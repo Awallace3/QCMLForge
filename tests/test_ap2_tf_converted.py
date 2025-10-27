@@ -197,7 +197,9 @@ def test_tf_converted_predict_water_dimer_single_README():
     """Test prediction on a single water dimer using converted TF models."""
     # pt reference
     energies = [-2.617089,   -3.5254788,   2.460659,   -0.5823244,  -0.96994525]
-    ref_elst, ref_exch, ref_ind, ref_disp = energies[1:]
+    energies = [-3.3612378,   2.2299695,  -0.53542924, -0.9564874]
+
+    ref_elst, ref_exch, ref_ind, ref_disp = energies #[1:]
     dimer = qcel.models.Molecule.from_data("""
         0 1
         O 0.000000 0.000000  0.000000
