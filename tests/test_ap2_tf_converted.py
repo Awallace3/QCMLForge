@@ -229,16 +229,16 @@ def test_tf_converted_predict_water_dimer_single_README():
     print(
         f"\nTF    Energies:\nELST={tf_elst}\nEXCH={tf_exch}\nIND={tf_ind}\nDISP={tf_disp}"
     )
-    assert np.isclose(tf_elst, ref_elst, atol=1.5e0), (
+    assert np.isclose(tf_elst, ref_elst, atol=1.0e-2), (
         f"ELST should be close to reference: {tf_elst} vs {ref_elst}"
     )
-    assert np.isclose(tf_exch, ref_exch, atol=1e0), (
+    assert np.isclose(tf_exch, ref_exch, atol=1e-2), (
         f"EXCH should be close to reference: {tf_exch} vs {ref_exch}"
     )
-    assert np.isclose(tf_ind, ref_ind, atol=1e0), (
+    assert np.isclose(tf_ind, ref_ind, atol=1e-2), (
             f"IND should be close to reference: {tf_ind} vs {ref_ind}"
     )
-    assert np.isclose(tf_disp, ref_disp, atol=1e0), (
+    assert np.isclose(tf_disp, ref_disp, atol=1e-2), (
         f"DISP should be close to reference: {tf_disp} vs {ref_disp}"
     )
 
