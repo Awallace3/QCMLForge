@@ -376,6 +376,8 @@ class APNet2_MPNN(nn.Module):
         # invariant hidden state lists
         hA_list = [self.embed_layer(ZA).view(ZA.size(0), -1)]
         hB_list = [self.embed_layer(ZB).view(ZB.size(0), -1)]
+        print(f"{hA_list = }")
+        print(f"{hB_list = }")
 
         # directional hidden state lists
         hA_dir_list = []
@@ -439,6 +441,9 @@ class APNet2_MPNN(nn.Module):
         hA = torch.cat(hA_list, dim=-1)
         hB = torch.cat(hB_list, dim=-1)
 
+        print(f"{hA = }")
+        print(f"{hB = }")
+
         # mock right sized output with N_dimer, 4 components
 
         # atom-pair features are a combo of atomic hidden states and the interatomic distance
@@ -446,6 +451,8 @@ class APNet2_MPNN(nn.Module):
                             e_ABsr_source, e_ABsr_target)
         hBA = self.get_pair(hB, hA, qB, qA, rbf_sr,
                             e_ABsr_target, e_ABsr_source)
+        # print(f"{hAB = }")
+        # print(f"{hBA = }")
 
         # project the directional atomic hidden states along the interatomic axis
         hA_dir = torch.cat(hA_dir_list, dim=-1)
@@ -472,6 +479,9 @@ class APNet2_MPNN(nn.Module):
         hAB = torch.cat([hAB, hA_dir_blah, hB_dir_blah], dim=1)
         hBA = torch.cat([hBA, hB_dir_blah, hA_dir_blah], dim=1)
 
+        print(f"{hAB = }")
+        print(f"{hBA = }")
+
         # run atom-pair features through a dense net to predict SAPT components
         EAB_sr = torch.cat(
             [
@@ -492,6 +502,9 @@ class APNet2_MPNN(nn.Module):
             dim=1,
         )
 
+        # TODO: the different between TF and PT is from the read_out_layers!
+        print(f"{EAB_sr = }")
+        print(f"{EBA_sr = }")
         E_sr = EAB_sr + EBA_sr
 
         cutoff = (1.0 / (dR_sr**3)).unsqueeze(-1)
@@ -1186,6 +1199,33 @@ class APNet2Model:
                             muB=muB,
                             quadB=quadB,
                             hlistB=hlistB,
+                        )
+                        print(f"""
+{data_A[j].x = }
+{data_A[j].R = }
+{data_B[j].x = }
+{data_B[j].R = }
+{e_ABsr_source = }
+{e_ABsr_target = }
+{dimer_ind = }
+{e_ABlr_source = }
+{e_ABlr_target = }
+{dimer_ind = }
+{e_AA_source = }
+{e_AA_target = }
+{e_BB_source = }
+{e_BB_target = }
+{data_A[j].total_charge = }
+{data_B[j].total_charge = }
+{qA = }
+{muA = }
+{quadA = }
+{hlistA = }
+{qB = }
+{muB = }
+{quadB = }
+{hlistB = }
+                        """
                         )
                         dimer_ls.append(data)
                 dimer_batch = pairwise_datasets.apnet2_collate_update_no_target_monomer_indices(
