@@ -10,22 +10,20 @@ authors = [
 ]
 description = "Package for creating QC ML models on QCArchive datasets. The AP-Net2 has been re-implemnented in PyTorch with newer versions to come."
 readme = "README.md"
-# requires-python = ">=3.12"
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    # "torch==2.7.0",
+    "torch==2.7.0",
     "qm_tools_aw",
-    # "torch-geometric==2.6.1",
-    # "torch-scatter==2.1.2",
-    # "numpy>=2.2.0",
-    # "qcelemental>=0.29.0",
-    # "torch-geometric==2.6.1",
-    # "torch-scatter==2.1.2",
-    # "pytorch-minimize",
-    # "qcportal>=0.59",
+    "numpy>=2.2.0",
+    "qcelemental>=0.29.0",
+    "torch-geometric==2.6.1",
+    "torch-scatter==2.1.2",
+    "pytorch-minimize",
+    "qcportal>=0.59",
 ]
 license = {text = "MIT"}
 
