@@ -849,6 +849,10 @@ class APNet2Model:
             ap2_model_path = resources.files('apnet_pt').joinpath("models", "ap2_ensemble", f"ap2_{model_id}.pt")
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
+        # have to do an inference to initialize lazy layers
+        batch = self.example_input()
+        batch.to(self.device)
+        self.model(**batch)
 
         checkpoint = torch.load(ap2_model_path, weights_only=False)
         if "_orig_mod" not in list(self.model.state_dict().keys())[0]:
