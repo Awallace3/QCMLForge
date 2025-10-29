@@ -12,6 +12,7 @@ from glob import glob
 import pandas as pd
 import pytest
 import shutil
+import tempfile
 
 torch.manual_seed(42)
 spec_type = 5
@@ -520,8 +521,6 @@ def test_classical_ap3_long_range():
 
 
 def test_ap3_fused_lmdb_dataset():
-    import tempfile
-    import shutil
     batch_size = 2
     atomic_batch_size = 4
     datapoint_storage_n_objects = 6
@@ -631,6 +630,7 @@ def test_ap3_fused_lmdb_dataset():
         
     finally:
         shutil.rmtree(temp_dir)
+
 
 def test_ap3_fused_train_qcel_molecules_in_memory_precompute_lmdb():
     batch_size = 2

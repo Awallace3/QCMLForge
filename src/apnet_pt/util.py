@@ -207,6 +207,7 @@ def load_dimer_dataset(
     columns=["Total_aug", "Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
     return_qcel_mols=True,
     return_qcel_mons=False,
+    return_fragment_indices=False,
     random_seed_shuffle=None,
 ):
     """Load multiple dimers from a :class:`~pandas.DataFrame`
@@ -240,24 +241,50 @@ def load_dimer_dataset(
     if random_seed_shuffle is not None:
         df = df.sample(frac=1, random_state=random_seed_shuffle).reset_index(drop=True)
     allowed_elements = constants.z_to_elem.keys()
-    len_df_start = len(df)
-    df = df[df["ZA"].apply(lambda x: all([z in allowed_elements for z in x]))].copy()
-    df = df[df["ZB"].apply(lambda x: all([z in allowed_elements for z in x]))].copy()
-    len_df_end = len(df)
-    if len_df_start != len_df_end:
-        print(f"  Removed {len_df_start - len_df_end} rows with invalid elements")
-    N = len(df.index)
 
-    if max_size is not None and max_size < N:
-        df = df.head(max_size)
-        N = max_size
+    assert not ((return_qcel_mons != True) and (return_fragment_indices != True)), (
+        "Cannot return both monomers and fragment indices simultaneously presently."
+    )
 
-    RA = df.RA.tolist()
-    RB = df.RB.tolist()
-    ZA = df.ZA.tolist()
-    ZB = df.ZB.tolist()
-    TQA = df.TQA.tolist()
-    TQB = df.TQB.tolist()
+    # if qcel_molecules is a column, use this as the source of truth to generate RA, RB, ZA, ZB, TQA, TQB
+    if 'qcel_molecule' in df.columns:
+        def extract_mol_data(mol):
+            if all([z in allowed_elements for z in mol.atomic_numbers]) is False:
+                return None, None, None, None, None, None
+            monA, monB = mol.get_fragment(0), mol.get_fragment(1)
+
+            RA = torch.tensor(monA.geometry, dtype=torch.float32) * constants.au2ang
+            RB = torch.tensor(monB.geometry, dtype=torch.float32) * constants.au2ang
+            ZA = torch.tensor(monA.atomic_numbers, dtype=torch.int64)
+            ZB = torch.tensor(monB.atomic_numbers, dtype=torch.int64)
+
+            TQA = torch.tensor(monA.molecular_charge, dtype=torch.float32)
+            TQB = torch.tensor(monB.molecular_charge, dtype=torch.float32)
+            return RA.numpy(), RB.numpy(), ZA.numpy(), ZB.numpy(), TQA.item(), TQB.item()
+        v = df['qcel_molecule'].apply(extract_mol_data).tolist()
+        # Filter out any None entries due to invalid elements
+        v = [entry for entry in v if entry[0] is not None]
+        N = len(v)
+        RA, RB, ZA, ZB, TQA, TQB = zip(*v)
+    else:
+        len_df_start = len(df)
+        df = df[df["ZA"].apply(lambda x: all([z in allowed_elements for z in x]))].copy()
+        df = df[df["ZB"].apply(lambda x: all([z in allowed_elements for z in x]))].copy()
+        len_df_end = len(df)
+        if len_df_start != len_df_end:
+            print(f"  Removed {len_df_start - len_df_end} rows with invalid elements")
+        N = len(df.index)
+
+        if max_size is not None and max_size < N:
+            df = df.head(max_size)
+            N = max_size
+
+        RA = df.RA.tolist()
+        RB = df.RB.tolist()
+        ZA = df.ZA.tolist()
+        ZB = df.ZB.tolist()
+        TQA = df.TQA.tolist()
+        TQB = df.TQB.tolist()
     aQA = [TQA[i] / np.sum(ZA[i] > 0) for i in range(N)]
     aQB = [TQB[i] / np.sum(ZB[i] > 0) for i in range(N)]
     try:
@@ -277,6 +304,10 @@ def load_dimer_dataset(
             dimers.append(dimerdata_to_qcel(RA[i], RB[i], ZA[i], ZB[i], aQA[i], aQB[i]))
 
         return dimers, labels
+    if return_fragment_indices:
+        frag1_indices = df["Frag1_indices"].tolist()
+        frag2_indices = df["Frag2_indices"].tolist()
+        return RA, RB, ZA, ZB, TQA, TQB, labels, frag1_indices, frag2_indices
     return RA, RB, ZA, ZB, TQA, TQB, labels
 
 
