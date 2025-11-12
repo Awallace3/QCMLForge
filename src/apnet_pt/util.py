@@ -495,7 +495,6 @@ def load_monomer_dataset(
     """
 
     df = pd.read_pickle(file)
-    print(df.columns.values)
     N = len(df.index)
     print(f"Reading {file} with {N} rows")
 

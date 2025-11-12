@@ -348,7 +348,7 @@ def T_cart_Thole_damping(RA, RB, alpha_i, alpha_j, a, damping_term="mutual"):
     # l5 = np.ones_like(l5)
     # print(f"{alpha_i:.2f}-{alpha_j:.2f} {l3 = }, {l5 = }")
     T0 = R**-1
-    print(f"{damping_term}, {l3=:.2f}")
+    # print(f"{damping_term}, {l3=:.2f}")
     T1 = l3 * (R**-3) * (-1.0 * dR)
     T2 = (R**-5) * (l5 * 3 * np.outer(dR, dR) - l3 * R * R * delta)
 
@@ -449,6 +449,40 @@ def eval_qcel_dimer_individual(
             total_energy[2] += E_qpole
     return total_energy * constants.h2kcalmol
 
+
+def eval_qcel_dimer_individual_pairs(
+    mol_dimer, qA, muA, thetaA, qB, muB, thetaB, match_cliff=False
+) -> float:
+    """
+    Evaluate the electrostatic interaction energy between two molecules using
+    their multipole moments. Dimensionalities of qA should be [N], muA should
+    be [N, 3], and thetaA should be [N, 3, 3]. Same for qB, muB, and thetaB.
+    """
+    total_energy = np.zeros(3)
+    RA = mol_dimer.get_fragment(0).geometry
+    RB = mol_dimer.get_fragment(1).geometry
+    ZA = mol_dimer.get_fragment(0).atomic_numbers
+    ZB = mol_dimer.get_fragment(1).atomic_numbers
+    elst_pairs = np.zeros((len(ZA), len(ZB)))
+    for i in range(len(ZA)):
+        for j in range(len(ZB)):
+            rA = RA[i]
+            qA_i = qA[i]
+            muA_i = muA[i]
+            thetaA_i = thetaA[i]
+
+            rB = RB[j]
+            qB_j = qB[j]
+            muB_j = muB[j]
+            thetaB_j = thetaB[j]
+
+            E_q, E_dp, E_qpole = eval_interaction_individual(
+                rA, qA_i, muA_i, thetaA_i, rB, qB_j, muB_j, thetaB_j
+            )
+            elst_pairs[i, j] += E_q
+            elst_pairs[i, j] += E_dp
+            elst_pairs[i, j] += E_qpole
+    return elst_pairs * constants.h2kcalmol
 
 def eval_qcel_dimer_individual_components(
     mol_dimer,
@@ -1576,6 +1610,11 @@ def intramolecular_induced_dipole(
     thole_damping_param_direct: float = 0.340,
     zero_dipoles: bool = False,
     zero_quadrupoles: bool = False,
+    screening: bool = True,
+    screening_distance: float = 1.8,
+    heavy_atoms_only: bool = True,
+    compute_energies: bool = False,
+    verbose: int = 0,
 ) -> tuple:
     """
     Calculate intramolecular induced dipoles for a single molecule using
@@ -1620,6 +1659,7 @@ def intramolecular_induced_dipole(
     """
     
     R = qcel_mol.geometry
+    # dist = np.linalg.norm(R[:, np.newaxis, :] - R[np.newaxis, :, :], axis=-1)
     Z = qcel_mol.atomic_numbers
     # print(f"{R=}")
     # print(f"{Z=}")
@@ -1630,8 +1670,9 @@ def intramolecular_induced_dipole(
         alpha_0 = np.array([free_atom_polarizabilities[i] for i in Z])
         hirshfeld_volume_ratio = hirshfeld_volume_ratio.flatten()
         alpha = alpha_0 * hirshfeld_volume_ratio ** (4 / 3.0)
-    print(f"{alpha=}")
-    print(f"{thole_damping_param_mutual=}")
+    if verbose > 0:
+        print(f"{alpha=}")
+        print(f"{thole_damping_param_mutual=}")
     
     n_atoms = len(R)
     q_flat = q.flatten()
@@ -1664,6 +1705,14 @@ def intramolecular_induced_dipole(
             T0, T1, T2, T3, T4 = T_cart_Thole_damping(
                 R[i], R[j], alpha[i], alpha[j], thole_damping_param_direct, damping_term="direct"
             )
+            if screening and T0 ** -1 < screening_distance / constants.au2ang:
+                # screening out 1-2 and 1-3 type interactions crudely
+                # print(f"  Screening direct {i}-{j} at distance {T0**-1:.2f} < {1.8 / constants.au2ang} bohr")
+                T0 *= 0
+                T1 *= 0
+                T2 *= 0
+                T3 *= 0
+                T4 *= 0
             T_abij_direct[i, j, 0, 0] = T0
             T_abij_direct[i, j, 0, 1:4] = T1
             T_abij_direct[i, j, 1:4, 0] = T1
@@ -1687,11 +1736,14 @@ def intramolecular_induced_dipole(
     mu_induced_0[:, :] += np.einsum(
         "a,abij,bj->ai", alpha, T_abij_direct[:, :, 1:4, 1:4], M[:, 1:4]
     )
+    if heavy_atoms_only:
+        h_inds = np.where(Z == 1)[0]
+        mu_induced_0[h_inds, :] *= 0
+        T_abij_mutual[h_inds, :, :, :] *= 0
+
     # mu_induced_0[:, :] += np.einsum(
     #     "a,abik,bk->ai", alpha, T_abij[:, :, 1:4, 4:13], M[:, 4:13]
     # )
-    print("mu(0):")
-    print(mu_induced_0)
     
     mu_induced = mu_induced_0.copy()
     
@@ -1710,7 +1762,93 @@ def intramolecular_induced_dipole(
         delta = np.linalg.norm(mu_induced - mu_induced_old)
         if delta < convergence_threshold:
             break
-    
+
+    # Energies
+    if compute_energies:
+
+        E_ind_pairs = (
+            np.einsum(
+                "ai,abi,b->ab",
+                mu_induced,
+                T_abij_direct[:, :, 1:4, 0],
+                M[:, 0],
+            )
+            + np.einsum(
+                "ai,abij,bj->ab",
+                mu_induced,
+                T_abij_direct[:, :, 1:4, 1:4],
+                M[:, 1:4],
+            )
+        ) * constants.h2kcalmol
+        E_ind = np.sum(E_ind_pairs) / -2
+        print(f"Total intramolecular E_ind: {E_ind:.4f} kcal/mol")
+        # Electrostatics energies using all permanent multipoles only
+        E_elst_pairs = (
+            # q-q
+            np.einsum(
+                "a,ab,b->ab",
+                M[:, 0],
+                T_abij_direct[:, :, 0, 0],
+                M[:, 0],
+            )
+            # q-mu
+            + np.einsum(
+                "ai,abi,b->ab",
+                M[:, 1:4],
+                T_abij_direct[:, :, 1:4, 0],
+                M[:, 0],
+            )
+            # q-Q
+            + np.einsum(
+                "ai,abi,b->ab",
+                M[:, 4:13],
+                T_abij_direct[:, :, 4:13, 0],
+                M[:, 0],
+            )
+            # mu-mu
+            + np.einsum(
+                "ai,abij,bj->ab",
+                M[:, 1:4],
+                T_abij_direct[:, :, 1:4, 1:4],
+                M[:, 1:4],
+            )
+            # mu-Q
+            + np.einsum(
+                "ai,abik,bl->ab",
+                M[:, 1:4],
+                T_abij_direct[:, :, 1:4, 4:13],
+                M[:, 4:13],
+            )
+            # Q-Q
+            + np.einsum(
+                "ak,abkl,bl->ab",
+                M[:, 4:13],
+                T_abij_direct[:, :, 4:13, 4:13],
+                M[:, 4:13],
+                )
+        ) * constants.h2kcalmol
+        # Now that you don't have an A and B, you have to divide by 2 to avoid double counting
+        E_elst = np.sum(E_elst_pairs) / -2
+        print(f"Total intramolecular E_elst: {E_elst:.4f} kcal/mol")
+        # difference of pairs
+        if verbose > 1:
+            E_diff_pairs = E_elst_pairs - E_ind_pairs
+            print(f"{E_ind_pairs =}")
+            print(f"{E_elst_pairs =}")
+            print(f"{E_diff_pairs =}")
+    if verbose > 0:
+        mu_diff = mu_induced - mu.reshape(-1, 3)
+        print(f"Original   dipoles:\n{mu}")
+        print(f"Induced    dipoles:\n{mu_induced}")
+        print("mu(0)=direct induced-dipoles:")
+        print(mu_induced_0)
+        # get magnitudes of dipoles
+        mu_magnitudes = np.linalg.norm(mu.reshape(-1, 3), axis=1)
+        mu_induced_magnitudes = np.linalg.norm(mu_induced, axis=1)
+        mu_diff_magnitudes = np.linalg.norm(mu_diff, axis=1)
+        print(f"Original   dipole magnitudes: {mu_magnitudes}")
+        print(f"Induced    dipole magnitudes: {mu_induced_magnitudes}")
+        print(f"Difference dipole magnitudes: {mu_diff_magnitudes}")
     return q_flat, mu_induced, theta
 
 

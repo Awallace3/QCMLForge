@@ -33,6 +33,7 @@ from apnet_pt import constants
 from .ap3_fused_ds import (
     dimer_fused_data,
 )
+import json
 
 ###############################
 #######   PairDataset   #######
@@ -915,7 +916,9 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
         if not hasattr(self, "lmdb_path") or self.lmdb_path is None:
             return ["lmdb_missing"]
 
+        print(f"{self.lmdb_path=}")
         if osp.exists(self.lmdb_path):
+            print("LMDB path exists, checking contents...")
             env = None
             try:
                 import lmdb
@@ -931,18 +934,16 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
                 with env.begin() as txn:
                     metadata_bytes = txn.get(b"__metadata__")
                     if metadata_bytes:
-                        import json
-
                         metadata = json.loads(metadata_bytes.decode("utf-8"))
                         length = metadata.get("length", 0)
 
                         if length > 0:
                             split_name = f"_{self.split}" if self.split != "all" else ""
-                            if self.MAX_SIZE is not None and length >= self.MAX_SIZE:
-                                return [
-                                    f"lmdb_ap3_fused{split_name}_spec_{self.spec_type}"
-                                ]
-                            return [f"lmdb_ap3_fused{split_name}_spec_{self.spec_type}"]
+                            files_to_return = [
+                                f"lmdb_ap3_fused_fsapt{split_name}_spec_{self.spec_type}/data.mdb",
+                                f"lmdb_ap3_fused_fsapt{split_name}_spec_{self.spec_type}/lock.mdb",
+                            ]
+                            return files_to_return
             except Exception as e:
                 print(f"Error checking LMDB: {e}")
             finally:

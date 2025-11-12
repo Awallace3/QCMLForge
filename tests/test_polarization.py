@@ -452,70 +452,97 @@ units angstrom
 
 
 def test_intramolecular_induced_dipole_MPID():
-    molA = qcel.models.Molecule.from_data("""
-0 1
-O      0.000000    0.000000    0.000000
-H     -0.756950    0.585882    0.000000
-H      0.756950    0.585882    0.000000
-units angstrom
-    """)
+    current_file_path = os.path.dirname(os.path.abspath(__file__))
+    df = pd.read_pickle(
+        current_file_path + os.sep + os.path.join("dataset_data", "water_dimer_pes3.pkl")
+    )
+    df = df[df["system_id"].str.contains("01_Water-Water")].copy()
+    df = df.sort_values(by="system_id")
+    r = df.iloc[0]
+    mol = r["qcel_molecule"]
+    
+    molA = mol.get_fragment(0)
     print(molA.to_string("psi4"))
-
-    qA = np.array([-0.51966, 0.25983, 0.25983])
-    # Need to switch ZXY to XYZ and multiply dipoles by -1 to match sign
-    # convention
-    muA = 1.0 * np.array(
-        [
-            [0.0, 0.14279, 0.0],
-            [-0.06962867, 0.00509394, 0.0],
-            [0.06962867, 0.00509394, 0.0],
-        ]
+    
+    qA = r["q_A pbe0/atz"]
+    muA = r["mu_A pbe0/atz"]
+    thetaA = r["theta_A pbe0/atz"]
+    vrA = r["vol_ratios_A pbe0/atz"]
+    vwA = r["val_widths_A pbe0/atz"]
+    np.set_printoptions(precision=6, suppress=True)
+    
+    q_returned, mu_induced, theta_returned = apnet_pt.multipole.intramolecular_induced_dipole(
+        qcel_mol=molA,
+        q=qA,
+        mu=muA,
+        theta=thetaA,
+        hirshfeld_volume_ratio=vrA,
+        valence_widths=vwA,
+        thole_damping_param_mutual=0.39,
+        thole_damping_param_direct=0.34,
     )
-    thetaA = [
-        # They have order of ZXY...
-        [0.37928, 0.0, -0.41809, 0.0, 0.0, 0.03881],
-        [-0.03673, 0.0, -0.10739, -0.00203, 0.0, 0.14412],
-        [-0.03673, 0.0, -0.10739, -2.03e-03, 0.0, 0.14412],
-    ]
-    # expand thetaA to full 3x3 tensors from the lower-triangular representation
-    # Lower-triangular format: [XX, XY, YY, XZ, YZ, ZZ]
-    thetaA_full = []
-    for theta_lt in thetaA:
-        theta_3x3 = np.array(
-            [
-                [theta_lt[3], theta_lt[1], theta_lt[0]],  # XX, XY, XZ
-                [theta_lt[4], theta_lt[2], theta_lt[1]],  # XY, YY, YZ
-                [theta_lt[5], theta_lt[4], theta_lt[3]],  # XZ, YZ, ZZ
-            ]
-        )
-        thetaA_full.append(theta_3x3)
-    thetaA = np.array(thetaA_full)
+    mu_diff = mu_induced - muA.reshape(-1, 3)
 
-    # vrA = r["vol_ratios_A pbe0/atz"]
-    atomic_polarizabilities = np.array([0.8370, 0.4960, 0.4960])  # in angstrom^3
-    # convert from angstrom^3 to atomic units (1 A^3 = 0.148184711 au)
-    # ang2bohr = qcel.constants.conversion_factor("angstrom", "bohr")
-    # atomic_polarizabilities *= (ang2bohr ** 3)
-
-    q_returned, mu_induced, theta_returned = (
-        apnet_pt.multipole.intramolecular_induced_dipole(
-            qcel_mol=molA,
-            q=qA,
-            mu=muA,
-            theta=thetaA,
-            atom_polarizabilities=atomic_polarizabilities,
-            # hirshfeld_volume_ratio=vrA,
-            # valence_widths=vwA,
-            # AMOEBA+ uses a=0.75 for direct, a=39 for mutual
-            # https://pubs.acs.org/doi/pdf/10.1021/acs.jctc.7b00225?ref=article_openPDF
-            thole_damping_param_direct=0.34,
-            thole_damping_param_mutual=0.39,
-            zero_quadrupoles=True,
-        )
-    )
     print(f"charges: {q_returned}")
-    print(f"perm    dipoles:\n{muA}")
-    print(f"Induced dipoles:\n{mu_induced}")
+    print(f"Quadrupoles:\n{theta_returned}")
+    print(f"Original   dipoles:\n{muA}")
+    print(f"Induced    dipoles:\n{mu_induced}")
+    # get magnitudes of dipoles
+    muA_magnitudes = np.linalg.norm(muA.reshape(-1, 3), axis=1)
+    mu_induced_magnitudes = np.linalg.norm(mu_induced, axis=1)
+    mu_diff_magnitudes = np.linalg.norm(mu_diff, axis=1)
+    print(f"Original   dipole magnitudes: {muA_magnitudes}")
+    print(f"Induced    dipole magnitudes: {mu_induced_magnitudes}")
+    print(f"Difference dipole magnitudes: {mu_diff_magnitudes}")
+    return
+
+
+def test_intramolecular_induced_dipole_MPID_df_bz():
+    current_file_path = os.path.dirname(os.path.abspath(__file__))
+    df = pd.read_pickle(
+        current_file_path + os.sep + os.path.join("dataset_data", "df_bz_meoh_mbis.pkl")
+    )
+    print(df)
+    df = df.sort_values(by="system_id")
+    r = df.iloc[0]
+    mol = r["qcel_molecule"]
+    
+    molA = mol.get_fragment(0)
+    print(molA.to_string("psi4"))
+    
+    qA = r["q_A pbe0/atz"]
+    muA = r["mu_A pbe0/atz"]
+    thetaA = r["theta_A pbe0/atz"]
+    vrA = r["vol_ratios_A pbe0/atz"]
+    vwA = r["val_widths_A pbe0/atz"]
+    np.set_printoptions(precision=6, suppress=True)
+
+    q_returned, mu_induced, theta_returned = apnet_pt.multipole.intramolecular_induced_dipole(
+        qcel_mol=molA,
+        q=qA,
+        mu=muA,
+        theta=thetaA,
+        hirshfeld_volume_ratio=vrA,
+        valence_widths=vwA,
+        thole_damping_param_mutual=0.39,
+        thole_damping_param_direct=0.34,
+        compute_energies=True,
+        heavy_atoms_only=False,
+        verbose=True
+    )
+    
+    q_returned, mu_induced, theta_returned = apnet_pt.multipole.intramolecular_induced_dipole(
+        qcel_mol=molA,
+        q=qA,
+        mu=muA,
+        theta=thetaA,
+        hirshfeld_volume_ratio=vrA,
+        valence_widths=vwA,
+        thole_damping_param_mutual=0.39,
+        thole_damping_param_direct=0.34,
+        compute_energies=True,
+        verbose=True
+    )
     return
 
 
@@ -583,4 +610,6 @@ def amoeba_transform():
 
 if __name__ == "__main__":
     # Now run the actual test
-    test_intramolecular_induced_dipole()
+    # test_intramolecular_induced_dipole()
+    # test_intramolecular_induced_dipole_MPID()
+    test_intramolecular_induced_dipole_MPID_df_bz()
