@@ -13,7 +13,7 @@ dependencies:
   - psycopg2=2.9.9
   - pytest=7.4.4
   - python=3.12.8
-  - pytorch=2.7.0
+  - pytorch=2.8.0
   - pytorch-mutex=1.0
   - requests=2.32.3
   - setuptools=72.1.0
@@ -31,8 +31,8 @@ dependencies:
       - qm-tools-aw==1.4.5
       # torch-geometric and torch-scatter with explicit wheel URLs for CUDA 12.8
       # For CPU-only systems, change +cu128 to +cpu in the URLs below
-      - torch-geometric==2.6.1 -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
-      - torch-scatter==2.1.2 -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
+      - torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-2.8.0+cu129.html
+      - torch-scatter -f https://data.pyg.org/whl/torch-2.8.0+cu129.html
       - waitress==3.0.2
       - yarl==1.18.3
       - pytorch-minimize

@@ -16,12 +16,12 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch==2.7.0",
+    "torch==2.8.0",
     "qm_tools_aw",
     "numpy>=2.2.0",
     "qcelemental>=0.29.0",
-    "torch-geometric==2.6.1",
-    "torch-scatter==2.1.2",
+    "torch-geometric==2.7.0",
+    "torch-scatter",
     "pytorch-minimize",
     "qcportal>=0.59",
 ]
