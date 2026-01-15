@@ -325,6 +325,42 @@ class APNet2_AM_MPNN(nn.Module):
         self,
         batch,
     ):
+        """
+        Compute intermolecular SAPT component energies and multipole electrostatics for a fused dimer batch via intramonomer message passing and atom-pair readouts.
+        
+        This performs: distance computation and encoding, predicts monomer multipole moments via the frozen atom_model, runs several message-passing iterations to produce invariant and directional atomic hidden states, forms atom-pair features (including directional projections), applies readout networks to predict short-range SAPT components per atom-pair, applies a 1/r^3 distance cutoff and aggregates per-dimer, computes multipole electrostatic energies for short- and long-range edges, aligns and pads the electrostatic terms to per-dimer shape, and returns summed energies and intermediate tensors needed for diagnostics or further processing.
+        
+        Parameters:
+            batch: A fused batch object containing tensors required by the model. Expected attributes include
+                ZA, RA, ZB, RB (atomic numbers and coordinates for monomers A and B),
+                e_ABsr_source, e_ABsr_target, dimer_ind (short-range intermolecular edge indices and dimer mapping),
+                e_ABlr_source, e_ABlr_target, dimer_ind_lr (long-range intermolecular edge indices and dimer mapping),
+                e_AA_source, e_AA_target (intramonomer A edge indices),
+                e_BB_source, e_BB_target (intramonomer B edge indices),
+                batch_atomic_A, batch_atomic_B (inputs for the atom_model),
+                total_charge_A (used to infer ndimer). The batch must follow the fused dataset structure used by this model.
+        
+        Returns:
+            If self.return_hidden_states is True:
+                tuple(
+                    E_output (Tensor): per-dimer total energy tensor shaped [ndimer, C_total],
+                    E_sr_dimer (Tensor): aggregated short-range SAPT components per dimer [ndimer, C_sr],
+                    E_elst_sr_dimer (Tensor): aggregated short-range multipole electrostatics per dimer [ndimer, C_elst_sr],
+                    E_elst_lr_dimer (Tensor): aggregated long-range multipole electrostatics per dimer [ndimer, C_elst_lr],
+                    hAB (Tensor): per-edge atom-pair feature tensor for A->B edges,
+                    hBA (Tensor): per-edge atom-pair feature tensor for B->A edges,
+                    cutoff (Tensor): per-edge distance-based cutoff factors used to scale short-range SAPT terms
+                )
+            Otherwise:
+                tuple(
+                    E_output (Tensor): per-dimer total energy tensor shaped [ndimer, C_total],
+                    E_sr (Tensor): per-edge short-range SAPT components before per-dimer aggregation,
+                    E_elst_sr (Tensor): per-edge short-range multipole electrostatics,
+                    E_elst_lr (Tensor): per-edge long-range multipole electrostatics,
+                    hAB (Tensor): per-edge atom-pair feature tensor for A->B edges,
+                    hBA (Tensor): per-edge atom-pair feature tensor for B->A edges
+                )
+        """
         ZA = batch.ZA
         RA = batch.RA
         ZB = batch.ZB
@@ -407,8 +443,12 @@ class APNet2_AM_MPNN(nn.Module):
             #################
 
             # sum each atom's messages
-            mA_i = scatter_sum_compile(mA_ij, e_AA_source, dim_size=natomA, reduce="sum")
-            mB_i = scatter_sum_compile(mB_ij, e_BB_source, dim_size=natomB, reduce="sum")
+            mA_i = scatter_sum_compile(
+                mA_ij, e_AA_source, dim_size=natomA, reduce="sum"
+            )
+            mB_i = scatter_sum_compile(
+                mB_ij, e_BB_source, dim_size=natomB, reduce="sum"
+            )
 
             # get the next hidden state of the atom
             hA_next = self.update_layers[i](mA_i)
@@ -820,6 +860,11 @@ class APNet2_AM_Model:
         return
 
     def compile_model(self):
+        """
+        Prepare and compile the model for optimized execution on the configured device.
+        
+        Moves the model to self.device, configures TorchDynamo to allow dynamic shapes, and compiles the model with torch.compile(dynamic=True).
+        """
         self.model.to(self.device)
         torch._dynamo.config.dynamic_shapes = True
         torch._dynamo.config.capture_dynamic_output_shape_ops = False
@@ -828,10 +873,12 @@ class APNet2_AM_Model:
         self.model = torch.compile(self.model, dynamic=True)
         return
 
-
     def set_all_weights_to_value(self, value: float):
         """
-        Sets the weights of the model to a constant value for debugging.
+        Set every learnable parameter in the APNet model to a constant value, initializing any lazy modules first by running a sample forward pass.
+        
+        Parameters:
+            value (float): The constant value to assign to all weight and bias tensors of the model.
         """
         batch = self.example_input()
         batch.to(self.device)
@@ -839,10 +886,23 @@ class APNet2_AM_Model:
         set_weights_to_value(self.model, value)
         return
 
-
     def set_pretrained_model(
         self, ap2_model_path=None, am_model_path=None, model_id=None
     ):
+        """
+        Load a pretrained APNet2 model checkpoint into this wrapper's APNet2 model instance.
+        
+        Parameters:
+            ap2_model_path (str | pathlib.Path | os.PathLike | None): Filesystem path to a saved APNet2 checkpoint; ignored if `model_id` is provided.
+            am_model_path (Any): Present for API compatibility but not used by this method.
+            model_id (str | int | None): If provided, selects a bundled model resource by identifier and overrides `ap2_model_path`.
+        
+        Returns:
+            self: The instance with `self.model` updated from the loaded checkpoint.
+        
+        Raises:
+            ValueError: If neither `ap2_model_path` nor `model_id` is provided.
+        """
         if model_id is not None:
             ap2_model_path = resources.files("apnet_pt").joinpath(
                 "models", "ap2-fused_ensemble", f"ap2_{model_id}.pt"
@@ -1356,6 +1416,24 @@ units angstrom
         num_workers,
         lr_decay=None,
     ):
+        """
+        Run a distributed data-parallel training loop for the APNet2 model.
+        
+        Sets up the distributed process group when world_size > 1, moves and (on multi‑GPU runs) wraps the model with DistributedDataParallel, constructs distributed-aware data loaders, runs a pre‑training evaluation, then performs training for n_epochs with evaluation after each epoch. When test loss improves on rank 0, saves the current best model state_dict and configuration to self.model_save_path. Cleans up the process group when finished.
+        
+        Parameters:
+            rank (int): Process rank within the distributed run.
+            world_size (int): Total number of processes in the distributed run.
+            train_dataset (Sequence): Dataset used for training (iterable of samples).
+            test_dataset (Sequence): Dataset used for validation/testing.
+            n_epochs (int): Number of training epochs to run.
+            batch_size (int): Batch size per process.
+            lr (float): Initial learning rate for the optimizer.
+            pin_memory (bool): If True, DataLoader will copy tensors into CUDA pinned memory.
+            num_workers (int): Number of worker processes for data loading.
+            lr_decay (float | None): Optional decay factor used to create an InverseTimeDecayLR scheduler; if None no scheduler is used.
+        
+        """
         print(f"{self.device.type=}")
         if self.device.type == "cpu":
             rank_device = "cpu"
@@ -1454,7 +1532,7 @@ units angstrom
             dt = time.time() - t1
             if rank == 0:
                 print(
-                    f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{ total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} { exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{ indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
+                    f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                     flush=True,
                 )
         for epoch in range(n_epochs):
@@ -1501,12 +1579,11 @@ units angstrom
                 dt = time.time() - t1
                 test_loss = 0.0
                 print(
-                    f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{
-                        total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {
-                        exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{
-                        indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f} {
-                        test_lowered
-                    }",
+                    f"  EPOCH: {epoch: 4d}({dt: < 7.2f} sec)  MAE: {
+                        total_MAE_t: > 7.3f}/{total_MAE_v: < 7.3f} {
+                        elst_MAE_t: > 7.3f}/{elst_MAE_v: < 7.3f} {exch_MAE_t: > 7.3f}/{
+                        exch_MAE_v: < 7.3f} {indu_MAE_t: > 7.3f}/{indu_MAE_v: < 7.3f} {
+                        disp_MAE_t: > 7.3f}/{disp_MAE_v: < 7.3f} {test_lowered}",
                     flush=True,
                 )
 
@@ -1529,8 +1606,39 @@ units angstrom
         lr_decay=None,
         skip_compile=False,
         transfer_learning=False,
+        pretrain_test_loss=True,
     ):
         # (1) Compile Model
+        """
+        Train the APNet2 model on a single process using provided datasets and hyperparameters.
+        
+        Performs an optional compile step, constructs dataloaders, runs a pre-training evaluation, executes epoched training and evaluation loops, tracks and restores the best-performing model by test loss, and optionally saves the best model to self.model_save_path. The method updates self.model in-place (replacing it with the best model found) and moves model tensors between devices as needed.
+        
+        Parameters:
+            train_dataset: Dataset
+                Training dataset used to construct the training DataLoader.
+            test_dataset: Dataset
+                Validation/testing dataset used to construct the evaluation DataLoader.
+            n_epochs: int
+                Number of training epochs to run.
+            batch_size: int
+                Batch size for training and evaluation DataLoaders.
+            lr: float
+                Initial learning rate for the optimizer.
+            pin_memory: bool
+                Whether DataLoaders should use pinned memory.
+            num_workers: int
+                Number of worker processes for DataLoader data loading.
+            lr_decay: float | None
+                If provided, configures an inverse-time decay schedule using this decay rate; if None, no scheduler is used.
+            skip_compile: bool
+                If True, skip model compilation step; otherwise attempt compilation before training.
+            transfer_learning: bool
+                If True, use the transfer-learning training/evaluation routines and simplified logging format.
+            pretrain_test_loss: bool
+                If True, initialize best-model selection using the pre-training test loss; if False, initialize it to infinity so any subsequent improvement is accepted.
+        
+        """
         rank_device = self.device
         # self.model.to(rank_device)
         batch = self.example_input()
@@ -1601,8 +1709,8 @@ units angstrom
                 v_out
             )
             print(
-                f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {
-                    total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} "
+                f"  (Pre-training)({time.time() - t0: < 7.2f}s)  MAE: {
+                    total_MAE_t: > 7.3f}/{total_MAE_v: < 7.3f} "
                 f"{elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} "
                 f"{indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                 flush=True,
@@ -1611,13 +1719,17 @@ units angstrom
             train_loss, total_MAE_t = t_out
             test_loss, total_MAE_v = v_out
             print(
-                f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {
-                    total_MAE_t:>7.3f}/{total_MAE_v:<7.3f}",
+                f"  (Pre-training)({time.time() - t0: < 7.2f}s)  MAE: {
+                    total_MAE_t: > 7.3f}/{total_MAE_v: < 7.3f}",
                 flush=True,
             )
 
         # (6) Main training loop
-        lowest_test_loss = test_loss
+        if pretrain_test_loss:
+            lowest_test_loss = test_loss
+        else:
+            lowest_test_loss = torch.tensor(float("inf"))
+        # print(f"{lowest_test_loss=:.6f}")
         for epoch in range(n_epochs):
             t1 = time.time()
             t_out = __train_batch(
@@ -1647,6 +1759,7 @@ units angstrom
 
             # Track best model
             star_marker = " "
+            # print(f"{test_loss=:.6f}")
             if test_loss < lowest_test_loss:
                 lowest_test_loss = test_loss
                 star_marker = "*"
@@ -1704,10 +1817,34 @@ units angstrom
         random_seed=42,
         skip_compile=False,
         transfer_learning=False,
+        pretrain_test_loss=True,
     ):
         """
-        hyperparameters match the defaults in the original code:
-        https://chemrxiv.org/engage/chemrxiv/article-details/65ccd41866c1381729a2b885
+        Train the APNet2 model on the provided dataset and manage training workflow (single- or multi-process).
+        
+        Parameters:
+            dataset: Optional dataset or list [train_dataset, test_dataset]; if omitted the instance's dataset is used.
+            n_epochs (int): Number of training epochs.
+            lr (float): Initial learning rate.
+            split_percent (float): Fraction of the dataset to use for training when a single dataset is supplied.
+            model_path (str): Filesystem path where training results and checkpoints will be saved.
+            shuffle (bool): Whether to shuffle dataset indices before splitting or batching.
+            dataloader_num_workers (int): Number of worker processes for data loading per DataLoader.
+            world_size (int): Number of parallel processes for distributed training; >1 enables multi-process training.
+            omp_num_threads_per_process (int): Value assigned to OMP_NUM_THREADS for each spawned process.
+            lr_decay: Optional learning-rate scheduler configuration passed to training routines.
+            random_seed (int): Seed used for NumPy RNG to control dataset shuffling/splitting.
+            skip_compile (bool): If True, skip model compilation step before training.
+            transfer_learning (bool): If True, run the transfer-learning training path.
+            pretrain_test_loss (bool): If True, initialize best-test-loss tracking from the initial test evaluation; otherwise start from infinity.
+        
+        Side effects:
+            - Updates self.dataset, self.batch_size, self.model_save_path, and self.shuffle.
+            - May spawn multiple processes (torch.multiprocessing.spawn) when world_size > 1.
+            - Writes training outputs/checkpoints to model_path during training.
+        
+        Raises:
+            ValueError: If no dataset is available after argument resolution.
         """
         if dataset is not None:
             self.dataset = dataset
@@ -1718,7 +1855,7 @@ units angstrom
             raise ValueError("No dataset provided")
         np.random.seed(random_seed)
         self.model_save_path = model_path
-        print(f"Saving training results to...\n{model_path}")
+        print(f"Saving training results to...\n{self.model_save_path}")
         if isinstance(self.dataset, list):
             train_dataset = self.dataset[0]
             if shuffle:
@@ -1804,5 +1941,30 @@ units angstrom
                 lr_decay=lr_decay,
                 skip_compile=skip_compile,
                 transfer_learning=transfer_learning,
+                pretrain_test_loss=pretrain_test_loss,
             )
+        return
+
+    def freeze_parameters_except_readouts(self):
+        """
+        Freeze all parameters of self.model except those belonging to the readout modules for electrostatics, exchange, induction, and dispersion.
+        
+        Sets requires_grad = True for parameters in the readout modules named with the suffixes 'elst', 'exch', 'indu', or 'disp', and sets requires_grad = False for all other parameters on self.model.
+        """
+        for name, param in self.model.named_parameters():
+            term = name.split('.')[0]
+            if "readout" in name and term[-4:] in ['elst', 'exch', 'indu', 'disp']:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        return
+
+    def unfreeze_all_parameters(self):
+        """
+        Unfreeze all parameters of the wrapped APNet2 model so they are trainable.
+        
+        Sets each parameter in self.model to require gradients (`requires_grad = True`).
+        """
+        for name, param in self.model.named_parameters():
+            param.requires_grad = True
         return

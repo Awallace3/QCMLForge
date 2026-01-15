@@ -14,6 +14,12 @@ import pytest
 import shutil
 import tempfile
 
+from apnet_pt.AtomPairwiseModels.mtp_mtp import classical_dispersion_scatter
+import tad_mctc as mctc
+import tad_dftd3 as d3
+
+from tad_dftd3 import my_disp
+
 torch.manual_seed(42)
 spec_type = 5
 current_file_path = os.path.dirname(os.path.realpath(__file__))
@@ -633,6 +639,11 @@ def test_ap3_fused_lmdb_dataset():
 
 
 def test_ap3_fused_train_qcel_molecules_in_memory_precompute_lmdb():
+    """
+    Train an APNet3 atom-type model using an LMDB-backed precomputed fused dataset and verify prediction stability.
+    
+    Creates a small LMDB-backed ap3 fused dataset from test qcel molecules, constructs atom-type and dimer parameter models, trains the APNet3_AtomType_Model, compares predictions before and after a subsequent short retraining to ensure outputs remain numerically identical within tolerance, and removes the created LMDB processed folder on completion.
+    """
     batch_size = 2
     atomic_batch_size = 4
     datapoint_storage_n_objects = 6
@@ -713,6 +724,205 @@ def test_ap3_fused_train_qcel_molecules_in_memory_precompute_lmdb():
     # need to cleanup lmdb_ap3_fused_spec_None in data_path/processed
     shutil.rmtree(f"{data_path}/processed/lmdb_ap3_fused_spec_None")
 
+def test_classical_ap3_dispersion():
+
+    menh2_water_dimer = qcel.models.Molecule.from_data("""
+    0 1
+    --
+    0 1
+    N                    -1.008100800000    -0.528355160000     0.202192680000
+    H                    -1.188923790000    -2.359180490000     0.723479130000
+    H                    -2.121413420000    -0.313995840000    -1.337480310000
+    C                    -1.921680310000     1.112077560000     2.243810640000
+    H                    -1.724865800000     3.071847600000     1.662054110000
+    H                    -3.882890690000     0.784391550000     2.793966870000
+    H                    -0.727588730000     0.848110780000     3.893996460000
+    --
+    0 1
+    O                     4.023106790000     1.759569490000     0.398270440000
+    H                     2.478222790000     0.821750410000     0.071058880000
+    H                     5.122741160000     1.271079320000    -0.954293650000
+    units bohr
+    no_com
+    no_reorient
+    """)
+
+    water_water_dimer = qcel.models.Molecule.from_data("""
+    0 1
+    --
+    0 1
+    O                    -1.326958230000    -0.105938530000     0.018788150000
+    H                    -1.931665240000     1.600174320000    -0.021710520000
+    H                     0.486644280000     0.079598090000     0.009862480000
+    --
+    0 1
+    O                     4.287563290000     0.049775580000     0.000960040000
+    H                     4.999275000000    -0.778642690000     1.448725300000
+    H                     4.991040900000    -0.850136520000    -1.407646550000
+    units bohr
+    no_com
+    no_reorient
+    """)
+
+    benzene_pyridine_dimer = qcel.models.Molecule.from_data("""
+    0 1
+    --
+    0 1
+    C                     1.547207570000     1.633049050000     0.355809190000
+    H                     2.770553190000     3.244031740000     0.651429050000
+    C                     2.587029620000    -0.737983290000    -0.126041300000
+    H                     4.616669650000    -0.967278880000    -0.208955410000
+    C                     1.009829210000    -2.812844480000    -0.513793930000
+    H                     1.815740040000    -4.651682210000    -0.898578930000
+    C                    -1.604595960000    -2.514294490000    -0.415544040000
+    H                    -2.829051200000    -4.123118380000    -0.717251620000
+    C                    -2.644644230000    -0.143676260000     0.076409500000
+    H                    -4.672700600000     0.084863400000     0.176466510000
+    C                    -1.068247630000     1.930172610000     0.457841350000
+    H                    -1.875660280000     3.767473860000     0.843305720000
+    --
+    0 1
+    N                    -4.484042050000     0.282741320000     6.476783420000
+    C                    -3.322076040000     2.470416420000     7.006028040000
+    H                    -4.545870340000     4.082676810000     7.313131390000
+    C                    -0.710068430000     2.736580070000     7.176426190000
+    H                     0.106007450000     4.557614870000     7.613361660000
+    C                     0.803510340000     0.625795100000     6.771620560000
+    H                     2.839820940000     0.758802100000     6.875242770000
+    C                    -0.369162810000    -1.658231910000     6.216684390000
+    H                     0.718893330000    -3.350711980000     5.868833170000
+    C                    -2.996853970000    -1.730113090000     6.093002910000
+    H                    -3.958446630000    -3.484635690000     5.660552930000
+    units bohr
+    no_com
+    no_reorient
+    """)
+
+    mols = [
+        menh2_water_dimer,
+        water_water_dimer,
+        benzene_pyridine_dimer,
+    ]
+
+    mols = [
+        water_water_dimer,
+    ]
+
+    batch = apnet_pt.pt_datasets.ap2_fused_ds.ap2_fused_collate_update_no_target(
+        [
+            apnet_pt.pt_datasets.ap2_fused_ds.qcel_dimer_to_fused_data(
+                mol, r_cut=5.0, dimer_ind=n, r_cut_im=torch.inf
+            )
+            for n, mol in enumerate(mols)
+        ]
+    )
+
+    am_path = resources.files("qcmlforge").joinpath("../../models/ap3_ensemble/1/am_3.pt")
+    at_hf_vw_path = resources.files("qcmlforge").joinpath("../../models/ap3_ensemble/1/am_h+1_3.pt")
+    at_elst_path = resources.files("qcmlforge").joinpath("../../models/ap3_ensemble/1/am_elst_h+1_3.pt")
+    ap3_path = resources.files("qcmlforge").joinpath("../../models/ap3_ensemble/1/ap3_1.pt")
+
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        use_GPU=False,
+        n_neuron=64,
+        n_params=1,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        model_type="AtomTypeParamNN",
+        # model_type="AtomTypeParamMPNN",
+        # pre_trained_model_path=at_elst_path_mpnn,
+        pre_trained_model_path=at_elst_path,
+    )
+
+    ap3 = APNet3_AtomType_Model(
+        ds_root=None,
+        atom_type_model=atom_type_hf_vw_model.model,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        am_dimer_param_model=atom_type_elst_model,
+        #use_precomputed_classical=False,
+    )
+    v = ap3.predict_qcel_mols([water_water_dimer,], batch_size=1, return_classical_pairs=True)
+    print(f"{v = }")
+    E_classical, mA, mB = ap3.dimer_prop_model(batch)
+    print(torch.sum(E_classical[:,2]))
+    #print(torch.sum(Disp))
+    return
+
+def test_scatter_dispersion():
+    param = {
+    "a1": torch.tensor(0.095),
+    "s8": torch.tensor(0.738),
+    "a2": torch.tensor(3.637),
+    }
+    water_water_dimer = qcel.models.Molecule.from_data("""
+    0 1
+    --
+    0 1
+    O                    -1.326958230000    -0.105938530000     0.018788150000
+    H                    -1.931665240000     1.600174320000    -0.021710520000
+    H                     0.486644280000     0.079598090000     0.009862480000
+    --
+    0 1
+    O                     4.287563290000     0.049775580000     0.000960040000
+    H                     4.999275000000    -0.778642690000     1.448725300000
+    H                     4.991040900000    -0.850136520000    -1.407646550000
+    units bohr
+    no_com
+    no_reorient
+    """)
+
+    mols = [water_water_dimer, water_water_dimer]
+    batch = apnet_pt.pt_datasets.ap2_fused_ds.ap2_fused_collate_update_no_target(
+        [
+            apnet_pt.pt_datasets.ap2_fused_ds.qcel_dimer_to_fused_data(
+                mol, r_cut=5.0, dimer_ind=n, r_cut_im=torch.inf
+            )
+            for n, mol in enumerate(mols)
+        ]
+    )
+
+    # classical_dispersion_scatter(
+    #     ZA=batch.ZA,
+    #     RA=batch.RA,
+    #     ZB=batch.ZB,
+    #     RB=batch.RB,
+    #     molecule_ind_A=batch.molecule_ind_A,
+    #     molecule_ind_B=batch.molecule_ind_B,
+    # )
+
+
+    print(dir(batch))
+    
+    if not hasattr(batch, "e_ABfull_source"):
+        batch.e_ABfull_source = torch.cat([batch.e_ABsr_source, batch.e_ABlr_source], dim=0)
+        batch.e_ABfull_target = torch.cat([batch.e_ABsr_target, batch.e_ABlr_target], dim=0)
+
+    d3.my_disp.apnet_dispersion(
+        numbers=torch.tensor(water_water_dimer.atomic_numbers),
+        positions=torch.tensor(water_water_dimer.geometry),
+        param=param,
+        ZA=batch.ZA,
+        RA=batch.RA,
+        ZB=batch.ZB,
+        RB=batch.RB,
+        e_source=batch.e_ABfull_source,
+        e_target=batch.e_ABfull_target,
+        mon_A_indices=torch.tensor(water_water_dimer.fragments[0]),
+        mon_B_indices=torch.tensor(water_water_dimer.fragments[1]),
+        pairwise_matrix=True
+    )
+
+    
+    #print(torch.sum(energy))
 
 if __name__ == "__main__":
     # test_classical_ap3()

@@ -12,6 +12,7 @@ def train_atom_model(
     atom_model_type="AtomModel",
     model_path="./models/am_amw_1.pt",
     atom_type_param_model_path=None,
+    atom_mpnn_pretrained_path=None,
     data_dir="data_atomic",
     spec_type=3,
     testing=False,
@@ -26,7 +27,39 @@ def train_atom_model(
     n_neuron=128,
     n_embed=8,
     r_cut=5.0,
+    use_nn_screening=False,
+    precompute_hfvr=False,
+    ds_use_lmdb=False,
 ):
+    """
+    Train an atom-level model specified by `atom_model_type` using the dataset and hyperparameters provided.
+    
+    Selects and instantiates the appropriate atom model class, optionally initializes from an existing checkpoint (if `model_path` exists), and runs training with the supplied dataset and training hyperparameters. Raises ValueError if `atom_model_type` is not recognized.
+    
+    Parameters:
+        atom_model_type (str): Identifier of the atom model to train (e.g., "AtomModel", "AtomHirshfeldModel", "AtomTypeParamModel", "AtomInducedDipoleModel", "InducedDipoleModel").
+        model_path (str): Output path for the trained model and path used to detect/load a pretrained checkpoint if the file exists.
+        atom_type_param_model_path (str or None): Path to a pretrained atom-type parameter model (used by Hirshfeld/induced-dipole variants).
+        atom_mpnn_pretrained_path (str or None): Path to a pretrained AtomMPNN model (used by InducedDipoleModel).
+        data_dir (str): Root directory containing the atomic dataset.
+        spec_type (int): Dataset specification/type index used by the dataset loader.
+        testing (bool): Reserved flag for test mode (not used for return value).
+        n_epochs (int): Number of training epochs.
+        random_seed (int): Seed for reproducible training runs.
+        ds_max_size (int or None): Maximum number of dataset entries to load; None means no explicit cap.
+        world_size (int): Number of devices/processes participating in distributed training.
+        omp_num_threads (int): Number of OpenMP threads available per process; used to derive dataloader worker count.
+        lr (float): Initial learning rate.
+        n_message (int): Number of message-passing steps (when applicable to the chosen model).
+        n_rbf (int): Number of radial basis functions used by the model.
+        n_neuron (int): Number of neurons per hidden layer.
+        n_embed (int): Size of embedding vectors.
+        r_cut (float): Cutoff radius for neighbor interactions.
+        use_nn_screening (bool): Enable neural-network–based screening of interactions (applies to induced-dipole variants).
+        precompute_hfvr (bool): Precompute Hirshfeld volumes/widths for models that use them.
+        ds_use_lmdb (bool): Use LMDB-backed dataset storage when supported.
+    
+    """
     if atom_model_type == "AtomModel":
         AM = AtomModels.ap2_atom_model.AtomModel
         batch_size = 16
@@ -39,6 +72,9 @@ def train_atom_model(
     elif atom_model_type == "AtomInducedDipoleModel":
         AM = AtomModels.ap3_atom_model.AtomInducedDipoleModel
         batch_size = 16
+    elif atom_model_type == "InducedDipoleModel":
+        AM = AtomModels.ap3_atom_model_frozen.InducedDipoleModel
+        batch_size = 16
     else:
         raise ValueError("Invalid Atom Model Type")
     pretrained_model = None
@@ -46,7 +82,7 @@ def train_atom_model(
         pretrained_model = model_path
     print("Training {}...".format(atom_model_type))
     # TODO complete
-    if atom_model_type in ['AtomModel', 'AtomHirshfeldModel', 'AtomTypeParamModel']:
+    if atom_model_type in ["AtomModel", "AtomHirshfeldModel", "AtomTypeParamModel"]:
         atom_model = AM(
             n_message=n_message,
             n_rbf=n_rbf,
@@ -62,13 +98,15 @@ def train_atom_model(
             pre_trained_model_path=pretrained_model,
         )
         skip_compile = False
-    elif atom_model_type in ['AtomInducedDipoleModel']:
+    elif atom_model_type in ["AtomInducedDipoleModel"]:
         atom_model = AM(
             atomtype_hfvr_pre_trained_path=atom_type_param_model_path,
             n_rbf=n_rbf,
             n_neuron=n_neuron,
             n_embed=n_embed,
             r_cut=r_cut,
+            use_nn_screening=use_nn_screening,
+            precompute_hfvr=precompute_hfvr,
             ds_root=data_dir,
             ds_spec_type=spec_type,
             ds_max_size=ds_max_size,
@@ -77,7 +115,27 @@ def train_atom_model(
             use_GPU=True,
             pre_trained_model_path=pretrained_model,
         )
-        skip_compile = True
+        skip_compile = False
+    elif atom_model_type in ["InducedDipoleModel"]:
+        atom_model = AM(
+            atomtype_hfvr_pre_trained_path=atom_type_param_model_path,
+            atom_mpnn_pre_trained_path=atom_mpnn_pretrained_path,
+            n_rbf=n_rbf,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            r_cut=r_cut,
+            use_nn_screening=use_nn_screening,
+            precompute_hfvr=precompute_hfvr,
+            ds_use_lmdb=ds_use_lmdb,
+            ds_root=data_dir,
+            ds_spec_type=spec_type,
+            ds_max_size=ds_max_size,
+            ignore_database_null=False,
+            ds_in_memory=True,
+            use_GPU=True,
+            pre_trained_model_path=pretrained_model,
+        )
+        skip_compile = False
     dataloader_num_workers = 0
     if torch.cuda.is_available() and omp_num_threads > 2:
         dataloader_num_workers = omp_num_threads - 2
@@ -129,6 +187,41 @@ def train_pairwise_model(
     ds_type="total_component_energies",
 ):
     # Ensure param_start_mean and param_start_std are lists
+    """
+    Train a pairwise APNet-style model using specified architecture, pretrained components, dataset, and training hyperparameters.
+    
+    Parameters:
+        apnet_model_type (str): Identifier of the APNet variant to train (e.g., "APNet2", "APNet2-fused", "APNet3-fused", "dAPNet2", "AM-DimerParam", "AtomTypeParamModel").
+        model_out (str): Path where the trained model will be saved.
+        am_model_path (str): Path to a pretrained atom-model checkpoint used to initialize the atom encoder.
+        atom_type_param_model_path (str): Path to a pretrained AtomTypeParam model (used by fused or dimer-prop workflows).
+        atom_type_param_model_path2 (str): Secondary AtomTypeParam model path (used for fused variants that separate HF/VW and ELST parts).
+        data_dir (str): Root directory of the pairwise/dimer dataset.
+        n_epochs (int): Number of training epochs.
+        lr (float): Initial learning rate.
+        random_seed (int): Seed used for dataset splitting and training reproducibility.
+        spec_type (int): Dataset specification/version selector passed through to dataset construction.
+        r_cut_im (float): Interaction cutoff distance used by long-range components (if applicable).
+        r_cut (float): Local neighbor cutoff distance used by the model.
+        n_rbf (int): Number of radial basis functions used for distance expansion.
+        n_neuron (int): Width of dense layers in network blocks.
+        n_embed (int): Dimensionality of learned embeddings.
+        n_params (int): Number of learnable dimer parameters when training parametric dimer models.
+        m1, m2 (str): Optional mass/identifier overrides forwarded into dataset construction (passed through as-is).
+        pre_trained_model_path (str): Path to an APNet checkpoint to initialize the pairwise model (overrides model_out if provided).
+        param_start_mean (float or list[float]): Initial mean(s) for dimer parameter initialization; broadcast to length `n_params` if scalar.
+        param_start_std (float or list[float]): Initial standard deviation(s) for dimer parameter initialization; broadcast to length `n_params` if scalar.
+        dimer_eval_type (str): Evaluation type for dimer properties (controls which param/model variant is used, e.g., "elst_damping").
+        ds_in_memory (bool): If True, load dataset into memory when supported.
+        ds_class_type (str): Dataset class selection token forwarded to dataset constructor.
+        DimerProp_model_type (str): Dimer property/model type name used by AM-DimerParam workflows.
+        ap2_pretrained_model_only (str or None): If provided for APNet3-fused variants, path to AP2-only weights to load into the APNet3 model.
+        ds_type (str): Dataset energy/type selector (e.g., "total_component_energies" or "fsapt_energies").
+    
+    Notes:
+        - Scalar `param_start_mean` and `param_start_std` values are automatically expanded to lists of length `n_params`.
+        - The function prints training status, infers available GPUs to set world size, instantiates the requested APNet variant with appropriate submodels and dataset settings, and calls its `train(...)` method. It does not return a value.
+    """
     if not isinstance(param_start_mean, (list, tuple)):
         param_start_mean = [param_start_mean] * n_params
     if not isinstance(param_start_std, (list, tuple)):
@@ -141,6 +234,13 @@ def train_pairwise_model(
         APNet = AtomPairwiseModels.apnet2_fused.APNet2_AM_Model
     elif apnet_model_type == "APNet3-fused":
         APNet = AtomPairwiseModels.apnet3_fused.APNet3_AtomType_Model
+        # Note: presently ap3_fused_ds requires atomic batch size to be <=
+        # n_objects. NEDS FIXED
+        ds_atomic_batch_size = 16
+        ds_datapoint_storage_n_objects = 16
+        ds_batch_size = 16
+    elif apnet_model_type == "APNet3-fused-variant":
+        APNet = AtomPairwiseModels.apnet3_fused_variants.APNet3_AtomType_Model
         # Note: presently ap3_fused_ds requires atomic batch size to be <=
         # n_objects. NEDS FIXED
         ds_atomic_batch_size = 16
@@ -245,7 +345,7 @@ def train_pairwise_model(
             n_params=n_params,
             model_type=DimerProp_model_type,
         )
-    elif apnet_model_type in ["APNet3-fused"]:
+    elif apnet_model_type in ["APNet3-fused", "APNet3-fused-variant"]:
         print("Setting AtomTypeParams...")
         atom_type_hf_vw_model = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
             ds_root=None,
@@ -368,6 +468,11 @@ def parse_param_list(param_str):
 
 
 def main():
+    """
+    Parse command-line arguments, configure randomness, and invoke atom-level and pairwise model training based on the provided options.
+    
+    This function builds an argparse.ArgumentParser with many training and dataset options, parses the command-line, normalizes embedding start parameters, pretty-prints the parsed arguments, sets global random seeds for reproducibility, and then conditionally calls train_atom_model and/or train_pairwise_model when their respective flags are provided. The function does not return a value.
+    """
     args = argparse.ArgumentParser()
     args.add_argument(
         "--am_model_path",
@@ -380,6 +485,12 @@ def main():
         type=str,
         default=None,
         help="specify AtomTypeParamModel to use for AtomTypeParam Dimer props or AtomInducedDipoleModel (default: None)",
+    )
+    args.add_argument(
+        "--atom_mpnn_pretrained_path",
+        type=str,
+        default=None,
+        help="specify pretrained AtomMPNN model path for InducedDipoleModel with frozen charge/dipole/quadrupole layers (default: None)",
     )
     args.add_argument(
         "--atom_type_param_model_path2",
@@ -415,7 +526,7 @@ def main():
         "--train_apnet",
         type=str,
         default="",
-        help="Train APNet Model: (APNet2, APNet3-fused, dAPNet2, APNet2-fused, AM-DimerParam)",
+        help="Train APNet Model: (APNet2, APNet3-fused, APNet3-fused-variant, dAPNet2, APNet2-fused, AM-DimerParam)",
     )
     args.add_argument(
         "--dimer_eval_type",
@@ -524,6 +635,24 @@ def main():
         help="specify AtomModel r_cut (default: 5.0)",
     )
     args.add_argument(
+        "--use_nn_screening",
+        action="store_true",
+        default=False,
+        help="use NN-based screening for induced dipole calculation in AtomInducedDipoleModel (default: False)",
+    )
+    args.add_argument(
+        "--precompute_hfvr",
+        action="store_true",
+        default=False,
+        help="pre-compute Hirshfeld volume ratios and valence widths during dataset processing for faster training (default: False)",
+    )
+    args.add_argument(
+        "--ds_use_lmdb",
+        action="store_true",
+        default=False,
+        help="use LMDB-based dataset storage for InducedDipoleModel training (default: False). Requires spec_type_am to be 5, 9, 10, or 11",
+    )
+    args.add_argument(
         "--param_start_mean",
         type=str,
         default="2.0",
@@ -581,6 +710,7 @@ def main():
         train_atom_model(
             atom_model_type=args.train_am,
             atom_type_param_model_path=args.atom_type_param_model_path,
+            atom_mpnn_pretrained_path=args.atom_mpnn_pretrained_path,
             model_path=args.am_model_path,
             data_dir=args.data_dir,
             spec_type=args.spec_type_am,
@@ -595,6 +725,9 @@ def main():
             n_neuron=args.n_neuron_atom,
             n_embed=args.n_embed_atom,
             r_cut=args.r_cut_atom,
+            use_nn_screening=args.use_nn_screening,
+            precompute_hfvr=args.precompute_hfvr,
+            ds_use_lmdb=args.ds_use_lmdb,
         )
     if args.train_apnet != "":
         train_pairwise_model(

@@ -30,6 +30,9 @@ from ..pt_datasets.ap2_fused_ds import (
     ap2_fused_collate_update_no_target,
     qcel_dimer_to_fused_data,
 )
+
+from dftd3.d3 import d3
+
 from .. import constants
 import os
 import torch.distributed as dist
@@ -40,6 +43,7 @@ from copy import deepcopy
 from apnet_pt.torch_util import set_weights_to_value
 from torch_geometric.data import Data
 from ..multipole import thole_damping_mutual_torch, thole_damping_direct_torch
+
 
 
 max_Z = 118
@@ -77,6 +81,25 @@ class DimerProp(nn.Module):
         return
 
     def set_forward(self, dimer_eval):
+        """
+        Selects and assigns the dimer evaluation strategy used by this DimerProp instance.
+        
+        Parameters:
+            dimer_eval (str): Identifier for the desired evaluation mode. Accepted values:
+                - "elst_damping": electrostatics with Thole-style damping.
+                - "elst": undamped electrostatics.
+                - "induced_dipole": induction-only evaluation (loads polarizability table).
+                - "induced_dipole_param": induction using parametrized polarizabilities (loads polarizability table).
+                - "elst_damping__induced_dipole": combined damped electrostatics and induction (loads polarizability table).
+                - "ap3_elst_damping__induced_dipole": AP3 variant combining damped electrostatics and induction (loads polarizability table).
+                - "ap3_elst_damping__induced_dipole__disp": AP3 variant returning electrostatics, induction, and dispersion (loads polarizability table).
+                - "disp": dispersion-only evaluation.
+                - "ap3_atomMPNN": AP3 atom-parameter readout mode (no energy computation).
+            For modes that perform induction, this method clones and assigns the module-level polarizability table to self.polarizability_table.
+        
+        Raises:
+            ValueError: If dimer_eval is not one of the accepted identifiers.
+        """
         if dimer_eval == "elst_damping":
             self.forward = self._elst_damping_forward
         elif dimer_eval == "elst":
@@ -93,6 +116,11 @@ class DimerProp(nn.Module):
         elif dimer_eval == "ap3_elst_damping__induced_dipole":
             self.forward = self._ap3_elst_damping_indu_induced_dipole_forward
             self.polarizability_table = constants.polarizability_table.clone()
+        elif dimer_eval == "ap3_elst_damping__induced_dipole__disp":
+            self.forward = self._ap3_elst_damping_indu_induced_dipole_disp_forward
+            self.polarizability_table = constants.polarizability_table.clone()
+        elif dimer_eval == "disp":
+            self.forward = self._disp_foward
         elif dimer_eval == "ap3_atomMPNN":
             self.forward = self._ap3_atomMPNN
         else:
@@ -267,6 +295,20 @@ class DimerProp(nn.Module):
         self,
         batch,
     ):
+        """
+        Compute per-dimer damped electrostatic and induced-dipole energies and return them alongside the atom-parameter outputs.
+        
+        This forwards the batch through the frozen AtomTypeParam model to obtain per-atom predicted multipoles and auxiliary parameters, computes the induced-dipole (Indu) energy using those parameters, then computes the Thole-damped multipole electrostatic (Elst) energy. Both energy components are returned stacked per dimer; the atom-parameter outputs from the atom model are returned unchanged.
+        
+        Parameters:
+            batch: Batch object containing dimer geometry and edge/index tensors required by the model (expected attributes include ZA, RA, ZB, RB, e_ABsr_source, e_ABsr_target, e_AA_source, e_BB_source, e_AA_target, e_BB_target, and batch_atomic_A/batch_atomic_B).
+        
+        Returns:
+            tuple:
+                - energies (torch.Tensor): Float tensor of shape (n_pairs, 2) where column 0 is the damped electrostatic energy (Elst) and column 1 is the induced-dipole energy (Indu) for each dimer.
+                - v_A: Sequence/tuple of per-atom outputs from the AtomTypeParam model for the A-side atoms (charges, dipoles, quadrupoles, hirshfeld/valence data, parameter guesses/corrections).
+                - v_B: Same as v_A but for the B-side atoms.
+        """
         v_A = self.AtomTypeParam(batch.batch_atomic_A)
         v_B = self.AtomTypeParam(batch.batch_atomic_B)
         Kas = torch.abs(v_A[-1])
@@ -282,6 +324,7 @@ class DimerProp(nn.Module):
         # Kb = torch.clamp(v_B[-1][:, 1], min=0.0001, max=20.0)
         # Ka = torch.tensor([1.8398, 2.4643, 2.5112, 1.8398, 2.4643, 2.5112], requires_grad=True)
         # Kb = torch.tensor([1.8398, 2.4643, 2.5112, 1.8398, 2.4643, 2.5112], requires_grad=True)
+
         Indu = induced_dipole_induction_optimized(
             ZA=batch.ZA,
             RA=batch.RA,
@@ -345,6 +388,22 @@ class DimerProp(nn.Module):
         self,
         batch,
     ):
+        """
+        Compute damped electrostatic (Elst) and SCF-induced dipole (Indu) energies for AP3 parameterization and return per-atom parameter outputs.
+        
+        Runs the no-correction optimized induced-dipole induction using atom-type predictions from the internal AtomTypeParam model, then computes Thole-damped multipole electrostatics with per-atom Ka/Kb damping parameters. The energy columns are stacked so the first column is the electrostatic energy and the second is the induction energy.
+        
+        Parameters:
+            batch: input batch object containing paired-molecule fields required by the induction and electrostatics kernels (including ZA, RA, ZB, RB, e_ABfull_source, e_ABfull_target, e_AA_source, e_BB_source, e_AA_target, e_BB_target, and related geometric/edge tensors).
+        
+        Returns:
+            tuple: (energies, v_A, v_B)
+                energies (torch.Tensor): shape (n_pairs, 2) with columns [Elst, Indu].
+                v_A, v_B: atom-parameter output sequences produced by the AtomTypeParam model for the A and B fragments respectively (per-atom tensors such as charge, dipole, quadrupole, Hirshfeld ratio, Ka, etc.).
+        
+        Notes:
+            - The function may modify elements of the returned v_A and v_B in-place during induction; callers should copy them if original unmodified values are needed.
+        """
         v_A = self.AtomTypeParam(batch.batch_atomic_A)
         v_B = self.AtomTypeParam(batch.batch_atomic_B)
         Kas = torch.abs(v_A[-1])
@@ -410,14 +469,108 @@ class DimerProp(nn.Module):
         #     print(f"{v_B[-1] =}")
         #     raise ValueError("Electrostatic energy is NaN")
         return torch.vstack((Elst, Indu)).T, v_A, v_B
-
+    
     def _ap3_atomMPNN(
         self,
         batch,
     ):
+        """
+        Predict per-atom parameter vectors from the AtomTypeParam model for both partners in a dimer batch.
+        
+        Parameters:
+            batch: Batch object containing at least `batch_atomic_A` and `batch_atomic_B` inputs for the AtomTypeParam network.
+        
+        Returns:
+            v_A, v_B (torch.Tensor, torch.Tensor): Per-atom parameter tensors produced for the first and second molecule in each dimer of the batch.
+        """
         v_A = self.AtomTypeParam(batch.batch_atomic_A)
         v_B = self.AtomTypeParam(batch.batch_atomic_B)
+
         return v_A, v_B
+
+    def _ap3_elst_damping_indu_induced_dipole_disp_forward(
+            self,
+            batch,
+    ):
+   
+        """
+            Compute AP3 electrostatic (damped), induction (Thole, no-correction), and D3 dispersion energies for a batched dimer set and return per-dimer energies along with atom-parameter outputs.
+            
+            Parameters:
+                batch: A fused batch object containing paired-molecule fields required by the energy kernels (e.g., ZA, RA, ZB, RB, e_ABsr_source, e_ABsr_target, e_AA_source, e_BB_source, e_AA_target, e_BB_target, batch_atomic_A, batch_atomic_B). The function expects that AtomTypeParam has already been configured and that batch provides all tensors referenced in the computation.
+            
+            Returns:
+                energies (torch.Tensor): An (N, 3) tensor of per-dimer energies where columns are [Elst, Indu, Disp] (electrostatic, induction, dispersion).
+                v_A: Atom-parameter outputs (tuple/list) produced for molecule A by the AtomTypeParam network; may include updated per-atom multipoles and parameter tensors.
+                v_B: Atom-parameter outputs (tuple/list) produced for molecule B by the AtomTypeParam network; same structure as v_A.
+            
+            Raises:
+                ValueError: If the computed induction or electrostatic energies contain NaNs, a ValueError is raised after saving the offending batch for debugging.
+            """
+            v_A = self.AtomTypeParam(batch.batch_atomic_A)
+        v_B = self.AtomTypeParam(batch.batch_atomic_B)
+        Kas = torch.abs(v_A[-1])
+        Kbs = torch.abs(v_B[-1])
+        print(f"{Kas =}")
+        print(f"{v_A[-1] =}")
+        print(f"{v_A[-2] =}")
+        Indu = induced_dipole_induction_optimized_no_correction(
+            ZA=batch.ZA,
+            RA=batch.RA,
+            qA=v_A[0],
+            muA=v_A[1],
+            quadA=v_A[2],
+            ZB=batch.ZB,
+            RB=batch.RB,
+            qB=v_B[0],
+            muB=v_B[1],
+            quadB=v_B[2],
+            e_AB_source=batch.e_ABsr_source,
+            e_AB_target=batch.e_ABsr_target,
+            # Additional parameters for induction
+            e_AA_source=batch.e_AA_source,
+            e_BB_source=batch.e_BB_source,
+            e_AA_target=batch.e_AA_target,
+            e_BB_target=batch.e_BB_target,
+            hirshfeld_volume_ratio_A=torch.abs(v_A[-2][:, 0]),
+            hirshfeld_volume_ratio_B=torch.abs(v_B[-2][:, 0]),
+            polarizability_table=self.polarizability_table,
+        )
+        if Indu.isnan().any():
+            print("Induced dipole energy is NaN, debugging info:")
+            torch.save(batch, "ind_nan_batch.pt")
+            print(f"{v_A[-2] =}")
+            print(f"{v_B[-2] =}")
+            print(f"{v_A[-1] =}")
+            print(f"{v_B[-1] =}")
+            raise ValueError("Induced dipole energy is NaN")
+        # Must compute Elst after Ind because we modify qA and qB in place... pain to debug
+
+        Elst = mtp_elst_damping(
+            ZA=batch.ZA,
+            RA=batch.RA,
+            qA_0=v_A[0],
+            muA=v_A[1],
+            quadA=v_A[2],
+            Ka=Kas,
+            ZB=batch.ZB,
+            RB=batch.RB,
+            qB_0=v_B[0],
+            muB=v_B[1],
+            quadB=v_B[2],
+            Kb=Kbs,
+            e_AB_source=batch.e_ABsr_source,
+            e_AB_target=batch.e_ABsr_target,
+        )
+        if Elst.isnan().any():
+            print("Electrostatic energy is NaN, debugging info:")
+            torch.save(batch, "elst_nan_batch.pt")
+            print(f"{v_A[-1] =}")
+            print(f"{v_B[-1] =}")
+            raise ValueError("Electrostatic energy is NaN")
+        
+        Disp = d3(batch)
+        return torch.vstack((Elst, Indu, Disp)).T, v_A, v_B    
 
 
 class AtomTypeParamNN(nn.Module):
@@ -431,6 +584,22 @@ class AtomTypeParamNN(nn.Module):
         param_start_std=0.01,
         n_params=1,
     ):
+        """
+        Initialize an AtomTypeParamNN that provides per-atom learnable parameter guesses and per-parameter readout MLPs.
+        
+        Parameters:
+            atom_model (AtomMPNN | AtomHirshfeldMPNN | AtomTypeParamNN): Frozen base atom model used to produce hidden representations; its gradients are disabled.
+            n_message (int): Number of message-passing layers / number of hidden-state indices to attach readouts for (readouts created for indices 0..n_message).
+            n_neuron (int): Width hyperparameter for internal readout MLP hidden layers.
+            n_embed (int): Dimension of the hidden representation input to each readout MLP.
+            param_start_mean (float | Sequence[float]): Per-parameter initial mean for the NoisyConstantEmbedding guesses. If a scalar is provided, it is broadcast to length n_params.
+            param_start_std (float | Sequence[float]): Per-parameter initial standard deviation for the NoisyConstantEmbedding guesses. If a scalar is provided, it is broadcast to length n_params.
+            n_params (int): Number of distinct per-atom parameters (number of guess embeddings and readout output channels).
+        
+        Raises:
+            ValueError: If atom_model is not one of the supported types (AtomMPNN, AtomHirshfeldMPNN, AtomTypeParamNN).
+            ValueError: If the lengths of param_start_mean or param_start_std after broadcasting do not equal n_params.
+        """
         super().__init__()
         self.atom_model = atom_model
         self.atom_model.requires_grad_(False)
@@ -1706,7 +1875,29 @@ def induced_dipole_induction_optimized_no_correction(
     polarizability_table=constants.polarizability_table,
 ) -> float:
     """
-    Since only using induced dipoles, don't need overlap correction (valence widths, Ka, Kb)
+    Compute the induction (induced-dipole) interaction energy between two molecules using a Thole-damped SCF without overlap/valence-width corrections.
+    
+    This routine performs a self-consistent iteration to converge induced dipoles on both fragments A and B (using Thole damping and simple mixing), then evaluates the induction energy contributions arising from charges and dipoles. It omits overlap/valence-width corrections (Ka/Kb) and returns per-interaction energies corresponding to the AB edge list.
+    
+    Parameters:
+        ZA, ZB: 1-D tensors of atomic numbers for fragments A and B.
+        RA, RB: (N,3) position tensors for atoms in fragments A and B.
+        qA, qB: per-atom monopoles (charges) for A and B; will be reshaped if needed.
+        muA, muB: per-atom permanent dipoles for A and B.
+        quadA, quadB: per-atom quadrupoles for A and B (unused by this function but kept for API compatibility).
+        e_AB_source, e_AB_target: 1-D index tensors describing edges from atoms in A to atoms in B (source indices into A, target indices into B).
+        e_AA_source, e_AA_target: index tensors describing intra-A interaction pairs (source,target).
+        e_BB_source, e_BB_target: index tensors describing intra-B interaction pairs (source,target).
+        hirshfeld_volume_ratio_A, hirshfeld_volume_ratio_B: per-atom Hirshfeld volume ratios used to scale free-atom polarizabilities to obtain per-atom polarizabilities.
+        max_iterations: maximum SCF iterations for induced-dipole convergence.
+        convergence_threshold: L2-norm convergence threshold for induced-dipole updates.
+        omega: mixing parameter applied each SCF iteration (0 < omega <= 1).
+        thole_damping_param: Thole damping parameter used when building damped interaction tensors.
+        Q_const: constant used elsewhere in file; kept for API compatibility (not used here).
+        polarizability_table: lookup table mapping atomic numbers to free-atom polarizabilities.
+    
+    Returns:
+        Tensor of induction energy contributions for each AB interaction (aligned with the AB edge list), in kcal/mol.
     """
 
     delta = torch.eye(3, device=qA.device)
@@ -1715,9 +1906,15 @@ def induced_dipole_induction_optimized_no_correction(
     alpha_0_A = torch.zeros_like(hirshfeld_volume_ratio_A)
     alpha_0_B = torch.zeros_like(hirshfeld_volume_ratio_B)
 
+    print(f'{alpha_0_A = }')
+    print(f'{alpha_0_B = }')
     # Use index_select for vectorized lookup
     alpha_0_A = torch.index_select(polarizability_table, 0, ZA.long())
     alpha_0_B = torch.index_select(polarizability_table, 0, ZB.long())
+    print(f"{alpha_0_A = }")
+    print(f"{alpha_0_A = }")
+    print(f"{hirshfeld_volume_ratio_A = }")
+    print(f"{hirshfeld_volume_ratio_B = }")
     alpha_A = alpha_0_A * hirshfeld_volume_ratio_A ** (4 / 3.0)
     alpha_B = alpha_0_B * hirshfeld_volume_ratio_B ** (4 / 3.0)
 
@@ -1852,7 +2049,6 @@ def induced_dipole_induction_optimized_no_correction(
     E_ind = (E_qu + E_uu) / 2.0
     return E_ind
 
-
 def induced_dipole(
     ZA,
     RA,
@@ -1870,7 +2066,29 @@ def induced_dipole(
     polarizability_table=constants.polarizability_table,
 ) -> float:
     """
-    Since only using induced dipoles, don't need overlap correction (valence widths, Ka, Kb)
+    Converges intramolecular induced dipoles for a single molecule using a Thole-damped self-consistent field (SCF) procedure and computes per-atom induced dipole vectors.
+    
+    This function builds atomic polarizabilities from a polarizability table scaled by Hirshfeld volume ratios, constructs Thole-damped interaction tensors, initializes induced dipoles from permanent multipoles (charges and dipoles), and performs an iterative SCF with exponential mixing parameter `omega` until changes in induced dipoles fall below `convergence_threshold` or `max_iterations` is reached. The implementation currently computes the converged induced dipoles but does not return an energy value.
+    
+    Parameters:
+        ZA (Tensor): Atomic number indices for atoms in the molecule (shape [n_atoms]).
+        RA (Tensor): Atomic coordinates for the molecule (shape [n_atoms, 3]).
+        qA (Tensor): Atomic charges (shape [n_atoms] or [n_atoms, 1]).
+        muA (Tensor): Permanent atomic dipoles (shape [n_atoms, 3]).
+        quadA (Tensor): Atomic quadrupoles (present for API compatibility; not used here).
+        e_AA_source (LongTensor): Edge/source index array for pair interactions (shape [n_edges]).
+        e_AA_target (LongTensor): Edge/target index array for pair interactions (shape [n_edges]).
+        hirshfeld_volume_ratio_A (Tensor): Per-atom Hirshfeld volume ratios used to scale polarizabilities (shape [n_atoms]).
+        max_iterations (int): Maximum SCF iterations (default 200).
+        convergence_threshold (float): Convergence threshold on the norm change of induced dipoles (default 1e-8).
+        omega (float): Mixing parameter for SCF updates in [0,1] (default 0.7).
+        thole_damping_param (float): Thole damping parameter controlling short-range damping (default 0.39).
+        Q_const (float): Constant used for quadrupole interaction conventions (kept for API compatibility; default 3.0).
+        polarizability_table (Tensor): Table mapping atomic numbers to base polarizabilities (indexed by ZA).
+    
+    Notes:
+        - The routine uses Thole damping via distance_tensors and scatter_sum_compile for aggregating pair contributions.
+        - Although the function signature is annotated to return a float, the current implementation does not return an energy value.
     """
 
     delta = torch.eye(3, device=qA.device)

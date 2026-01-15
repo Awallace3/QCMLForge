@@ -1097,6 +1097,32 @@ class APNet2Model:
         return_pairs=False,
         return_elst=False,
     ):
+        """
+        Predict interaction energies for a list of QCEngine molecules and optionally return per-pair energies or intermediate hidden states.
+        
+        Parameters:
+            mols (Sequence): Iterable of QCEngine dimer input objects accepted by qcel_dimer_to_pyg_data.
+            batch_size (int): Number of dimers to process per device batch.
+            r_cut (float | None): Short-range cutoff to use; defaults to the model's r_cut when None.
+            r_cut_im (float | None): Intermolecular (long-range) cutoff to use; defaults to the model's r_cut_im when None.
+            verbose (bool): If True, print progress messages for each processed batch.
+            return_pairs (bool): If True, also return assembled per-dimer pairwise short-range and long-range contributions.
+            return_elst (bool): If True, also return assembled multipole electrostatic pair matrices. Mutually exclusive with return_pairs.
+        
+        Returns:
+            numpy.ndarray or tuple:
+                - If self.model.return_hidden_states is True:
+                    (predictions, h_ABs, h_BAs, cutoffs, dimer_inds, ndimers)
+                    where predictions is an (N, 4) array of per-dimer predicted SAPT component energies, h_ABs/h_BAs are lists of per-batch hidden-state tensors, cutoffs is a list of cutoff tensors, dimer_inds is a list of dimer index tensors, and ndimers is a list of dimer counts.
+                - Else if return_pairs or return_elst is True:
+                    (predictions, pairwise_energies)
+                    where pairwise_energies is a list of per-dimer pair energy tensors (assembled via _assemble_pairs or _assemble_mtp_pairs).
+                - Otherwise:
+                    predictions — an (N, 4) numpy array of per-dimer predicted SAPT component energies.
+        
+        Notes:
+            - `return_elst` and `return_pairs` are mutually exclusive.
+        """
         assert not (return_elst and return_pairs), "return_elst and return_pairs are not compatible"
         if r_cut is None:
             r_cut = self.model.r_cut
@@ -1235,10 +1261,210 @@ class APNet2Model:
             return predictions, pairwise_energies
         return predictions
 
+    @torch.inference_mode()
+    def predict_qcel_mols_indexing(
+        self,
+        mols,
+        batch_size=1,
+        r_cut=None,
+        r_cut_im=None,
+        verbose=False,
+        return_pairs=False,
+        return_elst=False,
+    ):
+        """
+        Predict per-dimer interaction energies for a list of QCElemental molecules using indexed batching.
+        
+        Parameters:
+            mols (Sequence): Iterable of dimer specifications (QCElemental/compatible molecule inputs) to predict.
+            batch_size (int): Number of dimers to process per atom-model batch. Defaults to 1.
+            r_cut (float | None): Short-range cutoff; when None uses self.model.r_cut.
+            r_cut_im (float | None): Intermolecular (long-range) cutoff; when None uses self.model.r_cut_im.
+            verbose (bool): If True, print progress messages for each processed batch.
+            return_pairs (bool): If True, also return per-pair short-range/long-range assembled energies for each dimer.
+            return_elst (bool): If True, also return per-pair multipole electrostatic matrices for each dimer.
+                Note: return_elst and return_pairs are mutually exclusive.
+        
+        Returns:
+            If self.model.return_hidden_states is True:
+                tuple (predictions, h_ABs, h_BAs, cutoffs, dimer_inds, ndimers)
+                - predictions (ndarray, shape (N, 4)): Per-dimer predicted energy components aggregated to 4 values.
+                - h_ABs, h_BAs (list[Tensor]): Collected atom-pair hidden-state tensors from model outputs, one entry per processed batch.
+                - cutoffs (list[Tensor]): Collected cutoff tensors associated with each batch.
+                - dimer_inds (list[Tensor]): Collected dimer index tensors for each batch.
+                - ndimers (list[Tensor]): Number of dimers in each processed batch.
+        
+            Else if return_pairs is True:
+                tuple (predictions, pairwise_energies)
+                - predictions (ndarray, shape (N, 4)): Per-dimer predicted energy components.
+                - pairwise_energies (list): Per-dimer assembled pairwise energy tensors returned by _assemble_pairs.
+        
+            Else if return_elst is True:
+                tuple (predictions, pairwise_energies)
+                - predictions (ndarray, shape (N, 4)): Per-dimer predicted energy components.
+                - pairwise_energies (list): Per-dimer multipole electrostatic matrices returned by _assemble_mtp_pairs.
+        
+            Else:
+                predictions (ndarray, shape (N, 4)): Per-dimer predicted energy components.
+        
+        Raises:
+            AssertionError: If both return_elst and return_pairs are True.
+        """
+        assert not (return_elst and return_pairs), "return_elst and return_pairs are not compatible"
+        if r_cut is None:
+            r_cut = self.model.r_cut
+        if r_cut_im is None:
+            r_cut_im = self.model.r_cut_im
+
+        mol_data = [[*qcel_dimer_to_pyg_data(mol)] for mol in mols]
+        predictions = np.zeros((len(mol_data), 4))
+        if return_pairs or return_elst:
+            pairwise_energies = []
+        if self.model.return_hidden_states:
+            # need to capture output
+            h_ABs, h_BAs, cutoffs, dimer_inds, ndimers, e_ABsr_source, e_ABsr_target = [], [], [], [], [], [], []
+        # self.model.to(self.device)
+        self.atom_model.to(self.device)
+        for i in range(0, len(mol_data), batch_size):
+            batch_mol_data = mol_data[i: i + batch_size]
+            data_A = [d[0] for d in batch_mol_data]
+            data_B = [d[1] for d in batch_mol_data]
+            batch_A = atomic_datasets.atomic_collate_update_no_target(data_A)
+            batch_B = atomic_datasets.atomic_collate_update_no_target(data_B)
+            with torch.no_grad():
+                batch_A.to(self.device)
+                am_out_A = self.atom_model(batch_A)
+                batch_B.to(self.device)
+                am_out_B = self.atom_model(batch_B)
+                qAs, muAs, quadAs, hlistAs = isolate_atomic_property_predictions(
+                    batch_A, am_out_A
+                )
+                qBs, muBs, quadBs, hlistBs = isolate_atomic_property_predictions(
+                    batch_B, am_out_B
+                )
+                if len(batch_A.total_charge.size()) == 0:
+                    batch_A.total_charge = batch_A.total_charge.unsqueeze(0)
+                if len(batch_B.total_charge.size()) == 0:
+                    batch_B.total_charge = batch_B.total_charge.unsqueeze(0)
+                dimer_ls = []
+                for j in range(len(batch_mol_data)):
+                    qA, muA, quadA, hlistA = qAs[j], muAs[j], quadAs[j], hlistAs[j]
+                    qB, muB, quadB, hlistB = qBs[j], muBs[j], quadBs[j], hlistBs[j]
+                    if len(qA.size()) == 0:
+                        qA = qA.unsqueeze(0).unsqueeze(0)
+                    elif len(qA.size()) == 1:
+                        qA = qA.unsqueeze(-1)
+                    if len(qB.size()) == 0:
+                        qB = qB.unsqueeze(0).unsqueeze(0)
+                    elif len(qB.size()) == 1:
+                        qB = qB.unsqueeze(-1)
+                        e_AA_source, e_AA_target = pairwise_edges(
+                            data_A[j].R, r_cut)
+                        e_BB_source, e_BB_target = pairwise_edges(
+                            data_B[j].R, r_cut)
+                        e_ABsr_source, e_ABsr_target, e_ABlr_source, e_ABlr_target = (
+                            pairwise_edges_im(
+                                data_A[j].R, data_B[j].R, r_cut_im)
+                        )
+                        dimer_ind = torch.ones((1), dtype=torch.long) * 0
+                        data = Data(
+                            ZA=data_A[j].x,
+                            RA=data_A[j].R,
+                            ZB=data_B[j].x,
+                            RB=data_B[j].R,
+                            # short range, intermolecular edges
+                            e_ABsr_source=e_ABsr_source,
+                            e_ABsr_target=e_ABsr_target,
+                            dimer_ind=dimer_ind,
+                            # long range, intermolecular edges
+                            e_ABlr_source=e_ABlr_source,
+                            e_ABlr_target=e_ABlr_target,
+                            dimer_ind_lr=dimer_ind,
+                            # intramonomer edges (monomer A)
+                            e_AA_source=e_AA_source,
+                            e_AA_target=e_AA_target,
+                            # intramonomer edges (monomer B)
+                            e_BB_source=e_BB_source,
+                            e_BB_target=e_BB_target,
+                            # monomer charges
+                            total_charge_A=data_A[j].total_charge,
+                            total_charge_B=data_B[j].total_charge,
+                            # monomer A properties
+                            qA=qA,
+                            muA=muA,
+                            quadA=quadA,
+                            hlistA=hlistA,
+                            # monomer B properties
+                            qB=qB,
+                            muB=muB,
+                            quadB=quadB,
+                            hlistB=hlistB,
+                        )
+                        dimer_ls.append(data)
+                dimer_batch = pairwise_datasets.apnet2_collate_update_no_target_monomer_indices(
+                    dimer_ls
+                )
+                dimer_batch.to(device=self.device)
+                preds = self.eval_fn(dimer_batch)
+                if self.model.return_hidden_states:
+                    E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA, cutoff = preds
+                    h_ABs.append(hAB)
+                    h_BAs.append(hBA)
+                    cutoffs.append(cutoff)
+                    dimer_inds.append(dimer_batch.dimer_ind)
+                    ndimers.append(torch.tensor(dimer_batch.total_charge_A.size(0), dtype=torch.long))
+                    predictions[i: i + batch_size] = E_sr_dimer.cpu().numpy()
+                elif return_pairs:
+                    E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = preds
+                    predictions[i: i + batch_size] = E_sr_dimer.cpu().numpy()
+                    pairwise_energies.extend(
+                        self._assemble_pairs(
+                            dimer_batch.cpu(),
+                            E_sr_dimer.cpu(),
+                            E_sr.cpu(),
+                            E_elst_sr.cpu(),
+                            E_elst_lr.cpu(),
+                        )
+                    )
+                elif return_elst:
+                    E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = preds
+                    predictions[i: i + batch_size] = E_sr_dimer.cpu().numpy()
+                    pairwise_energies.extend(
+                        self._assemble_mtp_pairs(
+                            dimer_batch,
+                            E_elst_sr,
+                            E_elst_lr,
+                        )
+                    )
+                else:
+                    predictions[i: i + batch_size] = preds[0].cpu().numpy()
+            if verbose:
+                print(
+                    f"Predictions for {i} to {i + batch_size} out of {len(mol_data)}"
+                )
+        if self.model.return_hidden_states:
+            return predictions, h_ABs, h_BAs, cutoffs, dimer_inds, ndimers
+        if return_pairs or return_elst:
+            return predictions, pairwise_energies
+        return predictions
+
     def example_input(self, mol=None,
         r_cut=5.0,
         r_cut_im=8.0,
 ):
+        """
+        Create a single-batch example dimer input suitable for model prediction.
+        
+        If `mol` is not provided, an internal example (a water dimer geometry) is used. The function converts the dimer into the same batched Data structure produced for real inputs so it can be fed directly to the model's forward/evaluation routines.
+        
+        Parameters:
+            mol (qcel.models.Molecule or None): A QCEngine/QCElemtal Molecule representing a dimer; if None, a built-in example dimer is used.
+            r_cut (float): Short-range cutoff (angstrom) used when constructing radial/batching features.
+            r_cut_im (float): Long-range/image cutoff (angstrom) used when constructing radial/batching features.
+        
+        Returns:
+            Batched dimer data (torch_geometric.data.Batch-like): A single-batch dimer dataset prepared by _qcel_example_input, ready for model evaluation on the configured device.
+        """
         if mol is None:
             mol = qcel.models.Molecule.from_data("""
 0 1

@@ -2206,5 +2206,75 @@ def monomer_induced_dipole_torch(
     return q.squeeze(-1), mu_induced, quad
 
 
+def multipoles_elst_ind_dimer(mols, dimer, monA, monB):
+    """
+    Compute electrostatic energies for each molecule pair and the corresponding dimer-level induction contribution.
+    
+    For each entry in `mols`, this function:
+    - evaluates the electrostatic interaction between the two fragments using the per-monomer multipoles provided in `monA` and `monB`;
+    - evaluates the electrostatic interaction using the corresponding multipoles from `dimer` (fragment-indexed multipoles for the full dimer);
+    - computes the induction contribution as the difference between the dimer-level and monomer-level electrostatic energies.
+    
+    Parameters:
+        mols (Sequence): Sequence of molecular descriptors (e.g., qcel dimer-like objects) with a `fragments` attribute that maps fragment indices for the two monomers.
+        dimer (Sequence): Parallel sequence to `mols`. Each element is a tuple (qD, muD, thetaD) containing multipole arrays for the full dimer; qD indexed by atom, muD shaped (N_atoms,3), thetaD shaped (N_atoms,3,3) or compatible.
+        monA (Sequence): Parallel sequence to `mols`. Each element is a tuple (q, mu, theta) of multipoles for monomer A (per-molecule).
+        monB (Sequence): Parallel sequence to `mols`. Each element is a tuple (q, mu, theta) of multipoles for monomer B (per-molecule).
+    
+    Returns:
+        tuple: Three lists (E_elst, E_elst_dimer, E_induction) where
+            - E_elst is the list of monomer–monomer electrostatic interaction energies,
+            - E_elst_dimer is the list of dimer-level electrostatic interaction energies (using `dimer` multipoles),
+            - E_induction is the list of induction contributions computed as E_elst_dimer - E_elst.
+        All energies are returned in the same energy units produced by `eval_qcel_dimer` (kcal/mol).
+    """
+    E_elst, E_elst_dimer, E_induction = [], [], []
+    for i, m in enumerate(mols):
+        qA, muA, thetaA = (
+            monA[i][0],
+            monA[i][1],
+            monA[i][2],
+        )
+        qB, muB, thetaB = (
+            monB[i][0],
+            monB[i][1],
+            monB[i][2],
+        )
+        elst = eval_qcel_dimer(
+            m,
+            qA,
+            muA,
+            thetaA,
+            qB,
+            muB,
+            thetaB,
+        )
+        qD, muD, thetaD = dimer[i][0], dimer[i][1], dimer[i][2]
+        qA, muA, thetaA = (
+            qD[m.fragments[0]],
+            muD[m.fragments[0], :],
+            thetaD[m.fragments[0], :, :],
+        )
+        qB, muB, thetaB = (
+            qD[m.fragments[1]],
+            muD[m.fragments[1], :],
+            thetaD[m.fragments[1], :, :],
+        )
+        elst_dimer = eval_qcel_dimer(
+            m,
+            qA,
+            muA,
+            thetaA,
+            qB,
+            muB,
+            thetaB,
+        )
+        indu = elst_dimer - elst
+        E_elst.append(elst)
+        E_elst_dimer.append(elst_dimer)
+        E_induction.append(indu)
+    return E_elst, E_elst_dimer, E_induction
+
+
 if __name__ == "__main__":
     T_cart()
