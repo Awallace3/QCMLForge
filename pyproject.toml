@@ -17,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "torch==2.7.0",
+    "e3nn>=0.5.6",
     "qm_tools_aw",
     "numpy>=2.2.0",
     "qcelemental>=0.29.0",

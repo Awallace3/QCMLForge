@@ -34,3 +34,4 @@ dependencies:
       - pytorch-minimize
       - qcportal==0.59
       - lmdb
+      - e3nn>=0.5.6

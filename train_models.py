@@ -62,6 +62,13 @@ def train_atom_model(
     if atom_model_type == "AtomModel":
         AM = AtomModels.ap2_atom_model.AtomModel
         batch_size = 16
+    elif atom_model_type == "AtomE3Model":
+        if AtomModels.ap2_atom_e3_model is None:
+            raise ImportError(
+                "AtomE3Model requires e3nn. Install e3nn to train this model."
+            )
+        AM = AtomModels.ap2_atom_e3_model.AtomE3Model
+        batch_size = 16
     elif atom_model_type == "AtomHirshfeldModel":
         AM = AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel
         batch_size = 1
@@ -81,7 +88,12 @@ def train_atom_model(
         pretrained_model = model_path
     print("Training {}...".format(atom_model_type))
     # TODO complete
-    if atom_model_type in ["AtomModel", "AtomHirshfeldModel", "AtomTypeParamModel"]:
+    if atom_model_type in [
+        "AtomModel",
+        "AtomE3Model",
+        "AtomHirshfeldModel",
+        "AtomTypeParamModel",
+    ]:
         atom_model = AM(
             n_message=n_message,
             n_rbf=n_rbf,
@@ -524,7 +536,7 @@ def main():
         "--train_am",
         type=str,
         default="",
-        help="Train AtomModel: (AtomModel, AtomHirshfeldModel)",
+        help="Train AtomModel: (AtomModel, AtomE3Model, AtomHirshfeldModel)",
     )
     args.add_argument(
         "--train_apnet",
