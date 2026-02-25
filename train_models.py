@@ -30,6 +30,12 @@ def train_atom_model(
     use_nn_screening=False,
     precompute_hfvr=False,
     ds_use_lmdb=False,
+    e3_lmax=1,
+    e3_contraction="einsum",
+    e3_dipole_mode="l1",
+    e3_qpole_mode="legacy",
+    e3_message_mode="none",
+    e3_normalization="component",
 ):
     """
     Train a single-atom model of the specified type using data in data_dir.
@@ -88,12 +94,7 @@ def train_atom_model(
         pretrained_model = model_path
     print("Training {}...".format(atom_model_type))
     # TODO complete
-    if atom_model_type in [
-        "AtomModel",
-        "AtomE3Model",
-        "AtomHirshfeldModel",
-        "AtomTypeParamModel",
-    ]:
+    if atom_model_type in ["AtomModel", "AtomHirshfeldModel", "AtomTypeParamModel"]:
         atom_model = AM(
             n_message=n_message,
             n_rbf=n_rbf,
@@ -109,6 +110,28 @@ def train_atom_model(
             pre_trained_model_path=pretrained_model,
         )
         skip_compile = False
+    elif atom_model_type in ["AtomE3Model"]:
+        atom_model = AM(
+            n_message=n_message,
+            n_rbf=n_rbf,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            r_cut=r_cut,
+            e3_lmax=e3_lmax,
+            e3_contraction=e3_contraction,
+            e3_dipole_mode=e3_dipole_mode,
+            e3_qpole_mode=e3_qpole_mode,
+            e3_message_mode=e3_message_mode,
+            e3_normalization=e3_normalization,
+            ds_root=data_dir,
+            ds_spec_type=spec_type,
+            ds_max_size=ds_max_size,
+            ignore_database_null=False,
+            ds_in_memory=True,
+            use_GPU=True,
+            pre_trained_model_path=pretrained_model,
+        )
+        skip_compile = True
     elif atom_model_type in ["AtomInducedDipoleModel"]:
         atom_model = AM(
             atomtype_hfvr_pre_trained_path=atom_type_param_model_path,
@@ -658,6 +681,47 @@ def main():
         help="specify AtomModel r_cut (default: 5.0)",
     )
     args.add_argument(
+        "--e3_lmax",
+        type=int,
+        default=1,
+        help="Max spherical harmonics order l for AtomE3Model (default: 1)",
+    )
+    args.add_argument(
+        "--e3_contraction",
+        type=str,
+        default="einsum",
+        choices=["einsum", "tensor_product", "fully_connected_tp"],
+        help="AtomE3Model dipole contraction type (default: einsum)",
+    )
+    args.add_argument(
+        "--e3_dipole_mode",
+        type=str,
+        default="l1",
+        choices=["l1", "multi_l"],
+        help="AtomE3Model dipole SH mode (default: l1)",
+    )
+    args.add_argument(
+        "--e3_qpole_mode",
+        type=str,
+        default="legacy",
+        choices=["legacy", "l2"],
+        help="AtomE3Model quadrupole update mode (default: legacy)",
+    )
+    args.add_argument(
+        "--e3_message_mode",
+        type=str,
+        default="none",
+        choices=["none", "concat_sh"],
+        help="AtomE3Model message augmentation mode (default: none)",
+    )
+    args.add_argument(
+        "--e3_normalization",
+        type=str,
+        default="component",
+        choices=["component", "norm", "integral"],
+        help="e3nn spherical harmonics normalization (default: component)",
+    )
+    args.add_argument(
         "--use_nn_screening",
         action="store_true",
         default=False,
@@ -751,6 +815,12 @@ def main():
             use_nn_screening=args.use_nn_screening,
             precompute_hfvr=args.precompute_hfvr,
             ds_use_lmdb=args.ds_use_lmdb,
+            e3_lmax=args.e3_lmax,
+            e3_contraction=args.e3_contraction,
+            e3_dipole_mode=args.e3_dipole_mode,
+            e3_qpole_mode=args.e3_qpole_mode,
+            e3_message_mode=args.e3_message_mode,
+            e3_normalization=args.e3_normalization,
         )
     if args.train_apnet != "":
         train_pairwise_model(

@@ -99,5 +99,49 @@ def test_am_e3_element_and_water_batch():
     assert torch.allclose(output[3][0].sum(), torch.tensor(0.0), atol=1e-4)
 
 
+@pytest.mark.parametrize(
+    "e3_kwargs",
+    [
+        {
+            "e3_lmax": 1,
+            "e3_contraction": "einsum",
+            "e3_dipole_mode": "l1",
+            "e3_qpole_mode": "legacy",
+            "e3_message_mode": "none",
+        },
+        {
+            "e3_lmax": 2,
+            "e3_contraction": "tensor_product",
+            "e3_dipole_mode": "multi_l",
+            "e3_qpole_mode": "l2",
+            "e3_message_mode": "concat_sh",
+        },
+        {
+            "e3_lmax": 3,
+            "e3_contraction": "fully_connected_tp",
+            "e3_dipole_mode": "multi_l",
+            "e3_qpole_mode": "l2",
+            "e3_message_mode": "concat_sh",
+        },
+    ],
+)
+def test_am_e3_configurable_modes_smoke(e3_kwargs):
+    atom_model = apnet_pt.AtomModels.ap2_atom_e3_model.AtomE3Model(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+        **e3_kwargs,
+    )
+    set_weights_to_value(atom_model.model, 0.02)
+    out = atom_model.predict_qcel_mols([mol_water], batch_size=1)
+    charges, dipoles, quads, _ = out[0]
+    assert charges.shape == (3,)
+    assert dipoles.shape == (3, 3)
+    assert quads.shape == (3, 3, 3)
+    cfg = atom_model.model.get_config()
+    for key, value in e3_kwargs.items():
+        assert cfg[key] == value
+
+
 if __name__ == "__main__":
     test_am_e3_architecture()

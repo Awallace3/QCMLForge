@@ -16,16 +16,105 @@ from .ap2_atom_model import (
 )
 
 
-class AtomE3MPNN(nn.Module):
-    """E(3)-aware atom model using e3nn spherical harmonics."""
+def _sh_dim_from_lmax(lmax: int) -> int:
+    return sum(2 * l + 1 for l in range(1, lmax + 1))
 
-    def __init__(self, n_message=3, n_rbf=8, n_neuron=128, n_embed=8, r_cut=5.0):
+
+def _fallback_sh_components(dr_unit: torch.Tensor, lmax: int) -> torch.Tensor:
+    x = dr_unit[:, 0:1]
+    y = dr_unit[:, 1:2]
+    z = dr_unit[:, 2:3]
+
+    parts = [dr_unit]
+
+    if lmax >= 2:
+        l2 = torch.cat(
+            [
+                x * y,
+                y * z,
+                z * x,
+                x * x - y * y,
+                0.5 * (3.0 * z * z - 1.0),
+            ],
+            dim=-1,
+        )
+        parts.append(l2)
+
+    if lmax >= 3:
+        l3 = torch.cat(
+            [
+                x * y * z,
+                x * (x * x - 3.0 * y * y),
+                y * (3.0 * x * x - y * y),
+                z * (x * x - y * y),
+                x * (5.0 * z * z - 1.0),
+                y * (5.0 * z * z - 1.0),
+                z * (5.0 * z * z - 3.0),
+            ],
+            dim=-1,
+        )
+        parts.append(l3)
+
+    return torch.cat(parts, dim=-1)
+
+
+class AtomE3MPNN(nn.Module):
+    """Configurable e3nn-based atom model for multipole prediction."""
+
+    def __init__(
+        self,
+        n_message: int = 3,
+        n_rbf: int = 8,
+        n_neuron: int = 128,
+        n_embed: int = 8,
+        r_cut: float = 5.0,
+        e3_lmax: int = 1,
+        e3_contraction: str = "einsum",
+        e3_dipole_mode: str = "l1",
+        e3_qpole_mode: str = "legacy",
+        e3_message_mode: str = "none",
+        e3_normalization: str = "component",
+    ):
         super().__init__()
+        if e3_lmax < 1:
+            raise ValueError("e3_lmax must be >= 1")
+        valid_contraction = {"einsum", "tensor_product", "fully_connected_tp"}
+        if e3_contraction not in valid_contraction:
+            raise ValueError(
+                f"Invalid e3_contraction={e3_contraction}. "
+                f"Expected one of {sorted(valid_contraction)}"
+            )
+        valid_dipole_mode = {"l1", "multi_l"}
+        if e3_dipole_mode not in valid_dipole_mode:
+            raise ValueError(
+                f"Invalid e3_dipole_mode={e3_dipole_mode}. "
+                f"Expected one of {sorted(valid_dipole_mode)}"
+            )
+        valid_qpole_mode = {"legacy", "l2"}
+        if e3_qpole_mode not in valid_qpole_mode:
+            raise ValueError(
+                f"Invalid e3_qpole_mode={e3_qpole_mode}. "
+                f"Expected one of {sorted(valid_qpole_mode)}"
+            )
+        valid_message_mode = {"none", "concat_sh"}
+        if e3_message_mode not in valid_message_mode:
+            raise ValueError(
+                f"Invalid e3_message_mode={e3_message_mode}. "
+                f"Expected one of {sorted(valid_message_mode)}"
+            )
+
         self.n_message = n_message
         self.n_rbf = n_rbf
         self.n_neuron = n_neuron
         self.n_embed = n_embed
         self.r_cut = r_cut
+
+        self.e3_lmax = e3_lmax
+        self.e3_contraction = e3_contraction
+        self.e3_dipole_mode = e3_dipole_mode
+        self.e3_qpole_mode = e3_qpole_mode
+        self.e3_message_mode = e3_message_mode
+        self.e3_normalization = e3_normalization
 
         self.distance_layer = DistanceLayer(n_rbf, r_cut)
         self.embed_layer = nn.Embedding(max_Z + 1, n_embed)
@@ -40,7 +129,12 @@ class AtomE3MPNN(nn.Module):
         self.dipole_edge_readout_layers = nn.ModuleList()
         self.qpole_readout_layers = nn.ModuleList()
 
-        input_layer_size = n_embed * 4 * n_rbf + n_embed * 4 + n_rbf
+        self.sh_dim = _sh_dim_from_lmax(self.e3_lmax)
+        message_extra = 0
+        if self.e3_message_mode == "concat_sh":
+            message_extra = self.sh_dim + self.sh_dim * self.n_rbf
+
+        input_layer_size = n_embed * 4 * n_rbf + n_embed * 4 + n_rbf + message_extra
 
         layer_nodes_hidden = [
             input_layer_size,
@@ -78,6 +172,14 @@ class AtomE3MPNN(nn.Module):
             self.dipole_edge_readout_layers.append(nn.Linear(n_embed, 1))
             self.qpole_readout_layers.append(nn.Linear(n_embed, 1))
 
+        self.dipole_feature_project = nn.Linear(n_embed, 3)
+        self.dipole_tp = o3.ElementwiseTensorProduct("1x0e", "1x1o")
+        self.dipole_fc_tp = o3.FullyConnectedTensorProduct("1x0e", "1x1o", "1x1o")
+        self.multi_l_to_l1 = nn.Linear(self.sh_dim, 3)
+
+        self.qpole_l2_readout = nn.Linear(n_embed, 1)
+        self.qpole_l2_to_cart = nn.Linear(5, 9, bias=False)
+
     def get_config(self) -> dict:
         return {
             "n_message": self.n_message,
@@ -85,6 +187,12 @@ class AtomE3MPNN(nn.Module):
             "n_neuron": self.n_neuron,
             "n_embed": self.n_embed,
             "r_cut": self.r_cut,
+            "e3_lmax": self.e3_lmax,
+            "e3_contraction": self.e3_contraction,
+            "e3_dipole_mode": self.e3_dipole_mode,
+            "e3_qpole_mode": self.e3_qpole_mode,
+            "e3_message_mode": self.e3_message_mode,
+            "e3_normalization": self.e3_normalization,
         }
 
     def _make_layers(self, layer_nodes, activations):
@@ -95,7 +203,7 @@ class AtomE3MPNN(nn.Module):
                 layers.append(activations[i])
         return nn.Sequential(*layers)
 
-    def get_messages(self, h0, h, rbf, e_source, e_target):
+    def get_messages(self, h0, h, rbf, e_source, e_target, sh_features=None):
         nedge = e_source.size(0)
 
         h0_source = h0.index_select(0, e_source)
@@ -107,7 +215,34 @@ class AtomE3MPNN(nn.Module):
         h_all_dot = torch.einsum("ez,er->ezr", h_all, rbf)
         h_all_dot = h_all_dot.view(nedge, -1)
 
-        return torch.cat([h_all, h_all_dot, rbf], dim=-1)
+        base = [h_all, h_all_dot, rbf]
+        if sh_features is not None:
+            base.append(sh_features)
+        return torch.cat(base, dim=-1)
+
+    def _get_sh_features(self, dr_unit: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        l_values = list(range(1, self.e3_lmax + 1))
+        try:
+            sh_all = o3.spherical_harmonics(
+                l_values,
+                dr_unit,
+                normalize=True,
+                normalization=self.e3_normalization,
+            )
+        except RuntimeError:
+            sh_all = _fallback_sh_components(dr_unit, self.e3_lmax)
+        sh_l1 = sh_all[:, :3]
+        return sh_all, sh_l1
+
+    def _contract_dipole(self, dipole_amp, dipole_feat, sh_used):
+        if self.e3_contraction == "einsum":
+            return dipole_amp * sh_used
+
+        if self.e3_contraction == "tensor_product":
+            return self.dipole_tp(dipole_amp, sh_used)
+
+        feat_scalar = dipole_feat.mean(dim=-1, keepdim=True)
+        return self.dipole_fc_tp(feat_scalar, sh_used)
 
     def forward(self, batch):
         x = batch.x
@@ -145,11 +280,10 @@ class AtomE3MPNN(nn.Module):
         keep_mask.scatter_(0, edge_index[1], True)
 
         filtered_charge = charge[keep_mask]
-        filtered_dipole = torch.zeros(
-            int(keep_mask.sum().item()), 3, dtype=torch.float32, device=Z.device
-        )
+        natom_filtered = int(keep_mask.sum().item())
+        filtered_dipole = torch.zeros(natom_filtered, 3, dtype=torch.float32, device=Z.device)
         filtered_qpole = torch.zeros(
-            int(keep_mask.sum().item()), 3, 3, dtype=torch.float32, device=Z.device
+            natom_filtered, 3, 3, dtype=torch.float32, device=Z.device
         )
 
         h_list = [h0[keep_mask]]
@@ -164,18 +298,51 @@ class AtomE3MPNN(nn.Module):
         e_target = idx_map[e_target]
 
         R = R[keep_mask, :]
-        natom_filtered = int(keep_mask.sum().item())
+
+        if e_source.numel() == 0:
+            h_stack = torch.stack([h0 for _ in range(self.n_message + 1)], dim=1)
+            molecule_ind.requires_grad_(False)
+            molecule_ind = molecule_ind.long()
+            num_mols = int(molecule_ind.max().item()) + 1 if molecule_ind.numel() > 0 else 1
+            total_charge_pred = scatter_sum_compile(
+                charge, molecule_ind, num_mols, reduce="sum"
+            ).squeeze()
+            total_charge_err = total_charge_pred - total_charge
+            charge_err = torch.repeat_interleave(
+                total_charge_err / natom_per_mol.float(), natom_per_mol
+            ).unsqueeze(1)
+            charge = (charge - charge_err).squeeze()
+            return charge, dipole, qpole, h_stack
 
         dR, dR_xyz = get_distances(R, R, e_source, e_target)
-        dr_unit = dR_xyz / dR.unsqueeze(1)
+        dR_safe = torch.clamp(dR, min=1.0e-8)
+        dr_unit = dR_xyz / dR_safe.unsqueeze(1)
+        dr_unit = torch.nan_to_num(dr_unit, nan=0.0, posinf=0.0, neginf=0.0)
         rbf = self.distance_layer(dR)
 
-        y_l1 = o3.spherical_harmonics(
-            1, dr_unit, normalize=True, normalization="component"
-        )
+        sh_all, sh_l1 = self._get_sh_features(dr_unit)
+        if self.e3_dipole_mode == "multi_l":
+            sh_used = self.multi_l_to_l1(sh_all)
+        else:
+            sh_used = sh_l1
+
+        sh_message_features = None
+        if self.e3_message_mode == "concat_sh":
+            sh_dot_rbf = torch.einsum("el,er->elr", sh_all, rbf).reshape(
+                rbf.size(0), -1
+            )
+            sh_message_features = torch.cat([sh_all, sh_dot_rbf], dim=-1)
+
+        sh_l2 = None
+        if self.e3_qpole_mode == "l2":
+            if self.e3_lmax < 2:
+                raise ValueError("e3_qpole_mode='l2' requires e3_lmax >= 2")
+            sh_l2 = sh_all[:, 3:8]
 
         for i in range(self.n_message):
-            m_ij = self.get_messages(h_list[0], h_list[-1], rbf, e_source, e_target)
+            m_ij = self.get_messages(
+                h_list[0], h_list[-1], rbf, e_source, e_target, sh_message_features
+            )
             m_i = scatter_sum_compile(m_ij, e_source, natom_filtered, reduce="sum")
 
             h_next = self.charge_update_layers[i](m_i)
@@ -184,23 +351,40 @@ class AtomE3MPNN(nn.Module):
 
             m_ij_dipole = self.dipole_update_layers[i](m_ij)
             dipole_amp = self.dipole_edge_readout_layers[i](m_ij_dipole)
-            edge_dipole = dipole_amp * y_l1
+            dipole_feat = self.dipole_feature_project(m_ij_dipole)
+            edge_dipole = self._contract_dipole(dipole_amp, dipole_feat, sh_used)
             filtered_dipole = filtered_dipole + scatter_sum_compile(
                 edge_dipole, e_source, natom_filtered, reduce="sum"
             )
 
-            m_ij_qpole1 = self.qpole1_update_layers[i](m_ij)
-            m_ij_qpole1 = torch.einsum("ex,em->exm", dr_unit, m_ij_qpole1)
-            m_i_qpole1 = unsorted_segment_sum_3d(m_ij_qpole1, e_source, natom_filtered)
+            if self.e3_qpole_mode == "l2" and sh_l2 is not None:
+                q_amp = self.qpole_l2_readout(m_ij_dipole)
+                edge_q_l2 = q_amp * sh_l2
+                edge_q_cart = self.qpole_l2_to_cart(edge_q_l2).view(-1, 3, 3)
+                edge_q_cart = 0.5 * (edge_q_cart + edge_q_cart.transpose(1, 2))
+                d_qpole = scatter_sum_compile(
+                    edge_q_cart, e_source, natom_filtered, reduce="sum"
+                )
+                filtered_qpole = filtered_qpole + d_qpole
+            else:
+                m_ij_qpole1 = self.qpole1_update_layers[i](m_ij)
+                m_ij_qpole1 = torch.einsum("ex,em->exm", dr_unit, m_ij_qpole1)
+                m_i_qpole1 = unsorted_segment_sum_3d(
+                    m_ij_qpole1, e_source, natom_filtered
+                )
 
-            m_ij_qpole2 = self.qpole2_update_layers[i](m_ij)
-            m_ij_qpole2 = torch.einsum("ex,em->exm", dr_unit, m_ij_qpole2)
-            m_i_qpole2 = unsorted_segment_sum_3d(m_ij_qpole2, e_source, natom_filtered)
+                m_ij_qpole2 = self.qpole2_update_layers[i](m_ij)
+                m_ij_qpole2 = torch.einsum("ex,em->exm", dr_unit, m_ij_qpole2)
+                m_i_qpole2 = unsorted_segment_sum_3d(
+                    m_ij_qpole2, e_source, natom_filtered
+                )
 
-            d_qpole = torch.einsum("axf,ayf->axyf", m_i_qpole1, m_i_qpole2)
-            d_qpole = d_qpole + d_qpole.permute(0, 2, 1, 3)
-            d_qpole = self.qpole_readout_layers[i](d_qpole).view(natom_filtered, 3, 3)
-            filtered_qpole = filtered_qpole + d_qpole
+                d_qpole = torch.einsum("axf,ayf->axyf", m_i_qpole1, m_i_qpole2)
+                d_qpole = d_qpole + d_qpole.permute(0, 2, 1, 3)
+                d_qpole = self.qpole_readout_layers[i](d_qpole).view(
+                    natom_filtered, 3, 3
+                )
+                filtered_qpole = filtered_qpole + d_qpole
 
         filtered_qpole = multipole.ensure_traceless_qpole(filtered_qpole)
 
@@ -246,6 +430,12 @@ class AtomE3Model(AtomModel):
         ds_force_reprocess=False,
         ds_in_memory=True,
         model_save_path=None,
+        e3_lmax=1,
+        e3_contraction="einsum",
+        e3_dipole_mode="l1",
+        e3_qpole_mode="legacy",
+        e3_message_mode="none",
+        e3_normalization="component",
     ):
         super().__init__(
             dataset=dataset,
@@ -266,6 +456,13 @@ class AtomE3Model(AtomModel):
             model_save_path=model_save_path,
         )
 
+        self.e3_lmax = e3_lmax
+        self.e3_contraction = e3_contraction
+        self.e3_dipole_mode = e3_dipole_mode
+        self.e3_qpole_mode = e3_qpole_mode
+        self.e3_message_mode = e3_message_mode
+        self.e3_normalization = e3_normalization
+
         if pre_trained_model_path:
             checkpoint = model_io.load_checkpoint(pre_trained_model_path)
             version = model_io.get_checkpoint_version(checkpoint)
@@ -280,6 +477,12 @@ class AtomE3Model(AtomModel):
                 n_neuron=config.get("n_neuron", n_neuron),
                 n_embed=config.get("n_embed", n_embed),
                 r_cut=config.get("r_cut", r_cut),
+                e3_lmax=config.get("e3_lmax", e3_lmax),
+                e3_contraction=config.get("e3_contraction", e3_contraction),
+                e3_dipole_mode=config.get("e3_dipole_mode", e3_dipole_mode),
+                e3_qpole_mode=config.get("e3_qpole_mode", e3_qpole_mode),
+                e3_message_mode=config.get("e3_message_mode", e3_message_mode),
+                e3_normalization=config.get("e3_normalization", e3_normalization),
             )
             state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(state_dict)
@@ -290,6 +493,12 @@ class AtomE3Model(AtomModel):
                 n_neuron=n_neuron,
                 n_embed=n_embed,
                 r_cut=r_cut,
+                e3_lmax=e3_lmax,
+                e3_contraction=e3_contraction,
+                e3_dipole_mode=e3_dipole_mode,
+                e3_qpole_mode=e3_qpole_mode,
+                e3_message_mode=e3_message_mode,
+                e3_normalization=e3_normalization,
             )
 
     def set_pretrained_model(self, model_path=None, model_id=None):
@@ -315,6 +524,12 @@ class AtomE3Model(AtomModel):
             "n_neuron": self.model.n_neuron,
             "n_embed": self.model.n_embed,
             "r_cut": self.model.r_cut,
+            "e3_lmax": self.model.e3_lmax,
+            "e3_contraction": self.model.e3_contraction,
+            "e3_dipole_mode": self.model.e3_dipole_mode,
+            "e3_qpole_mode": self.model.e3_qpole_mode,
+            "e3_message_mode": self.model.e3_message_mode,
+            "e3_normalization": self.model.e3_normalization,
         }
         return model_io.create_checkpoint(
             model=self.model,
