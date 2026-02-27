@@ -30,6 +30,7 @@ def train_atom_model(
     use_nn_screening=False,
     precompute_hfvr=False,
     ds_use_lmdb=False,
+    e3_use_compile=False,
     e3_lmax=1,
     e3_contraction="einsum",
     e3_dipole_mode="l1",
@@ -131,7 +132,7 @@ def train_atom_model(
             use_GPU=True,
             pre_trained_model_path=pretrained_model,
         )
-        skip_compile = True
+        skip_compile = not e3_use_compile
     elif atom_model_type in ["AtomInducedDipoleModel"]:
         atom_model = AM(
             atomtype_hfvr_pre_trained_path=atom_type_param_model_path,
@@ -681,6 +682,12 @@ def main():
         help="specify AtomModel r_cut (default: 5.0)",
     )
     args.add_argument(
+        "--e3_use_compile",
+        action="store_true",
+        default=False,
+        help="Enable torch.compile for AtomE3Model (default: False)",
+    )
+    args.add_argument(
         "--e3_lmax",
         type=int,
         default=1,
@@ -815,6 +822,7 @@ def main():
             use_nn_screening=args.use_nn_screening,
             precompute_hfvr=args.precompute_hfvr,
             ds_use_lmdb=args.ds_use_lmdb,
+            e3_use_compile=args.e3_use_compile,
             e3_lmax=args.e3_lmax,
             e3_contraction=args.e3_contraction,
             e3_dipole_mode=args.e3_dipole_mode,

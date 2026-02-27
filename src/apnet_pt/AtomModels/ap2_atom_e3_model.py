@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import time
+import warnings
 
 from e3nn import o3
 
@@ -9,11 +11,14 @@ from .. import model_io
 from .. import multipole
 from .ap2_atom_model import (
     AtomModel,
+    AtomicDataLoader,
     DistanceLayer,
     get_distances,
     max_Z,
+    atomic_collate_update,
     unsorted_segment_sum_3d,
 )
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 def _sh_dim_from_lmax(lmax: int) -> int:
@@ -221,6 +226,9 @@ class AtomE3MPNN(nn.Module):
         return torch.cat(base, dim=-1)
 
     def _get_sh_features(self, dr_unit: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.e3_lmax == 1:
+            return dr_unit, dr_unit
+
         l_values = list(range(1, self.e3_lmax + 1))
         try:
             sh_all = o3.spherical_harmonics(
@@ -275,29 +283,13 @@ class AtomE3MPNN(nn.Module):
             charge = charge - charge_err
             return charge, dipole, qpole, h_list
 
-        keep_mask = torch.zeros(natom, dtype=torch.bool, device=Z.device)
-        keep_mask.scatter_(0, edge_index[0], True)
-        keep_mask.scatter_(0, edge_index[1], True)
-
-        filtered_charge = charge[keep_mask]
-        natom_filtered = int(keep_mask.sum().item())
-        filtered_dipole = torch.zeros(natom_filtered, 3, dtype=torch.float32, device=Z.device)
-        filtered_qpole = torch.zeros(
-            natom_filtered, 3, 3, dtype=torch.float32, device=Z.device
-        )
-
-        h_list = [h0[keep_mask]]
+        filtered_charge = charge
+        filtered_dipole = dipole
+        filtered_qpole = qpole
+        h_list = [h0]
 
         e_source = edge_index[0]
         e_target = edge_index[1]
-        edge_keep = keep_mask[e_source] & keep_mask[e_target]
-        e_source = e_source[edge_keep]
-        e_target = e_target[edge_keep]
-        idx_map = (torch.cumsum(keep_mask, dim=0) - 1).long()
-        e_source = idx_map[e_source]
-        e_target = idx_map[e_target]
-
-        R = R[keep_mask, :]
 
         if e_source.numel() == 0:
             h_stack = torch.stack([h0 for _ in range(self.n_message + 1)], dim=1)
@@ -343,7 +335,7 @@ class AtomE3MPNN(nn.Module):
             m_ij = self.get_messages(
                 h_list[0], h_list[-1], rbf, e_source, e_target, sh_message_features
             )
-            m_i = scatter_sum_compile(m_ij, e_source, natom_filtered, reduce="sum")
+            m_i = scatter_sum_compile(m_ij, e_source, natom, reduce="sum")
 
             h_next = self.charge_update_layers[i](m_i)
             h_list.append(h_next)
@@ -354,7 +346,7 @@ class AtomE3MPNN(nn.Module):
             dipole_feat = self.dipole_feature_project(m_ij_dipole)
             edge_dipole = self._contract_dipole(dipole_amp, dipole_feat, sh_used)
             filtered_dipole = filtered_dipole + scatter_sum_compile(
-                edge_dipole, e_source, natom_filtered, reduce="sum"
+                edge_dipole, e_source, natom, reduce="sum"
             )
 
             if self.e3_qpole_mode == "l2" and sh_l2 is not None:
@@ -363,34 +355,27 @@ class AtomE3MPNN(nn.Module):
                 edge_q_cart = self.qpole_l2_to_cart(edge_q_l2).view(-1, 3, 3)
                 edge_q_cart = 0.5 * (edge_q_cart + edge_q_cart.transpose(1, 2))
                 d_qpole = scatter_sum_compile(
-                    edge_q_cart, e_source, natom_filtered, reduce="sum"
+                    edge_q_cart, e_source, natom, reduce="sum"
                 )
                 filtered_qpole = filtered_qpole + d_qpole
             else:
                 m_ij_qpole1 = self.qpole1_update_layers[i](m_ij)
                 m_ij_qpole1 = torch.einsum("ex,em->exm", dr_unit, m_ij_qpole1)
-                m_i_qpole1 = unsorted_segment_sum_3d(
-                    m_ij_qpole1, e_source, natom_filtered
-                )
+                m_i_qpole1 = unsorted_segment_sum_3d(m_ij_qpole1, e_source, natom)
 
                 m_ij_qpole2 = self.qpole2_update_layers[i](m_ij)
                 m_ij_qpole2 = torch.einsum("ex,em->exm", dr_unit, m_ij_qpole2)
-                m_i_qpole2 = unsorted_segment_sum_3d(
-                    m_ij_qpole2, e_source, natom_filtered
-                )
+                m_i_qpole2 = unsorted_segment_sum_3d(m_ij_qpole2, e_source, natom)
 
                 d_qpole = torch.einsum("axf,ayf->axyf", m_i_qpole1, m_i_qpole2)
                 d_qpole = d_qpole + d_qpole.permute(0, 2, 1, 3)
-                d_qpole = self.qpole_readout_layers[i](d_qpole).view(
-                    natom_filtered, 3, 3
-                )
+                d_qpole = self.qpole_readout_layers[i](d_qpole).view(natom, 3, 3)
                 filtered_qpole = filtered_qpole + d_qpole
 
         filtered_qpole = multipole.ensure_traceless_qpole(filtered_qpole)
-
-        charge[keep_mask] = filtered_charge
-        dipole[keep_mask] = filtered_dipole
-        qpole[keep_mask] = filtered_qpole
+        charge = filtered_charge
+        dipole = filtered_dipole
+        qpole = filtered_qpole
 
         molecule_ind.requires_grad_(False)
         molecule_ind = molecule_ind.long()
@@ -516,6 +501,133 @@ class AtomE3Model(AtomModel):
         state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
         self.model.load_state_dict(state_dict)
         return self
+
+    def compile_model(self):
+        torch._dynamo.config.suppress_errors = True
+        torch._dynamo.config.dynamic_shapes = True
+        torch._dynamo.config.capture_dynamic_output_shape_ops = True
+        torch._dynamo.config.capture_scalar_outputs = True
+        try:
+            self.model = torch.compile(
+                self.model,
+                dynamic=True,
+                fullgraph=False,
+                mode="reduce-overhead",
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"torch.compile failed for AtomE3Model; using eager mode. {exc}",
+                RuntimeWarning,
+            )
+        return
+
+    def ddp_train(
+        self,
+        rank,
+        world_size,
+        train_dataset,
+        test_dataset,
+        n_epochs,
+        batch_size,
+        lr,
+        pin_memory,
+        num_workers,
+    ):
+        if self.device.type == "cpu":
+            rank_device = "cpu"
+        else:
+            rank_device = rank
+        if world_size > 1:
+            self.setup(rank, world_size)
+
+        self.model.to(rank_device)
+        if world_size > 1:
+            if rank_device == "cpu":
+                self.model = DDP(self.model, find_unused_parameters=True)
+            else:
+                self.model = DDP(
+                    self.model,
+                    device_ids=[rank],
+                    output_device=rank_device,
+                    find_unused_parameters=True,
+                )
+
+        train_sampler = (
+            torch.utils.data.distributed.DistributedSampler(
+                train_dataset, num_replicas=world_size, rank=rank
+            )
+            if world_size > 1
+            else None
+        )
+        test_sampler = (
+            torch.utils.data.distributed.DistributedSampler(
+                test_dataset, num_replicas=world_size, rank=rank, shuffle=False
+            )
+            if world_size > 1
+            else None
+        )
+
+        train_loader = AtomicDataLoader(
+            dataset=train_dataset,
+            batch_size=batch_size,
+            shuffle=(train_sampler is None),
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            sampler=train_sampler,
+            collate_fn=atomic_collate_update,
+        )
+
+        test_loader = AtomicDataLoader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            sampler=test_sampler,
+            collate_fn=atomic_collate_update,
+        )
+
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        criterion = torch.nn.MSELoss()
+
+        test_loss = self.pretrain_statistics(train_loader, test_loader, criterion)
+        lowest_test_loss = test_loss
+
+        for epoch in range(n_epochs):
+            t1 = time.time()
+
+            test_lowered = False
+            train_loss, charge_MAE_t, dipole_MAE_t, qpole_MAE_t = self.train_batches(
+                rank, train_loader, criterion, optimizer, rank_device
+            )
+            test_loss, charge_MAE_v, dipole_MAE_v, qpole_MAE_v = self.evaluate_batches(
+                rank, test_loader, criterion, rank_device
+            )
+
+            if rank == 0:
+                if test_loss < lowest_test_loss:
+                    lowest_test_loss = test_loss
+                    test_lowered = "*"
+                    if self.model_save_path:
+                        cpu_model = model_io.unwrap_model(self.model).to("cpu")
+                        checkpoint = model_io.create_checkpoint(
+                            model=cpu_model,
+                            config=cpu_model.get_config(),
+                            model_type="AtomE3MPNN",
+                        )
+                        model_io.save_checkpoint(checkpoint, self.model_save_path)
+                        self.model.to(self.device)
+                else:
+                    test_lowered = " "
+
+                dt = time.time() - t1
+                print(
+                    f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f} {test_lowered}",
+                    flush=True,
+                )
+        if world_size > 1:
+            self.cleanup()
+        return
 
     def _create_checkpoint(self, metadata: dict | None = None) -> dict:
         config = {
