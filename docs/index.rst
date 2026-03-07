@@ -6,6 +6,10 @@
 Welcome to QCMLForge's documentation!
 =========================================================
 
+QCMLForge provides QCArchive tooling and PyTorch AP-Net models for molecular
+interaction learning. Start with the README-backed getting started guide, then
+move into the user guide and API reference for more detail.
+
 .. grid:: 1 1 2 2
 
     .. grid-item-card:: Getting Started
@@ -50,6 +54,20 @@ Welcome to QCMLForge's documentation!
 
       
 
+    .. grid-item-card:: APNet PT Models
+      :margin: 0 3 0 0
+
+      Model-level guide for trainable atom and pairwise AP-Net variants.
+
+      .. button-link:: ./apnet_pt_models.html
+         :color: primary
+         :outline:
+         :expand:
+
+         To the Model Guide
+
+
+
     .. grid-item-card::  Developer Guide
       :margin: 0 3 0 0
       
@@ -70,6 +88,6 @@ Welcome to QCMLForge's documentation!
 
    getting_started
    user_guide
+   apnet_pt_models
    api
    developer_guide
-
