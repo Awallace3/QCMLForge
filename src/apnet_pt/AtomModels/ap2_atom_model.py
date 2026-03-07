@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# from torch_scatter import scatter
-from torch_geometric.utils import scatter
+from apnet_pt.util import scatter_sum_compile
 from torch_geometric.nn import MessagePassing
 import numpy as np
 import warnings
 from .. import multipole
+from .. import model_io
 import time
 from ..atomic_datasets import (
     atomic_module_dataset,
@@ -22,6 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 from importlib import resources
 import qcelemental as qcel
+from pprint import pprint as pp
 
 warnings.filterwarnings("ignore")
 
@@ -69,7 +70,6 @@ def unsorted_segment_sum_3d(data, segment_ids, num_segments):
 
 
 def make_quad(flat_quad):
-
     natom = flat_quad.size()[0]
     full_quad = torch.zeros(
         (natom, 3, 3), device=flat_quad.device, dtype=flat_quad.dtype
@@ -240,6 +240,24 @@ class AtomMPNN(MessagePassing):
             self.dipole_readout_layers.append(nn.Linear(n_embed, 1))
             self.qpole_readout_layers.append(nn.Linear(n_embed, 1))
 
+    def get_config(self) -> dict:
+        """
+        Return the configuration dictionary for this model.
+
+        Returns
+        -------
+        dict
+            Dictionary containing all hyperparameters needed to reconstruct
+            this model architecture.
+        """
+        return {
+            "n_message": self.n_message,
+            "n_rbf": self.n_rbf,
+            "n_neuron": self.n_neuron,
+            "n_embed": self.n_embed,
+            "r_cut": self.r_cut,
+        }
+
     def _make_layers(self, layer_nodes, activations):
         layers = []
         for i in range(len(layer_nodes) - 1):
@@ -271,14 +289,16 @@ class AtomMPNN(MessagePassing):
     # @torch.jit.trace
     def forward(
         self,
-        x,
-        edge_index,
-        # edge_attr,
-        R,
-        molecule_ind,
-        total_charge,
-        natom_per_mol,
+        batch,
     ):
+        # Extract variables from batch
+        x = batch.x
+        edge_index = batch.edge_index
+        R = batch.R
+        molecule_ind = batch.molecule_ind
+        total_charge = batch.total_charge
+        natom_per_mol = batch.natom_per_mol
+
         # edge_index has shape [(e_source, e_target), n_edges]
         Z = x
         natom = Z.size(0)
@@ -297,7 +317,12 @@ class AtomMPNN(MessagePassing):
             h_list = torch.stack(h_list, dim=1)
             molecule_ind.requires_grad_(False)
             molecule_ind = molecule_ind.long()
-            total_charge_pred = scatter(charge, molecule_ind, dim=0, reduce="sum")
+            num_mols = (
+                int(molecule_ind.max().item()) + 1 if molecule_ind.numel() > 0 else 1
+            )
+            total_charge_pred = scatter_sum_compile(
+                charge, molecule_ind, num_mols, reduce="sum"
+            )
             total_charge_pred = total_charge_pred.squeeze()
             total_charge_err = total_charge_pred - total_charge
             charge_err = torch.repeat_interleave(
@@ -305,12 +330,19 @@ class AtomMPNN(MessagePassing):
             ).unsqueeze(1)
             charge = charge - charge_err
             return charge, dipole, qpole, h_list
-        
-        # 1) Identify which molecules have more than one atom
-        mol_ind = torch.where(natom_per_mol != 1)[0]
-        keep_mask = (molecule_ind.unsqueeze(1) == mol_ind).any(dim=1)
+
+        # 1) Filter out atoms that don't have edges
+        # Create keep_mask directly from edge_index without using torch.isin
+        # This is more compile-friendly than torch.isin with unbacked symbolic shapes
+        natom = len(molecule_ind)
+        keep_mask = torch.zeros(natom, dtype=torch.bool, device=molecule_ind.device)
+        if edge_index.size(1) > 0:
+            # Mark all atoms that appear in edge_index as True
+            keep_mask.scatter_(0, edge_index[0], True)
+            keep_mask.scatter_(0, edge_index[1], True)
         filtered_charge = charge[keep_mask]
-        # Now `filtered_charge` contains only atoms from molecules that have >= 2 atoms.
+
+        # Now `filtered_charge` contains only atoms from molecules that have >= 2 atoms and edges
         h_list = [h_list_0[0][keep_mask]]
 
         # Now we need to filter the edge_index to only include edges between
@@ -320,12 +352,15 @@ class AtomMPNN(MessagePassing):
         edge_keep = keep_mask[e_source] & keep_mask[e_target]
         e_source = e_source[edge_keep]
         e_target = e_target[edge_keep]
-        idx_map = torch.cumsum(keep_mask, dim=0) - 1  # shape [N], each kept atom -> new index
-        idx_map = idx_map.long()                     # ensure integer
+        idx_map = (
+            torch.cumsum(keep_mask, dim=0) - 1
+        )  # shape [N], each kept atom -> new index
+        idx_map = idx_map.long()  # ensure integer
         e_source = idx_map[e_source]
         e_target = idx_map[e_target]
 
         R = R[keep_mask, :]
+        natom_filtered = keep_mask.sum()
 
         #  [edges]
         dR, dR_xyz = get_distances(R, R, e_source, e_target)
@@ -345,7 +380,7 @@ class AtomMPNN(MessagePassing):
             # [atoms x message_embedding_dim]
             # m_i = unsorted_segment_sum_2d(m_ij, e_source, natom)
             # write unsorted_segment_sum_2d using scatter
-            m_i = scatter(m_ij, e_source, dim=0, reduce="sum")
+            m_i = scatter_sum_compile(m_ij, e_source, int(natom_filtered), reduce="sum")  # type: ignore
 
             # [atomx x hidden_dim]
             h_next = self.charge_update_layers[i](m_i)
@@ -407,7 +442,10 @@ class AtomMPNN(MessagePassing):
         charge[keep_mask] = filtered_charge
         molecule_ind.requires_grad_(False)
         molecule_ind = molecule_ind.long()
-        total_charge_pred = scatter(charge, molecule_ind, dim=0, reduce="sum")
+        num_mols = int(molecule_ind.max().item()) + 1 if molecule_ind.numel() > 0 else 1
+        total_charge_pred = scatter_sum_compile(
+            charge, molecule_ind, num_mols, reduce="sum"
+        )
         # return charge, dipole, qpole, h_list
 
         total_charge_pred = total_charge_pred.squeeze()
@@ -417,7 +455,12 @@ class AtomMPNN(MessagePassing):
         ).unsqueeze(1)
         charge = charge - charge_err
         charge = charge.squeeze()
+        # changed to dim=0 from dim=1 for usage in Param fitting # AMW 8/20/25
+        # Breaks test_apnet2_train_qcel_molecules_in_memory_transfer test,
+        # dimensions no longer correct... figure out another way to fix this. reverting back to dim=1 # AMW 9/17/25
+        # print(len(h_list), h_list[0].size())
         h_list = torch.stack(h_list, dim=1)
+        # print(h_list.size())
         return charge, dipole, qpole, h_list
 
 
@@ -426,6 +469,26 @@ def unwrap_model(model):
 
 
 def isolate_atomic_property_predictions(batch, output):
+    batch_size = batch.natom_per_mol.size(0)
+    qA = output[0]
+    muA = output[1]
+    thA = output[2]
+    hlistA = output[3]
+    mol_charges = [[] for i in range(batch_size)]
+    mol_dipoles = [[] for i in range(batch_size)]
+    mol_qpoles = [[] for i in range(batch_size)]
+    mol_hlist = [[] for i in range(batch_size)]
+    i_offset = 0
+    for n, i in enumerate(batch.natom_per_mol):
+        mol_charges[n] = qA[i_offset : i_offset + i]
+        mol_dipoles[n] = muA[i_offset : i_offset + i]
+        mol_qpoles[n] = thA[i_offset : i_offset + i]
+        mol_hlist[n] = hlistA[i_offset : i_offset + i]
+        i_offset += i
+    return mol_charges, mol_dipoles, mol_qpoles, mol_hlist
+
+
+def isolate_atomic_property_predictions_q_mu_theta_hlist_hfvr_vw(batch, output):
     batch_size = batch.natom_per_mol.size(0)
     qA = output[0]
     muA = output[1]
@@ -488,7 +551,10 @@ class AtomModel:
                 n_embed=checkpoint["config"]["n_embed"],
                 r_cut=checkpoint["config"]["r_cut"],
             )
-            model_state_dict = {k.replace("_orig_mod.", ""): v for k,v in checkpoint["model_state_dict"].items()}
+            model_state_dict = {
+                k.replace("_orig_mod.", ""): v
+                for k, v in checkpoint["model_state_dict"].items()
+            }
             self.model.load_state_dict(model_state_dict)
         else:
             self.model = AtomMPNN(
@@ -501,17 +567,60 @@ class AtomModel:
         # self.model.to(device)
         self.device = device
         self.dataset = dataset
+        self.ds_spec_type = ds_spec_type
         mp.set_sharing_strategy("file_system")
-        if not ignore_database_null and self.dataset is None:
-            self.dataset = atomic_module_dataset(
-                root=ds_root,
-                testing=ds_testing,
-                spec_type=ds_spec_type,
-                max_size=ds_max_size,
-                force_reprocess=ds_force_reprocess,
-                in_memory=ds_in_memory,
-            )
-        # print(f"{self.dataset = }")
+        split_dbs = [7]
+        if (
+            not ignore_database_null
+            and self.dataset is None
+            and self.ds_spec_type not in split_dbs
+        ):
+            print("Setting up dataset...")
+
+            def setup_ds(fp=ds_force_reprocess):
+                return atomic_module_dataset(
+                    root=ds_root,
+                    testing=ds_testing,
+                    spec_type=ds_spec_type,
+                    max_size=ds_max_size,
+                    force_reprocess=fp,
+                    in_memory=ds_in_memory,
+                )
+
+            self.dataset = setup_ds()
+            self.dataset = setup_ds(False)
+        elif (
+            not ignore_database_null
+            and self.dataset is None
+            and self.ds_spec_type in split_dbs
+        ):
+            print("Processing Split dataset...")
+
+            def setup_ds(fp=ds_force_reprocess):
+                return [
+                    atomic_module_dataset(
+                        root=ds_root,
+                        testing=ds_testing,
+                        spec_type=ds_spec_type,
+                        split="train",
+                        max_size=ds_max_size,
+                        force_reprocess=fp,
+                        in_memory=ds_in_memory,
+                    ),
+                    atomic_module_dataset(
+                        root=ds_root,
+                        testing=ds_testing,
+                        spec_type=ds_spec_type,
+                        split="test",
+                        max_size=ds_max_size,
+                        force_reprocess=fp,
+                        in_memory=ds_in_memory,
+                    ),
+                ]
+
+            self.dataset = setup_ds()
+            self.dataset = setup_ds(False)
+        print(f"{self.dataset = }")
         self.rank = None
         self.world_size = None
         self.model_save_path = model_save_path
@@ -520,22 +629,90 @@ class AtomModel:
         return
 
     def set_pretrained_model(self, model_path=None, model_id=None):
+        """
+        Load a pretrained model from a checkpoint file.
+
+        Supports both v1 (legacy) and v2 checkpoint formats.
+
+        Parameters
+        ----------
+        model_path : str, optional
+            Path to a checkpoint file
+        model_id : int, optional
+            ID of a bundled pretrained model (0-9)
+
+        Returns
+        -------
+        self
+            Returns self for method chaining
+        """
         if model_id is not None:
-            # model_path = f"{file_dir}/../models/am_ensemble/am_{model_id}.pt"
-            model_path = resources.files("apnet_pt").joinpath("models", "am_ensemble", f"am_{model_id}.pt")
+            model_path = resources.files("apnet_pt").joinpath(
+                "models", "am_ensemble", f"am_{model_id}.pt"
+            )
         elif model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 
-        checkpoint = torch.load(model_path)
-        if "_orig_mod" not in list(self.model.state_dict().keys())[0]:
-            model_state_dict = {
-                k.replace("_orig_mod.", ""):
-                v for k, v in checkpoint["model_state_dict"].items()
-            }
-            self.model.load_state_dict(model_state_dict)
-        else:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = model_io.load_checkpoint(model_path)
+        version = model_io.get_checkpoint_version(checkpoint)
+
+        # For v2, optionally validate checkpoint type
+        if version >= 2:
+            model_io.validate_checkpoint(checkpoint, expected_type="AtomMPNN")
+
+        # Load the state dict
+        state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
+
+        # Handle compiled model prefix mismatch
+        model_keys = list(self.model.state_dict().keys())
+        state_keys = list(state_dict.keys())
+        model_is_compiled = model_keys and "_orig_mod" in model_keys[0]
+        state_is_compiled = state_keys and "_orig_mod" in state_keys[0]
+
+        if model_is_compiled and not state_is_compiled:
+            # Loading non-compiled state_dict into compiled model
+            state_dict = model_io.add_prefix_to_state_dict(state_dict)
+        elif not model_is_compiled and state_is_compiled:
+            # Loading compiled state_dict into non-compiled model
+            state_dict = model_io.strip_prefix_from_state_dict(state_dict)
+
+        self.model.load_state_dict(state_dict)
         return self
+
+    def _create_checkpoint(self, metadata: dict | None = None) -> dict:
+        """
+        Create a v2 checkpoint dictionary for this model.
+
+        Parameters
+        ----------
+        metadata : dict, optional
+            Additional metadata to include in the checkpoint
+
+        Returns
+        -------
+        dict
+            Checkpoint dictionary in v2 format
+        """
+        return model_io.create_checkpoint(
+            model=self.model,
+            config=model_io.unwrap_model(self.model).get_config(),
+            model_type="AtomMPNN",
+            metadata=metadata,
+        )
+
+    def save_model(self, path: str, metadata: dict | None = None) -> None:
+        """
+        Save the model to a checkpoint file in v2 format.
+
+        Parameters
+        ----------
+        path : str
+            Path to save the checkpoint
+        metadata : dict, optional
+            Additional metadata to include
+        """
+        checkpoint = self._create_checkpoint(metadata=metadata)
+        model_io.save_checkpoint(checkpoint, path)
 
     def compile_model(self):
         torch._dynamo.config.dynamic_shapes = True
@@ -553,23 +730,11 @@ class AtomModel:
     def cleanup(self):
         dist.destroy_process_group()
 
-    def eval_fn(self, batch):
-        charge, dipole, qpole, hlist = self.model(
-            batch.x,
-            batch.edge_index,
-            # batch.edge_attr,
-            R=batch.R,
-            molecule_ind=batch.molecule_ind,
-            total_charge=batch.total_charge,
-            natom_per_mol=batch.natom_per_mol,
-        )
-        return charge, dipole, qpole, hlist
-
     def _qcel_example_input(self, mols, batch_size=1):
         mol_data = [qcel_mon_to_pyg_data(mol) for mol in mols]
         batches = []
         for i in range(0, len(mol_data), batch_size):
-            batch_mol_data = mol_data[i: i + batch_size]
+            batch_mol_data = mol_data[i : i + batch_size]
             batch_A = atomic_collate_update_no_target(batch_mol_data)
             batches.append(batch_A)
         return batches
@@ -592,14 +757,7 @@ units angstrom
             batch_loss = 0.0
             batch = batch.to(self.device)
             optimizer.zero_grad()
-            charge, dipole, qpole, _ = self.model(
-                batch.x,
-                batch.edge_index,
-                # batch.edge_attr,
-                R=batch.R,
-                molecule_ind=batch.molecule_ind,
-                total_charge=batch.total_charge,
-            )
+            charge, dipole, qpole, _ = self.model(batch)
 
             # Errors
             q_error = charge - batch.charges
@@ -637,15 +795,7 @@ units angstrom
             for batch in data_loader:
                 batch_loss = 0.0
                 batch = batch.to(self.device)
-                charge, dipole, qpole, hlist = self.model(
-                    batch.x,
-                    batch.edge_index,
-                    # batch.edge_attr,
-                    R=batch.R,
-                    molecule_ind=batch.molecule_ind,
-                    total_charge=batch.total_charge,
-                    natom_per_mol=batch.natom_per_mol,
-                )
+                charge, dipole, qpole, hlist = self.model(batch)
 
                 # Errors
                 q_error = charge - batch.charges
@@ -665,9 +815,9 @@ units angstrom
                 batch_loss = charge_loss + dipole_loss + qpole_loss
                 total_loss += batch_loss.detach()
 
-            charge_errors_t.append(q_error.detach())
-            dipole_errors_t.extend(d_error.detach())
-            qpole_errors_t.extend(qp_error.detach())
+            charge_errors_t.append(q_error.detach().cpu())
+            dipole_errors_t.extend(d_error.detach().cpu())
+            qpole_errors_t.extend(qp_error.detach().cpu())
         charge_errors_t = torch.cat(charge_errors_t)
         dipole_errors_t = torch.cat(dipole_errors_t)
         qpole_errors_t = torch.cat(qpole_errors_t)
@@ -717,15 +867,15 @@ units angstrom
         for batch in dataloader:
             batch = batch.to(rank_device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            charge, dipole, qpole, _ = self.eval_fn(batch)
+            charge, dipole, qpole, _ = self.model(batch)
 
             q_error = charge - batch.charges
             d_error = dipole - batch.dipoles
             qp_error = qpole - batch.quadrupoles
 
-            charge_loss = (q_error ** 2).mean()
-            dipole_loss = (d_error ** 2).mean()
-            qpole_loss = (qp_error ** 2).mean()
+            charge_loss = (q_error**2).mean()
+            dipole_loss = (d_error**2).mean()
+            qpole_loss = (qp_error**2).mean()
 
             loss = charge_loss + dipole_loss + qpole_loss
             loss.backward()
@@ -756,7 +906,7 @@ units angstrom
         for batch in dataloader:
             batch = batch.to(rank_device)
             optimizer.zero_grad()
-            charge, dipole, qpole, _ = self.eval_fn(batch)
+            charge, dipole, qpole, _ = self.model(batch)
 
             q_error = charge - batch.charges
             d_error = dipole - batch.dipoles
@@ -813,15 +963,15 @@ units angstrom
         with torch.no_grad():
             for batch in dataloader:
                 batch = batch.to(rank_device, non_blocking=True)
-                charge, dipole, qpole, _ = self.eval_fn(batch)
+                charge, dipole, qpole, _ = self.model(batch)
 
                 q_error = charge - batch.charges
                 d_error = dipole - batch.dipoles
                 qp_error = qpole - batch.quadrupoles
 
-                charge_loss = (q_error ** 2).mean()
-                dipole_loss = (d_error ** 2).mean()
-                qpole_loss = (qp_error ** 2).mean()
+                charge_loss = (q_error**2).mean()
+                dipole_loss = (d_error**2).mean()
+                qpole_loss = (qp_error**2).mean()
 
                 loss = charge_loss + dipole_loss + qpole_loss
                 total_loss += loss.item()
@@ -850,7 +1000,7 @@ units angstrom
         with torch.no_grad():
             for batch in dataloader:
                 batch = batch.to(rank_device)
-                charge, dipole, qpole, _ = self.eval_fn(batch)
+                charge, dipole, qpole, _ = self.model(batch)
 
                 q_error = charge - batch.charges
                 d_error = dipole - batch.dipoles
@@ -990,20 +1140,13 @@ units angstrom
                     test_lowered = "*"
                     if self.model_save_path:
                         # cpu_model = self.model.to("cpu")
-                        cpu_model = unwrap_model(self.model).to("cpu")
-                        torch.save(
-                            {
-                                "model_state_dict": cpu_model.state_dict(),
-                                "config": {
-                                    "n_message": cpu_model.n_message,
-                                    "n_rbf": cpu_model.n_rbf,
-                                    "n_neuron": cpu_model.n_neuron,
-                                    "n_embed": cpu_model.n_embed,
-                                    "r_cut": cpu_model.r_cut,
-                                },
-                            },
-                            self.model_save_path,
+                        cpu_model = model_io.unwrap_model(self.model).to("cpu")
+                        checkpoint = model_io.create_checkpoint(
+                            model=cpu_model,
+                            config=cpu_model.get_config(),
+                            model_type="AtomMPNN",
                         )
+                        model_io.save_checkpoint(checkpoint, self.model_save_path)
                         self.model.to(self.device)
                 else:
                     test_lowered = " "
@@ -1029,7 +1172,7 @@ units angstrom
         lr,
         pin_memory,
         num_workers,
-        optimize_for_speed=True,
+        skip_compile=True,
     ):
         if self.device.type == "cpu":
             rank_device = "cpu"
@@ -1037,7 +1180,7 @@ units angstrom
             rank_device = rank
 
         self.model.to(rank_device)
-        if optimize_for_speed:
+        if not skip_compile:
             self.compile_model()
 
         train_loader = AtomicDataLoader(
@@ -1086,20 +1229,13 @@ units angstrom
                     test_lowered = "*"
                     if self.model_save_path:
                         # cpu_model = self.model.to("cpu")
-                        cpu_model = unwrap_model(self.model).to("cpu")
-                        torch.save(
-                            {
-                                "model_state_dict": cpu_model.state_dict(),
-                                "config": {
-                                    "n_message": cpu_model.n_message,
-                                    "n_rbf": cpu_model.n_rbf,
-                                    "n_neuron": cpu_model.n_neuron,
-                                    "n_embed": cpu_model.n_embed,
-                                    "r_cut": cpu_model.r_cut,
-                                },
-                            },
-                            self.model_save_path,
+                        cpu_model = model_io.unwrap_model(self.model).to("cpu")
+                        checkpoint = model_io.create_checkpoint(
+                            model=cpu_model,
+                            config=cpu_model.get_config(),
+                            model_type="AtomMPNN",
                         )
+                        model_io.save_checkpoint(checkpoint, self.model_save_path)
                         self.model.to(self.device)
                 else:
                     test_lowered = " "
@@ -1121,7 +1257,7 @@ units angstrom
         lr=5e-4,
         split_percent=0.9,
         model_path=None,
-        optimize_for_speed=True,
+        skip_compile=False,
         shuffle=True,
         dataloader_num_workers=0,
         world_size=1,  # Default to 1 for single-core operation
@@ -1140,17 +1276,33 @@ units angstrom
             raise ValueError("No dataset provided")
         self.train_shuffle = shuffle
 
-        np.random.seed(42)
-        torch.manual_seed(42)
-        random_indices = np.random.permutation(len(self.dataset))
-        train_indices = random_indices[: int(len(self.dataset) * split_percent)]
-        test_indices = random_indices[int(len(self.dataset) * split_percent) :]
         if random_seed:
             np.random.seed(random_seed)
             torch.manual_seed(random_seed)
-            train_indices = np.random.permutation(train_indices)
-        train_dataset = self.dataset[train_indices]
-        test_dataset = self.dataset[test_indices]
+
+        if isinstance(self.dataset, list):
+            train_dataset = self.dataset[0]
+            if shuffle:
+                order_indices = np.random.permutation(len(train_dataset))
+            else:
+                order_indices = [i for i in range(len(train_dataset))]
+            train_dataset = train_dataset[order_indices]
+
+            test_dataset = self.dataset[1]
+            if shuffle:
+                order_indices = np.random.permutation(len(test_dataset))
+            else:
+                order_indices = [i for i in range(len(test_dataset))]
+            test_dataset = test_dataset[order_indices]
+        else:
+            if shuffle:
+                order_indices = np.random.permutation(len(self.dataset))
+            else:
+                order_indices = np.arange(len(self.dataset))
+            train_indices = order_indices[: int(len(self.dataset) * split_percent)]
+            test_indices = order_indices[int(len(self.dataset) * split_percent) :]
+            train_dataset = self.dataset[train_indices]
+            test_dataset = self.dataset[test_indices]
 
         print("~~ Training Atom Model ~~", flush=True)
         print(
@@ -1171,7 +1323,7 @@ units angstrom
         # pin_memory = torch.cuda.is_available()
         pin_memory = True
 
-        if optimize_for_speed:
+        if skip_compile:
             torch.jit.enable_onednn_fusion(True)
             torch.autograd.set_detect_anomaly(False)
 
@@ -1208,7 +1360,7 @@ units angstrom
                 lr=lr,
                 pin_memory=pin_memory,
                 num_workers=dataloader_num_workers,
-                optimize_for_speed=optimize_for_speed,
+                skip_compile=skip_compile,
             )
 
         return
@@ -1217,7 +1369,7 @@ units angstrom
     def predict_multipoles_batch(self, batch, isolate_predictions=True):
         batch.to(self.device)
         self.model.to(self.device)
-        qA, muA, thA, hlistA = self.eval_fn(batch)
+        qA, muA, thA, hlistA = self.model(batch)
         batch = batch.cpu()
         qA = qA.detach().detach().cpu()
         # print("predict_multipoles_batch")
@@ -1266,6 +1418,20 @@ units angstrom
 
     @torch.inference_mode()
     def predict_qcel_mols(self, mols, batch_size=2):
+        """
+        Predict per-atom multipole properties for a list of QCEL-formatted molecules by batching them through the model.
+
+        Parameters:
+            mols (Iterable): Iterable of molecules in QCEL/monomer format accepted by qcel_mon_to_pyg_data.
+            batch_size (int): Number of molecules to process per model forward pass.
+
+        Returns:
+            List[Tuple]: A list, one entry per input molecule, of tuples (charges, dipoles, qpoles, hlists) where:
+                - charges: Tensor of shape (n_atoms,) containing predicted atomic charges.
+                - dipoles: Tensor of shape (n_atoms, 3) containing predicted atomic dipole vectors.
+                - qpoles: Tensor of shape (n_atoms, 3, 3) containing predicted atomic quadrupole tensors.
+                - hlists: Tensor or list containing per-atom hidden-state vectors returned by the model.
+        """
         output = []
         mol_data = []
         cnt = 0
@@ -1276,17 +1442,119 @@ units angstrom
             if len(mol_data) == batch_size or cnt == len(mols):
                 batch = atomic_collate_update_no_target(mol_data)
                 with torch.no_grad():
-                    charge, dipole, qpole, hlist = self.eval_fn(batch)
+                    charge, dipole, qpole, hlist = self.model(batch)
                     # Isolate atomic properties by molecule
-                    mol_charges, mol_dipoles, mol_qpoles, mol_hlists = isolate_atomic_property_predictions(
-                        batch, (charge, dipole, qpole, hlist)
+                    mol_charges, mol_dipoles, mol_qpoles, mol_hlists = (
+                        isolate_atomic_property_predictions(
+                            batch, (charge, dipole, qpole, hlist)
+                        )
                     )
-                    output.extend(list(zip(mol_charges, mol_dipoles, mol_qpoles, mol_hlists)))
+                    output.extend(
+                        list(zip(mol_charges, mol_dipoles, mol_qpoles, mol_hlists))
+                    )
                 mol_data = []
         return output
 
     @torch.inference_mode()
+    def predict_qcel_mols_dimer(self, mols, batch_size=2):
+        """
+        Predict multipole outputs for each dimer and its two monomer fragments.
+
+        Parameters:
+            mols (Sequence): Sequence of QCEngine/QCEL molecule objects representing dimers; each molecule must support `get_fragment`.
+            batch_size (int): Number of molecules to process per inference batch.
+
+        Returns:
+            tuple: (dimer_output, monA_output, monB_output) where each element is the list of per-molecule prediction tuples produced by `predict_qcel_mols` (e.g., (charges, dipoles, qpoles, hlists) per molecule).
+        """
+        monA = [mol.get_fragment([0]) for mol in mols]
+        monB = [mol.get_fragment([1]) for mol in mols]
+        dimer_output = self.predict_qcel_mols(mols, batch_size=batch_size)
+        monA_output = self.predict_qcel_mols(monA, batch_size=batch_size)
+        monB_output = self.predict_qcel_mols(monB, batch_size=batch_size)
+        return dimer_output, monA_output, monB_output
+
+    def predict_elst_ind_dimer(self, mols, batch_size=2):
+        """
+        Compute per-dimer electrostatic energies, dimer electrostatic energies after model prediction, and their difference (induction) for a list of QCELEM dimer molecules.
+
+        Parameters:
+            mols (Sequence): Iterable of QCEL dimer molecules; each molecule must contain fragment indexing in `fragments`.
+            batch_size (int): Number of molecules to process per prediction batch.
+
+        Returns:
+            E_elst (list of float): Electrostatic energies computed from monomer reference multipoles for each dimer.
+            E_elst_dimer (list of float): Electrostatic energies computed from model-predicted multipoles on the full dimer for each dimer.
+            E_induction (list of float): Difference `E_elst_dimer - E_elst` for each dimer, representing the induction-like contribution.
+        """
+        E_elst, E_elst_dimer, E_induction = [], [], []
+        dimer, monA, monB = self.predict_qcel_mols_dimer(
+            mols,
+            batch_size=batch_size,
+        )
+        for i, m in enumerate(mols):
+            qA, muA, thetaA = (
+                monA[i][0].detach().numpy(),
+                monA[i][1].numpy(),
+                monA[i][2].numpy(),
+            )
+            qB, muB, thetaB = (
+                monB[i][0].detach().numpy(),
+                monB[i][1].numpy(),
+                monB[i][2].numpy(),
+            )
+            elst = multipole.eval_qcel_dimer(
+                m,
+                qA,
+                muA,
+                thetaA,
+                qB,
+                muB,
+                thetaB,
+            )
+            qD, muD, thetaD = dimer[i][0], dimer[i][1], dimer[i][2]
+            qA, muA, thetaA = (
+                qD[m.fragments[0]].detach().numpy(),
+                muD[m.fragments[0], :].numpy(),
+                thetaD[m.fragments[0], :, :].numpy(),
+            )
+            qB, muB, thetaB = (
+                qD[m.fragments[1]].detach().numpy(),
+                muD[m.fragments[1], :].numpy(),
+                thetaD[m.fragments[1], :, :].numpy(),
+            )
+            elst_dimer = multipole.eval_qcel_dimer(
+                m,
+                qA,
+                muA,
+                thetaA,
+                qB,
+                muB,
+                thetaB,
+            )
+            indu = elst_dimer - elst
+            E_elst.append(elst)
+            E_elst_dimer.append(elst_dimer)
+            E_induction.append(indu)
+        return E_elst, E_elst_dimer, E_induction
+
+    @torch.inference_mode()
     def model_predict(self, data):
+        """
+        Produce atomic multipole predictions and hidden states for a batched input.
+
+        Parameters:
+            data: Batched graph-like object containing at least the attributes
+                `x` (atom types), `edge_index` (edge indices), `R` (positions),
+                `molecule_ind` (molecule indices per atom), `total_charge` (per-batch total charge),
+                and `natom_per_mol` (number of atoms per molecule).
+
+        Returns:
+            charge (Tensor): Per-atom scalar charges with shape (N,).
+            dipole (Tensor): Per-atom dipole vectors with shape (N, 3).
+            qpole (Tensor): Per-atom quadrupole tensors with shape (N, 3, 3), traceless.
+            hlist (Tensor or list[Tensor]): Per-atom hidden representations produced by the model.
+        """
         charge, dipole, qpole, hlist = self.model(
             data.x,
             data.edge_index,
@@ -1297,4 +1565,3 @@ units angstrom
             natom_per_mol=data.natom_per_mol,
         )
         return charge, dipole, qpole, hlist
-

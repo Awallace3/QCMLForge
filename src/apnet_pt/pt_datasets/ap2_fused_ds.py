@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 from importlib import resources
 from apnet_pt import constants
+import h5py
 
 
 def qcel_dimer_to_fused_data(dimer, r_cut=5.0, r_cut_im=8.0, **kwargs):
@@ -36,6 +37,30 @@ def qcel_dimer_to_fused_data(dimer, r_cut=5.0, r_cut_im=8.0, **kwargs):
     )
 
 
+def assert_molecule_featurization_is_valid(atomic_props, dimer_ind):
+    if len(atomic_props.molecule_ind) == 1:
+        return True
+
+    edge_index = atomic_props.edge_index
+    atoms_with_edges = torch.cat([edge_index[0], edge_index[1]]).unique()
+    keep_mask = torch.isin(
+        torch.arange(
+            len(atomic_props.molecule_ind), device=atomic_props.molecule_ind.device
+        ),
+        atoms_with_edges,
+    )
+    # all valid molecules will have edges
+    if not keep_mask.all():
+        print(
+            "Molecule featurization is invalid. "
+            "Some atoms in the molecule do not have edges."
+            f"atomic_props:\n{atomic_props}. Skipping this data point."
+        )
+        torch.save(atomic_props, f"invalid_molecule_{dimer_ind}.pt")
+        return False
+    return True
+
+
 def dimer_fused_data(
     RA,
     ZA,
@@ -46,10 +71,49 @@ def dimer_fused_data(
     dimer_ind,
     r_cut=5.0,
     r_cut_im=8.0,
+    check_validity=True,
     **kwargs,
 ):
+    """
+    Constructs a PyG Data object representing a fused dimer from two monomer specifications.
+    
+    Creates per-monomer atomic features, optionally validates featurization, computes intra-monomer edges and inter-monomer short- and long-range edges, and returns a Data object containing atom tensors, edge index tensors, molecule indices, and total charges. Returns `None` if validity checks fail.
+    
+    Parameters:
+        RA (Tensor): Positions for monomer A (cartesian coordinates, expected in angstroms).
+        ZA (Tensor or sequence): Atomic numbers or one-hot/feature tensor for monomer A.
+        TQA (Tensor or sequence): Per-atom quantum labels/properties for monomer A.
+        RB (Tensor): Positions for monomer B.
+        ZB (Tensor or sequence): Atomic numbers or one-hot/feature tensor for monomer B.
+        TQB (Tensor or sequence): Per-atom quantum labels/properties for monomer B.
+        dimer_ind (int): Integer index identifying the dimer (used to populate dimer index fields).
+        r_cut (float, optional): Distance cutoff for intramonomer (AA/BB) edges. Default 5.0.
+        r_cut_im (float, optional): Distance threshold separating short- and long-range inter-monomer AB edges. Default 8.0.
+        check_validity (bool, optional): If True, validate that each atom in a monomer has at least one edge; return `None` when invalid. Default True.
+        **kwargs: Additional attributes to include in the returned Data object.
+    
+    Returns:
+        Data or None: A PyG Data object containing at least the following fields when successful:
+            - ZA, RA, ZB, RB: atom features and positions for monomers A and B
+            - e_ABsr_source, e_ABsr_target: short-range AB edge indices
+            - dimer_ind: dimer index for short-range AB edges
+            - e_ABlr_source, e_ABlr_target: long-range AB edge indices
+            - dimer_ind_lr: dimer index for long-range AB edges
+            - e_AA_source, e_AA_target: intramonomer A edge indices
+            - e_BB_source, e_BB_target: intramonomer B edge indices
+            - molecule_ind_A, molecule_ind_B: per-atom molecule indices for A and B
+            - total_charge_A, total_charge_B: total charges for monomers A and B
+        Returns `None` if validation fails.
+    """
     atomic_props_A = atomic_datasets.create_atomic_data(ZA, RA, TQA, r_cut=r_cut)
     atomic_props_B = atomic_datasets.create_atomic_data(ZB, RB, TQB, r_cut=r_cut)
+    if check_validity:
+        valid = assert_molecule_featurization_is_valid(atomic_props_A, dimer_ind)
+        if not valid:
+            return None
+        valid = assert_molecule_featurization_is_valid(atomic_props_B, dimer_ind)
+        if not valid:
+            return None
     e_AA_source, e_AA_target = pairwise_edges(atomic_props_A.R, r_cut)
     e_BB_source, e_BB_target = pairwise_edges(atomic_props_B.R, r_cut)
     e_ABsr_source, e_ABsr_target, e_ABlr_source, e_ABlr_target = pairwise_edges_im(
@@ -85,6 +149,15 @@ def dimer_fused_data(
 
 
 def natural_key(text):
+    """
+    Create a sort key that splits a string into alternating non-numeric and numeric parts, converting numeric parts to integers for natural ordering.
+    
+    Parameters:
+        text (str): Input string to be split into components.
+    
+    Returns:
+        list: A list of parts where contiguous digit sequences are converted to `int` and all other segments remain `str`, suitable for natural/alphanumeric sorting.
+    """
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", text)]
 
 
@@ -144,9 +217,26 @@ def pairwise_edges_im(RA, RB, r_cut_im, full_indices=False):
 
 def ap2_fused_collate_update(batch):
     """
-    Need to update the edge_index values so that each molecule has a unique
-    set of indices. Then, the data.molecule_ind can be used to group
-    atoms into molecules during a forward pass.
+    Merge a list of per-dimer PyG Data objects into a single batched Data with unique, offset atom and edge indices.
+    
+    Parameters:
+        batch (list[Data]): List of per-dimer Data objects containing fields for monomers A and B (ZA, RA, ZB, RB), per-monomer edge indices (e_AA_*, e_BB_*), inter-monomer edge lists (e_ABsr_*, e_ABlr_*), molecule and dimer index tensors, charges, and target y.
+    
+    Returns:
+        Data: A single PyG Data object containing:
+            - y: stacked targets for the batch.
+            - ZA, RA, ZB, RB: concatenated atomic numbers and coordinates for monomers A and B.
+            - e_AA_source, e_AA_target, e_BB_source, e_BB_target: concatenated intramonomer edge index lists with per-item offsets applied.
+            - e_ABsr_source, e_ABsr_target, e_ABlr_source, e_ABlr_target: concatenated short- and long-range inter-monomer edge lists with atom-index offsets applied so every atom in the batch has a unique index.
+            - dimer_ind, dimer_ind_lr: per-edge tensors indicating the originating dimer index for short- and long-range AB edges.
+            - molecule_ind_A, molecule_ind_B: concatenated per-atom molecule indices for A and B.
+            - natom_per_mol_A, natom_per_mol_B: number of atoms per molecule for A and B.
+            - total_charge_A, total_charge_B: per-dimer total charges for A and B.
+            - batch_atomic_A, batch_atomic_B: Data sub-objects for the batched monomer A and B atom graphs (x, edge_index, R, molecule_ind, total_charge, natom_per_mol).
+    
+    Behavior notes:
+        - Per-item molecule and dimer index tensors are replaced with batch-local indices (0..batch_size-1).
+        - All atom indices in edge lists are offset so atoms from different batch entries do not collide.
     """
     monA_edge_offset, monB_edge_offset = 0, 0
     local_e_ABsr_source = []
@@ -191,16 +281,49 @@ def ap2_fused_collate_update(batch):
     natom_per_mol_A = torch.bincount(molecule_ind_A)
     natom_per_mol_B = torch.bincount(molecule_ind_B)
     y = torch.stack([data.y for data in batch], dim=0)
+    ZA_cat = torch.cat([data.ZA for data in batch], dim=0)
+    RA_cat = torch.cat([data.RA for data in batch], dim=0)
+    ZB_cat = torch.cat([data.ZB for data in batch], dim=0)
+    RB_cat = torch.cat([data.RB for data in batch], dim=0)
+    e_AA_source_cat = torch.cat(local_e_AA_source, dim=0)
+    e_AA_target_cat = torch.cat(local_e_AA_target, dim=0)
+    e_BB_source_cat = torch.cat(local_e_BB_source, dim=0)
+    e_BB_target_cat = torch.cat(local_e_BB_target, dim=0)
+    total_charge_A_tensor = torch.tensor(
+        [data.total_charge_A for data in batch], dtype=batch[0].total_charge_A.dtype
+    )
+    total_charge_B_tensor = torch.tensor(
+        [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
+    )
+
+    batch_atomic_A = Data(
+        x=ZA_cat,
+        edge_index=torch.vstack((e_AA_source_cat, e_AA_target_cat)),
+        R=RA_cat,
+        molecule_ind=molecule_ind_A,
+        total_charge=total_charge_A_tensor,
+        natom_per_mol=natom_per_mol_A,
+    )
+
+    batch_atomic_B = Data(
+        x=ZB_cat,
+        edge_index=torch.vstack((e_BB_source_cat, e_BB_target_cat)),
+        R=RB_cat,
+        molecule_ind=molecule_ind_B,
+        total_charge=total_charge_B_tensor,
+        natom_per_mol=natom_per_mol_B,
+    )
+
     batched_data = Data(
         y=y,
-        ZA=torch.cat([data.ZA for data in batch], dim=0),
-        RA=torch.cat([data.RA for data in batch], dim=0),
-        ZB=torch.cat([data.ZB for data in batch], dim=0),
-        RB=torch.cat([data.RB for data in batch], dim=0),
-        e_AA_source=torch.cat(local_e_AA_source, dim=0),
-        e_AA_target=torch.cat(local_e_AA_target, dim=0),
-        e_BB_source=torch.cat(local_e_BB_source, dim=0),
-        e_BB_target=torch.cat(local_e_BB_target, dim=0),
+        ZA=ZA_cat,
+        RA=RA_cat,
+        ZB=ZB_cat,
+        RB=RB_cat,
+        e_AA_source=e_AA_source_cat,
+        e_AA_target=e_AA_target_cat,
+        e_BB_source=e_BB_source_cat,
+        e_BB_target=e_BB_target_cat,
         molecule_ind_A=molecule_ind_A,
         molecule_ind_B=molecule_ind_B,
         natom_per_mol_A=natom_per_mol_A,
@@ -211,21 +334,32 @@ def ap2_fused_collate_update(batch):
         e_ABlr_target=torch.cat(local_e_ABlr_target, dim=0),
         dimer_ind=torch.cat([data.dimer_ind for data in batch], dim=0),
         dimer_ind_lr=torch.cat([data.dimer_ind_lr for data in batch], dim=0),
-        total_charge_A=torch.tensor(
-            [data.total_charge_A for data in batch], dtype=batch[0].total_charge_A.dtype
-        ),
-        total_charge_B=torch.tensor(
-            [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
-        ),
+        total_charge_A=total_charge_A_tensor,
+        total_charge_B=total_charge_B_tensor,
+        batch_atomic_A=batch_atomic_A,
+        batch_atomic_B=batch_atomic_B,
     )
     return batched_data
 
 
 def ap2_fused_collate_update_no_target(batch):
     """
-    Need to update the edge_index values so that each molecule has a unique
-    set of indices. Then, the data.molecule_ind can be used to group
-    atoms into molecules during a forward pass.
+    Batch-collate a list of fused Data objects into a single batched Data without target labels.
+    
+    This function offsets and concatenates per-item atom and edge indices so every atom in the batch has a unique global index, assembles per-monomer (A and B) batched subgraphs, and produces combined inter-monomer edge lists. The resulting Data includes short- and long-range AB edges, a concatenated full AB edge list, corresponding dimer index vectors (including `dimer_ind_full`), per-molecule indices and counts, total charges, and the per-monomer Data objects `batch_atomic_A` and `batch_atomic_B`.
+    
+    Returns:
+        Data: A PyG Data object containing the following notable fields:
+            - ZA, RA, ZB, RB: concatenated atomic numbers and coordinates for monomers A and B
+            - e_AA_source/target, e_BB_source/target: concatenated intra-monomer edge indices
+            - e_ABsr_source/target, e_ABlr_source/target: concatenated short- and long-range AB edge indices
+            - e_ABfull_source/target: concatenated full AB edge indices (short + long)
+            - dimer_ind, dimer_ind_lr, dimer_ind_full: dimer index vectors for AB edges
+            - molecule_ind_A, molecule_ind_B: per-atom molecule indices for A and B
+            - natom_per_mol_A, natom_per_mol_B: atom counts per molecule for A and B
+            - total_charge_A, total_charge_B: per-dimer total charges for A and B
+            - indA, indB: batch-local atom-to-dimer mapping for A and B
+            - batch_atomic_A, batch_atomic_B: Data objects representing the batched A and B atomic graphs
     """
     monA_edge_offset, monB_edge_offset = 0, 0
     local_e_ABsr_source = []
@@ -271,42 +405,103 @@ def ap2_fused_collate_update_no_target(batch):
     molecule_ind_B = torch.cat([data.molecule_ind_B for data in batch], dim=0)
     natom_per_mol_A = torch.bincount(molecule_ind_A)
     natom_per_mol_B = torch.bincount(molecule_ind_B)
+
+    ZA_cat = torch.cat([data.ZA for data in batch], dim=0)
+    RA_cat = torch.cat([data.RA for data in batch], dim=0)
+    ZB_cat = torch.cat([data.ZB for data in batch], dim=0)
+    RB_cat = torch.cat([data.RB for data in batch], dim=0)
+    e_AA_source_cat = torch.cat(local_e_AA_source, dim=0)
+    e_AA_target_cat = torch.cat(local_e_AA_target, dim=0)
+    e_BB_source_cat = torch.cat(local_e_BB_source, dim=0)
+    e_BB_target_cat = torch.cat(local_e_BB_target, dim=0)
+    total_charge_A_tensor = torch.tensor(
+        [data.total_charge_A for data in batch], dtype=batch[0].total_charge_A.dtype
+    )
+    total_charge_B_tensor = torch.tensor(
+        [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
+    )
+
+    batch_atomic_A = Data(
+        x=ZA_cat,
+        edge_index=torch.vstack((e_AA_source_cat, e_AA_target_cat)),
+        R=RA_cat,
+        molecule_ind=molecule_ind_A,
+        total_charge=total_charge_A_tensor,
+        natom_per_mol=natom_per_mol_A,
+    )
+
+    batch_atomic_B = Data(
+        x=ZB_cat,
+        edge_index=torch.vstack((e_BB_source_cat, e_BB_target_cat)),
+        R=RB_cat,
+        molecule_ind=molecule_ind_B,
+        total_charge=total_charge_B_tensor,
+        natom_per_mol=natom_per_mol_B,
+    )
+
+    e_ABsr_source_cat = torch.cat(local_e_ABsr_source, dim=0)
+    e_ABsr_target_cat = torch.cat(local_e_ABsr_target, dim=0)
+    e_ABlr_source_cat = torch.cat(local_e_ABlr_source, dim=0)
+    e_ABlr_target_cat = torch.cat(local_e_ABlr_target, dim=0)
+
+    # Create full edge lists (short-range + long-range)
+    e_ABfull_source = torch.cat([e_ABsr_source_cat, e_ABlr_source_cat], dim=0)
+    e_ABfull_target = torch.cat([e_ABsr_target_cat, e_ABlr_target_cat], dim=0)
+
+    # Create dimer_ind_full for full edge list
+    dimer_ind_cat = torch.cat([data.dimer_ind for data in batch], dim=0)
+    dimer_ind_lr_cat = torch.cat([data.dimer_ind_lr for data in batch], dim=0)
+    dimer_ind_full = torch.cat([dimer_ind_cat, dimer_ind_lr_cat], dim=0)
+
     batched_data = Data(
-        ZA=torch.cat([data.ZA for data in batch], dim=0),
-        RA=torch.cat([data.RA for data in batch], dim=0),
-        ZB=torch.cat([data.ZB for data in batch], dim=0),
-        RB=torch.cat([data.RB for data in batch], dim=0),
-        e_AA_source=torch.cat(local_e_AA_source, dim=0),
-        e_AA_target=torch.cat(local_e_AA_target, dim=0),
-        e_BB_source=torch.cat(local_e_BB_source, dim=0),
-        e_BB_target=torch.cat(local_e_BB_target, dim=0),
+        ZA=ZA_cat,
+        RA=RA_cat,
+        ZB=ZB_cat,
+        RB=RB_cat,
+        e_AA_source=e_AA_source_cat,
+        e_AA_target=e_AA_target_cat,
+        e_BB_source=e_BB_source_cat,
+        e_BB_target=e_BB_target_cat,
         molecule_ind_A=molecule_ind_A,
         molecule_ind_B=molecule_ind_B,
         natom_per_mol_A=natom_per_mol_A,
         natom_per_mol_B=natom_per_mol_B,
-        e_ABsr_source=torch.cat(local_e_ABsr_source, dim=0),
-        e_ABsr_target=torch.cat(local_e_ABsr_target, dim=0),
-        e_ABlr_source=torch.cat(local_e_ABlr_source, dim=0),
-        e_ABlr_target=torch.cat(local_e_ABlr_target, dim=0),
-        dimer_ind=torch.cat([data.dimer_ind for data in batch], dim=0),
-        dimer_ind_lr=torch.cat([data.dimer_ind_lr for data in batch], dim=0),
-        total_charge_A=torch.tensor(
-            [data.total_charge_A for data in batch], dtype=batch[0].total_charge_A.dtype
-        ),
-        total_charge_B=torch.tensor(
-            [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
-        ),
+        e_ABsr_source=e_ABsr_source_cat,
+        e_ABsr_target=e_ABsr_target_cat,
+        e_ABlr_source=e_ABlr_source_cat,
+        e_ABlr_target=e_ABlr_target_cat,
+        e_ABfull_source=e_ABfull_source,
+        e_ABfull_target=e_ABfull_target,
+        dimer_ind=dimer_ind_cat,
+        dimer_ind_lr=dimer_ind_lr_cat,
+        dimer_ind_full=dimer_ind_full,
+        total_charge_A=total_charge_A_tensor,
+        total_charge_B=total_charge_B_tensor,
         indA=torch.cat(local_indA, dim=0),
         indB=torch.cat(local_indB, dim=0),
+        batch_atomic_A=batch_atomic_A,
+        batch_atomic_B=batch_atomic_B,
     )
     return batched_data
 
 
 def ap2_fused_collate_update_no_target_monomer_indices(batch):
     """
-    Need to update the edge_index values so that each molecule has a unique
-    set of indices. Then, the data.molecule_ind can be used to group
-    atoms into molecules during a forward pass.
+    Merge a list of fused-dimer Data objects (no target) into a single batched Data with unique global atom and edge indices and explicit per-monomer molecule indices.
+    
+    Parameters:
+        batch (list[torch_geometric.data.Data]): List of per-dimer Data objects containing atomic features, intra- and inter-monomer edge indices, per-dimer indices, and monomer properties.
+    
+    Returns:
+        torch_geometric.data.Data: A single Data object containing concatenated/offset fields:
+            - ZA, RA, ZB, RB: concatenated atomic numbers and positions for monomers A and B.
+            - e_AA_source, e_AA_target, e_BB_source, e_BB_target: batched intra-monomer edge index components.
+            - e_ABsr_source, e_ABsr_target, e_ABlr_source, e_ABlr_target: batched short- and long-range inter-monomer edge index components.
+            - dimer_ind, dimer_ind_lr: per-edge dimer membership indices for short- and long-range AB edges.
+            - total_charge_A, total_charge_B: per-dimer total charges for monomers A and B.
+            - qA, muA, quadA, hlistA, qB, muB, quadB, hlistB: concatenated per-monomer properties.
+            - indA, indB (molecule_ind): per-atom tensors mapping each atom to its originating dimer (monomer index).
+            - batch_atomic_A, batch_atomic_B: Data sub-objects representing the batched atomic graphs for monomers A and B (with x, edge_index, R, molecule_ind, total_charge).
     """
     monA_edge_offset, monB_edge_offset = 0, 0
     local_e_ABsr_source = []
@@ -341,27 +536,56 @@ def ap2_fused_collate_update_no_target_monomer_indices(batch):
         local_indB.append(
             torch.ones(data.RB.size(0), dtype=data.dimer_ind_lr.dtype) * i
         )
+    ZA_cat = torch.cat([data.ZA for data in batch], dim=0)
+    RA_cat = torch.cat([data.RA for data in batch], dim=0)
+    ZB_cat = torch.cat([data.ZB for data in batch], dim=0)
+    RB_cat = torch.cat([data.RB for data in batch], dim=0)
+    e_AA_source_cat = torch.cat(local_e_AA_source, dim=0)
+    e_AA_target_cat = torch.cat(local_e_AA_target, dim=0)
+    e_BB_source_cat = torch.cat(local_e_BB_source, dim=0)
+    e_BB_target_cat = torch.cat(local_e_BB_target, dim=0)
+    indA_cat = torch.cat(local_indA, dim=0)
+    indB_cat = torch.cat(local_indB, dim=0)
+    total_charge_A_tensor = torch.tensor(
+        [data.total_charge_A for data in batch], dtype=batch[0].total_charge_A.dtype
+    )
+    total_charge_B_tensor = torch.tensor(
+        [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
+    )
+
+    batch_atomic_A = Data(
+        x=ZA_cat,
+        edge_index=torch.vstack((e_AA_source_cat, e_AA_target_cat)),
+        R=RA_cat,
+        molecule_ind=indA_cat,
+        total_charge=total_charge_A_tensor,
+    )
+
+    batch_atomic_B = Data(
+        x=ZB_cat,
+        edge_index=torch.vstack((e_BB_source_cat, e_BB_target_cat)),
+        R=RB_cat,
+        molecule_ind=indB_cat,
+        total_charge=total_charge_B_tensor,
+    )
+
     batched_data = Data(
-        ZA=torch.cat([data.ZA for data in batch], dim=0),
-        RA=torch.cat([data.RA for data in batch], dim=0),
-        ZB=torch.cat([data.ZB for data in batch], dim=0),
-        RB=torch.cat([data.RB for data in batch], dim=0),
-        e_AA_source=torch.cat(local_e_AA_source, dim=0),
-        e_AA_target=torch.cat(local_e_AA_target, dim=0),
-        e_BB_source=torch.cat(local_e_BB_source, dim=0),
-        e_BB_target=torch.cat(local_e_BB_target, dim=0),
+        ZA=ZA_cat,
+        RA=RA_cat,
+        ZB=ZB_cat,
+        RB=RB_cat,
+        e_AA_source=e_AA_source_cat,
+        e_AA_target=e_AA_target_cat,
+        e_BB_source=e_BB_source_cat,
+        e_BB_target=e_BB_target_cat,
         e_ABsr_source=torch.cat(local_e_ABsr_source, dim=0),
         e_ABsr_target=torch.cat(local_e_ABsr_target, dim=0),
         e_ABlr_source=torch.cat(local_e_ABlr_source, dim=0),
         e_ABlr_target=torch.cat(local_e_ABlr_target, dim=0),
         dimer_ind=torch.cat([data.dimer_ind for data in batch], dim=0),
         dimer_ind_lr=torch.cat([data.dimer_ind_lr for data in batch], dim=0),
-        total_charge_A=torch.tensor(
-            [data.total_charge_A for data in batch], dtype=batch[0].total_charge_A.dtype
-        ),
-        total_charge_B=torch.tensor(
-            [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
-        ),
+        total_charge_A=total_charge_A_tensor,
+        total_charge_B=total_charge_B_tensor,
         qA=torch.cat([data.qA for data in batch], dim=0),
         muA=torch.cat([data.muA for data in batch], dim=0),
         quadA=torch.cat([data.quadA for data in batch], dim=0),
@@ -370,8 +594,158 @@ def ap2_fused_collate_update_no_target_monomer_indices(batch):
         muB=torch.cat([data.muB for data in batch], dim=0),
         quadB=torch.cat([data.quadB for data in batch], dim=0),
         hlistB=torch.cat([data.hlistB for data in batch], dim=0),
-        indA=torch.cat(local_indA, dim=0),
-        indB=torch.cat(local_indB, dim=0),
+        indA=indA_cat,
+        indB=indB_cat,
+        batch_atomic_A=batch_atomic_A,
+        batch_atomic_B=batch_atomic_B,
+    )
+    return batched_data
+
+
+def ap3_fused_collate_update(batch):
+    """
+    Batch-collate a list of fused dimer Data objects into a single batched Data with adjusted intra- and inter-monomer indices.
+    
+    Parameters:
+        batch (list[Data]): List of per-dimer PyG Data objects containing atom features, coordinates, intra-monomer edges (e_AA*, e_BB*), inter-monomer edges (e_ABsr_*, e_ABlr_*), dimer index fields, charges, and target `y`.
+    
+    Returns:
+        Data: A single PyG Data object that contains:
+            - concatenated atom features and coordinates for monomers A and B (ZA, RA, ZB, RB)
+            - adjusted intra-monomer edge lists (e_AA_source/target, e_BB_source/target)
+            - concatenated short- and long-range inter-monomer edge lists (e_ABsr_*, e_ABlr_*)
+            - full inter-monomer edge lists (e_ABfull_source, e_ABfull_target)
+            - per-edge dimer indices (dimer_ind, dimer_ind_lr, dimer_ind_full)
+            - per-monomer molecule indices and counts (molecule_ind_A/B, natom_per_mol_A/B)
+            - total charges per monomer (total_charge_A/B)
+            - stacked targets `y`
+            - nested batch_atomic_A and batch_atomic_B Data objects for the A and B atom pools
+    """
+    monA_edge_offset, monB_edge_offset = 0, 0
+    local_e_ABsr_source = []
+    local_e_ABsr_target = []
+    local_e_ABlr_source = []
+    local_e_ABlr_target = []
+    local_e_AA_source = []
+    local_e_AA_target = []
+    local_e_BB_source = []
+    local_e_BB_target = []
+    for i, data in enumerate(batch):
+        data.dimer_ind = (
+            torch.ones(data.e_ABsr_source.size(0), dtype=data.dimer_ind.dtype) * i
+        )
+        data.dimer_ind_lr = (
+            torch.ones(data.e_ABlr_source.size(0), dtype=data.dimer_ind_lr.dtype) * i
+        )
+        data.dimer_ind_full = (
+            torch.ones(
+                data.e_ABsr_source.size(0) + data.e_ABlr_source.size(0),
+                dtype=data.dimer_ind_lr.dtype,
+            )
+            * i
+        )
+        local_e_ABsr_source.append(data.e_ABsr_source.clone() + monA_edge_offset)
+        local_e_ABsr_target.append(data.e_ABsr_target.clone() + monB_edge_offset)
+        local_e_ABlr_source.append(data.e_ABlr_source.clone() + monA_edge_offset)
+        local_e_ABlr_target.append(data.e_ABlr_target.clone() + monB_edge_offset)
+        local_e_AA_source.append(data.e_AA_source.clone() + monA_edge_offset)
+        local_e_AA_target.append(data.e_AA_target.clone() + monA_edge_offset)
+        local_e_BB_source.append(data.e_BB_source.clone() + monB_edge_offset)
+        local_e_BB_target.append(data.e_BB_target.clone() + monB_edge_offset)
+        monA_edge_offset += data.RA.size(0)
+        monB_edge_offset += data.RB.size(0)
+    ZA_cat = torch.cat([data.ZA for data in batch], dim=0)
+    RA_cat = torch.cat([data.RA for data in batch], dim=0)
+    ZB_cat = torch.cat([data.ZB for data in batch], dim=0)
+    RB_cat = torch.cat([data.RB for data in batch], dim=0)
+    e_AA_source_cat = torch.cat(local_e_AA_source, dim=0)
+    e_AA_target_cat = torch.cat(local_e_AA_target, dim=0)
+    e_BB_source_cat = torch.cat(local_e_BB_source, dim=0)
+    e_BB_target_cat = torch.cat(local_e_BB_target, dim=0)
+    total_charge_A_tensor = torch.tensor(
+        [data.total_charge_A for data in batch], dtype=batch[0].total_charge_A.dtype
+    )
+    total_charge_B_tensor = torch.tensor(
+        [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
+    )
+    molecule_ind_A = torch.cat(
+        [
+            torch.ones(data.RA.size(0), dtype=torch.long) * i
+            for i, data in enumerate(batch)
+        ],
+        dim=0,
+    )
+    molecule_ind_B = torch.cat(
+        [
+            torch.ones(data.RB.size(0), dtype=torch.long) * i
+            for i, data in enumerate(batch)
+        ],
+        dim=0,
+    )
+    natom_per_mol_A = torch.tensor(
+        [data.RA.size(0) for data in batch], dtype=torch.long
+    )
+    natom_per_mol_B = torch.tensor(
+        [data.RB.size(0) for data in batch], dtype=torch.long
+    )
+
+    batch_atomic_A = Data(
+        x=ZA_cat,
+        edge_index=torch.vstack((e_AA_source_cat, e_AA_target_cat)),
+        R=RA_cat,
+        molecule_ind=molecule_ind_A,
+        total_charge=total_charge_A_tensor,
+        natom_per_mol=natom_per_mol_A,
+    )
+
+    batch_atomic_B = Data(
+        x=ZB_cat,
+        edge_index=torch.vstack((e_BB_source_cat, e_BB_target_cat)),
+        R=RB_cat,
+        molecule_ind=molecule_ind_B,
+        total_charge=total_charge_B_tensor,
+        natom_per_mol=natom_per_mol_B,
+    )
+
+    e_ABsr_source_cat = torch.cat(local_e_ABsr_source, dim=0)
+    e_ABsr_target_cat = torch.cat(local_e_ABsr_target, dim=0)
+    e_ABlr_source_cat = torch.cat(local_e_ABlr_source, dim=0)
+    e_ABlr_target_cat = torch.cat(local_e_ABlr_target, dim=0)
+
+    e_ABfull_source = torch.cat([e_ABsr_source_cat, e_ABlr_source_cat], dim=0)
+    e_ABfull_target = torch.cat([e_ABsr_target_cat, e_ABlr_target_cat], dim=0)
+
+    dimer_ind_cat = torch.cat([data.dimer_ind for data in batch], dim=0)
+    dimer_ind_lr_cat = torch.cat([data.dimer_ind_lr for data in batch], dim=0)
+    dimer_ind_full = torch.cat([data.dimer_ind_full for data in batch], dim=0)
+
+    batched_data = Data(
+        ZA=ZA_cat,
+        RA=RA_cat,
+        ZB=ZB_cat,
+        RB=RB_cat,
+        e_AA_source=e_AA_source_cat,
+        e_AA_target=e_AA_target_cat,
+        e_BB_source=e_BB_source_cat,
+        e_BB_target=e_BB_target_cat,
+        molecule_ind_A=molecule_ind_A,
+        molecule_ind_B=molecule_ind_B,
+        natom_per_mol_A=natom_per_mol_A,
+        natom_per_mol_B=natom_per_mol_B,
+        e_ABsr_source=e_ABsr_source_cat,
+        e_ABsr_target=e_ABsr_target_cat,
+        e_ABlr_source=e_ABlr_source_cat,
+        e_ABlr_target=e_ABlr_target_cat,
+        e_ABfull_source=e_ABfull_source,
+        e_ABfull_target=e_ABfull_target,
+        dimer_ind=dimer_ind_cat,
+        dimer_ind_lr=dimer_ind_lr_cat,
+        dimer_ind_full=dimer_ind_full,
+        total_charge_A=total_charge_A_tensor,
+        total_charge_B=total_charge_B_tensor,
+        y=torch.stack([data.y for data in batch], dim=0),
+        batch_atomic_A=batch_atomic_A,
+        batch_atomic_B=batch_atomic_B,
     )
     return batched_data
 
@@ -493,6 +867,92 @@ def ap2_fused_setup(molA_data, molB_data, atom_model, r_cut, r_cut_im, index=0):
     return dimer_data
 
 
+def save_hdf5_data_objects(data_objects, filepath):
+    """
+    Save a list of PyG Data objects into an HDF5 file where each object is stored as a separate group.
+    
+    Each data object is written to a group named "data_<index>". The following attributes, when present on a data object, are persisted: ZA, RA, ZB, RB, e_ABsr_source, e_ABsr_target, e_ABlr_source, e_ABlr_target, e_AA_source, e_AA_target, e_BB_source, e_BB_target, dimer_ind, dimer_ind_lr, molecule_ind_A, molecule_ind_B, total_charge_A, total_charge_B, qA, muA, quadA, hlistA, qB, muB, quadB, hlistB, and y. Tensor attributes are converted to NumPy arrays and saved as datasets; numeric scalar attributes (int/float) are saved as group attributes.
+    
+    Parameters:
+        data_objects (Sequence): Sequence of PyG Data-like objects to save. Objects should expose the attributes listed above when applicable.
+        filepath (str or os.PathLike): Destination HDF5 file path.
+    
+    """
+    with h5py.File(filepath, "w") as f:
+        for i, data_obj in enumerate(data_objects):
+            group = f.create_group(f"data_{i}")
+            # Save essential tensor and scalar attributes
+            essential_attrs = [
+                "ZA",
+                "RA",
+                "ZB",
+                "RB",
+                "e_ABsr_source",
+                "e_ABsr_target",
+                "e_ABlr_source",
+                "e_ABlr_target",
+                "e_AA_source",
+                "e_AA_target",
+                "e_BB_source",
+                "e_BB_target",
+                "dimer_ind",
+                "dimer_ind_lr",
+                "molecule_ind_A",
+                "molecule_ind_B",
+                "total_charge_A",
+                "total_charge_B",
+                "qA",
+                "muA",
+                "quadA",
+                "hlistA",
+                "qB",
+                "muB",
+                "quadB",
+                "hlistB",
+                "y",  # Essential for training
+            ]
+            for attr_name in essential_attrs:
+                if hasattr(data_obj, attr_name):
+                    attr_value = getattr(data_obj, attr_name)
+                    if isinstance(attr_value, torch.Tensor):
+                        group.create_dataset(attr_name, data=attr_value.numpy())
+                    elif isinstance(attr_value, (int, float)):
+                        group.attrs[attr_name] = attr_value
+
+
+def load_hdf5_data_objects(filepath):  # type: ignore
+    """
+    Load a list of PyG Data objects stored in an HDF5 file.
+    
+    Reads groups whose names start with "data_" (sorted lexicographically). For each such group, datasets are converted to torch tensors (array datasets become tensor arrays; scalar datasets become 0-dim tensors) and group attributes are copied as scalar fields. Each group's combined data is used to construct a torch_geometric.data.Data object; the function returns the list of these Data objects in the sorted group order.
+    
+    Parameters:
+        filepath (str or os.PathLike): Path to the HDF5 file to read.
+    
+    Returns:
+        list[torch_geometric.data.Data]: List of reconstructed Data objects.
+    """
+    data_objects = []
+    with h5py.File(filepath, "r") as f:
+        for key in sorted(f.keys()):
+            if key.startswith("data_"):
+                group = f[key]
+                data_dict = {}
+                # Load datasets (tensor data)
+                for ds_name in group.keys():
+                    try:
+                        # Try to load as array first
+                        data_dict[ds_name] = torch.from_numpy(group[ds_name][:])
+                    except ValueError:
+                        # If that fails, it's a scalar
+                        data_dict[ds_name] = torch.tensor(group[ds_name][()])
+                # Load attributes (scalar data)
+                for attr_name, attr_value in group.attrs.items():
+                    data_dict[attr_name] = attr_value
+                data_objects.append(Data(**data_dict))
+    return data_objects
+
+
 class ap2_fused_module_dataset(Dataset):
     def __init__(
         self,
@@ -522,6 +982,8 @@ class ap2_fused_module_dataset(Dataset):
         qcel_molecules: Optional[List[qcel.models.Molecule]] = None,
         energy_labels: Optional[List[float]] = None,
         random_seed=42,
+        check_monomer_validity=True,
+        storage_type="pt",  # "pt" or "h5" for storage format
     ):
         """
         spec_type definitions:
@@ -540,6 +1002,11 @@ class ap2_fused_module_dataset(Dataset):
             raise ValueError
         self.spec_type = spec_type
 
+        # Validate storage_type
+        if storage_type not in ["pt", "h5"]:
+            raise ValueError("storage_type must be 'pt' or 'h5'")
+        self.storage_type = storage_type
+
         self.qcel_molecules = None
         self.energy_labels = None
         # Store qcel_molecules and energy_labels if provided
@@ -551,9 +1018,8 @@ class ap2_fused_module_dataset(Dataset):
                     "Length of qcel_molecules and energy_labels must match"
                 )
             print(
-                f"Received {
-                    len(qcel_molecules)
-                } QCElemental molecules with energy labels"
+                f"Received {len(qcel_molecules)}"
+                " QCElemental molecules with energy labels"
             )
 
         self.MAX_SIZE = max_size
@@ -564,6 +1030,7 @@ class ap2_fused_module_dataset(Dataset):
         self.r_cut_im = r_cut_im
         self.force_reprocess = force_reprocess
         self.atomic_batch_size = atomic_batch_size
+        self.check_monomer_validity = check_monomer_validity
         self.batch_size = batch_size
         self.training_batch_size = batch_size
         self.datapoint_storage_n_objects = datapoint_storage_n_objects
@@ -616,6 +1083,11 @@ class ap2_fused_module_dataset(Dataset):
         self.active_data = None
 
     @property
+    def file_extension(self):
+        """Return the file extension based on storage type"""
+        return ".h5" if self.storage_type == "h5" else ".pt"
+
+    @property
     def raw_file_names(self):
         # TODO: enable users to specify data source via QCArchive, url, or local file
         # spec_1 = "spec_1" # 'SAPT0/jun-cc-pVDZ'
@@ -657,21 +1129,28 @@ class ap2_fused_module_dataset(Dataset):
             ]
 
     def reprocess_file_names(self):
+        """
+        Determine which processed file names should be used (or signal that reprocessing is required).
+        
+        If force_reprocess is True, returns ["file"]. Otherwise, searches the processed directory for files matching the dataset split and spec_type, sorts them using natural_key, and trims the list according to MAX_SIZE and datapoint_storage_n_objects. If matching files are found, returns the ordered list of file basenames; if none are found, returns a single marker filename indicating missing data (e.g., "dimer_missing" plus the file extension).
+        
+        Returns:
+            list[str]: Ordered list of processed file basenames to use, or a single-element list
+            signaling reprocessing (either ["file"] for forced reprocess or ["dimer_missing{ext}"] when no files exist).
+        """
         if self.force_reprocess:
             return ["file"]
         else:
             if self.split == "train":
                 file_cmd = f"{self.root}/processed/dimer_ap2_fused_train_spec_{
                     self.spec_type
-                }_*.pt"
+                }_*{self.file_extension}"
             elif self.split == "test":
                 file_cmd = f"{self.root}/processed/dimer_ap2_fused_test_spec_{
                     self.spec_type
-                }_*.pt"
+                }_*{self.file_extension}"
             else:
-                file_cmd = (
-                    f"{self.root}/processed/dimer_ap2_fused_spec_{self.spec_type}_*.pt"
-                )
+                file_cmd = f"{self.root}/processed/dimer_ap2_fused_spec_{self.spec_type}_*{self.file_extension}"
             spec_files = glob(file_cmd)
             spec_files = [i.split("/")[-1] for i in spec_files]
             if len(spec_files) > 0:
@@ -691,7 +1170,7 @@ class ap2_fused_module_dataset(Dataset):
                 return spec_files
             else:
                 # Forces a re-processing of the dataset
-                return ["dimer_missing.pt"]
+                return [f"dimer_missing{self.file_extension}"]
 
     @property
     def processed_file_names(self):
@@ -729,6 +1208,21 @@ class ap2_fused_module_dataset(Dataset):
         return
 
     def process(self):
+        """
+        Builds fused PyG Data objects from raw dimers or provided QCElemental molecules and writes them to disk or stores them in memory.
+        
+        Processes either self.qcel_molecules with self.energy_labels or files listed in self.raw_paths, converts each dimer into a fused Data object via dimer_fused_data (respecting r_cut, r_cut_im, and monomer-validity checks), applies self.pre_filter when provided, and accumulates data objects in chunks of self.points_per_file. Depending on configuration, the method:
+        - appends chunks to self.data when in_memory is True, or
+        - saves chunks to processed files under self.processed_dir using either HDF5 or PT format per self.storage_type.
+        
+        Behavioral details:
+        - Honors self.MAX_SIZE to limit the number of processed dimers.
+        - Skips already-processed files when self.skip_processed is True.
+        - Uses self.print_level to control progress output.
+        - Uses self.random_seed when loading raw datasets.
+        - Populates self.data (when in_memory) and creates processed files named like dimer_ap2_fused_{split_name}_spec_{spec_type}_{file_index}{file_extension}.
+        - Skips dimers for which dimer_fused_data returns None or that fail self.pre_filter.
+        """
         self.data = []
         idx = 0
         data_objects = []
@@ -809,7 +1303,7 @@ class ap2_fused_module_dataset(Dataset):
                     self.processed_dir,
                     f"dimer_ap2_fused{split_name}_spec_{self.spec_type}_{
                         idx // self.points_per_file
-                    }.pt",
+                    }{self.file_extension}",
                 )
                 if osp.exists(datapath):
                     idx += 1
@@ -825,8 +1319,13 @@ class ap2_fused_module_dataset(Dataset):
                 dimer_ind=i,
                 r_cut=self.r_cut,
                 r_cut_im=self.r_cut_im,
+                check_validity=self.check_monomer_validity,
                 y=y,
             )
+            if data is None:
+                print(data)
+                print(f"Skipping invalid dimer index {i}")
+                continue
             data = data.cpu()
             if self.pre_filter is not None and not self.pre_filter(data):
                 continue
@@ -844,12 +1343,15 @@ class ap2_fused_module_dataset(Dataset):
                         self.processed_dir,
                         f"dimer_ap2_fused{split_name}_spec_{self.spec_type}_{
                             idx // self.points_per_file
-                        }.pt",
+                        }{self.file_extension}",
                     )
                     if self.print_level >= 2:
                         print(f"Saving to {datapath}")
                         print(len(data_objects))
-                    torch.save(data_objects, datapath)
+                    if self.storage_type == "h5":
+                        save_hdf5_data_objects(data_objects, datapath)
+                    else:
+                        torch.save(data_objects, datapath)
                 data_objects = []
                 if self.MAX_SIZE is not None and idx > self.MAX_SIZE:
                     break
@@ -869,22 +1371,30 @@ class ap2_fused_module_dataset(Dataset):
                     self.processed_dir,
                     f"dimer_ap2_fused{split_name}_spec_{self.spec_type}_{
                         idx // self.points_per_file
-                    }.pt",
+                    }{self.file_extension}",
                 )
                 if self.print_level >= 2:
                     print(f"Final Saving to {datapath}")
                     print(len(data_objects))
-                torch.save(data_objects, datapath)
+                if self.storage_type == "h5":
+                    save_hdf5_data_objects(data_objects, datapath)
+                else:
+                    torch.save(data_objects, datapath)
         return
 
     def len(self):
         if self.in_memory:
             return len(self.data)
 
-        d = torch.load(
-            osp.join(self.processed_dir, self.processed_file_names[-1]),
-            weights_only=False,
-        )
+        if self.storage_type == "h5":
+            d = load_hdf5_data_objects(
+                osp.join(self.processed_dir, self.processed_file_names[-1])
+            )
+        else:
+            d = torch.load(
+                osp.join(self.processed_dir, self.processed_file_names[-1]),
+                weights_only=False,
+            )
         return (
             len(self.processed_file_names) - 1
         ) * self.datapoint_storage_n_objects + len(d)
@@ -899,15 +1409,18 @@ class ap2_fused_module_dataset(Dataset):
             split_name = f"_{self.split}" if self.split != "all" else ""
         datapath = osp.join(
             self.processed_dir,
-            f"dimer_ap2_fused{split_name}_spec_{self.spec_type}_{idx_datapath}.pt",
+            f"dimer_ap2_fused{split_name}_spec_{self.spec_type}_{idx_datapath}{self.file_extension}",
         )
-        self.active_data = torch.load(datapath, weights_only=False)
+        if self.storage_type == "h5":
+            self.active_data = load_hdf5_data_objects(datapath)
+        else:
+            self.active_data = torch.load(datapath, weights_only=False)
         try:
             self.active_data[obj_ind]
         except Exception:
             print(
                 f"Error loading {datapath}\n    at {
-                    idx=}, {idx_datapath=}, {obj_ind=}"
+                    idx = }, {idx_datapath = }, {obj_ind = }"
             )
         return self.active_data[obj_ind]
 

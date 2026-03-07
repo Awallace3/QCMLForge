@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
-from torch_scatter import scatter
+from apnet_pt.util import scatter_sum_compile
 from torch_geometric.data import Data
 import numpy as np
 import time
 from ..AtomModels.ap2_atom_model import AtomMPNN, isolate_atomic_property_predictions
 from .. import atomic_datasets
 from .. import pairwise_datasets
+from .. import model_io
 from ..pairwise_datasets import (
     APNet2_DataLoader,
     apnet2_collate_update,
@@ -23,7 +24,6 @@ from ..pt_datasets.dapnet_ds import (
 from ..AtomPairwiseModels.apnet2 import (
     APNet2_MPNN,
     InverseTimeDecayLR,
-    unwrap_model,
 )
 import os
 import torch.distributed as dist
@@ -71,7 +71,7 @@ class APNet2_dAPNet2_MPNN(nn.Module):
             nn.ReLU(),
             nn.ReLU(),
             None,
-        ]  
+        ]
         self.readout_layer_energy = self._make_layers(
             layer_nodes_readout, layer_activations
         )
@@ -86,6 +86,25 @@ class APNet2_dAPNet2_MPNN(nn.Module):
             if activations[i + 1] is not None:
                 layers.append(activations[i + 1])
         return nn.Sequential(*layers)
+
+    def get_config(self) -> dict:
+        """
+        Return the model configuration as a dictionary.
+
+        Returns
+        -------
+        dict
+            Configuration dictionary containing all hyperparameters needed
+            to reconstruct this model.
+        """
+        return {
+            "n_message": self.n_message,
+            "n_rbf": self.n_rbf,
+            "n_neuron": self.n_neuron,
+            "n_embed": self.n_embed,
+            "r_cut_im": self.r_cut_im,
+            "r_cut": self.r_cut,
+        }
 
     def forward(
         self,
@@ -121,6 +140,32 @@ class APNet2_dAPNet2_MPNN(nn.Module):
         quadB,
         hlistB,
     ):
+        """
+        Compute per-dimer energy outputs by running the inner APNet2 model and applying the frozen readout to short-range interaction embeddings.
+
+        Parameters:
+            ZA (Tensor): Atomic numbers for monomer A, batched for all dimers.
+            RA (Tensor): Positions for atoms in monomer A.
+            ZB (Tensor): Atomic numbers for monomer B.
+            RB (Tensor): Positions for atoms in monomer B.
+            e_ABsr_source, e_ABsr_target (Tensor): Short-range intermolecular edge index tensors (source and target).
+            dimer_ind (Tensor): Mapping from short-range edge/global entries to dimer indices used for aggregation.
+            e_ABlr_source, e_ABlr_target (Tensor): Long-range intermolecular edge index tensors (source and target).
+            dimer_ind_lr (Tensor): Mapping for long-range entries to dimer indices.
+            e_AA_source, e_AA_target (Tensor): Intramonomer edge indices for monomer A.
+            e_BB_source, e_BB_target (Tensor): Intramonomer edge indices for monomer B.
+            total_charge_A, total_charge_B (Tensor): Total charges for monomer A and B for each dimer.
+            qA, muA, quadA, hlistA (Tensor): Predicted atomic multipole and descriptor arrays for monomer A.
+            qB, muB, quadB, hlistB (Tensor): Predicted atomic multipole and descriptor arrays for monomer B.
+
+        Returns:
+            E_output (Tensor): Per-dimer aggregated energy tensor expanded to match the original number of dimers; shape (ndimer, C) where C is readout output channels.
+            E_sr (Tensor): Short-range energy contributions from the inner APNet2 model prior to readout aggregation.
+            E_elst_sr (Tensor): Short-range electrostatic energy components from the inner APNet2 model.
+            E_elst_lr (Tensor): Long-range electrostatic energy components from the inner APNet2 model.
+            hAB (Tensor): Short-range embedding/features for interactions A->B produced by the inner APNet2 model.
+            hBA (Tensor): Short-range embedding/features for interactions B->A produced by the inner APNet2 model.
+        """
         E_pairmodel, E_sr, E_elst_sr, E_elst_lr, hAB, hBA, cutoff = self.apnet2_model(
             ZA,
             RA,
@@ -159,7 +204,9 @@ class APNet2_dAPNet2_MPNN(nn.Module):
 
         delta_E = EAB_sr + EBA_sr
         delta_E *= cutoff
-        E = scatter(delta_E, dimer_ind, dim=0, reduce="sum")
+        E = scatter_sum_compile(
+            delta_E, dimer_ind, dim_size=int(dimer_ind.max()) + 1, reduce="sum"
+        )
 
         # Need to ensure that the output is the same size as input dimers
         ndimer = torch.tensor(total_charge_A.size(0), dtype=torch.long)
@@ -190,7 +237,7 @@ class dAPNet2_MPNN(nn.Module):
             nn.ReLU(),
             nn.ReLU(),
             None,
-        ]  
+        ]
         self.readout_layer_energy = self._make_layers(
             layer_nodes_readout, layer_activations
         )
@@ -206,20 +253,49 @@ class dAPNet2_MPNN(nn.Module):
                 layers.append(activations[i + 1])
         return nn.Sequential(*layers)
 
+    def get_config(self) -> dict:
+        """
+        Return the model configuration as a dictionary.
+
+        Returns
+        -------
+        dict
+            Configuration dictionary containing all hyperparameters needed
+            to reconstruct this model.
+        """
+        return {
+            "n_neuron": self.n_neuron,
+        }
+
     def forward(
         self,
-        h_AB, 
+        h_AB,
         h_BA,
         cutoff,
         dimer_ind,
         ndimer,
     ):
+        """
+        Compute aggregated per-dimer energy predictions from pairwise readout embeddings.
+
+        Parameters:
+            h_AB (Tensor): Readout embeddings for AB-directed pairs.
+            h_BA (Tensor): Readout embeddings for BA-directed pairs.
+            cutoff (Tensor or float): Per-pair multiplicative cutoff weights applied to predicted pair energies.
+            dimer_ind (LongTensor): 1D index tensor mapping each pair row to a dimer index for aggregation.
+            ndimer (int): Total number of dimers in the original batch; determines the first dimension of the output.
+
+        Returns:
+            Tensor: Aggregated energy tensor of shape (ndimer, C) where C is the number of output channels from the readout; each row is the sum of scaled pair contributions for that dimer.
+        """
         EAB_sr = self.readout_layer_energy(h_AB)
         EBA_sr = self.readout_layer_energy(h_BA)
 
         delta_E = EAB_sr + EBA_sr
         delta_E *= cutoff
-        E = scatter(delta_E, dimer_ind, dim=0, reduce="sum")
+        E = scatter_sum_compile(
+            delta_E, dimer_ind, dim_size=int(dimer_ind.max()) + 1, reduce="sum"
+        )
         # Need to ensure that the output is the same size as input dimers
         N_sr, num_cols = E.shape
         E_expanded = E.new_zeros((ndimer, num_cols))
@@ -429,8 +505,7 @@ class APNet2_dAPNet2Model:
         self.model.eval()
         for batch in self.dataset:
             batch = batch.to(self.device)
-            E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(
-                batch)
+            E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(batch)
         return
 
     def compile_model(self):
@@ -441,32 +516,147 @@ class APNet2_dAPNet2Model:
         self.model = torch.compile(self.model)
         return
 
-    def set_pretrained_model(self, ap2_model_path=None, am_model_path=None, model_id=None):
+    def set_pretrained_model(
+        self, ap2_model_path=None, am_model_path=None, model_id=None
+    ):
+        """
+        Load pretrained model weights from checkpoint files.
+
+        Parameters
+        ----------
+        ap2_model_path : str, optional
+            Path to the dAPNet2 checkpoint file
+        am_model_path : str, optional
+            Path to the atom model checkpoint file
+        model_id : int, optional
+            Model ID to load from bundled ensemble models
+
+        Returns
+        -------
+        self
+            The model instance with loaded weights
+        """
         if model_id is not None:
-            am_model_path = resources.files("apnet_pt").joinpath("models", "am_ensemble", f"am_{model_id}.pt")
-            ap2_model_path = resources.files("apnet_pt").joinpath("models", "ap2_ensemble", f"ap2_{model_id}.pt")
+            am_model_path = resources.files("apnet_pt").joinpath(
+                "models", "am_ensemble", f"am_{model_id}.pt"
+            )
+            ap2_model_path = resources.files("apnet_pt").joinpath(
+                "models", "ap2_ensemble", f"ap2_{model_id}.pt"
+            )
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 
-        checkpoint = torch.load(ap2_model_path)
+        # Load main model checkpoint
+        checkpoint = model_io.load_checkpoint(ap2_model_path, map_location=self.device)
+        state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
+
         if "_orig_mod" not in list(self.model.state_dict().keys())[0]:
-            model_state_dict = {
-                k.replace("_orig_mod.", ""): v
-                for k, v in checkpoint["model_state_dict"].items()
-            }
-            self.model.load_state_dict(model_state_dict)
+            self.model.load_state_dict(state_dict)
         else:
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-        checkpoint = torch.load(am_model_path)
+            state_dict_with_prefix = {
+                f"_orig_mod.{k}": v for k, v in state_dict.items()
+            }
+            self.model.load_state_dict(state_dict_with_prefix)
+
+        # Load atom model checkpoint
+        am_checkpoint = model_io.load_checkpoint(
+            am_model_path, map_location=self.device
+        )
+        am_state_dict = model_io.load_state_dict_from_checkpoint(am_checkpoint)
+
         if "_orig_mod" not in list(self.atom_model.state_dict().keys())[0]:
-            model_state_dict = {
-                k.replace("_orig_mod.", ""): v
-                for k, v in checkpoint["model_state_dict"].items()
-            }
-            self.atom_model.load_state_dict(model_state_dict)
+            self.atom_model.load_state_dict(am_state_dict)
         else:
-            self.atom_model.load_state_dict(checkpoint['model_state_dict'])
+            am_state_dict_with_prefix = {
+                f"_orig_mod.{k}": v for k, v in am_state_dict.items()
+            }
+            self.atom_model.load_state_dict(am_state_dict_with_prefix)
         return self
+
+    def _create_checkpoint(self, metadata: dict = None) -> dict:
+        """
+        Create a v2 checkpoint dictionary for this model.
+
+        The checkpoint embeds the apnet2_model and atom_model as submodels.
+
+        Parameters
+        ----------
+        metadata : dict, optional
+            Additional metadata to include in the checkpoint
+
+        Returns
+        -------
+        dict
+            Complete v2 checkpoint dictionary
+        """
+        cpu_model = model_io.unwrap_model(self.model).to("cpu")
+        config = cpu_model.get_config()
+
+        # Create submodel checkpoints
+        submodels = {}
+
+        # Embed the APNet2 model
+        if hasattr(cpu_model, "apnet2_model") and cpu_model.apnet2_model is not None:
+            if hasattr(cpu_model.apnet2_model, "get_config"):
+                apnet2_config = cpu_model.apnet2_model.get_config()
+            else:
+                apnet2_config = {
+                    "n_message": getattr(cpu_model.apnet2_model, "n_message", 3),
+                    "n_rbf": getattr(cpu_model.apnet2_model, "n_rbf", 8),
+                    "n_neuron": getattr(cpu_model.apnet2_model, "n_neuron", 128),
+                    "n_embed": getattr(cpu_model.apnet2_model, "n_embed", 8),
+                    "r_cut_im": getattr(cpu_model.apnet2_model, "r_cut_im", 8.0),
+                    "r_cut": getattr(cpu_model.apnet2_model, "r_cut", 5.0),
+                }
+            submodels["apnet2_model"] = model_io.create_submodel_checkpoint(
+                model=cpu_model.apnet2_model,
+                config=apnet2_config,
+                model_type="APNet2_MPNN",
+            )
+
+        # Embed the atom model
+        if hasattr(self, "atom_model") and self.atom_model is not None:
+            if hasattr(self.atom_model, "get_config"):
+                atom_config = self.atom_model.get_config()
+            else:
+                atom_config = {
+                    "n_message": getattr(self.atom_model, "n_message", 3),
+                    "n_rbf": getattr(self.atom_model, "n_rbf", 8),
+                    "n_neuron": getattr(self.atom_model, "n_neuron", 128),
+                    "n_embed": getattr(self.atom_model, "n_embed", 8),
+                    "r_cut": getattr(self.atom_model, "r_cut", 5.0),
+                }
+            submodels["atom_model"] = model_io.create_submodel_checkpoint(
+                model=self.atom_model,
+                config=atom_config,
+                model_type="AtomMPNN",
+            )
+
+        checkpoint = model_io.create_checkpoint(
+            model=cpu_model,
+            config=config,
+            model_type="APNet2_dAPNet2_MPNN",
+            submodels=submodels if submodels else None,
+            metadata=metadata,
+        )
+
+        self.model.to(self.device)
+        return checkpoint
+
+    def save_model(self, path: str, metadata: dict = None) -> None:
+        """
+        Save the model to a checkpoint file.
+
+        Parameters
+        ----------
+        path : str
+            Path to save the checkpoint to
+        metadata : dict, optional
+            Additional metadata to include
+        """
+        checkpoint = self._create_checkpoint(metadata=metadata)
+        model_io.save_checkpoint(checkpoint, path)
+        print(f"Model saved to {path}")
 
     ############################################################################
     # The main forward/eval function
@@ -508,28 +698,14 @@ class APNet2_dAPNet2Model:
     ):
         mol_data = [[*qcel_dimer_to_pyg_data(mol)] for mol in mols]
         for i in range(0, len(mol_data), batch_size):
-            batch_mol_data = mol_data[i: i + batch_size]
+            batch_mol_data = mol_data[i : i + batch_size]
             data_A = [d[0] for d in batch_mol_data]
             data_B = [d[1] for d in batch_mol_data]
             batch_A = atomic_datasets.atomic_collate_update_no_target(data_A)
             batch_B = atomic_datasets.atomic_collate_update_no_target(data_B)
             with torch.no_grad():
-                am_out_A = self.atom_model(
-                    batch_A.x,
-                    batch_A.edge_index,
-                    R=batch_A.R,
-                    molecule_ind=batch_A.molecule_ind,
-                    total_charge=batch_A.total_charge,
-                    natom_per_mol=batch_A.natom_per_mol,
-                )
-                am_out_B = self.atom_model(
-                    batch_B.x,
-                    batch_B.edge_index,
-                    R=batch_B.R,
-                    molecule_ind=batch_B.molecule_ind,
-                    total_charge=batch_B.total_charge,
-                    natom_per_mol=batch_B.natom_per_mol,
-                )
+                am_out_A = self.atom_model(batch_A)
+                am_out_B = self.atom_model(batch_B)
                 qAs, muAs, quadAs, hlistAs = isolate_atomic_property_predictions(
                     batch_A, am_out_A
                 )
@@ -552,13 +728,10 @@ class APNet2_dAPNet2Model:
                         qB = qB.unsqueeze(0).unsqueeze(0)
                     elif len(qB.size()) == 1:
                         qB = qB.unsqueeze(-1)
-                    e_AA_source, e_AA_target = pairwise_edges(
-                        data_A[j].R, r_cut)
-                    e_BB_source, e_BB_target = pairwise_edges(
-                        data_B[j].R, r_cut)
+                    e_AA_source, e_AA_target = pairwise_edges(data_A[j].R, r_cut)
+                    e_BB_source, e_BB_target = pairwise_edges(data_B[j].R, r_cut)
                     e_ABsr_source, e_ABsr_target, e_ABlr_source, e_ABlr_target = (
-                        pairwise_edges_im(
-                            data_A[j].R, data_B[j].R, r_cut_im)
+                        pairwise_edges_im(data_A[j].R, data_B[j].R, r_cut_im)
                     )
                     dimer_ind = torch.ones((1), dtype=torch.long) * 0
                     data = Data(
@@ -611,28 +784,14 @@ class APNet2_dAPNet2Model:
         mol_data = [[*qcel_dimer_to_pyg_data(mol)] for mol in mols]
         predictions = np.zeros((len(mol_data), 1))
         for i in range(0, len(mol_data), batch_size):
-            batch_mol_data = mol_data[i: i + batch_size]
+            batch_mol_data = mol_data[i : i + batch_size]
             data_A = [d[0] for d in batch_mol_data]
             data_B = [d[1] for d in batch_mol_data]
             batch_A = atomic_datasets.atomic_collate_update_no_target(data_A)
             batch_B = atomic_datasets.atomic_collate_update_no_target(data_B)
             with torch.no_grad():
-                am_out_A = self.atom_model(
-                    batch_A.x,
-                    batch_A.edge_index,
-                    R=batch_A.R,
-                    molecule_ind=batch_A.molecule_ind,
-                    total_charge=batch_A.total_charge,
-                    natom_per_mol=batch_A.natom_per_mol,
-                )
-                am_out_B = self.atom_model(
-                    batch_B.x,
-                    batch_B.edge_index,
-                    R=batch_B.R,
-                    molecule_ind=batch_B.molecule_ind,
-                    total_charge=batch_B.total_charge,
-                    natom_per_mol=batch_B.natom_per_mol,
-                )
+                am_out_A = self.atom_model(batch_A)
+                am_out_B = self.atom_model(batch_B)
                 qAs, muAs, quadAs, hlistAs = isolate_atomic_property_predictions(
                     batch_A, am_out_A
                 )
@@ -655,13 +814,10 @@ class APNet2_dAPNet2Model:
                         qB = qB.unsqueeze(0).unsqueeze(0)
                     elif len(qB.size()) == 1:
                         qB = qB.unsqueeze(-1)
-                        e_AA_source, e_AA_target = pairwise_edges(
-                            data_A[j].R, r_cut)
-                        e_BB_source, e_BB_target = pairwise_edges(
-                            data_B[j].R, r_cut)
+                        e_AA_source, e_AA_target = pairwise_edges(data_A[j].R, r_cut)
+                        e_BB_source, e_BB_target = pairwise_edges(data_B[j].R, r_cut)
                         e_ABsr_source, e_ABsr_target, e_ABlr_source, e_ABlr_target = (
-                            pairwise_edges_im(
-                                data_A[j].R, data_B[j].R, r_cut_im)
+                            pairwise_edges_im(data_A[j].R, data_B[j].R, r_cut_im)
                         )
                         dimer_ind = torch.ones((1), dtype=torch.long) * 0
                         data = Data(
@@ -703,7 +859,7 @@ class APNet2_dAPNet2Model:
                 )
                 dimer_batch.to(self.device)
                 preds = self.eval_fn(dimer_batch)
-                predictions[i: i + batch_size] = preds[0].cpu().numpy()
+                predictions[i : i + batch_size] = preds[0].cpu().numpy()
         return predictions
 
     def example_input(self):
@@ -749,8 +905,7 @@ units angstrom
         for n, batch in enumerate(dataloader):
             optimizer.zero_grad(set_to_none=True)  # minor speed-up
             batch = batch.to(rank_device, non_blocking=True)
-            E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(
-                batch)
+            E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(batch)
             preds = E_sr_dimer.flatten()
             # print(f"{preds=}")
             # print(f"{batch.y=}")
@@ -821,8 +976,7 @@ units angstrom
             batch_loss = 0.0
             optimizer.zero_grad()
             batch = batch.to(rank_device)
-            E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(
-                batch)
+            E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(batch)
             preds = E_sr_dimer.reshape(-1, 4)
             comp_errors = preds - batch.y
             if loss_fn is None:
@@ -844,16 +998,11 @@ units angstrom
         if scheduler is not None:
             scheduler.step()
 
-        total_loss = torch.tensor(
-            total_loss, dtype=torch.float32, device=rank_device)
-        total_error = torch.tensor(
-            total_error, dtype=torch.float32, device=rank_device)
-        elst_error = torch.tensor(
-            elst_error, dtype=torch.float32, device=rank_device)
-        exch_error = torch.tensor(
-            exch_error, dtype=torch.float32, device=rank_device)
-        indu_error = torch.tensor(
-            indu_error, dtype=torch.float32, device=rank_device)
+        total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
+        total_error = torch.tensor(total_error, dtype=torch.float32, device=rank_device)
+        elst_error = torch.tensor(elst_error, dtype=torch.float32, device=rank_device)
+        exch_error = torch.tensor(exch_error, dtype=torch.float32, device=rank_device)
+        indu_error = torch.tensor(indu_error, dtype=torch.float32, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -884,8 +1033,7 @@ units angstrom
             for batch in dataloader:
                 batch_loss = 0.0
                 batch = batch.to(rank_device)
-                E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(
-                    batch)
+                E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(batch)
                 preds = E_sr_dimer.reshape(-1, 4)
                 comp_errors = preds - batch.y
                 if loss_fn is None:
@@ -1026,12 +1174,10 @@ units angstrom
         t1 = time.time()
         with torch.no_grad():
             train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
-                self.__evaluate_batches(
-                    rank, train_loader, criterion, rank_device)
+                self.__evaluate_batches(rank, train_loader, criterion, rank_device)
             )
             test_loss, total_MAE_v, elst_MAE_v, exch_MAE_v, indu_MAE_v, disp_MAE_v = (
-                self.__evaluate_batches(
-                    rank, test_loader, criterion, rank_device)
+                self.__evaluate_batches(rank, test_loader, criterion, rank_device)
             )
             dt = time.time() - t1
             if rank == 0:
@@ -1053,8 +1199,7 @@ units angstrom
                 )
             )
             test_loss, total_MAE_v, elst_MAE_v, exch_MAE_v, indu_MAE_v, disp_MAE_v = (
-                self.__evaluate_batches(
-                    rank, test_loader, criterion, rank_device)
+                self.__evaluate_batches(rank, test_loader, criterion, rank_device)
             )
 
             if rank == 0:
@@ -1063,22 +1208,10 @@ units angstrom
                     test_lowered = "*"
                     if self.model_save_path:
                         print("Saving model")
-                        cpu_model = unwrap_model(self.model).to("cpu")
-                        torch.save(
-                            {
-                                "model_state_dict": cpu_model.state_dict(),
-                                "config": {
-                                    "n_message": cpu_model.n_message,
-                                    "n_rbf": cpu_model.n_rbf,
-                                    "n_neuron": cpu_model.n_neuron,
-                                    "n_embed": cpu_model.n_embed,
-                                    "r_cut_im": cpu_model.r_cut_im,
-                                    "r_cut": cpu_model.r_cut,
-                                },
-                            },
+                        self.save_model(
                             self.model_save_path,
+                            metadata={"training_mode": "ddp", "epoch": epoch},
                         )
-                        self.model.to(rank_device)
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
@@ -1159,13 +1292,11 @@ units angstrom
 
         # (5) Evaluate once pre-training
         t0 = time.time()
-        train_loss, total_MAE_t = (
-            self.__evaluate_batches_single_proc(
-                train_loader, criterion, rank_device)
+        train_loss, total_MAE_t = self.__evaluate_batches_single_proc(
+            train_loader, criterion, rank_device
         )
-        test_loss, total_MAE_v = (
-            self.__evaluate_batches_single_proc(
-                test_loader, criterion, rank_device)
+        test_loss, total_MAE_v = self.__evaluate_batches_single_proc(
+            test_loader, criterion, rank_device
         )
 
         print(
@@ -1177,14 +1308,11 @@ units angstrom
         lowest_test_loss = test_loss
         for epoch in range(n_epochs):
             t1 = time.time()
-            train_loss, total_MAE_t= (
-                self.__train_batches_single_proc(
-                    train_loader, criterion, optimizer, rank_device, scheduler
-                )
+            train_loss, total_MAE_t = self.__train_batches_single_proc(
+                train_loader, criterion, optimizer, rank_device, scheduler
             )
-            test_loss, total_MAE_v= (
-                self.__evaluate_batches_single_proc(
-                    test_loader, criterion, rank_device)
+            test_loss, total_MAE_v = self.__evaluate_batches_single_proc(
+                test_loader, criterion, rank_device
             )
 
             # Track best model
@@ -1192,22 +1320,15 @@ units angstrom
             if test_loss < lowest_test_loss:
                 lowest_test_loss = test_loss
                 star_marker = "*"
-                cpu_model = unwrap_model(self.model).to("cpu")
+                cpu_model = model_io.unwrap_model(self.model).to("cpu")
                 best_model = deepcopy(cpu_model)
                 if self.model_save_path:
-                    torch.save(
-                        {
-                            "model_state_dict": cpu_model.state_dict(),
-                            "config": {
-                                "n_message": cpu_model.n_message,
-                                "n_rbf": cpu_model.n_rbf,
-                                "n_neuron": cpu_model.n_neuron,
-                                "n_embed": cpu_model.n_embed,
-                                "r_cut_im": cpu_model.r_cut_im,
-                                "r_cut": cpu_model.r_cut,
-                            },
-                        },
+                    self.save_model(
                         self.model_save_path,
+                        metadata={
+                            "training_mode": "single_proc",
+                            "epoch": epoch,
+                        },
                     )
                 self.model.to(rank_device)
 
@@ -1268,10 +1389,8 @@ units angstrom
                 order_indices = np.random.permutation(len(self.dataset))
             else:
                 order_indices = np.arange(len(self.dataset))
-            train_indices = order_indices[: int(
-                len(self.dataset) * split_percent)]
-            test_indices = order_indices[int(
-                len(self.dataset) * split_percent):]
+            train_indices = order_indices[: int(len(self.dataset) * split_percent)]
+            test_indices = order_indices[int(len(self.dataset) * split_percent) :]
             train_dataset = self.dataset[train_indices]
             test_dataset = self.dataset[test_indices]
             batch_size = train_dataset.training_batch_size
@@ -1338,7 +1457,6 @@ units angstrom
                 skip_compile=skip_compile,
             )
         return
-
 
 
 class dAPNet2Model:
@@ -1529,8 +1647,7 @@ class dAPNet2Model:
         self.model.eval()
         for batch in self.dataset:
             batch = batch.to(self.device)
-            E_sr_dimer = self.eval_fn(
-                batch)
+            E_sr_dimer = self.eval_fn(batch)
         return
 
     def compile_model(self):
@@ -1541,10 +1658,16 @@ class dAPNet2Model:
         self.model = torch.compile(self.model)
         return
 
-    def set_pretrained_model(self, ap2_model_path=None, am_model_path=None, model_id=None):
+    def set_pretrained_model(
+        self, ap2_model_path=None, am_model_path=None, model_id=None
+    ):
         if model_id is not None:
-            am_model_path = resources.files("apnet_pt").joinpath("models", "am_ensemble", f"am_{model_id}.pt")
-            ap2_model_path = resources.files("apnet_pt").joinpath("models", "ap2_ensemble", f"ap2_{model_id}.pt")
+            am_model_path = resources.files("apnet_pt").joinpath(
+                "models", "am_ensemble", f"am_{model_id}.pt"
+            )
+            ap2_model_path = resources.files("apnet_pt").joinpath(
+                "models", "ap2_ensemble", f"ap2_{model_id}.pt"
+            )
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 
@@ -1566,8 +1689,99 @@ class dAPNet2Model:
             }
             self.atom_model.load_state_dict(model_state_dict)
         else:
-            self.atom_model.load_state_dict(checkpoint['model_state_dict'])
+            self.atom_model.load_state_dict(checkpoint["model_state_dict"])
         return self
+
+    def _create_checkpoint(self, metadata: dict = None) -> dict:
+        """
+        Create a v2 checkpoint dictionary for this model.
+
+        The checkpoint embeds the apnet2_model and atom_model as submodels.
+
+        Parameters
+        ----------
+        metadata : dict, optional
+            Additional metadata to include in the checkpoint
+
+        Returns
+        -------
+        dict
+            Complete v2 checkpoint dictionary
+        """
+        cpu_model = model_io.unwrap_model(self.model).to("cpu")
+        config = cpu_model.get_config()
+
+        # Create submodel checkpoints
+        submodels = {}
+
+        # Embed the APNet2 model if available
+        if hasattr(self, "apnet2_model") and self.apnet2_model is not None:
+            if hasattr(self.apnet2_model, "model"):
+                # apnet2_model is a harness, get the underlying model
+                apnet2_nn = self.apnet2_model.model
+            else:
+                apnet2_nn = self.apnet2_model
+
+            if hasattr(apnet2_nn, "get_config"):
+                apnet2_config = apnet2_nn.get_config()
+            else:
+                apnet2_config = {
+                    "n_message": getattr(apnet2_nn, "n_message", 3),
+                    "n_rbf": getattr(apnet2_nn, "n_rbf", 8),
+                    "n_neuron": getattr(apnet2_nn, "n_neuron", 128),
+                    "n_embed": getattr(apnet2_nn, "n_embed", 8),
+                    "r_cut_im": getattr(apnet2_nn, "r_cut_im", 8.0),
+                    "r_cut": getattr(apnet2_nn, "r_cut", 5.0),
+                }
+            submodels["apnet2_model"] = model_io.create_submodel_checkpoint(
+                model=apnet2_nn,
+                config=apnet2_config,
+                model_type="APNet2_MPNN",
+            )
+
+        # Embed the atom model
+        if hasattr(self, "atom_model") and self.atom_model is not None:
+            if hasattr(self.atom_model, "get_config"):
+                atom_config = self.atom_model.get_config()
+            else:
+                atom_config = {
+                    "n_message": getattr(self.atom_model, "n_message", 3),
+                    "n_rbf": getattr(self.atom_model, "n_rbf", 8),
+                    "n_neuron": getattr(self.atom_model, "n_neuron", 128),
+                    "n_embed": getattr(self.atom_model, "n_embed", 8),
+                    "r_cut": getattr(self.atom_model, "r_cut", 5.0),
+                }
+            submodels["atom_model"] = model_io.create_submodel_checkpoint(
+                model=self.atom_model,
+                config=atom_config,
+                model_type="AtomMPNN",
+            )
+
+        checkpoint = model_io.create_checkpoint(
+            model=cpu_model,
+            config=config,
+            model_type="dAPNet2_MPNN",
+            submodels=submodels if submodels else None,
+            metadata=metadata,
+        )
+
+        self.model.to(self.device)
+        return checkpoint
+
+    def save_model(self, path: str, metadata: dict = None) -> None:
+        """
+        Save the model to a checkpoint file.
+
+        Parameters
+        ----------
+        path : str
+            Path to save the checkpoint to
+        metadata : dict, optional
+            Additional metadata to include
+        """
+        checkpoint = self._create_checkpoint(metadata=metadata)
+        model_io.save_checkpoint(checkpoint, path)
+        print(f"Model saved to {path}")
 
     ############################################################################
     # The main forward/eval function
@@ -1591,14 +1805,16 @@ class dAPNet2Model:
         dimers = []
         for i in range(0, len(mols) + len(mols) % batch_size + 1, batch_size):
             upper_bound = min(i + batch_size, len(mols))
-            local_mols=mols[i: upper_bound]
+            local_mols = mols[i:upper_bound]
             if len(local_mols) == 0:
                 break
-            _, h_ABs, h_BAs, cutoffs, dimer_inds, ndimers = self.apnet2_model.predict_qcel_mols(
-                mols=local_mols,
-                batch_size=batch_size,
-                r_cut=self.apnet2_model.model.r_cut,
-                r_cut_im=self.apnet2_model.model.r_cut_im,
+            _, h_ABs, h_BAs, cutoffs, dimer_inds, ndimers = (
+                self.apnet2_model.predict_qcel_mols(
+                    mols=local_mols,
+                    batch_size=batch_size,
+                    r_cut=self.apnet2_model.model.r_cut,
+                    r_cut_im=self.apnet2_model.model.r_cut_im,
+                )
             )
             dimer_data = Data(
                 h_AB=h_ABs[0],
@@ -1622,14 +1838,16 @@ class dAPNet2Model:
         predictions = np.zeros((len(mols)))
         for i in range(0, len(mols) + len(mols) % batch_size + 1, batch_size):
             upper_bound = min(i + batch_size, len(mols))
-            local_mols=mols[i: upper_bound]
+            local_mols = mols[i:upper_bound]
             if len(local_mols) == 0:
                 break
-            _, h_ABs, h_BAs, cutoffs, dimer_inds, ndimers = self.apnet2_model.predict_qcel_mols(
-                mols=local_mols,
-                batch_size=batch_size,
-                r_cut=self.apnet2_model.model.r_cut,
-                r_cut_im=self.apnet2_model.model.r_cut_im,
+            _, h_ABs, h_BAs, cutoffs, dimer_inds, ndimers = (
+                self.apnet2_model.predict_qcel_mols(
+                    mols=local_mols,
+                    batch_size=batch_size,
+                    r_cut=self.apnet2_model.model.r_cut,
+                    r_cut_im=self.apnet2_model.model.r_cut_im,
+                )
             )
             dimer_batch = Data(
                 h_AB=h_ABs[0],
@@ -1641,7 +1859,7 @@ class dAPNet2Model:
             dimer_batch.to(self.device)
             preds = self.eval_fn(dimer_batch)
             preds = preds.flatten()
-            predictions[i: i + batch_size] = preds.cpu().numpy()
+            predictions[i : i + batch_size] = preds.cpu().numpy()
         return predictions
 
     def example_input(self):
@@ -1687,8 +1905,7 @@ units angstrom
         for n, batch in enumerate(dataloader):
             optimizer.zero_grad(set_to_none=True)  # minor speed-up
             batch = batch.to(rank_device, non_blocking=True)
-            E_sr_dimer = self.eval_fn(
-                batch)
+            E_sr_dimer = self.eval_fn(batch)
             preds = E_sr_dimer.flatten()
             comp_errors = preds - batch.y
             batch_loss = (
@@ -1756,8 +1973,7 @@ units angstrom
             batch_loss = 0.0
             optimizer.zero_grad()
             batch = batch.to(rank_device)
-            E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(
-                batch)
+            E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(batch)
             preds = E_sr_dimer.reshape(-1, 4)
             comp_errors = preds - batch.y
             if loss_fn is None:
@@ -1779,16 +1995,11 @@ units angstrom
         if scheduler is not None:
             scheduler.step()
 
-        total_loss = torch.tensor(
-            total_loss, dtype=torch.float32, device=rank_device)
-        total_error = torch.tensor(
-            total_error, dtype=torch.float32, device=rank_device)
-        elst_error = torch.tensor(
-            elst_error, dtype=torch.float32, device=rank_device)
-        exch_error = torch.tensor(
-            exch_error, dtype=torch.float32, device=rank_device)
-        indu_error = torch.tensor(
-            indu_error, dtype=torch.float32, device=rank_device)
+        total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
+        total_error = torch.tensor(total_error, dtype=torch.float32, device=rank_device)
+        elst_error = torch.tensor(elst_error, dtype=torch.float32, device=rank_device)
+        exch_error = torch.tensor(exch_error, dtype=torch.float32, device=rank_device)
+        indu_error = torch.tensor(indu_error, dtype=torch.float32, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -1819,8 +2030,7 @@ units angstrom
             for batch in dataloader:
                 batch_loss = 0.0
                 batch = batch.to(rank_device)
-                E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(
-                    batch)
+                E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.eval_fn(batch)
                 preds = E_sr_dimer.reshape(-1, 4)
                 comp_errors = preds - batch.y
                 if loss_fn is None:
@@ -1961,12 +2171,10 @@ units angstrom
         t1 = time.time()
         with torch.no_grad():
             train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
-                self.__evaluate_batches(
-                    rank, train_loader, criterion, rank_device)
+                self.__evaluate_batches(rank, train_loader, criterion, rank_device)
             )
             test_loss, total_MAE_v, elst_MAE_v, exch_MAE_v, indu_MAE_v, disp_MAE_v = (
-                self.__evaluate_batches(
-                    rank, test_loader, criterion, rank_device)
+                self.__evaluate_batches(rank, test_loader, criterion, rank_device)
             )
             dt = time.time() - t1
             if rank == 0:
@@ -1988,8 +2196,7 @@ units angstrom
                 )
             )
             test_loss, total_MAE_v, elst_MAE_v, exch_MAE_v, indu_MAE_v, disp_MAE_v = (
-                self.__evaluate_batches(
-                    rank, test_loader, criterion, rank_device)
+                self.__evaluate_batches(rank, test_loader, criterion, rank_device)
             )
 
             if rank == 0:
@@ -1998,17 +2205,10 @@ units angstrom
                     test_lowered = "*"
                     if self.model_save_path:
                         print("Saving model")
-                        cpu_model = unwrap_model(self.model).to("cpu")
-                        torch.save(
-                            {
-                                "model_state_dict": cpu_model.state_dict(),
-                                "config": {
-                                    "n_neuron": cpu_model.n_neuron,
-                                },
-                            },
+                        self.save_model(
                             self.model_save_path,
+                            metadata={"training_mode": "ddp", "epoch": epoch},
                         )
-                        self.model.to(rank_device)
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
@@ -2089,13 +2289,11 @@ units angstrom
 
         # (5) Evaluate once pre-training
         t0 = time.time()
-        train_loss, total_MAE_t = (
-            self.__evaluate_batches_single_proc(
-                train_loader, criterion, rank_device)
+        train_loss, total_MAE_t = self.__evaluate_batches_single_proc(
+            train_loader, criterion, rank_device
         )
-        test_loss, total_MAE_v = (
-            self.__evaluate_batches_single_proc(
-                test_loader, criterion, rank_device)
+        test_loss, total_MAE_v = self.__evaluate_batches_single_proc(
+            test_loader, criterion, rank_device
         )
 
         print(
@@ -2107,14 +2305,11 @@ units angstrom
         lowest_test_loss = test_loss
         for epoch in range(n_epochs):
             t1 = time.time()
-            train_loss, total_MAE_t= (
-                self.__train_batches_single_proc(
-                    train_loader, criterion, optimizer, rank_device, scheduler
-                )
+            train_loss, total_MAE_t = self.__train_batches_single_proc(
+                train_loader, criterion, optimizer, rank_device, scheduler
             )
-            test_loss, total_MAE_v= (
-                self.__evaluate_batches_single_proc(
-                    test_loader, criterion, rank_device)
+            test_loss, total_MAE_v = self.__evaluate_batches_single_proc(
+                test_loader, criterion, rank_device
             )
 
             # Track best model
@@ -2123,17 +2318,13 @@ units angstrom
                 lowest_test_loss = test_loss
                 star_marker = "*"
                 if self.model_save_path:
-                    cpu_model = unwrap_model(self.model).to("cpu")
-                    torch.save(
-                        {
-                            "model_state_dict": cpu_model.state_dict(),
-                            "config": {
-                                "n_neuron": cpu_model.n_neuron,
-                            },
-                        },
+                    self.save_model(
                         self.model_save_path,
+                        metadata={
+                            "training_mode": "single_proc",
+                            "epoch": epoch,
+                        },
                     )
-                    self.model.to(rank_device)
 
             print(
                 f"  EPOCH: {epoch:4d} ({time.time() - t1:<7.2f}s)  MAE: "
@@ -2191,10 +2382,8 @@ units angstrom
                 order_indices = np.random.permutation(len(self.dataset))
             else:
                 order_indices = np.arange(len(self.dataset))
-            train_indices = order_indices[: int(
-                len(self.dataset) * split_percent)]
-            test_indices = order_indices[int(
-                len(self.dataset) * split_percent):]
+            train_indices = order_indices[: int(len(self.dataset) * split_percent)]
+            test_indices = order_indices[int(len(self.dataset) * split_percent) :]
             train_dataset = self.dataset[train_indices]
             test_dataset = self.dataset[test_indices]
             batch_size = train_dataset.training_batch_size

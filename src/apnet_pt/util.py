@@ -5,6 +5,7 @@ General utility functions for pre-processing molecules
 import numpy as np
 import pandas as pd
 import qcelemental as qcel
+import torch
 
 from apnet_pt import constants
 
@@ -12,6 +13,49 @@ from apnet_pt import constants
 from torch_geometric.data import Data
 from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
+
+
+def scatter_sum_compile(src, index, dim_size, reduce="sum"):
+    """
+    Compile-friendly version of torch_geometric scatter for sum reduction.
+    
+    This function avoids graph breaks in torch.compile by using native PyTorch
+    operations instead of torch_geometric.utils.scatter which contains .item()
+    calls that cause dynamo graph breaks.
+    
+    Parameters
+    ----------
+    src : torch.Tensor
+        Source tensor to scatter (any number of dimensions)
+    index : torch.Tensor
+        Index tensor indicating where to scatter each element (1D)
+    dim_size : int
+        Size of the output dimension 0
+    reduce : str
+        Reduction operation, must be "sum" or "add"
+    
+    Returns
+    -------
+    torch.Tensor
+        Scattered tensor with shape (dim_size, *src.shape[1:])
+    
+    Notes
+    -----
+    This function only supports reduce="sum" and reduce="add" which are equivalent.
+    For other reduction types, use torch_geometric.utils.scatter.
+    """
+    # if reduce not in ["sum", "add"]:
+    #     raise ValueError(f"Only 'sum' and 'add' reductions supported, got '{reduce}'")
+    
+    out_shape = (dim_size,) + src.shape[1:]
+    output = torch.zeros(out_shape, dtype=src.dtype, device=src.device)
+    
+    index_shape = (index.size(0),) + (1,) * (src.dim() - 1)
+    index_expanded = index.view(index_shape).expand_as(src)
+    
+    result = output.scatter_add_(0, index_expanded, src)
+    
+    return result
 
 
 def qcel_to_dimerdata(dimer):
@@ -64,18 +108,40 @@ def qcel_to_monomerdata(monomer):
 
 
 def dimerdata_to_qcel(RA, RB, ZA, ZB, aQA, aQB):
-    """ML-ready numpy arrays to qcel mol"""
+    """
+    Convert ML-ready dimer arrays into a qcel Molecule representing the two fragments.
+    
+    Parameters:
+        RA (np.ndarray): Coordinates for fragment A with shape (nA, 3) in angstroms.
+        RB (np.ndarray): Coordinates for fragment B with shape (nB, 3) in angstroms.
+        ZA (Sequence[int]): Atomic numbers for fragment A (length nA).
+        ZB (Sequence[int]): Atomic numbers for fragment B (length nB).
+        aQA (float|int|np.integer): Per-atom charge for fragment A, or an integer total charge for fragment A.
+        aQB (float|int|np.integer): Per-atom charge for fragment B, or an integer total charge for fragment B.
+    
+    Returns:
+        qcel.models.Molecule: A qcel Molecule composed of fragment A and fragment B.
+    
+    Notes:
+        - If `aQA`/`aQB` is an integer type, it is treated as the fragment total charge; otherwise it is interpreted as a per-atom charge and multiplied by the fragment atom count and rounded to produce the total fragment charge (with an assertion that the rounded value matches within 1e-6).
+        - The returned molecule string includes "no_com", "no_reorient", and units set to angstrom.
+    """
 
     nA = RA.shape[0]
     nB = RB.shape[0]
     ZA = [int(z) for z in ZA]
     ZB = [int(z) for z in ZB]
 
-    tQA = int(round(aQA * nA))
-    tQB = int(round(aQB * nB))
+    # if type of aQA is int, then tQA is just aQA
+    if isinstance(aQA, int) or isinstance(aQA, np.integer):
+        tQA = aQA
+        tQB = aQB
+    else:
+        tQA = int(round(aQA * nA))
+        tQB = int(round(aQB * nB))
 
-    assert abs(tQA - aQA * nA) < 1e-6
-    assert abs(tQB - aQB * nB) < 1e-6
+        assert abs(tQA - aQA * nA) < 1e-6
+        assert abs(tQB - aQB * nB) < 1e-6
 
     blockA = f"{tQA} {1}\n"
     for ia in range(nA):
@@ -163,31 +229,49 @@ def load_dimer_dataset(
     columns=["Total_aug", "Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
     return_qcel_mols=True,
     return_qcel_mons=False,
+    return_fragment_indices=False,
     random_seed_shuffle=None,
 ):
-    """Load multiple dimers from a :class:`~pandas.DataFrame`
-
-    Loads dimers from the :class:`~pandas.DataFrame` format associated with the original AP-Net publication.
-    Each row of the :class:`~pandas.DataFrame` corresponds to a molecular dimer.
-
-    The columns [`ZA`, `ZB`, `RA`, `RB`, `TQA`, `TQB`] are required.
-    `ZA` and `ZB` are atom types (:class:`~numpy.ndarray` of `int` with shape (`n`,)).
-    `RA` and `RB` are atomic positions in Angstrom (:class:`~numpy.ndarray` of `float` with shape (`n`,3.)).
-    `TQA` and `TQB` are monomer charges (int).
-
-    The columns [`Total_aug`, `Elst_aug`, `Exch_aug`, `Ind_aug`, and `Disp_aug`] are optional.
-    Each column describes SAPT0/aug-cc-pV(D+d)Z labels in kcal / mol (`float`).
-
-    Parameters
-    ----------
-    file : str
-        The name of a file containing the :class:`~pandas.DataFrame`
-
-    Returns
-    -------
-    dimers : list of :class:`~qcelemental.models.Molecule`
-    labels : list of :class:`~numpy.ndarray` or None
-        None is returned if SAPT0 label columns are not present in the :class:`~pandas.DataFrame`
+    """
+    Load a dataset of molecular dimers from a pandas DataFrame file in AP‑Net format and return selected representations and labels.
+    
+    This function reads a DataFrame pickle, filters rows missing specified SAPT columns (if provided), optionally shuffles and truncates the dataset, validates element types, and extracts per-dimer data either from explicit columns or from a `qcel_molecule` column when present. Depending on the boolean flags it returns qcel Molecule dimers, qcel monomers, fragment index mappings suitable for monomer contexts, or raw per-fragment arrays, along with optional SAPT labels.
+    
+    Parameters:
+        file (str): Path to a pickle file containing the pandas DataFrame.
+        max_size (int or None): If set, limit the returned dataset to at most this many rows.
+        columns (list of str): SAPT label column names to require and return. Rows with NaN in any of these columns are dropped; if these columns are absent or unreadable, returned labels will be None.
+        return_qcel_mols (bool): If True, return a list of qcelemental Molecule objects representing each dimer.
+        return_qcel_mons (bool): If True, return two lists (monomer A list, monomer B list) of qcelemental Molecule objects for each row.
+        return_fragment_indices (bool): If True, return fragment index lists converted to 0-based monomer indexing (see Returns). Mutually exclusive with return_qcel_mons.
+        random_seed_shuffle (int or None): If set, shuffle the DataFrame deterministically using this seed before further processing.
+    
+    Returns:
+        Depending on the flags:
+        - If return_qcel_mons is True:
+            (monAs, monBs, labels)
+            monAs, monBs: lists of qcelemental.models.Molecule for monomer A and monomer B respectively.
+            labels: numpy.ndarray of SAPT columns or None if labels are not available.
+        - Else if return_qcel_mols is True:
+            (dimers, labels)
+            dimers: list of qcelemental.models.Molecule representing each dimer.
+            labels: numpy.ndarray of SAPT columns or None.
+        - Else if return_fragment_indices is True:
+            (RA, RB, ZA, ZB, TQA, TQB, labels, frag1_indices, frag2_indices)
+            RA, RB: lists of per-atom coordinate arrays (Angstrom) for monomer A and B.
+            ZA, ZB: lists of int arrays of atomic numbers for monomer A and B.
+            TQA, TQB: lists of total fragment charges (int or float) for A and B.
+            labels: numpy.ndarray of SAPT columns or None.
+            frag1_indices: list of lists of 0-based atom indices into monomer A corresponding to original dimer Frag1_indices.
+            frag2_indices: list of lists of 0-based atom indices into monomer B corresponding to original dimer Frag2_indices (converted from dimer 1-based indexing by subtracting monomer A size and 1).
+        - Otherwise (default fallback):
+            (RA, RB, ZA, ZB, TQA, TQB, labels)
+            As above but without fragment index lists.
+    
+    Notes:
+        - The DataFrame must contain ZA, ZB, RA, RB, TQA, and TQB columns (or a valid qcel_molecule column). ZA/ZB should be iterable of atomic numbers; RA/RB should be per-atom coordinate arrays in Angstrom.
+        - Rows containing elements not present in the module's allowed element set are removed.
+        - return_qcel_mons and return_fragment_indices cannot both be True.
     """
 
     df = pd.read_pickle(file)
@@ -196,29 +280,55 @@ def load_dimer_dataset(
     if random_seed_shuffle is not None:
         df = df.sample(frac=1, random_state=random_seed_shuffle).reset_index(drop=True)
     allowed_elements = constants.z_to_elem.keys()
-    len_df_start = len(df)
-    df = df[df["ZA"].apply(lambda x: all([z in allowed_elements for z in x]))].copy()
-    df = df[df["ZB"].apply(lambda x: all([z in allowed_elements for z in x]))].copy()
-    len_df_end = len(df)
-    if len_df_start != len_df_end:
-        print(f"  Removed {len_df_start - len_df_end} rows with invalid elements")
-    N = len(df.index)
 
-    if max_size is not None and max_size < N:
-        df = df.head(max_size)
-        N = max_size
+    assert not ((return_qcel_mons == True) and (return_fragment_indices == True)), (
+        "Cannot return both monomers and fragment indices simultaneously presently."
+    )
 
-    RA = df.RA.tolist()
-    RB = df.RB.tolist()
-    ZA = df.ZA.tolist()
-    ZB = df.ZB.tolist()
-    TQA = df.TQA.tolist()
-    TQB = df.TQB.tolist()
+    # if qcel_molecules is a column, use this as the source of truth to generate RA, RB, ZA, ZB, TQA, TQB
+    if 'qcel_molecule' in df.columns:
+        def extract_mol_data(mol):
+            if all([z in allowed_elements for z in mol.atomic_numbers]) is False:
+                return None, None, None, None, None, None
+            monA, monB = mol.get_fragment(0), mol.get_fragment(1)
+
+            RA = torch.tensor(monA.geometry, dtype=torch.float32) * constants.au2ang
+            RB = torch.tensor(monB.geometry, dtype=torch.float32) * constants.au2ang
+            ZA = torch.tensor(monA.atomic_numbers, dtype=torch.int64)
+            ZB = torch.tensor(monB.atomic_numbers, dtype=torch.int64)
+
+            TQA = torch.tensor(monA.molecular_charge, dtype=torch.float32)
+            TQB = torch.tensor(monB.molecular_charge, dtype=torch.float32)
+            return RA.numpy(), RB.numpy(), ZA.numpy(), ZB.numpy(), TQA.item(), TQB.item()
+        v = df['qcel_molecule'].apply(extract_mol_data).tolist()
+        # Filter out any None entries due to invalid elements
+        v = [entry for entry in v if entry[0] is not None]
+        N = len(v)
+        RA, RB, ZA, ZB, TQA, TQB = zip(*v)
+    else:
+        len_df_start = len(df)
+        df = df[df["ZA"].apply(lambda x: all([z in allowed_elements for z in x]))].copy()
+        df = df[df["ZB"].apply(lambda x: all([z in allowed_elements for z in x]))].copy()
+        len_df_end = len(df)
+        if len_df_start != len_df_end:
+            print(f"  Removed {len_df_start - len_df_end} rows with invalid elements")
+        N = len(df.index)
+
+        if max_size is not None and max_size < N:
+            df = df.head(max_size)
+            N = max_size
+
+        RA = df.RA.tolist()
+        RB = df.RB.tolist()
+        ZA = df.ZA.tolist()
+        ZB = df.ZB.tolist()
+        TQA = df.TQA.tolist()
+        TQB = df.TQB.tolist()
     aQA = [TQA[i] / np.sum(ZA[i] > 0) for i in range(N)]
     aQB = [TQB[i] / np.sum(ZB[i] > 0) for i in range(N)]
     try:
         labels = df[columns].to_numpy()
-    except:
+    except Exception:
         labels = None
 
     if return_qcel_mons:
@@ -233,6 +343,35 @@ def load_dimer_dataset(
             dimers.append(dimerdata_to_qcel(RA[i], RB[i], ZA[i], ZB[i], aQA[i], aQB[i]))
 
         return dimers, labels
+    if return_fragment_indices:
+        frag1_indices = df["Frag1_indices"].tolist()
+        # frag2_indices are defined in the dimer geometry context (1-indexed),
+        # but we need them in the monomer B context (0-indexed), so subtract
+        # nA (number of atoms in monomer A) + 1 to convert to 0-indexed monB.
+        frag2_indices = df["Frag2_indices"].tolist()
+        for i in range(N):
+            # print(f"\n{i=}")
+            # Convert frag1 from 1-indexed dimer to 0-indexed monA
+            frag1_indices[i] = [int(idx - 1) for idx in frag1_indices[i]]
+            # Get number of atoms in monomer A (NOT the fragment length!)
+            nA = len(ZA[i])
+            # Convert frag2 from 1-indexed dimer to 0-indexed monB
+            # Subtract nA to shift from dimer indexing to monB indexing,
+            # then subtract 1 to convert from 1-indexed to 0-indexed
+            frag2_indices[i] = [int(idx - nA) for idx in frag2_indices[i]]
+            # print(f"{frag1_indices[i] = }")
+            # print(f"{frag2_indices[i] = }")
+
+            assert np.all(np.array(frag1_indices[i]) >= 0), (
+                "Fragment 1 indices are negative after conversion. "
+                "Ensure Frag1_indices in the dataset are 1-indexed dimer coordinates."
+            )
+            assert np.all(np.array(frag2_indices[i]) >= 0), (
+                "Fragment 2 indices are negative after conversion. "
+                "Ensure Frag2_indices in the dataset are 1-indexed dimer coordinates "
+                "with monB atoms starting at index nA+1."
+            )
+        return RA, RB, ZA, ZB, TQA, TQB, labels, frag1_indices, frag2_indices
     return RA, RB, ZA, ZB, TQA, TQB, labels
 
 
@@ -406,9 +545,18 @@ def load_monomer_dataset(
     """
 
     df = pd.read_pickle(file)
-    print(df.columns.values)
     N = len(df.index)
     print(f"Reading {file} with {N} rows")
+    if hirshfeld_props:
+        # drop rows with missing hirshfeld properties
+        pre_drop_N = len(df.index)
+        df = df.dropna(subset=["volume ratios", "valence widths"])
+        post_drop_N = len(df.index)
+        if pre_drop_N != post_drop_N:
+            print(
+                f"Dropped {pre_drop_N - post_drop_N} rows with missing hirshfeld properties"
+            )
+        N = post_drop_N 
 
     if max_size is not None and max_size < N:
         print("Truncating dataset to max_size:", max_size)

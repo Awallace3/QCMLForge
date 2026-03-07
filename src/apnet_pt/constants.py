@@ -3,6 +3,9 @@ Fixed constants (units, atom types, etc.)
 """
 
 import qcelemental as qcel
+import pandas as pd
+from importlib import resources
+import torch
 
 au2ang = qcel.constants.conversion_factor("bohr", "angstrom")
 h2kcalmol = qcel.constants.conversion_factor("hartree", "kcal/mol")
@@ -69,3 +72,28 @@ pol_free = {
   'Kr': 16.80,
   'I' : 35.00,
 }
+
+libmbd_vwd_params = pd.read_csv(
+    # osp.join(current_file_path, "data", "vdw-params.csv"),
+    resources.files(
+        "apnet_pt",
+    ).joinpath("data", "vdw-params.csv"),
+    header=0,
+    index_col=0,
+    sep=",",
+    nrows=102,
+)
+free_atom_polarizabilities = {
+    # el: v for el, v in zip(libmbd_vwd_params['Z'], libmbd_vwd_params['alpha_0(TS)'])
+    el: v
+    for el, v in zip(libmbd_vwd_params["Z"], libmbd_vwd_params["alpha_0(BG)"])
+}
+
+# from pprint import pprint as pp
+# pp(free_atom_polarizabilities)
+
+# Create lookup table as a tensor
+max_z = max(free_atom_polarizabilities.keys())
+polarizability_table = torch.zeros(max_z + 1)
+for z, value in free_atom_polarizabilities.items():
+    polarizability_table[z] = value

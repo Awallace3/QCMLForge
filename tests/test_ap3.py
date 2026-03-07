@@ -64,7 +64,7 @@ def test_ap3_architecture():
         4.996978532290086150e-06,  # INDU
         4.996978532290086150e-06,  # DISP
     ]
-    atom_model = apnet_pt.AtomModels.ap3_atom_model.AtomHirshfeldModel(
+    atom_model = apnet_pt.AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel(
         ds_root=None,
         ignore_database_null=True,
     )
@@ -83,7 +83,7 @@ def test_ap3_architecture():
 
 @pytest.mark.skip(reason="Models still being updated... run only for development reasons.")
 def test_ap3_exch():
-    atom_model = apnet_pt.AtomModels.ap3_atom_model.AtomHirshfeldModel(
+    atom_model = apnet_pt.AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel(
         ds_root=None,
         ignore_database_null=True,
         pre_trained_model_path="./models/am_hf_ensemble/am_4.pt",
@@ -107,7 +107,7 @@ def test_ap3_exch():
 
 @pytest.mark.skip(reason="Models still being updated... run only for development reasons.")
 def test_ap3_indu():
-    atom_model = apnet_pt.AtomModels.ap3_atom_model.AtomHirshfeldModel(
+    atom_model = apnet_pt.AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel(
         ds_root=None,
         ignore_database_null=True,
         pre_trained_model_path="./models/am_hf_ensemble/am_4.pt",

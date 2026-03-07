@@ -1,4 +1,5 @@
 from apnet_pt.AtomPairwiseModels.apnet2 import APNet2Model
+import apnet_pt
 from apnet_pt.AtomPairwiseModels.dapnet2 import dAPNet2Model, APNet2_dAPNet2Model
 from apnet_pt import AtomPairwiseModels
 from apnet_pt import atomic_datasets
@@ -26,6 +27,16 @@ import qcelemental as qcel
 import torch
 import pandas as pd
 from pprint import pprint as pp
+from .mols import (
+    # mol_mon,
+    mol_dimer,
+    # mol_dimer2,
+    # mol_A,
+    mol_dimer_ion,
+    mol_cliff_water_close,
+    # mol3,
+    # mol_fsapt,
+)
 
 
 torch.manual_seed(42)
@@ -33,50 +44,12 @@ spec_type = 5
 current_file_path = os.path.dirname(os.path.realpath(__file__))
 data_path = f"{current_file_path}/test_data_path"
 am_path = f"{current_file_path}/../src/apnet_pt/models/am_ensemble/am_0.pt"
-am_hf_path = f"{current_file_path}/../src/apnet_pt/models/am_hf_ensemble/am_0.pt"
 
-
-mol_mon = qcel.models.Molecule.from_data("""0 1
-16  -0.8795  -2.0832  -0.5531
-7   -0.2959  -1.8177   1.0312
-7    0.5447  -0.7201   1.0401
-6    0.7089  -0.1380  -0.1269
-6    0.0093  -0.7249  -1.1722
-1    1.3541   0.7291  -0.1989
-1   -0.0341  -0.4523  -2.2196
-units angstrom
-""")
-
-mol_dimer = qcel.models.Molecule.from_data("""
-0 1
-8   -0.702196054   -0.056060256   0.009942262
-1   -1.022193224   0.846775782   -0.011488714
-1   0.257521062   0.042121496   0.005218999
---
-0 1
-8   2.268880784   0.026340101   0.000508029
-1   2.645502399   -0.412039965   0.766632411
-1   2.641145101   -0.449872874   -0.744894473
-""")
-
-mol_dimer2 = qcel.models.Molecule.from_data("""
-0 1
-8   -0.702196054   -0.056060256   0.009942262
-1   -1.022193224   0.846775782   -0.011488714
-1   0.257521062   0.042121496   0.005218999
---
-0 1
-8   3.268880784   0.026340101   0.000508029
-1   3.645502399   -0.412039965   0.766632411
-1   3.641145101   -0.449872874   -0.744894473
-""")
-
-mol_A = qcel.models.Molecule.from_data("""
-0 1
-8   -0.702196054   -0.056060256   0.009942262
-1   -1.022193224   0.846775782   -0.011488714
-1   0.257521062   0.042121496   0.005218999
-""")
+am_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_3.pt"
+at_hf_vw_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_h+1_3.pt"
+at_elst_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_elst_h+1_3.pt"
+ap3_path = f"{current_file_path}/test_models/ap3_ensemble_0/ap3_.pt"
+am_hf_path = f"{current_file_path}/test_models/am_hf_0.pt"
 
 
 def test_apnet2_dataset_size_no_prebatched():
@@ -388,6 +361,7 @@ def test_apnet2_dataset_size_prebatched_qcel_molecules_in_memory():
     )
 
 
+@pytest.mark.skip("Models no longer available vi PyPI")
 def test_dapnet2_dataset_size_prebatched_qcel_molecules_in_memory():
     batch_size = 4
     datapoint_storage_n_objects = 4
@@ -435,6 +409,7 @@ def test_dapnet2_dataset_size_prebatched_qcel_molecules_in_memory():
     )
 
 
+@pytest.mark.skip("Models no longer available vi PyPI")
 def test_dapnet2_dataset_size_qcel_molecules_in_memory():
     batch_size = 4
     datapoint_storage_n_objects = 4
@@ -481,12 +456,12 @@ def test_dapnet2_dataset_size_qcel_molecules_in_memory():
     )
 
 
+@pytest.mark.skip("Models no longer available vi PyPI")
 def test_apnet2_train_qcel_molecules_in_memory_transfer():
     batch_size = 2
     atomic_batch_size = 4
     datapoint_storage_n_objects = 6
     prebatched = False
-    collate = apnet2_collate_update_prebatched if prebatched else apnet2_collate_update
     qcel_molecules = [mol_dimer] * 31
     energy_labels = [1.0 for _ in range(len(qcel_molecules))]
     print(
@@ -518,15 +493,16 @@ def test_apnet2_train_qcel_molecules_in_memory_transfer():
     v_0 = ap2.predict_qcel_mols(qcel_molecules[0:2], batch_size=2)
     ap2.train(
         ds,
-        n_epochs=10,
+        n_epochs=6,
         skip_compile=True,
         transfer_learning=True,
     )
     v = ap2.predict_qcel_mols(qcel_molecules[0:2], batch_size=2)
     print(np.sum(v_0, axis=1), np.sum(v, axis=1))
-    assert np.allclose(np.sum(v, axis=1), np.ones(2), atol=1e-2)
+    assert np.allclose(np.sum(v, axis=1), np.ones(2), atol=1e-1)
 
 
+@pytest.mark.skip("Models no longer available vi PyPI")
 def test_dapnet2_train_qcel_molecules_in_memory_transfer():
     batch_size = 4
     datapoint_storage_n_objects = 4
@@ -565,7 +541,7 @@ def test_dapnet2_train_qcel_molecules_in_memory_transfer():
     v_0 = dap2.predict_qcel_mols(qcel_molecules_pair, batch_size=2)
     dap2.train(
         ds,
-        n_epochs=10,
+        n_epochs=6,
         skip_compile=True,
     )
     v = dap2.predict_qcel_mols(qcel_molecules_pair, batch_size=2)
@@ -581,7 +557,7 @@ def test_apnet2_train_qcel_molecules_in_memory():
     qcel_molecules = [mol_dimer] * 31
     energy_labels = [[1.0] * 4 for _ in range(len(qcel_molecules))]
     atom_model = AtomModels.ap2_atom_model.AtomModel().set_pretrained_model(model_id=0)
-    ap2 = APNet2Model().set_pretrained_model(model_id=0)
+    ap2 = APNet2Model()
     ds = apnet2_module_dataset(
         root=data_path,
         r_cut=5.0,
@@ -605,7 +581,7 @@ def test_apnet2_train_qcel_molecules_in_memory():
     )
     ap2.train(
         ds,
-        n_epochs=5,
+        n_epochs=3,
         skip_compile=True,
         transfer_learning=False,
         lr=0.005,
@@ -652,12 +628,12 @@ def test_apnet2_dataset_size_prebatched_train_spec8():
     print()
     print(ds)
     print(ds.training_batch_size)
-    ap2 = APNet2Model().set_pretrained_model(model_id=0)
+    ap2 = APNet2Model()
     print("Example input before training:")
     print(ap2.eval_fn(ap2.example_input()))
     ap2.train(
         ds,
-        n_epochs=2,
+        n_epochs=3,
         skip_compile=True,
     )
     print("Example input after training:")
@@ -692,10 +668,10 @@ def test_apnet2_dataset_size_prebatched_train_spec9():
     print()
     print(ds)
     print(ds.training_batch_size)
-    ap2 = APNet2Model().set_pretrained_model(model_id=0)
+    ap2 = APNet2Model()
     ap2.train(
         ds,
-        n_epochs=2,
+        n_epochs=3,
         skip_compile=True,
     )
 
@@ -805,6 +781,7 @@ def test_dapnet2_dataset_size_prebatched():
     )
 
 
+@pytest.mark.skip("Models no longer available vi PyPI")
 def test_dapnet2_dataset_ap2_stored_size_prebatched():
     batch_size = 2
     datapoint_storage_n_objects = 8
@@ -853,11 +830,12 @@ def test_dapnet2_dataset_ap2_stored_size_prebatched():
         os.remove(i)
     for i in glob(f"{data_path}/processed_delta/targets_Elst_aug_to_Exch_aug.pt"):
         os.remove(i)
-    assert ds_labels * ds.batch_size - 1 == cnt, f"Expected {
-        ds_labels * ds.batch_size - 1
-    } points, but got {cnt} points"
+    assert ds_labels * ds.batch_size - 1 == cnt, (
+        f"Expected {ds_labels * ds.batch_size - 1} points, but got {cnt} points"
+    )
 
 
+@pytest.mark.skip("Models no longer available vi PyPI")
 def test_dapnet2_dataset_ap2_stored_size_prebatched_train():
     batch_size = 2
     atomic_batch_size = 4
@@ -890,7 +868,7 @@ def test_dapnet2_dataset_ap2_stored_size_prebatched_train():
     apnet2_model.model.return_hidden_states = True
     dapnet2 = dAPNet2Model(apnet2_model=apnet2_model, dataset=ds)
     dapnet2.train(
-        n_epochs=2,
+        n_epochs=3,
         skip_compile=True,
     )
     for i in glob(
@@ -900,6 +878,7 @@ def test_dapnet2_dataset_ap2_stored_size_prebatched_train():
     return
 
 
+@pytest.mark.skip("Models no longer available vi PyPI")
 def test_dapnet2_dataset_size_prebatched_train():
     batch_size = 2
     atomic_batch_size = 4
@@ -933,7 +912,7 @@ def test_dapnet2_dataset_size_prebatched_train():
     apnet2_model.return_hidden_states = True
     dapnet2 = APNet2_dAPNet2Model(apnet2_mpnn=apnet2_model, dataset=ds)
     dapnet2.train(
-        n_epochs=2,
+        n_epochs=3,
         skip_compile=True,
     )
     for i in glob(
@@ -1062,7 +1041,7 @@ def test_apnet2_model_train():
         ds_num_devices=1,
         ds_skip_process=False,
         # ds_max_size=10,
-    ).set_pretrained_model(model_id=0)
+    )
     apnet2.train(
         model_path="./models/ap2_test.pt",
         n_epochs=1,
@@ -1102,7 +1081,7 @@ def test_apnet2_model_train_small():
         ds_num_devices=1,
         ds_skip_process=False,
         # ds_max_size=10,
-    ).set_pretrained_model(model_id=0)
+    )
     apnet2.train(
         model_path="./models/ap2_test.pt",
         n_epochs=1,
@@ -1154,143 +1133,60 @@ def test_apnet2_model_train_small_r_cut_im():
         omp_num_threads_per_process=8,
         lr=2e-3,
         lr_decay=0.10,
-        skip_compile=True,
+        skip_compile=False,
         # lr_decay=None,
     )
     return
 
 
-def test_atomhirshfeld_model_train():
-    ds = atomic_datasets.atomic_hirshfeld_module_dataset(
+def test_atom_model_train():
+    ds = atomic_datasets.atomic_module_dataset(
         root=data_path,
         transform=None,
         pre_transform=None,
         r_cut=5.0,
         testing=False,
-        spec_type=5,
+        spec_type=6,
         max_size=None,
         force_reprocess=False,
         in_memory=True,
         batch_size=1,
     )
     print(ds)
-    am = AtomModels.ap3_atom_model.AtomHirshfeldModel(
-        use_GPU=False,
-        ignore_database_null=False,
-        dataset=ds,
-    )
-    print(am)
-    am.train(
-        n_epochs=5,
-        batch_size=1,
-        lr=5e-4,
-        split_percent=0.5,
-        model_path=None,
-        optimize_for_speed=False,
-        shuffle=True,
-        dataloader_num_workers=0,
-        world_size=1,
-        omp_num_threads_per_process=None,
-        random_seed=42,
-    )
-    return
-
-
-def test_atomhirshfeld_model_train():
-    ds = atomic_datasets.atomic_hirshfeld_module_dataset(
-        root=data_path,
-        transform=None,
-        pre_transform=None,
-        r_cut=5.0,
-        testing=False,
-        spec_type=5,
-        max_size=None,
-        force_reprocess=False,
-        in_memory=True,
-        batch_size=1,
-    )
-    print(ds)
-    am = AtomModels.ap3_atom_model.AtomHirshfeldModel(
-        use_GPU=False,
-        ignore_database_null=False,
-        dataset=ds,
-    )
-    print(am)
-    am.train(
-        n_epochs=5,
-        batch_size=1,
-        lr=5e-4,
-        split_percent=0.5,
-        model_path=None,
-        optimize_for_speed=False,
-        shuffle=True,
-        dataloader_num_workers=0,
-        world_size=1,
-        omp_num_threads_per_process=None,
-        random_seed=42,
-    )
-    return
-
-
-@pytest.mark.skip(reason="Skip this test for large ap3 dataset")
-def test_ap3_model_train():
-    world_size = 1
-    print("World Size", world_size)
-
-    batch_size = 16
-    omp_num_threads_per_process = 8
-    apnet3 = AtomPairwiseModels.apnet3.APNet3Model(
-        atom_model_pre_trained_path="./models/am_hf_ensemble/am_4.pt",
-        pre_trained_model_path=None,
-        ds_spec_type=7,
-        ds_root=data_path,
-        ignore_database_null=False,
-        ds_atomic_batch_size=200,
-        ds_num_devices=1,
-        ds_skip_process=False,
-        ds_datapoint_storage_n_objects=batch_size,
-        ds_prebatched=True,
-        use_GPU=False,
-    )
-    apnet3.train(
-        model_path="./ap3_test.pt",
-        n_epochs=5,
-        world_size=world_size,
-        omp_num_threads_per_process=omp_num_threads_per_process,
-        lr=5e-4,
-        dataloader_num_workers=4,
-        random_seed=4,
-        skip_compile=True,
-    )
-
-
-def test_am_dimer_multipole_ds():
-    ds = atomic_datasets.atomic_hirshfeld_module_dataset(
-        root=data_path,
-        transform=None,
-        pre_transform=None,
-        r_cut=5.0,
-        testing=False,
-        spec_type=5,
-        max_size=None,
-        force_reprocess=False,
-        in_memory=True,
-        batch_size=1,
-    )
-    print(ds)
+    # DDP
+    os.environ["OMP_NUM_THREADS"] = "2"
     am = AtomModels.ap2_atom_model.AtomModel(
         use_GPU=False,
         ignore_database_null=False,
         dataset=ds,
     )
-    print(am)
     am.train(
-        n_epochs=5,
+        n_epochs=3,
         batch_size=1,
         lr=5e-4,
         split_percent=0.5,
         model_path=None,
-        optimize_for_speed=False,
+        shuffle=True,
+        skip_compile=True,
+        dataloader_num_workers=0,
+        world_size=2,
+        omp_num_threads_per_process=4,
+        random_seed=42,
+    )
+    am = AtomModels.ap2_atom_model.AtomModel(
+        use_GPU=True,
+        ignore_database_null=False,
+        dataset=ds,
+    )
+    print(am)
+    # GPU
+    am.train(
+        n_epochs=3,
+        batch_size=1,
+        lr=5e-4,
+        split_percent=0.5,
+        model_path=None,
+        skip_compile=True,
         shuffle=True,
         dataloader_num_workers=0,
         world_size=1,
@@ -1300,14 +1196,722 @@ def test_am_dimer_multipole_ds():
     return
 
 
+def test_AtomTypeParamModel_train():
+    """
+    AtomTypeParamModel hirsfhfeld_valencewidth uses atomic_hirshfeld_module_dataset with ap2_atom_model
+    """
+    ds = atomic_datasets.atomic_hirshfeld_module_dataset(
+        root=data_path,
+        transform=None,
+        pre_transform=None,
+        r_cut=5.0,
+        testing=False,
+        spec_type=5,
+        max_size=None,
+        force_reprocess=False,
+        in_memory=True,
+        batch_size=1,
+    )
+    print(ds)
+    am = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        use_GPU=False,
+        ignore_database_null=False,
+        dataset=ds,
+    )
+    print(am)
+    am.train(
+        n_epochs=3,
+        batch_size=1,
+        lr=5e-4,
+        split_percent=0.5,
+        model_path=None,
+        shuffle=True,
+        dataloader_num_workers=0,
+        world_size=1,
+        omp_num_threads_per_process=None,
+        random_seed=42,
+    )
+
+
+def test_AtomTypeParamModel_elst_train():
+    """
+    AtomTypeParamModel hirsfhfeld_valencewidth uses atomic_hirshfeld_module_dataset with ap2_atom_model
+    """
+    qcel_molecules = [mol_cliff_water_close] * 4
+    energy_labels = [
+        np.array([-10.779292828139122, -500, -3.414543432719425, 10000])
+        for _ in range(len(qcel_molecules))
+    ]
+    am = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    am.set_pretrained_model(model_id=0)
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        # atom_model_type='AtomTypeParamNN',
+        atom_model_type="AtomMPNN",
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=None,
+        ds_qcel_molecules=qcel_molecules,
+        ds_energy_labels=energy_labels,
+        param_start_mean=[3.2],
+        param_start_std=[0.2],
+        n_neuron=32,
+        n_params=1,
+        dimer_eval_type="elst_damping",
+    )
+    param_mod.train(
+        n_epochs=3,
+        # skip_compile=True,
+        skip_compile=False,
+        lr=5e-4,
+        split_percent=0.5,
+    )
+
+
+def test_AtomTypeParamModel_ind_train():
+    """ """
+    qcel_molecules = [mol_cliff_water_close] * 4
+    energy_labels = [
+        np.array([-10.779292828139122, -500, -3.414543432719425, 10000])
+        for _ in range(len(qcel_molecules))
+    ]
+    am = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+        # current_file_path + "/../models/ap_atomTypeParamModel/am_0.pt",
+    )
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        atom_model_type="AtomTypeParamNN",
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=None,
+        ds_qcel_molecules=qcel_molecules,
+        ds_energy_labels=energy_labels,
+        param_start_mean=[1.8],
+        param_start_std=[0.05],
+        n_neuron=32,
+        n_params=1,
+        dimer_eval_type="induced_dipole_param",
+    )
+    param_mod.train(
+        # n_epochs=100,
+        n_epochs=1,
+        # skip_compile=True,
+        skip_compile=False,
+        lr=5e-4,
+        split_percent=0.5,
+    )
+
+
+def test_AtomTypeParamModel_AM_DimerProp_train():
+    df = pd.read_pickle(current_file_path + "/dataset_data/elst_damping_test.pkl")
+    qcel_molecules = df["qcel_molecule"].to_list()
+    energy_labels = (
+        df[["SAPT0 ELST", "SAPT0 EXCH", "SAPT0 IND", "SAPT0 DISP"]].values
+        * qcel.constants.hartree2kcalmol
+    )
+    print(energy_labels)
+    am = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=current_file_path
+        + "/../models/am_ensemble/am_0.pt",
+        pre_trained_model_path=current_file_path
+        + "/../models/ap_atomTypeParamModel/am_h+1_0.pt",
+    )
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        atom_model_type="AtomTypeParamNN",
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=None,
+        ds_qcel_molecules=qcel_molecules,
+        ds_energy_labels=energy_labels,
+        param_start_mean=[0.9, 1.8],
+        param_start_std=[0.15, 0.05],
+        n_neuron=64,
+        n_params=2,
+        dimer_eval_type="elst_damping__induced_dipole",
+    )
+    param_mod.train(
+        n_epochs=3,
+        # n_epochs=25,
+        # skip_compile=True,
+        skip_compile=False,
+        lr=5e-5,
+        split_percent=0.5,
+    )
+
+
+def test_AtomTypeParamModel_AM_DimerProp_train_elst_only():
+    """
+    AtomTypeParamModel hirsfhfeld_valencewidth uses atomic_hirshfeld_module_dataset with ap2_atom_model
+    """
+    df = pd.read_pickle(current_file_path + "/dataset_data/elst_damping_test.pkl")
+    qcel_molecules = df["qcel_molecule"].to_list()
+    for i in qcel_molecules:
+        print(i.to_string("psi4"))
+    energy_labels = (
+        df[["SAPT0 ELST", "SAPT0 EXCH", "SAPT0 IND", "SAPT0 DISP"]].values
+        * qcel.constants.hartree2kcalmol
+    )
+    print(energy_labels)
+
+    am = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=current_file_path
+        + "/../models/am_ensemble/am_0.pt",
+        pre_trained_model_path=current_file_path
+        + "/../models/ap_atomTypeParamModel/am_h+1_0.pt",
+    )
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        atom_model_type="AtomTypeParamNN",
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=None,
+        ds_qcel_molecules=qcel_molecules,
+        ds_energy_labels=energy_labels,
+        param_start_mean=[0.9],
+        param_start_std=[0.15],
+        n_neuron=64,
+        n_params=1,
+        dimer_eval_type="elst_damping",
+    )
+    param_mod.train(
+        n_epochs=3,
+        # n_epochs=25,
+        # skip_compile=True,
+        skip_compile=False,
+        lr=5e-5,
+        split_percent=0.5,
+    )
+
+
+def test_AtomTypeParamModel_AM_DimerProp_train_elst_only():
+    """
+    AtomTypeParamModel hirsfhfeld_valencewidth uses atomic_hirshfeld_module_dataset with ap2_atom_model
+    """
+    df = pd.read_pickle(current_file_path + "/dataset_data/elst_damping_test.pkl")
+    qcel_molecules = df["qcel_molecule"].to_list()
+    for i in qcel_molecules:
+        print(i.to_string("psi4"))
+    energy_labels = (
+        df[["SAPT0 ELST", "SAPT0 EXCH", "SAPT0 IND", "SAPT0 DISP"]].values
+        * qcel.constants.hartree2kcalmol
+    )
+    print(energy_labels)
+
+    am = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=current_file_path
+        + "/../models/am_ensemble/am_0.pt",
+        pre_trained_model_path=current_file_path
+        + "/../models/ap_atomTypeParamModel/am_h+1_0.pt",
+    )
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        atom_model_type="AtomTypeParamNN",
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=None,
+        ds_qcel_molecules=qcel_molecules,
+        ds_energy_labels=energy_labels,
+        param_start_mean=[0.9],
+        param_start_std=[0.15],
+        n_neuron=64,
+        n_params=1,
+        dimer_eval_type="elst_damping",
+    )
+    param_mod.train(
+        n_epochs=3,
+        # n_epochs=25,
+        # skip_compile=True,
+        skip_compile=False,
+        lr=5e-5,
+        split_percent=0.5,
+    )
+
+
+def test_AtomTypeNNParamModel_AM_DimerProp_train_elst_only():
+    df = pd.read_pickle(current_file_path + "/dataset_data/elst_damping_test.pkl")
+    qcel_molecules = df["qcel_molecule"].to_list()
+    energy_labels = (
+        df[["SAPT0 ELST", "SAPT0 EXCH", "SAPT0 IND", "SAPT0 DISP"]].values
+        * qcel.constants.hartree2kcalmol
+    )
+
+    am = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=current_file_path
+        + "/../models/am_ensemble/am_0.pt",
+        pre_trained_model_path=current_file_path
+        + "/../models/ap_atomTypeParamModel/am_h+1_0.pt",
+    )
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        atom_model_type="AtomTypeParamNN",
+        model_type="AtomTypeParamNN",
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=None,
+        ds_qcel_molecules=qcel_molecules,
+        ds_energy_labels=energy_labels,
+        param_start_mean=[3.3],
+        param_start_std=[0.3],
+        n_neuron=64,
+        n_params=1,
+        dimer_eval_type="elst_damping",
+    )
+    param_mod.train(
+        n_epochs=3,
+        # skip_compile=True,
+        skip_compile=False,
+        lr=5e-4,
+        split_percent=0.5,
+    )
+
+
+def test_AtomTypeParamNNModel_AM_DimerProp_train_elst_only_spec7():
+    am = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=current_file_path
+        + "/../models/am_ensemble/am_0.pt",
+        pre_trained_model_path=current_file_path
+        + "/../models/ap_atomTypeParamModel/am_h+1_0.pt",
+    )
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        atom_model_type="AtomTypeParamNN",
+        model_type="AtomTypeParamNN",
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=7,
+        param_start_mean=[2.6],
+        param_start_std=[0.3],
+        n_neuron=32,
+        n_params=1,
+        dimer_eval_type="elst_damping",
+    )
+    param_mod.train(
+        n_epochs=3,
+        skip_compile=False,
+        lr=5e-4,
+    )
+
+
+def test_AtomTypeParamModel_AM_DimerProp_train_elst_only_spec7():
+    """
+    AtomTypeParamModel hirsfhfeld_valencewidth uses atomic_hirshfeld_module_dataset with ap2_atom_model
+    """
+    am = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        atom_model_type="AtomTypeParamNN",
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=7,
+        param_start_mean=[1.6],
+        param_start_std=[0.15],
+        n_neuron=64,
+        n_params=1,
+        dimer_eval_type="elst_damping",
+    )
+    param_mod.train(
+        n_epochs=3,
+        skip_compile=False,
+        lr=5e-5,
+        model_path=None,
+    )
+
+
+def test_ap3_spec7():
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=data_path,
+        use_GPU=False,
+        n_neuron=64,
+        n_params=1,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+    ap3 = apnet_pt.AtomPairwiseModels.apnet3_fused.APNet3_AtomType_Model(
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=7,
+        ds_in_memory=False,
+        atom_type_model=atom_type_hf_vw_model.model,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        use_precomputed_classical=True,
+    )
+    ap3.train(
+        n_epochs=3,
+        skip_compile=True,
+        transfer_learning=False,
+        lr=5e-4,
+        dataloader_num_workers=4,
+    )
+    for i in glob(f"{data_path}/processed/dimer_ap2_spec_*.pt"):
+        os.remove(i)
+
+
+def test_ap2_spec7():
+    atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        pre_trained_model_path=current_file_path + "/../models/am_ensemble/am_0.pt",
+        ignore_database_null=True,
+    )
+    ap2 = apnet_pt.AtomPairwiseModels.apnet2_fused.APNet2_AM_Model(
+        atom_model=atom_model.model,
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=7,
+    )
+    ap2.train(
+        n_epochs=5,
+        skip_compile=False,
+        transfer_learning=False,
+        lr=5e-4,
+        dataloader_num_workers=4,
+    )
+    for i in glob(f"{data_path}/processed/dimer_ap2_spec_*.pt"):
+        os.remove(i)
+
+
+def test_atomhirshfeld_model_train():
+    ds = atomic_datasets.atomic_hirshfeld_module_dataset(
+        root=data_path,
+        transform=None,
+        pre_transform=None,
+        r_cut=5.0,
+        testing=False,
+        spec_type=5,
+        max_size=None,
+        force_reprocess=False,
+        in_memory=True,
+        batch_size=1,
+    )
+    print(ds)
+    am = AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel(
+        use_GPU=False,
+        ignore_database_null=False,
+        dataset=ds,
+    )
+    print(am)
+    am.train(
+        n_epochs=3,
+        batch_size=1,
+        lr=5e-4,
+        split_percent=0.5,
+        model_path=None,
+        shuffle=True,
+        dataloader_num_workers=0,
+        world_size=1,
+        omp_num_threads_per_process=None,
+        random_seed=42,
+    )
+    return
+
+
+def test_mtp_mtp_elst_qcel_mols():
+    qcel_molecules = [mol_dimer] * 4
+    energy_labels = [
+        np.array([-10.779292828139122, 0, 0, 0]) for _ in range(len(qcel_molecules))
+    ]
+    print(energy_labels)
+    am = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    am.set_pretrained_model(model_id=0)
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=None,
+        ds_qcel_molecules=qcel_molecules,
+        ds_energy_labels=energy_labels,
+        param_start_mean=2.0,
+        param_start_std=0.1,
+        n_neuron=16,
+    )
+    print(param_mod)
+    param_mod.train(
+        n_epochs=3,
+        skip_compile=True,
+        lr=5e-4,
+        split_percent=0.5,
+    )
+
+
+def test_mtp_mtp_elst_dataset():
+    am = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    am.set_pretrained_model(model_id=0)
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        ignore_database_null=False,
+        # pre_trained_model_path="nan.pt",
+        ds_force_reprocess=True,
+        ds_spec_type=7,
+        use_GPU=False,
+        ds_root=data_path,
+        param_start_mean=1.5,
+        param_start_std=0.1,
+        n_neuron=32,
+    )
+    param_mod.train(
+        n_epochs=2,
+        skip_compile=False,
+        lr=5e-3,
+        # model_path='nan.pt',
+    )
+
+
+def test_mtp_mtp_elst_eval():
+    am = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    am.set_pretrained_model(model_id=0)
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        ignore_database_null=False,
+        # pre_trained_model_path="nan.pt",
+        ds_force_reprocess=True,
+        ds_spec_type=7,
+        use_GPU=False,
+        ds_root=data_path,
+        param_start_mean=1.5,
+        param_start_std=0.1,
+        n_neuron=32,
+    )
+    batch = param_mod._qcel_example_input([mol_dimer_ion])
+    v = param_mod.model(batch)
+    print(v[-1])
+    batch = param_mod._qcel_dimer_example_input([mol_dimer_ion])
+    v = param_mod.dimer_model(batch)
+    print(v[-1])
+    elst_energy = param_mod.predict_qcel_mols_dimer([mol_dimer_ion], batch_size=1)
+    print(f"Predicted ELST energy: {elst_energy}")
+    return
+
+
+def test_induced_dipole_qcel_mols():
+    qcel_molecules = [mol_cliff_water_close] * 4
+    energy_labels = [
+        np.array([-1000, -500, -3.414543432719425, 10000])
+        for _ in range(len(qcel_molecules))
+    ]
+    print(energy_labels)
+    am = apnet_pt.AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    am.set_pretrained_model(current_file_path + "/../models/am_hf_ensemble/am_0.pt")
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        ds_root=data_path,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=None,
+        ds_qcel_molecules=qcel_molecules,
+        ds_energy_labels=energy_labels,
+        param_start_mean=1.3,
+        param_start_std=0.05,
+        n_neuron=32,
+        dimer_eval_type="induced_dipole",
+    )
+    print(param_mod)
+    param_mod.train(
+        n_epochs=3,
+        # skip_compile=True,
+        skip_compile=False,
+        lr=5e-4,
+        split_percent=0.5,
+    )
+
+
+def test_induced_dipole_dataset():
+    am = apnet_pt.AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=True,
+    )
+    am.set_pretrained_model(am_hf_path)
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        ignore_database_null=False,
+        # pre_trained_model_path="nan.pt",
+        ds_force_reprocess=True,
+        ds_spec_type=7,
+        use_GPU=False,
+        ds_root=data_path,
+        param_start_mean=0.4,
+        param_start_std=0.2,
+        n_neuron=32,
+        dimer_eval_type="induced_dipole",
+    )
+    param_mod.train(
+        n_epochs=3,
+        skip_compile=False,
+        lr=5e-4,
+        # model_path='nan.pt',
+    )
+
+
+def test_induced_dipole_eval():
+    am = apnet_pt.AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    am.set_pretrained_model(am_hf_path)
+    param_mod = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        atom_model=am.model,
+        ignore_database_null=False,
+        # pre_trained_model_path="nan.pt",
+        ds_force_reprocess=True,
+        ds_spec_type=7,
+        use_GPU=False,
+        ds_root=data_path,
+        param_start_mean=1.5,
+        param_start_std=0.1,
+        n_neuron=32,
+        dimer_eval_type="induced_dipole",
+    )
+    print("\nSingle Molecule Eval\n")
+    batch = param_mod._qcel_example_input([mol_dimer_ion])
+    v = param_mod.model(batch)
+    print(v[-1])
+    print("\nDimer Molecule Eval\n")
+    batch = param_mod._qcel_dimer_example_input([mol_dimer])
+    v = param_mod.dimer_model(batch)
+    print(v[-1])
+    print("\nDimer Molecule Ion Eval\n")
+    batch = param_mod._qcel_dimer_example_input([mol_dimer_ion])
+    v = param_mod.dimer_model(batch)
+    print(v[-1])
+    elst_energy = param_mod.predict_qcel_mols_dimer([mol_dimer_ion], batch_size=1)
+    print(f"Predicted INDU energy: {elst_energy}")
+    return
+
+
+def test_ap2_elst_dataset():
+    am = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    am.set_pretrained_model(model_id=0)
+    param_mod = apnet_pt.AtomPairwiseModels.apnet2_fused.APNet2_AM_Model(
+        atom_model=am.model,
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        ds_spec_type=7,
+        use_GPU=False,
+        ds_root=data_path,
+        n_neuron=32,
+    )
+    param_mod.train(
+        # n_epochs=500,
+        n_epochs=3,
+        skip_compile=True,
+        lr=5e-4,
+    )
+
+
 if __name__ == "__main__":
+    # test_AtomTypeParamModel_AM_DimerProp_train_elst_only_spec7()
+    # test_AtomTypeParamNNModel_AM_DimerProp_train_elst_only_spec7()
+    # test_AtomTypeParamModel_train()
+    # test_induced_dipole_qcel_mols()
+    # test_AtomTypeParamModel_AM_DimerProp_train()
+    # test_induced_dipole_eval()
+    # test_induced_dipole_dataset()
+
+    # test_atomhirshfeld_model_train()
+    # test_AtomTypeParamModel_elst_train()
+
+    # test_AtomTypeParamModel_AM_DimerProp_train_elst_only_spec7()
+    # test_ap2_spec7()
+    test_ap3_spec7()
+    # test_ap3_train()
+    # test_AtomTypeParamModel_AM_DimerProp_train_elst_only()
+    # test_AtomTypeParamModel_ind_train()
+
+    # test_mtp_mtp_elst_qcel_mols()
+    # test_mtp_mtp_elst_eval()
+    # test_atom_model_train()
+    # test_mtp_mtp_elst_dataset()
+
+    # test_ap2_elst_dataset()
+    # test_mtp_mtp_elst_dataset()
     # test_apnet2_train_qcel_molecules_in_memory()
-    test_apnet2_train_qcel_molecules_in_memory()
+    # test_apnet2_train_qcel_molecules_in_memory()
     # test_dapnet2_dataset_size_prebatched_qcel_molecules_in_memory()
     # test_apnet2_dataset_size_prebatched_train_spec8()
     # test_apnet2_dataset_size_prebatched()
     # test_dapnet2_dataset_size_prebatched()
     # test_dapnet2_train_qcel_molecules_in_memory_transfer()
     # test_apnet2_model_train()
-    # test_ap3_model_train()
     pass

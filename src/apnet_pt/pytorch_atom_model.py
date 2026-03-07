@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .layers import DistanceLayer, FeedForwardLayer  
-from torch_scatter import scatter_add
 
 #################
 
@@ -13,19 +12,21 @@ max_Z = 118  # largest atomic number
 #################
 
 
-def unsorted_segment_sum(data, segment_ids, num_segments):
-    """
-    Args:
-        data (Tensor): The source tensor.
-        segment_ids (Tensor): The indices of the segments.
-        num_segments (int): The number of segments.
-
-    Returns:
-        Tensor: A tensor of the same type as data, containing the result of the operation.
-    """
-    return scatter_add(data, segment_ids, dim=0, dim_size=num_segments)
-
 def get_distances(RA, RB, e_source, e_target):
+    """
+    Compute pairwise displacement vectors and their Euclidean norms for specified edges.
+    
+    Parameters:
+        RA (torch.Tensor): Source node coordinates with shape (..., 3) or (n_nodes, 3).
+        RB (torch.Tensor): Target node coordinates with shape compatible with RA.
+        e_source (Tensor or LongTensor): Index tensor selecting source positions from RA (shape (n_edges,)).
+        e_target (Tensor or LongTensor): Index tensor selecting target positions from RB (shape (n_edges,)).
+    
+    Returns:
+        tuple:
+            dR (torch.Tensor): 1D tensor of Euclidean distances for each edge (shape (n_edges,)).
+            dR_xyz (torch.Tensor): 2D tensor of displacement vectors RB_target - RA_source for each edge (shape (n_edges, 3)).
+    """
     RA_source = RA[e_source]
     RB_target = RB[e_target]
 

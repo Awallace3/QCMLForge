@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Conda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        python-version: 3.12
+        environment-file: environment.yml
+        activate-environment: qcml
+        auto-activate-base: false
+    
+    - name: Install PyTorch Geometric packages
+      shell: bash -l {0}
+      run: |
+        # Install torch-scatter and torch-geometric from pre-built wheels (CPU version for CI)
+        pip install torch-geometric -f https://data.pyg.org/whl/torch-2.7.0+cpu.html
+    
+    - name: Install package
+      shell: bash -l {0}
+      run: |
+        pip install -e . --no-deps
+    
+    - name: Run tests
+      shell: bash -l {0}
+      run: |
+        python -m pytest tests/
