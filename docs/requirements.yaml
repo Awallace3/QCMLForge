@@ -7,37 +7,30 @@ channels:
 dependencies:
     # Base depends
   - pip
-  
+  - sphinx
   - pydata-sphinx-theme
   - sphinx-design
   - sphinx-copybutton
-
   - numpy=2.2.*
   - pandas=2.2.*
-  - pytorch=2.7.0
+  - pytorch=2.5.1
   - flask=3.1.0
   - jinja2=3.1.4
-  - numpy=2.2.*
-  - pandas=2.2.*
-  - pip
   - psycopg2=2.9.9
   - pytest=7.4.4
-  - python>=3.12
-  - pytorch=2.7.0
+  - python=3.12
   - sympy=1.13.3
-  - matplotlib==3.10.0
-  - pydantic==2.*
-  - scipy==1.15.*
-  - tqdm==4.*
+  - matplotlib=3.10.0
+  - pydantic=2.*
+  - scipy=1.15.*
+  - tqdm=4.*
     # Pip-only installs
   - pip:
     - qcelemental==0.29.0
     - qm-tools-aw==1.4.5
     - torch-geometric==2.6.1
-    - torch-scatter==2.1.2
     - waitress==3.0.2
     - yarl==1.18.3
     - pytorch-minimize
     - qcportal==0.59
     - -e ../
-

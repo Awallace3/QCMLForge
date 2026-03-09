@@ -2,12 +2,12 @@
 
 Add any paths that contain templates here, relative to  
 the `conf.py` file's directory.
-They are copied after the builtin template files,
-so a file named "page.html" will overwrite the builtin "page.html".
+Sphinx looks in `templates_path` when rendering pages,
+so a file named `page.html` can override the built-in template.
 
-The path to this folder is set in the Sphinx `conf.py` file in the line: 
+The path to this folder is set in the Sphinx `conf.py` file in the line:
 ```python
-html_static_path = ['_templates']
+templates_path = ['_templates']
 ```
 
 ## Examples of file to add to this directory

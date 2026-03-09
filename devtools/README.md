@@ -26,7 +26,7 @@ This directory contains OS agnostic helper scripts which don't fall in any of th
 
 
 ## How to contribute changes
-- Clone the repository if you have write access to the main repo, fork the repository if you are a collaborator.
+- Fork the repository if you do not have write access to the main repo; if you have write access, clone the main repository and work on a branch.
 - Make a new branch with `git checkout -b {your branch name}`
 - Make changes and test your code
 - Ensure that the test environment dependencies (`conda-envs`) line up with the build and deploy dependencies (`conda-recipe/meta.yaml`)
@@ -49,7 +49,7 @@ This directory contains OS agnostic helper scripts which don't fall in any of th
 is installed by looking at the `git` tags and how many commits ahead this version is. The format follows 
 [PEP 440](https://www.python.org/dev/peps/pep-0440/) and has the regular expression of:
 ```regexp
-\d+.\d+.\d+(?\+\d+-[a-z0-9]+)
+\d+\.\d+\.\d+(?:\+\d+-[a-z0-9]+)?
 ```
 If the version of this commit is the same as a `git` tag, the installed version is the same as the tag, 
 e.g. `qcmlforge-0.1.2`, otherwise it will be appended with `+X` where `X` is the number of commits 

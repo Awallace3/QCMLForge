@@ -13,7 +13,7 @@ dependencies:
   - psycopg2=2.9.9
   - pytest=7.4.4
   - python=3.12.8
-  - pytorch=2.7.0
+  - pytorch=2.5.1
   - pytorch-mutex=1.0
   - requests=2.32.3
   - setuptools=72.1.0
@@ -21,13 +21,12 @@ dependencies:
   - torchaudio
   - torchtriton
   - torchvision
-  - matplotlib==3.10.0
-  - pydantic==2.*
-  - scipy==1.15.*
-  - tqdm==4.*
+  - matplotlib=3.10.0
+  - pydantic=2.*
+  - scipy=1.15.*
+  - tqdm=4.*
 
     # Testing
-  - pytest
   - pytest-cov
   - codecov
 
@@ -35,7 +34,6 @@ dependencies:
       - qcelemental==0.29.0
       - qm-tools-aw==1.4.5
       - torch-geometric==2.6.1
-      - torch-scatter==2.1.2
       - waitress==3.0.2
       - yarl==1.18.3
       - pytorch-minimize

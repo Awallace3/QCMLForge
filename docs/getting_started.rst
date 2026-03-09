@@ -17,23 +17,21 @@ mode:
    conda activate qcml
    pip install -e .
 
-If `torch-scatter` or `torch-geometric` fail to import, reinstall the matching
+If `torch-geometric` fail to import, reinstall the matching
 prebuilt wheels for your PyTorch runtime:
 
 .. code-block:: bash
 
    # CUDA example
-   pip uninstall torch-geometric torch-scatter
-   export TORCH=2.7.0
+   pip uninstall torch-geometric
+   export TORCH=2.5.1
    export CUDA=cu126
    pip install torch-geometric==2.6.1 -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
-   pip install torch-scatter==2.1.2 -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
 
    # CPU example
-   pip uninstall torch-geometric torch-scatter
-   export TORCH=2.7.0
+   pip uninstall torch-geometric
+   export TORCH=2.5.1
    pip install torch-geometric==2.6.1 -f https://data.pyg.org/whl/torch-${TORCH}+cpu.html
-   pip install torch-scatter==2.1.2 -f https://data.pyg.org/whl/torch-${TORCH}+cpu.html
 
 Run Pretrained AtomModel Inference
 ----------------------------------
@@ -110,7 +108,7 @@ run:
 .. code-block:: bash
 
    python3 ./train_models.py \
-       --train_ap2 \
+       --train_apnet APNet2 \
        --ap_model_path ./models/example/ap2_example.pt \
        --n_epochs 5
 
@@ -119,9 +117,9 @@ For the atomic multipole model:
 .. code-block:: bash
 
    python3 ./train_models.py \
-       --train_am \
+       --train_am AtomModel \
        --am_model_path ./models/example/am_example.pt \
-       --n_epochs 5
+       --n_epochs_atom 5
 
 Next Steps
 ----------

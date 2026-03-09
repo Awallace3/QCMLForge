@@ -121,9 +121,10 @@ submodels. They require:
 - a dimer-property model for classical electrostatic and polarization terms
 - either raw or precomputed classical features depending on `use_precomputed_classical`
 
-The `apnet3_fused` class is the main fused AP3 implementation, while
-`apnet3_fused_variants` exposes the same harness name with larger default model
-sizes and cutoff settings.
+The `APNet3_AtomType_Model` class in `apnet3_fused` is the main fused AP3
+implementation, while `apnet3_fused_variants` exposes the same
+`APNet3_AtomType_Model` harness with larger default model sizes and cutoff
+settings.
 
 Reference Classes
 -----------------

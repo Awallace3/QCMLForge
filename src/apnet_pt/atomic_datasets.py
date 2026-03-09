@@ -54,12 +54,6 @@ def natural_key(text):
     -------
     list
         A list of strings and integers representing the input text, suitable
-def generate_monomer_multipole_dataset(file):
-    monomers, cartesian_multipoles, _, _ = util.load_monomer_dataset(
-        "mon200.pkl")
-    return
-
-
         for natural sorting.
 
     Examples
@@ -82,8 +76,7 @@ def distance_matrix_torch(r):
 
 
 def generate_monomer_multipole_dataset(file):
-    monomers, cartesian_multipoles, _, _ = util.load_monomer_dataset("mon200.pkl")
-    return
+    return util.load_monomer_dataset(file)
 
 
 def vec_func(R_ij, R_c=5.0, n_bessel=8):

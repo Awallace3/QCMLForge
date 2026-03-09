@@ -25,7 +25,7 @@ jobs:
       shell: bash -l {0}
       run: |
         # Install torch-scatter and torch-geometric from pre-built wheels (CPU version for CI)
-        pip install torch-geometric -f https://data.pyg.org/whl/torch-2.7.0+cpu.html
+        pip install torch-geometric -f https://data.pyg.org/whl/torch-2.5.1+cpu.html
     
     - name: Install package
       shell: bash -l {0}
@@ -35,7 +35,7 @@ jobs:
     - name: Install documentation dependencies
       shell: bash -l {0}
       run: |
-        pip install sphinx pydata-sphinx-theme sphinx-design sphinx-copybutton
+        python -m pip install -r docs/requirements.txt
      
     - name: Run tests
       shell: bash -l {0}

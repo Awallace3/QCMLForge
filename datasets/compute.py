@@ -24,7 +24,7 @@ ROOT = os.getcwd()
 
 
 def add_QCdataset(
-    df: pd.DataFrame,
+    df: pd.DataFrame | None,
     system: str = "AP2-monomers",
     method: str = "PBE0",
     basis: str = "aug-cc-pVTZ",
@@ -39,9 +39,10 @@ def add_QCdataset(
 
     Parameters
     ----------
-    df : pd.DataFrame
+    df : pd.DataFrame or None
         A DataFrame containing molecular information. It must have columns
         "name" and "qcel", where "qcel" contains QCElemental Molecule objects.
+        This is only required when ``mode="create"``.
     system : str, optional
         The name of the dataset on the QCFractal server. Defaults to
         "AP2-monomers".
@@ -63,8 +64,7 @@ def add_QCdataset(
     """
     # client.delete_dataset(dataset_id=2, delete_records=True)
     try:
-        ds = client.add_dataset("singlepoint", system,
-                                f"Dataset to contain {system}")
+        ds = client.add_dataset("singlepoint", system, f"Dataset to contain {system}")
         print(f"Added {system} as dataset")
     except Exception:
         ds = client.get_dataset("singlepoint", system)
@@ -72,6 +72,8 @@ def add_QCdataset(
         print(ds)
 
     if mode == "create":
+        if df is None:
+            raise ValueError("A DataFrame is required when mode='create'.")
         entry_list = []
         for idx, row in df.iterrows():
             name = row["name"]
@@ -131,6 +133,112 @@ def submit(ds: SinglepointDataset, tag: str = "short") -> None:
     print(f"Submitted {ds.name} dataset")
 
 
+def analyze(ds: SinglepointDataset, output: str) -> pd.DataFrame:
+    """Collect completed QCFractal results and save them to disk.
+
+    Parameters
+    ----------
+    ds : SinglepointDataset
+        Dataset to analyze.
+    output : str
+        Path where the processed DataFrame will be written.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing the processed MBIS properties.
+
+    """
+    ds.status()
+    ds.print_status()
+
+    data = {
+        "id": [],
+        "name": [],
+        "Z": [],
+        "R": [],
+        "cartesian_multipoles": [],
+        "entry_name": [],
+        "spec_name": [],
+        "TQ": [],
+        "molecular_multiplicity": [],
+        "volume ratios": [],
+        "valence widths": [],
+        "radial moments <r^2>": [],
+        "radial moments <r^3>": [],
+        "radial moments <r^4>": [],
+    }
+    for entry_name, spec_name, record in tqdm(ds.iterate_records(status="complete")):
+        record_dict = record.dict()
+        qcvars = record_dict["properties"]
+        charges = qcvars["mbis charges"]
+        dipoles = qcvars["mbis dipoles"]
+        quadrupoles = qcvars["mbis quadrupoles"]
+
+        n = len(charges)
+        charges = np.reshape(charges, (n, 1))
+        dipoles = np.reshape(dipoles, (n, 3))
+        quad = np.reshape(quadrupoles, (n, 3, 3))
+        quad = [q[np.triu_indices(3)] for q in quad]
+        multipoles = np.concatenate([charges, dipoles, np.array(quad)], axis=1)
+
+        data["volume ratios"].append(qcvars["mbis volume ratios"])
+        data["valence widths"].append(qcvars["mbis valence widths"])
+        data["radial moments <r^2>"].append(qcvars["mbis radial moments <r^2>"])
+        data["radial moments <r^3>"].append(qcvars["mbis radial moments <r^3>"])
+        data["radial moments <r^4>"].append(qcvars["mbis radial moments <r^4>"])
+        data["id"].append(record.molecule.extras["idx"])
+        data["name"].append(record.molecule.extras["name"])
+        data["Z"].append(record.molecule.atomic_numbers)
+        data["R"].append(record.molecule.geometry * qcel.constants.bohr2angstroms)
+        data["cartesian_multipoles"].append(multipoles)
+        data["entry_name"].append(entry_name)
+        data["spec_name"].append(spec_name)
+        data["TQ"].append(int(record.molecule.molecular_charge))
+        data["molecular_multiplicity"].append(record.molecule.molecular_multiplicity)
+
+    df = pd.DataFrame(data)
+    df.to_pickle(output)
+    print(df)
+    print(df.columns.values)
+    return df
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for dataset workflow management."""
+    parser = argparse.ArgumentParser(
+        description="Manage QCFractal singlepoint datasets."
+    )
+    parser.add_argument(
+        "mode",
+        choices=["create", "run", "progress", "analyze"],
+        help="Workflow stage to execute.",
+    )
+    parser.add_argument(
+        "--input",
+        default="../data_dir/raw/monomers_ap3_spec_1.pkl",
+        help="Pickle file used to create the dataset.",
+    )
+    parser.add_argument(
+        "--output",
+        default="../data_dir/raw/monomers_ap3_spec_1_pbe0.pkl",
+        help="Pickle file written during analyze mode.",
+    )
+    parser.add_argument(
+        "--system",
+        default="AP2-monomers",
+        help="QCFractal dataset name.",
+    )
+    parser.add_argument("--method", default="PBE0", help="Quantum chemistry method.")
+    parser.add_argument(
+        "--basis", default="aug-cc-pVTZ", help="Basis set used for the dataset."
+    )
+    parser.add_argument(
+        "--tag", default="normal", help="Submission tag used in run mode."
+    )
+    return parser.parse_args()
+
+
 def main():
     """Main function to manage the QC dataset workflow.
 
@@ -153,6 +261,28 @@ def main():
     server, and data is read from and saved to pickled pandas DataFrames.
 
     """
+    args = parse_args()
+    print(f"Running in {args.mode} mode")
+
+    df = None
+    if args.mode == "create":
+        df = pd.read_pickle(args.input)
+
+    ds = add_QCdataset(
+        df,
+        args.system,
+        method=args.method,
+        basis=args.basis,
+        mode=args.mode,
+    )
+
+    if args.mode == "run":
+        submit(ds, tag=args.tag)
+    elif args.mode == "progress":
+        ds.status()
+        ds.print_status()
+    elif args.mode == "analyze":
+        analyze(ds, args.output)
 
 
 if __name__ == "__main__":

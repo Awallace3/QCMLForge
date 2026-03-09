@@ -1,5 +1,5 @@
-﻿qcmlforge.qca.setup\_qcarchive\_qcfractal
-=========================================
+qcmlforge.qca.setup_qcarchive_qcfractal
+========================================
 
 .. currentmodule:: qcmlforge.qca
 

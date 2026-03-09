@@ -52,8 +52,8 @@ Training Scripts
 `train_models.py` is the main command-line entry point for local training. The
 repository README includes minimal examples for:
 
-- AtomModel multipole training with `--train_am`
-- APNet2 interaction training with `--train_ap2`
+- AtomModel multipole training with `--train_am <model_name>`
+- APNet interaction training with `--train_apnet <model_name>`
 
 Use `train_ddp_slurm.py` when running distributed jobs under Slurm.
 

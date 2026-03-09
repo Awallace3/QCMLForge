@@ -1,6 +1,7 @@
 # QCMLForge
 
 [![Tests](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml/badge.svg)](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml)
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/Awallace3/QCMLForge?utm_source=oss&utm_medium=github&utm_campaign=Awallace3%2FQCMLForge&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
 Leverage QCArchive data for creating QC ML models. AP-Net2 has been
 re-implemented in PyTorch with newer versions to come.
@@ -21,17 +22,15 @@ If you get an OS.Error when running qcml related to torch-scatter, you likely ne
 to install a specific version through the following example:
 ```bash
 # If you want the CUDA version
-pip uninstall torch-geometric torch-scatter
+pip uninstall torch-geometric
 export TORCH=2.7.0
 export CUDA=cu126 # for cuda version 12.8
 pip install torch-geometric==2.6.1 -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
-pip install torch-scatter==2.1.2 -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
 
 # If you want the CPU version
-pip uninstall torch-geometric torch-scatter
+pip uninstall torch-geometric
 export TORCH=2.7.0
 pip install torch-geometric==2.6.1 -f https://data.pyg.org/whl/torch-${TORCH}+cpu.html
-pip install torch-scatter==2.1.2 -f https://data.pyg.org/whl/torch-${TORCH}+cpu.html
 ```
 
 ## Usage Workshop Demo

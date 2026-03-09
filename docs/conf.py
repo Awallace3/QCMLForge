@@ -13,12 +13,11 @@
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 
 # Incase the project was not installed
-import os
 import sys
+from importlib.metadata import PackageNotFoundError, version as pkg_version
+from pathlib import Path
 
-sys.path.insert(0, os.path.abspath(".."))
-
-import qcmlforge
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 # -- Project information -----------------------------------------------------
@@ -31,7 +30,10 @@ copyright = (
 author = "Austin M. Wallace"
 
 # The short X.Y version
-version = getattr(qcmlforge, "__version__", "")
+try:
+    version = pkg_version("qcmlforge")
+except PackageNotFoundError:
+    version = "0.1.0"
 # The full version, including alpha/beta/rc tags
 release = version
 

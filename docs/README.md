@@ -3,6 +3,12 @@
 The docs for this project are built with [Sphinx](http://www.sphinx-doc.org/en/master/).
 To compile the docs, first ensure that the necessary dependencies are installed.
 
+The local docs build depends on `sphinx`, `pydata-sphinx-theme`,
+`sphinx-design`, and `sphinx-copybutton`.
+
+```bash
+python -m pip install -r docs/requirements.txt
+```
 
 
 Once installed, you can use the `Makefile` in this directory to compile static HTML pages by
@@ -20,4 +26,3 @@ be inside a directory called `html/` depending on what version of Sphinx is inst
 A configuration file for [Read The Docs](https://readthedocs.org/) (readthedocs.yaml) is included in the top level of the repository. To use Read the Docs to host your documentation, go to https://readthedocs.org/ and connect this repository. You may need to change your default branch to `main` under Advanced Settings for the project.
 
 If you would like to use Read The Docs with `autodoc` (included automatically) and your package has dependencies, you will need to include those dependencies in your documentation yaml file (`docs/requirements.yaml`).
-
