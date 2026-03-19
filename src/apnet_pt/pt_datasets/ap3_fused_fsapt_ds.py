@@ -940,12 +940,9 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
     def __getstate__(self):
         """Return a picklable state without an open LMDB handle."""
         state = self.__dict__.copy()
-        if state.get("lmdb_env") is not None:
-            try:
-                state["lmdb_env"].close()
-            except Exception:
-                pass
         state["lmdb_env"] = None
+        state["lmdb"] = None
+        state["json"] = None
         state["_cache"] = {}
         state["_cache_keys"] = []
         state["_worker_id"] = None
@@ -954,6 +951,11 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
     def __setstate__(self, state):
         """Restore dataset state and reopen LMDB in the new process."""
         self.__dict__.update(state)
+        import json
+        import lmdb
+
+        self.lmdb = lmdb
+        self.json = json
         self._init_lmdb()
 
     @property
@@ -1373,21 +1375,25 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
         if self.lmdb_env is None:
             raise RuntimeError("LMDB environment not initialized")
 
+        key = str(idx).encode("utf-8")
         with self.lmdb_env.begin() as txn:
-            key = str(idx).encode("utf-8")
             value_bytes = txn.get(key)
 
+        if value_bytes is None:
+            raise IndexError(f"Index {idx} not found in LMDB database")
+        if value_bytes == b"":
+            self._close_lmdb()
+            self._init_lmdb()
+            if self.lmdb_env is None:
+                raise RuntimeError("LMDB environment not initialized")
+            with self.lmdb_env.begin() as retry_txn:
+                value_bytes = retry_txn.get(key)
             if value_bytes is None:
                 raise IndexError(f"Index {idx} not found in LMDB database")
-            if len(value_bytes) == 0:
-                self._close_lmdb()
-                self._init_lmdb()
-                with self.lmdb_env.begin() as retry_txn:
-                    value_bytes = retry_txn.get(key)
-                if not value_bytes:
-                    raise EOFError(f"Stored LMDB value for index {idx} is empty")
+            if value_bytes == b"":
+                raise EOFError(f"Stored LMDB value for index {idx} is empty")
 
-            data = pickle.loads(value_bytes)
+        data = pickle.loads(value_bytes)
 
         self._cache[idx] = data
         self._cache_keys.append(idx)

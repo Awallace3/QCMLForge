@@ -2,6 +2,7 @@ import apnet_pt
 from apnet_pt import atomic_datasets
 from apnet_pt import AtomModels
 import os
+import shutil
 import numpy as np
 import pytest
 from glob import glob
@@ -29,10 +30,16 @@ atp_path = f"{current_file_path}/test_models/ap3_ensemble_0/atp_mpnn_1.pt"
 aidm_path = f"{current_file_path}/test_models/ap3_ensemble_0/atomInducedDipole_atp_screeningNN_lr_1.pt"
 
 
+def _isolated_test_data_dir(tmp_path, name):
+    test_root = tmp_path / name
+    shutil.copytree(f"{data_path}/raw", test_root / "raw")
+    return str(test_root)
+
+
 def test_train_ap3_atomTypeparamMPNN():
     """
     Builds a small Hirshfeld atomic dataset and trains an AP3 AtomTypeParamModel for a short smoke test.
-    
+
     Creates an in-memory atomic Hirshfeld dataset from the test data path, configures threading, instantiates an AP3 AtomTypeParamModel, and runs a 3-epoch training session to validate the training loop and integration with the dataset and model configuration.
     """
     ds = atomic_datasets.atomic_hirshfeld_module_dataset(
@@ -74,7 +81,7 @@ def test_train_ap3_atomTypeparamMPNN():
 def test_train_ap3_atom_model():
     """
     Train an AtomInducedDipoleModel on a small in-memory test dataset using a pretrained AtomTypeParamModel.
-    
+
     Builds an in-memory atomic dataset from the repository test data, instantiates an AtomTypeParamModel from a pretrained checkpoint, constructs an AtomInducedDipoleModel that wraps the atom-type model, and runs a short training session intended for integration/testing. The training runs for three epochs with a learning rate of 5e-4 and a batch size of 1; it configures OpenMP threads and single-process (non-DDP) execution.
     """
     ds = atomic_datasets.atomic_module_dataset(
@@ -124,7 +131,7 @@ def test_train_ap3_atom_model():
 def test_inference_ap3_atom_model():
     """
     Run inference with the AP3 Atom Induced Dipole model on sample dimers and validate outputs against a saved reference.
-    
+
     This test loads a pretrained AtomTypeParamModel and AtomInducedDipoleModel (with neural-network screening enabled), compiles the model, predicts properties for two water-dimer molecules, and asserts element-wise closeness to a previously saved reference tensor within an absolute tolerance of 1e-6.
     """
     atpm = AtomModels.ap3_atomtype_mpnn.AtomTypeParamModel(
@@ -162,9 +169,9 @@ def test_inference_ap3_atom_model():
 def train_ap3_atom_model():
     """
     Train an AP3 Atom Induced Dipole model using a local dimer dataset and a pretrained atom-type MPNN.
-    
+
     Builds an atomic dataset from tests data (spec_type 10, r_cut 5.0, in-memory) and initializes an AtomInducedDipoleModel with a pretrained AtomTypeParam MPNN. Trains the induced-dipole model (100 epochs, lr=5e-4, batch_size=16) and saves the trained weights to the repository models path.
-    
+
     Note: This function has side effects (training, file I/O, environment variable changes) and does not return a value.
     """
     ds = atomic_datasets.atomic_module_dataset(
@@ -212,7 +219,7 @@ def train_ap3_atom_model():
     return
 
 
-def test_lmdb_dataset_creation():
+def test_lmdb_dataset_creation(tmp_path):
     """Test LMDB dataset creation and basic functionality"""
     # Load pre-trained atomtype model
     atpm = AtomModels.ap3_atomtype_mpnn.AtomTypeParamModel(
@@ -224,8 +231,10 @@ def test_lmdb_dataset_creation():
     # Create LMDB dataset
     from apnet_pt.atomic_datasets import atomic_module_dataset_lmdb
 
+    ds_root = _isolated_test_data_dir(tmp_path, "lmdb_dataset_creation")
+
     ds_lmdb = atomic_module_dataset_lmdb(
-        root=data_path,
+        root=ds_root,
         atomtype_hfvr_model=atpm.model,
         testing=False,
         spec_type=5,
@@ -249,10 +258,10 @@ def test_lmdb_dataset_creation():
     return
 
 
-def test_train_with_lmdb():
+def test_train_with_lmdb(tmp_path):
     """
     Train an AtomInducedDipoleModel using an LMDB-backed dataset.
-    
+
     Loads a pretrained AtomTypeParamModel, constructs an AtomInducedDipoleModel configured to use an LMDB dataset with HFVR precomputation, and runs a short single-process training session for integration testing.
     """
     # Load pre-trained atomtype model
@@ -264,13 +273,14 @@ def test_train_with_lmdb():
 
     # Set up environment
     os.environ["OMP_NUM_THREADS"] = "4"
+    ds_root = _isolated_test_data_dir(tmp_path, "train_with_lmdb")
 
     # Create AtomInducedDipoleModel with LMDB dataset
     am = AtomModels.ap3_atom_model.AtomInducedDipoleModel(
         atomtype_hfvr_model=atpm.model,
         use_GPU=False,
         ignore_database_null=False,
-        ds_root=data_path,
+        ds_root=ds_root,
         ds_spec_type=5,
         ds_max_size=50,  # Small for testing
         ds_use_lmdb=True,  # KEY: Use LMDB dataset
@@ -296,7 +306,7 @@ def test_train_with_lmdb():
     return
 
 
-def test_ddp_train_ap3_atom_model():
+def test_ddp_train_ap3_atom_model(tmp_path):
     """Test distributed data parallel training with world_size=2"""
     # Load pre-trained atomtype model
     atpm = AtomModels.ap3_atomtype_mpnn.AtomTypeParamModel(
@@ -307,13 +317,14 @@ def test_ddp_train_ap3_atom_model():
 
     # Set up DDP environment
     os.environ["OMP_NUM_THREADS"] = "2"
+    ds_root = _isolated_test_data_dir(tmp_path, "ddp_train_with_lmdb")
 
     # Create AtomInducedDipoleModel with LMDB dataset
     am = AtomModels.ap3_atom_model.AtomInducedDipoleModel(
         atomtype_hfvr_model=atpm.model,
         use_GPU=False,
         ignore_database_null=False,
-        ds_root=data_path,
+        ds_root=ds_root,
         ds_spec_type=5,
         ds_max_size=50,  # Small for testing
         ds_use_lmdb=True,  # KEY: Use LMDB dataset
@@ -341,7 +352,7 @@ def test_ddp_train_ap3_atom_model():
 def debug_ap3_atom_model():
     """
     Builds debug AtomTypeParam and frozen InducedDipole models and runs a forward pass on a saved debug batch.
-    
+
     Constructs an AtomTypeParamModel and an InducedDipoleModel using the configured pretrained weights and environment, loads the debug batch tensor from ../debug_batch.pt, performs a forward pass, and prints the instantiated AtomTypeParamModel and the forward output.
     """
     atpm = AtomModels.ap3_atomtype_mpnn.AtomTypeParamModel(
@@ -355,12 +366,14 @@ def debug_ap3_atom_model():
     os.environ["OMP_NUM_THREADS"] = "4"
     idm = AtomModels.ap3_atom_model_frozen.InducedDipoleModel(
         atomtype_hfvr_model=atpm.model,
-        atom_mpnn_pre_trained_path='./models/spice/am_3.pt',
+        atom_mpnn_pre_trained_path="./models/spice/am_3.pt",
         use_GPU=False,
         ignore_database_null=True,
         dataset=None,
     )
-    v = idm.model(torch.load(f"{current_file_path}/../debug_batch.pt", weights_only=False))
+    v = idm.model(
+        torch.load(f"{current_file_path}/../debug_batch.pt", weights_only=False)
+    )
     print(f"{v = }")
     return
 

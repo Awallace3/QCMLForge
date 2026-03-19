@@ -11,8 +11,6 @@ from apnet_pt.AtomPairwiseModels.apnet3_fused import APNet3_AtomType_Model
 from glob import glob
 import pandas as pd
 import pytest
-import shutil
-import tempfile
 
 torch.manual_seed(42)
 spec_type = 5
@@ -120,12 +118,14 @@ def test_ap3_fused_train_qcel_molecules_in_memory():
     datapoint_storage_n_objects = 6
     qcel_molecules = [mol_cliff_water_close] * 4
     energy_labels = [
-        np.array([
-            -10.779292828139122,
-            11.390991215401051,
-            -3.414543432719425,
-            -2.436025699701581,
-        ])
+        np.array(
+            [
+                -10.779292828139122,
+                11.390991215401051,
+                -3.414543432719425,
+                -2.436025699701581,
+            ]
+        )
         for _ in range(len(qcel_molecules))
     ]
     atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
@@ -206,12 +206,14 @@ def test_ap3_fused_train_qcel_molecules_in_memory_precompute():
     datapoint_storage_n_objects = 6
     qcel_molecules = [mol_cliff_water_close] * 4
     energy_labels = [
-        np.array([
-            -10.779292828139122,
-            11.390991215401051,
-            -3.414543432719425,
-            -2.436025699701581,
-        ])
+        np.array(
+            [
+                -10.779292828139122,
+                11.390991215401051,
+                -3.414543432719425,
+                -2.436025699701581,
+            ]
+        )
         for _ in range(len(qcel_molecules))
     ]
     atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
@@ -258,7 +260,7 @@ def test_ap3_fused_train_qcel_molecules_in_memory_precompute():
         dimer_prop_model=atom_type_elst_model.dimer_model,
         am_dimer_param_model=atom_type_elst_model,
         use_precomputed_classical=False,
-        ds_class_type="pt"
+        ds_class_type="pt",
     )
     print(ap3)
     ap3.train(
@@ -287,7 +289,9 @@ def test_ap3_fused_train_qcel_molecules_in_memory_precompute():
 @pytest.mark.xdist_group(name="io_operations")
 def test_classical_ap3():
     df = pd.read_pickle(
-        current_file_path  + os.sep + os.path.join("dataset_data", "water_dimer_pes3.pkl")
+        current_file_path
+        + os.sep
+        + os.path.join("dataset_data", "water_dimer_pes3.pkl")
     )
     r = df.iloc[0]
     mol = r["qcel_molecule"]
@@ -316,14 +320,18 @@ def test_classical_ap3():
         dimer_prop_model=atom_type_elst_model.dimer_model,
         am_dimer_param_model=atom_type_elst_model,
     )
-    monA_props, monB_props = atom_type_elst_model.predict_qcel_mols_monomer_props([mol], model_type="model", am_type="ap3")
-    
-    dimer_batch = apnet_pt.pt_datasets.ap3_fused_ds.ap3_fused_collate_update_no_target([
-        apnet_pt.pt_datasets.ap2_fused_ds.qcel_dimer_to_fused_data(
-            mol, r_cut_im=99999.0, dimer_ind=0
-        )
-    ])
-    
+    monA_props, monB_props = atom_type_elst_model.predict_qcel_mols_monomer_props(
+        [mol], model_type="model", am_type="ap3"
+    )
+
+    dimer_batch = apnet_pt.pt_datasets.ap3_fused_ds.ap3_fused_collate_update_no_target(
+        [
+            apnet_pt.pt_datasets.ap2_fused_ds.qcel_dimer_to_fused_data(
+                mol, r_cut_im=99999.0, dimer_ind=0
+            )
+        ]
+    )
+
     dimer_batch.qA = torch.tensor(monA_props[0][0], dtype=torch.float32)
     dimer_batch.qB = torch.tensor(monB_props[0][0], dtype=torch.float32)
     dimer_batch.muA = torch.tensor(monA_props[0][1], dtype=torch.float32)
@@ -389,7 +397,9 @@ def test_classical_ap3():
     # ref = -1.264973
     # assert np.allclose(torch.sum(torch_ind).item(), ref, atol=1e-4)
 
-    pred, pair_elst, pair_ind = ap3.predict_qcel_mols([mol], batch_size=1, return_classical_pairs=True)
+    pred, pair_elst, pair_ind = ap3.predict_qcel_mols(
+        [mol], batch_size=1, return_classical_pairs=True
+    )
     print(f"AP3 elst = {pred[0][0]:.6f} kcal/mol")
     print(f"{torch_elst = }")
     print(f"{pair_elst  = }")
@@ -398,10 +408,14 @@ def test_classical_ap3():
     print(f"{torch_ind = }")
     print(f"{pair_ind  = }")
     assert np.allclose(torch_ind.cpu().numpy(), pair_ind[0].flatten(), atol=1e-4)
-    pred, pair_elst, pair_ind = ap3.predict_qcel_mols([mol, mol_element], batch_size=1, return_classical_pairs=True)
+    pred, pair_elst, pair_ind = ap3.predict_qcel_mols(
+        [mol, mol_element], batch_size=1, return_classical_pairs=True
+    )
     assert np.allclose(torch_elst.cpu().numpy(), pair_elst[0].flatten(), atol=1e-4)
     assert np.allclose(torch_ind.cpu().numpy(), pair_ind[0].flatten(), atol=1e-4)
-    pred, pair_ind, pair_ind = ap3.predict_qcel_mols([mol, mol_element], batch_size=1, return_classical_pairs=True)
+    pred, pair_ind, pair_ind = ap3.predict_qcel_mols(
+        [mol, mol_element], batch_size=1, return_classical_pairs=True
+    )
     assert np.allclose(torch_ind.cpu().numpy(), pair_ind[0].flatten(), atol=1e-4)
     return
 
@@ -431,7 +445,9 @@ def test_classical_ap3_long_range():
         dimer_prop_model=atom_type_elst_model.dimer_model,
         am_dimer_param_model=atom_type_elst_model,
     )
-    monA_props, monB_props = atom_type_elst_model.predict_qcel_mols_monomer_props([mol], model_type="model", am_type="ap3")
+    monA_props, monB_props = atom_type_elst_model.predict_qcel_mols_monomer_props(
+        [mol], model_type="model", am_type="ap3"
+    )
     dimer_batch = apnet_pt.pt_datasets.ap2_fused_ds.ap2_fused_collate_update_no_target(
         [
             apnet_pt.pt_datasets.ap2_fused_ds.qcel_dimer_to_fused_data(
@@ -503,7 +519,9 @@ def test_classical_ap3_long_range():
     # ref = -0.016318
     # assert np.allclose(torch.sum(torch_ind).item(), ref, atol=1e-4)
 
-    pred, pair_elst, pair_ind = ap3.predict_qcel_mols([mol], batch_size=1, return_classical_pairs=True)
+    pred, pair_elst, pair_ind = ap3.predict_qcel_mols(
+        [mol], batch_size=1, return_classical_pairs=True
+    )
     print(f"AP3 elst = {pred[0][0]:.6f} kcal/mol")
     print(f"{torch_elst = }")
     print(f"{pair_elst  = }")
@@ -512,26 +530,32 @@ def test_classical_ap3_long_range():
     print(f"{torch_ind = }")
     print(f"{pair_ind  = }")
     assert np.allclose(torch_ind.cpu().numpy(), pair_ind[0].flatten(), atol=1e-4)
-    pred, pair_elst, pair_ind = ap3.predict_qcel_mols([mol, mol_element], batch_size=1, return_classical_pairs=True)
+    pred, pair_elst, pair_ind = ap3.predict_qcel_mols(
+        [mol, mol_element], batch_size=1, return_classical_pairs=True
+    )
     assert np.allclose(torch_elst.cpu().numpy(), pair_elst[0].flatten(), atol=1e-4)
     assert np.allclose(torch_ind.cpu().numpy(), pair_ind[0].flatten(), atol=1e-4)
-    pred, pair_ind, pair_ind = ap3.predict_qcel_mols([mol, mol_element], batch_size=1, return_classical_pairs=True)
+    pred, pair_ind, pair_ind = ap3.predict_qcel_mols(
+        [mol, mol_element], batch_size=1, return_classical_pairs=True
+    )
     assert np.allclose(torch_ind.cpu().numpy(), pair_ind[0].flatten(), atol=1e-4)
     return
 
 
-def test_ap3_fused_lmdb_dataset():
+def test_ap3_fused_lmdb_dataset(tmp_path):
     batch_size = 2
     atomic_batch_size = 4
     datapoint_storage_n_objects = 6
     qcel_molecules = [mol_cliff_water_close] * 4
     energy_labels = [
-        np.array([
-            -10.779292828139122,
-            11.390991215401051,
-            -3.414543432719425,
-            -2.436025699701581,
-        ])
+        np.array(
+            [
+                -10.779292828139122,
+                11.390991215401051,
+                -3.414543432719425,
+                -2.436025699701581,
+            ]
+        )
         for _ in range(len(qcel_molecules))
     ]
     atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
@@ -549,101 +573,99 @@ def test_ap3_fused_lmdb_dataset():
         atom_model_type="AtomTypeParamNN",
         pre_trained_model_path=at_elst_path,
     )
-    
-    temp_dir = tempfile.mkdtemp()
-    
-    try:
-        ds_lmdb = ap3_fused_module_dataset_lmdb(
-            root=temp_dir,
-            r_cut=5.0,
-            r_cut_im=8.0,
-            spec_type=None,
-            qcel_molecules=qcel_molecules,
-            energy_labels=energy_labels,
-            dimer_prop_model=atom_type_elst_model.dimer_model,
-            cache_size=1000,
-            lmdb_map_size=1024**3,
-            print_level=2,
-            atomic_batch_size=atomic_batch_size,
-            datapoint_storage_n_objects=datapoint_storage_n_objects,
-            batch_size=batch_size,
-        )
-        
-        assert len(ds_lmdb) == len(qcel_molecules)
-        
-        item_0 = ds_lmdb[0]
-        assert item_0 is not None
-        assert hasattr(item_0, 'y')
-        assert hasattr(item_0, 'RA')
-        assert hasattr(item_0, 'RB')
-        
-        del ds_lmdb
-        
-        ds_lmdb_reload = ap3_fused_module_dataset_lmdb(
-            root=temp_dir,
-            r_cut=5.0,
-            r_cut_im=8.0,
-            spec_type=None,
-            cache_size=1000,
-            print_level=2,
-            lmdb_readonly=True,
-            atomic_batch_size=atomic_batch_size,
-            datapoint_storage_n_objects=datapoint_storage_n_objects,
-            batch_size=batch_size,
-        )
-        
-        assert len(ds_lmdb_reload) == len(qcel_molecules)
-        
-        item_0_reload = ds_lmdb_reload[0]
-        assert torch.allclose(item_0.y, item_0_reload.y, atol=1e-6)
-        assert torch.allclose(item_0.RA, item_0_reload.RA, atol=1e-6)
-        assert torch.allclose(item_0.RB, item_0_reload.RB, atol=1e-6)
-        
-        item_1 = ds_lmdb_reload[1]
-        assert item_1 is not None
-        
-        ds_orig = ap3_fused_module_dataset(
-            root=data_path,
-            r_cut=5.0,
-            r_cut_im=8.0,
-            spec_type=None,
-            max_size=None,
-            force_reprocess=True,
-            atomic_batch_size=atomic_batch_size,
-            dimer_prop_model=atom_type_elst_model.dimer_model,
-            datapoint_storage_n_objects=datapoint_storage_n_objects,
-            batch_size=batch_size,
-            num_devices=1,
-            skip_processed=True,
-            skip_compile=True,
-            print_level=2,
-            qcel_molecules=qcel_molecules,
-            energy_labels=energy_labels,
-            in_memory=True,
-            random_seed=None,
-        )
-        
-        item_0_orig = ds_orig[0]
-        assert torch.allclose(item_0_reload.y, item_0_orig.y, atol=1e-6)
-        
-        print("All LMDB dataset tests passed!")
-        
-    finally:
-        shutil.rmtree(temp_dir)
+
+    ds_root = str(tmp_path / "ap3_fused_lmdb_dataset")
+
+    ds_lmdb = ap3_fused_module_dataset_lmdb(
+        root=ds_root,
+        r_cut=5.0,
+        r_cut_im=8.0,
+        spec_type=None,
+        qcel_molecules=qcel_molecules,
+        energy_labels=energy_labels,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        cache_size=1000,
+        lmdb_map_size=1024**3,
+        print_level=2,
+        atomic_batch_size=atomic_batch_size,
+        datapoint_storage_n_objects=datapoint_storage_n_objects,
+        batch_size=batch_size,
+    )
+
+    assert len(ds_lmdb) == len(qcel_molecules)
+
+    item_0 = ds_lmdb[0]
+    assert item_0 is not None
+    assert hasattr(item_0, "y")
+    assert hasattr(item_0, "RA")
+    assert hasattr(item_0, "RB")
+
+    del ds_lmdb
+
+    ds_lmdb_reload = ap3_fused_module_dataset_lmdb(
+        root=ds_root,
+        r_cut=5.0,
+        r_cut_im=8.0,
+        spec_type=None,
+        cache_size=1000,
+        print_level=2,
+        lmdb_readonly=True,
+        atomic_batch_size=atomic_batch_size,
+        datapoint_storage_n_objects=datapoint_storage_n_objects,
+        batch_size=batch_size,
+    )
+
+    assert len(ds_lmdb_reload) == len(qcel_molecules)
+
+    item_0_reload = ds_lmdb_reload[0]
+    assert torch.allclose(item_0.y, item_0_reload.y, atol=1e-6)
+    assert torch.allclose(item_0.RA, item_0_reload.RA, atol=1e-6)
+    assert torch.allclose(item_0.RB, item_0_reload.RB, atol=1e-6)
+
+    item_1 = ds_lmdb_reload[1]
+    assert item_1 is not None
+
+    ds_orig = ap3_fused_module_dataset(
+        root=ds_root,
+        r_cut=5.0,
+        r_cut_im=8.0,
+        spec_type=None,
+        max_size=None,
+        force_reprocess=True,
+        atomic_batch_size=atomic_batch_size,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        datapoint_storage_n_objects=datapoint_storage_n_objects,
+        batch_size=batch_size,
+        num_devices=1,
+        skip_processed=True,
+        skip_compile=True,
+        print_level=2,
+        qcel_molecules=qcel_molecules,
+        energy_labels=energy_labels,
+        in_memory=True,
+        random_seed=None,
+    )
+
+    item_0_orig = ds_orig[0]
+    assert torch.allclose(item_0_reload.y, item_0_orig.y, atol=1e-6)
+
+    print("All LMDB dataset tests passed!")
 
 
-def test_ap3_fused_train_qcel_molecules_in_memory_precompute_lmdb():
+def test_ap3_fused_train_qcel_molecules_in_memory_precompute_lmdb(tmp_path):
     batch_size = 2
     atomic_batch_size = 4
     datapoint_storage_n_objects = 6
     qcel_molecules = [mol_cliff_water_close] * 4
     energy_labels = [
-        np.array([
-            -10.779292828139122,
-            11.390991215401051,
-            -3.414543432719425,
-            -2.436025699701581,
-        ])
+        np.array(
+            [
+                -10.779292828139122,
+                11.390991215401051,
+                -3.414543432719425,
+                -2.436025699701581,
+            ]
+        )
         for _ in range(len(qcel_molecules))
     ]
     atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
@@ -661,8 +683,9 @@ def test_ap3_fused_train_qcel_molecules_in_memory_precompute_lmdb():
         atom_model_type="AtomTypeParamNN",
         pre_trained_model_path=at_elst_path,
     )
+    ds_root = str(tmp_path / "ap3_fused_train_lmdb")
     ds = ap3_fused_module_dataset_lmdb(
-        root=data_path,
+        root=ds_root,
         r_cut=5.0,
         r_cut_im=8.0,
         spec_type=None,
@@ -710,8 +733,6 @@ def test_ap3_fused_train_qcel_molecules_in_memory_precompute_lmdb():
     v = ap3.predict_qcel_mols(qcel_molecules[0:2], batch_size=2)
     print(v_0, v)
     assert np.allclose(v_0, v, atol=1e-6)
-    # need to cleanup lmdb_ap3_fused_spec_None in data_path/processed
-    shutil.rmtree(f"{data_path}/processed/lmdb_ap3_fused_spec_None")
 
 
 if __name__ == "__main__":
@@ -721,4 +742,4 @@ if __name__ == "__main__":
     # test_ap3_fused_train_qcel_molecules_in_memory_precompute()
     # test_classical_ap3_induction()
     # test_ap3_fused_lmdb_dataset()
-    test_ap3_fused_train_qcel_molecules_in_memory_precompute_lmdb()
+    pytest.main([__file__])

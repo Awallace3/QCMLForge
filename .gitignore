@@ -233,3 +233,5 @@ amoeba
 d3data.json
 simple-dftd3/
 tmp.xyz
+tests/test_data_path/og_processed
+tests/test_data_path/processed
