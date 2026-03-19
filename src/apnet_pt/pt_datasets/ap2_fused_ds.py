@@ -1150,7 +1150,8 @@ class ap2_fused_module_dataset(Dataset):
                 "t_test_19.pkl",
             ]
         elif self.spec_type is None:
-            os.system(f"touch {self.raw_dir}/tmp.txt")
+            Path(self.raw_dir).mkdir(parents=True, exist_ok=True)
+            Path(self.raw_dir, "tmp.txt").touch(exist_ok=True)
             return ["tmp.txt"]
         else:
             return [

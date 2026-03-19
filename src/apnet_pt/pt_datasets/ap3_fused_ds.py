@@ -1024,7 +1024,8 @@ class ap3_fused_module_dataset(Dataset):
                 "35K_saptpbe0-d4_totals_test.pkl",
             ]
         elif self.spec_type is None:
-            os.system(f"touch {self.raw_dir}/tmp.txt")
+            Path(self.raw_dir).mkdir(parents=True, exist_ok=True)
+            Path(self.raw_dir, "tmp.txt").touch(exist_ok=True)
             return ["tmp.txt"]
         else:
             return [
@@ -1671,7 +1672,8 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 "35K_saptpbe0-d4_totals_test.pkl",
             ]
         elif self.spec_type is None:
-            os.system(f"touch {self.raw_dir}/tmp.txt")
+            Path(self.raw_dir).mkdir(parents=True, exist_ok=True)
+            Path(self.raw_dir, "tmp.txt").touch(exist_ok=True)
             return ["tmp.txt"]
         else:
             return [

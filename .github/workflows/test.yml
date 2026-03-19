@@ -17,14 +17,14 @@ jobs:
       uses: conda-incubator/setup-miniconda@v3
       with:
         python-version: 3.12
-        environment-file: environment.yml
+        environment-file: environment-ci.yml
         activate-environment: qcml
-        auto-activate-base: false
+        auto-activate: true
     
     - name: Install PyTorch Geometric packages
       shell: bash -l {0}
       run: |
-        # Install torch-scatter and torch-geometric from pre-built wheels (CPU version for CI)
+        # Install CPU-only PyG wheels to match the CI PyTorch build.
         pip install torch-geometric huggingface_hub -f https://data.pyg.org/whl/torch-2.7.0+cpu.html
     
     - name: Install package

@@ -22,6 +22,13 @@ at_hf_vw_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_h+1_3.pt"
 at_elst_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_elst_h+1_3.pt"
 ap3_path = f"{current_file_path}/test_models/ap3_ensemble_0/ap3_.pt"
 
+
+def _copy_tensor(value, dtype=torch.float32):
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone().to(dtype=dtype)
+    return torch.tensor(value, dtype=dtype)
+
+
 mol_cliff_water_close = qcel.models.Molecule.from_data("""
 0 1
 O                    -1.326958220000    -0.105938540000     0.018788150000
@@ -332,20 +339,20 @@ def test_classical_ap3():
         ]
     )
 
-    dimer_batch.qA = torch.tensor(monA_props[0][0], dtype=torch.float32)
-    dimer_batch.qB = torch.tensor(monB_props[0][0], dtype=torch.float32)
-    dimer_batch.muA = torch.tensor(monA_props[0][1], dtype=torch.float32)
-    dimer_batch.muB = torch.tensor(monB_props[0][1], dtype=torch.float32)
-    dimer_batch.quadA = torch.tensor(monA_props[0][2], dtype=torch.float32)
-    dimer_batch.quadB = torch.tensor(monB_props[0][2], dtype=torch.float32)
-    dimer_batch.hlistA = torch.tensor(monA_props[0][3], dtype=torch.float32)
-    dimer_batch.hlistB = torch.tensor(monB_props[0][3], dtype=torch.float32)
-    dimer_batch.Ka = torch.tensor(monA_props[0][-1], dtype=torch.float32)
-    dimer_batch.Kb = torch.tensor(monB_props[0][-1], dtype=torch.float32)
-    dimer_batch.vw_A = torch.tensor(monA_props[0][-2], dtype=torch.float32)
-    dimer_batch.vw_B = torch.tensor(monB_props[0][-2], dtype=torch.float32)
-    dimer_batch.hfvr_A = torch.tensor(monA_props[0][-3], dtype=torch.float32)
-    dimer_batch.hfvr_B = torch.tensor(monB_props[0][-3], dtype=torch.float32)
+    dimer_batch.qA = _copy_tensor(monA_props[0][0])
+    dimer_batch.qB = _copy_tensor(monB_props[0][0])
+    dimer_batch.muA = _copy_tensor(monA_props[0][1])
+    dimer_batch.muB = _copy_tensor(monB_props[0][1])
+    dimer_batch.quadA = _copy_tensor(monA_props[0][2])
+    dimer_batch.quadB = _copy_tensor(monB_props[0][2])
+    dimer_batch.hlistA = _copy_tensor(monA_props[0][3])
+    dimer_batch.hlistB = _copy_tensor(monB_props[0][3])
+    dimer_batch.Ka = _copy_tensor(monA_props[0][-1])
+    dimer_batch.Kb = _copy_tensor(monB_props[0][-1])
+    dimer_batch.vw_A = _copy_tensor(monA_props[0][-2])
+    dimer_batch.vw_B = _copy_tensor(monB_props[0][-2])
+    dimer_batch.hfvr_A = _copy_tensor(monA_props[0][-3])
+    dimer_batch.hfvr_B = _copy_tensor(monB_props[0][-3])
     print(f"dimer_batch.Ka: {dimer_batch.Ka}")
     print(f"dimer_batch.Kb: {dimer_batch.Kb}")
     print(f"dimer_batch.vw_A: {dimer_batch.vw_A}")
@@ -455,19 +462,19 @@ def test_classical_ap3_long_range():
             )
         ]
     )
-    dimer_batch.qA = torch.tensor(monA_props[0][0], dtype=torch.float32)
-    dimer_batch.qB = torch.tensor(monB_props[0][0], dtype=torch.float32)
-    dimer_batch.muA = torch.tensor(monA_props[0][1], dtype=torch.float32)
-    dimer_batch.muB = torch.tensor(monB_props[0][1], dtype=torch.float32)
-    dimer_batch.quadA = torch.tensor(monA_props[0][2], dtype=torch.float32)
-    dimer_batch.quadB = torch.tensor(monB_props[0][2], dtype=torch.float32)
+    dimer_batch.qA = _copy_tensor(monA_props[0][0])
+    dimer_batch.qB = _copy_tensor(monB_props[0][0])
+    dimer_batch.muA = _copy_tensor(monA_props[0][1])
+    dimer_batch.muB = _copy_tensor(monB_props[0][1])
+    dimer_batch.quadA = _copy_tensor(monA_props[0][2])
+    dimer_batch.quadB = _copy_tensor(monB_props[0][2])
 
-    dimer_batch.Ka = torch.tensor(monA_props[0][-1], dtype=torch.float32)
-    dimer_batch.Kb = torch.tensor(monB_props[0][-1], dtype=torch.float32)
-    dimer_batch.vw_A = torch.tensor(monA_props[0][-2], dtype=torch.float32)
-    dimer_batch.vw_B = torch.tensor(monB_props[0][-2], dtype=torch.float32)
-    dimer_batch.hfvr_A = torch.tensor(monA_props[0][-3], dtype=torch.float32)
-    dimer_batch.hfvr_B = torch.tensor(monB_props[0][-3], dtype=torch.float32)
+    dimer_batch.Ka = _copy_tensor(monA_props[0][-1])
+    dimer_batch.Kb = _copy_tensor(monB_props[0][-1])
+    dimer_batch.vw_A = _copy_tensor(monA_props[0][-2])
+    dimer_batch.vw_B = _copy_tensor(monB_props[0][-2])
+    dimer_batch.hfvr_A = _copy_tensor(monA_props[0][-3])
+    dimer_batch.hfvr_B = _copy_tensor(monB_props[0][-3])
     print(f"dimer_batch.Ka: {dimer_batch.Ka}")
     print(f"dimer_batch.Kb: {dimer_batch.Kb}")
     print(f"dimer_batch.vw_A: {dimer_batch.vw_A}")

@@ -1,0 +1,30 @@
+name: qcml
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy=2.*
+  - pandas=2.*
+  - pytest=7.4.4
+  - pytorch=2.7.0
+  - cpuonly
+  - requests=2.32.3
+  - setuptools=72.1.0
+  - torchvision
+  - torchaudio
+  - matplotlib
+  - pydantic=2.*
+  - scipy
+  - tqdm
+  - h5py
+  - pip:
+      - qcelemental==0.29.0
+      - qm-tools-aw==1.4.5
+      - waitress==3.0.2
+      - yarl==1.18.3
+      - pytorch-minimize
+      - qcportal==0.59
+      - lmdb
