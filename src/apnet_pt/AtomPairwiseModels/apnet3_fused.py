@@ -946,7 +946,10 @@ class APNet3_AtomType_Model:
                     )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                if hasattr(self.dataset, "_close_lmdb"):
+                    self.dataset._close_lmdb()
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
         elif not ignore_database_null and self.dataset is None and ds_split_db:
@@ -1061,7 +1064,11 @@ class APNet3_AtomType_Model:
                     ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                for ds in self.dataset:
+                    if hasattr(ds, "_close_lmdb"):
+                        ds._close_lmdb()
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset[0] = self.dataset[0][:ds_max_size]
                 self.dataset[1] = self.dataset[1][:ds_max_size]

@@ -1330,7 +1330,10 @@ class AtomInducedDipoleModel:
                     )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                if hasattr(self.dataset, "_close_lmdb"):
+                    self.dataset._close_lmdb()
+                self.dataset = setup_ds(False)
         elif (
             not ignore_database_null
             and self.dataset is None
@@ -1361,7 +1364,11 @@ class AtomInducedDipoleModel:
                 ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                for ds in self.dataset:
+                    if hasattr(ds, "_close_lmdb"):
+                        ds._close_lmdb()
+                self.dataset = setup_ds(False)
         print(f"{self.dataset = }")
         self.rank = None
         self.world_size = None

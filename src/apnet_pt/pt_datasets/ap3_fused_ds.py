@@ -1612,6 +1612,25 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         except:
             pass
 
+    def __getstate__(self):
+        """Return a picklable state without an open LMDB handle."""
+        state = self.__dict__.copy()
+        if state.get("lmdb_env") is not None:
+            try:
+                state["lmdb_env"].close()
+            except Exception:
+                pass
+        state["lmdb_env"] = None
+        state["_cache"] = {}
+        state["_cache_keys"] = []
+        state["_worker_id"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Restore dataset state and reopen LMDB in the new process."""
+        self.__dict__.update(state)
+        self._init_lmdb()
+
     @property
     def raw_file_names(self):
         """Same as original implementation"""
@@ -1807,7 +1826,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
             for i, data_obj in enumerate(data_objects):
                 idx = start_idx + i
                 key = str(idx).encode("utf-8")
-                value = pickle.dumps(data_obj)
+                value = pickle.dumps(data_obj, protocol=pickle.HIGHEST_PROTOCOL)
                 txn.put(key, value)
 
             metadata = {
@@ -1819,6 +1838,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
             txn.put(b"__metadata__", self.json.dumps(metadata).encode("utf-8"))
 
         self._length = start_idx + len(data_objects)
+        self.lmdb_env.sync()
 
     def process(self):
         """Process dataset and store in LMDB"""
@@ -2029,6 +2049,13 @@ class ap3_fused_module_dataset_lmdb(Dataset):
 
             if value_bytes is None:
                 raise IndexError(f"Index {idx} not found in LMDB database")
+            if len(value_bytes) == 0:
+                self._close_lmdb()
+                self._init_lmdb()
+                with self.lmdb_env.begin() as retry_txn:
+                    value_bytes = retry_txn.get(key)
+                if not value_bytes:
+                    raise EOFError(f"Stored LMDB value for index {idx} is empty")
 
             data = pickle.loads(value_bytes)
 
