@@ -1,35 +1,5 @@
-import torch
-import torch.nn as nn
-from apnet_pt.util import scatter_sum_compile
-import numpy as np
-import time
-from ..AtomModels.ap2_atom_model import (
-    AtomMPNN,
-    # isolate_atomic_property_predictions,
-    qcel_mon_to_pyg_data,
-    # DistanceLayer,
-)
-from ..AtomModels.ap2_hirshfeld_atom_model import isolate_atomic_property_predictions
-from ..atomic_datasets import (
-    AtomicDataLoader,
-    atomic_collate_update,
-    atomic_collate_update_no_target,
-    atomic_collate_update_prebatched,
-)
-from ..AtomModels.ap2_hirshfeld_atom_model import (
-    AtomHirshfeldMPNN,
-    atomic_hirshfeld_module_dataset,
-)
-from ..pt_datasets.ap2_fused_ds import (
-    ap2_fused_module_dataset,
-    APNet2_fused_DataLoader,
-    ap2_fused_collate_update,
-    ap2_fused_collate_update_no_target,
-    qcel_dimer_to_fused_data,
-)
-from .. import constants
-from .. import model_io
 import os
+import re
 import time
 from copy import deepcopy
 from importlib import resources
@@ -40,26 +10,39 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.data import Data
 
 from apnet_pt.torch_util import set_weights_to_value
-from dftd3.d3 import d3
+from qcml_dftd3.d3 import d3, resolve_d3_damping_parameters
 
 from .. import constants
-from ..atomic_datasets import (AtomicDataLoader, atomic_collate_update,
-                               atomic_collate_update_no_target,
-                               atomic_collate_update_prebatched)
+from .. import model_io
+from ..atomic_datasets import (
+    AtomicDataLoader,
+    atomic_collate_update,
+    atomic_collate_update_no_target,
+    atomic_collate_update_prebatched,
+)
 from ..AtomModels.ap2_atom_model import (  # isolate_atomic_property_predictions,; DistanceLayer,
-    AtomMPNN, qcel_mon_to_pyg_data, unwrap_model)
+    AtomMPNN,
+    qcel_mon_to_pyg_data,
+    unwrap_model,
+)
 from ..AtomModels.ap2_hirshfeld_atom_model import (
-    AtomHirshfeldMPNN, atomic_hirshfeld_module_dataset,
-    isolate_atomic_property_predictions)
+    AtomHirshfeldMPNN,
+    atomic_hirshfeld_module_dataset,
+    isolate_atomic_property_predictions,
+)
+from ..hf_pretrained import resolve_pretrained_path
 from ..multipole import thole_damping_direct_torch, thole_damping_mutual_torch
-from ..pt_datasets.ap2_fused_ds import (APNet2_fused_DataLoader,
-                                        ap2_fused_collate_update,
-                                        ap2_fused_collate_update_no_target,
-                                        ap2_fused_module_dataset,
-                                        qcel_dimer_to_fused_data)
+from ..pt_datasets.ap2_fused_ds import (
+    APNet2_fused_DataLoader,
+    ap2_fused_collate_update,
+    ap2_fused_collate_update_no_target,
+    ap2_fused_module_dataset,
+    qcel_dimer_to_fused_data,
+)
 from ..util import scatter_sum_compile
 
 max_Z = 118
@@ -89,20 +72,35 @@ class NoisyConstantEmbedding(nn.Embedding):
 
 
 class DimerProp(nn.Module):
-    def __init__(self, ATParam, dimer_eval="elst_damping", elst_damping_type="CLIFF"):
+    def __init__(
+        self,
+        ATParam,
+        dimer_eval="elst_damping",
+        elst_damping_type="CLIFF",
+        d3_damping_parameters=None,
+        freeze_atom_model=True,
+    ):
         """
         Create a DimerProp configured with an AtomTypeParam and selected evaluation and damping modes.
 
         Parameters:
-            ATParam: An AtomTypeParam instance providing per-atom parameter tensors and an `atom_model` used for multipole predictions. The `atom_model` will be frozen (requires_grad set to False).
+            ATParam: An AtomTypeParam instance providing per-atom parameter tensors and an `atom_model` used for multipole predictions. The `atom_model` will be frozen (requires_grad set to False) when freeze_atom_model is True (default).
             dimer_eval (str): Name of the dimer evaluation forward mode to use (e.g., "elst_damping", "induced_dipole", "elst").
             elst_damping_type (str): Electrostatic damping scheme to apply for damped elst evaluations; supported values include "CLIFF" and "AMOEBA".
         """
         super().__init__()
         self.AtomTypeParam = ATParam
-        self.AtomTypeParam.atom_model.requires_grad_(False)
+        if freeze_atom_model:
+            self.AtomTypeParam.atom_model.requires_grad_(False)
         self.elst_damping_type = elst_damping_type
+        self.set_d3_damping_parameters(d3_damping_parameters)
         self.set_forward(dimer_eval)
+        return
+
+    def set_d3_damping_parameters(self, d3_damping_parameters=None):
+        self.d3_damping_parameters = resolve_d3_damping_parameters(
+            d3_damping_parameters
+        )
         return
 
     def set_forward(self, dimer_eval):
@@ -152,6 +150,48 @@ class DimerProp(nn.Module):
             self.forward = self._ap3_atomMPNN
         else:
             raise ValueError(f"Unknown dimer_eval: {dimer_eval}")
+
+    def get_config(self) -> dict:
+        """
+        Return a reconstruction config for this DimerProp hierarchy.
+        """
+
+        def _infer_nested_r_cut(model):
+            current = model
+            while current is not None:
+                if hasattr(current, "r_cut"):
+                    return getattr(current, "r_cut")
+                current = getattr(current, "atom_model", None)
+            return None
+
+        atom_type_param_config = None
+        atom_type_param_type = None
+        atom_model_config = None
+        atom_model_type = None
+
+        if hasattr(self, "AtomTypeParam") and self.AtomTypeParam is not None:
+            atom_type_param_type = type(self.AtomTypeParam).__name__
+            if hasattr(self.AtomTypeParam, "get_config"):
+                atom_type_param_config = self.AtomTypeParam.get_config()
+
+            if hasattr(self.AtomTypeParam, "atom_model"):
+                atom_model = self.AtomTypeParam.atom_model
+                atom_model_type = type(atom_model).__name__
+                if hasattr(atom_model, "get_config"):
+                    atom_model_config = atom_model.get_config()
+                    nested_r_cut = _infer_nested_r_cut(atom_model)
+                    if nested_r_cut is not None and "r_cut" not in atom_model_config:
+                        atom_model_config["r_cut"] = nested_r_cut
+
+        return {
+            "dimer_eval": getattr(getattr(self, "forward", None), "__name__", None),
+            "elst_damping_type": self.elst_damping_type,
+            "d3_damping_parameters": deepcopy(self.d3_damping_parameters),
+            "atom_type_param_type": atom_type_param_type,
+            "atom_type_param_config": atom_type_param_config,
+            "atom_model_type": atom_model_type,
+            "atom_model_config": atom_model_config,
+        }
 
     def _elst_damping_forward(
         self,
@@ -548,7 +588,7 @@ class DimerProp(nn.Module):
         v_A = self.AtomTypeParam(batch.batch_atomic_A)
         v_B = self.AtomTypeParam(batch.batch_atomic_B)
 
-        Disp = d3(batch)
+        Disp = d3(batch, params=self.d3_damping_parameters)
         return Disp, v_A, v_B
 
     def _ap3_elst_damping_indu_induced_dipole_disp_forward(
@@ -559,9 +599,9 @@ class DimerProp(nn.Module):
         v_B = self.AtomTypeParam(batch.batch_atomic_B)
         Kas = torch.abs(v_A[-1])
         Kbs = torch.abs(v_B[-1])
-        print(f"{Kas =}")
-        print(f"{v_A[-1] =}")
-        print(f"{v_A[-2] =}")
+        # print(f"{Kas =}")
+        # print(f"{v_A[-1] =}")
+        # print(f"{v_A[-2] =}")
         Indu = induced_dipole_induction_optimized_no_correction(
             ZA=batch.ZA,
             RA=batch.RA,
@@ -573,8 +613,8 @@ class DimerProp(nn.Module):
             qB=v_B[0],
             muB=v_B[1],
             quadB=v_B[2],
-            e_AB_source=batch.e_ABsr_source,
-            e_AB_target=batch.e_ABsr_target,
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
             # Additional parameters for induction
             e_AA_source=batch.e_AA_source,
             e_BB_source=batch.e_BB_source,
@@ -607,8 +647,8 @@ class DimerProp(nn.Module):
             muB=v_B[1],
             quadB=v_B[2],
             Kb=Kbs,
-            e_AB_source=batch.e_ABsr_source,
-            e_AB_target=batch.e_ABsr_target,
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
         )
         if Elst.isnan().any():
             print("Electrostatic energy is NaN, debugging info:")
@@ -617,8 +657,152 @@ class DimerProp(nn.Module):
             print(f"{v_B[-1] =}")
             raise ValueError("Electrostatic energy is NaN")
 
-        Disp = d3(batch)
+        Disp = d3(batch, params=self.d3_damping_parameters)
         return torch.vstack((Elst, Indu, Disp)).T, v_A, v_B
+
+
+def _substate_dict(state_dict: dict, prefix: str) -> dict:
+    return {
+        key[len(prefix) :]: value
+        for key, value in state_dict.items()
+        if key.startswith(prefix)
+    }
+
+
+def _infer_max_index(state_dict: dict, pattern: str) -> int | None:
+    matches = []
+    regex = re.compile(pattern)
+    for key in state_dict:
+        match = regex.match(key)
+        if match:
+            matches.append(int(match.group(1)))
+    if not matches:
+        return None
+    return max(matches)
+
+
+def _infer_atommpnn_from_state_dict(
+    state_dict: dict,
+    r_cut: float = 5.0,
+):
+    n_message_max = _infer_max_index(
+        state_dict,
+        r"^charge_update_layers\.(\d+)\.0\.weight$",
+    )
+    n_message = 0 if n_message_max is None else n_message_max + 1
+    n_rbf = int(state_dict["distance_layer.frequencies"].shape[0])
+    n_embed = int(state_dict["embed_layer.weight"].shape[1])
+    n_neuron = int(state_dict["charge_readout_layers.0.0.weight"].shape[0] // 2)
+    return AtomMPNN(
+        n_message=n_message,
+        n_rbf=n_rbf,
+        n_neuron=n_neuron,
+        n_embed=n_embed,
+        r_cut=r_cut,
+    )
+
+
+def _infer_atomtypeparamnn_from_state_dict(
+    state_dict: dict,
+    r_cut: float = 5.0,
+):
+    nested_atom_type = any(
+        key.startswith("atom_model.param_readout_layers.") for key in state_dict
+    )
+    atom_model_state = _substate_dict(state_dict, "atom_model.")
+    if nested_atom_type:
+        atom_model = _infer_atomtypeparamnn_from_state_dict(
+            atom_model_state, r_cut=r_cut
+        )
+    else:
+        atom_model = _infer_atommpnn_from_state_dict(atom_model_state, r_cut=r_cut)
+
+    n_params_max = _infer_max_index(
+        state_dict,
+        r"^param_readout_layers\.(\d+)\.\d+\.0\.weight$",
+    )
+    n_params = 1 if n_params_max is None else n_params_max + 1
+    n_message_max = _infer_max_index(
+        state_dict,
+        r"^param_readout_layers\.\d+\.(\d+)\.0\.weight$",
+    )
+    n_message = 0 if n_message_max is None else n_message_max
+    first_weight = state_dict["param_readout_layers.0.0.0.weight"]
+    n_embed = int(first_weight.shape[1])
+    n_neuron = int(first_weight.shape[0] // 2)
+
+    return AtomTypeParamNN(
+        atom_model=atom_model,
+        n_message=n_message,
+        n_neuron=n_neuron,
+        n_embed=n_embed,
+        param_start_mean=[0.0] * n_params,
+        param_start_std=[0.01] * n_params,
+        n_params=n_params,
+        freeze_atom_model=False,
+    )
+
+
+def load_dimer_prop_from_checkpoint(
+    checkpoint: dict,
+    freeze_atom_model: bool = False,
+):
+    """
+    Reconstruct a DimerProp model from a v1/v2 checkpoint.
+
+    This supports older v2 checkpoints that embedded the full recursive state
+    dict but did not yet store enough nested config to rebuild the hierarchy
+    directly from config alone.
+    """
+    config = model_io.load_config_from_checkpoint(checkpoint) or {}
+    state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
+    atom_type_param_state = _substate_dict(state_dict, "AtomTypeParam.")
+
+    atom_type_param_config = config.get("atom_type_param_config") or {}
+    atom_type_param_type = config.get("atom_type_param_type", "AtomTypeParamNN")
+    atom_model_config = config.get("atom_model_config") or {}
+    atom_model_type = config.get("atom_model_type")
+    r_cut = atom_model_config.get("r_cut", config.get("r_cut", 5.0))
+
+    if atom_type_param_type == "AtomTypeParamNN" and atom_type_param_config:
+        atom_model_state = _substate_dict(atom_type_param_state, "atom_model.")
+        if atom_model_type == "AtomMPNN" and atom_model_config:
+            atom_model = AtomMPNN(
+                n_message=atom_model_config["n_message"],
+                n_rbf=atom_model_config["n_rbf"],
+                n_neuron=atom_model_config["n_neuron"],
+                n_embed=atom_model_config["n_embed"],
+                r_cut=atom_model_config["r_cut"],
+            )
+        else:
+            atom_model = _infer_atomtypeparamnn_from_state_dict(
+                atom_model_state, r_cut=r_cut
+            )
+
+        atom_type_param = AtomTypeParamNN(
+            atom_model=atom_model,
+            n_message=atom_type_param_config["n_message"],
+            n_neuron=atom_type_param_config["n_neuron"],
+            n_embed=atom_type_param_config["n_embed"],
+            param_start_mean=atom_type_param_config["param_start_mean"],
+            param_start_std=atom_type_param_config["param_start_std"],
+            n_params=atom_type_param_config.get("n_params", 1),
+            freeze_atom_model=False,
+        )
+    else:
+        atom_type_param = _infer_atomtypeparamnn_from_state_dict(
+            atom_type_param_state,
+            r_cut=r_cut,
+        )
+
+    dimer_prop = DimerProp(
+        ATParam=atom_type_param,
+        freeze_atom_model=freeze_atom_model,
+        elst_damping_type=config.get("elst_damping_type", "CLIFF"),
+        d3_damping_parameters=config.get("d3_damping_parameters"),
+    )
+    dimer_prop.load_state_dict(state_dict)
+    return dimer_prop
 
 
 class AtomTypeParamNN(nn.Module):
@@ -631,10 +815,12 @@ class AtomTypeParamNN(nn.Module):
         param_start_mean=1.8,
         param_start_std=0.01,
         n_params=1,
+        freeze_atom_model=True,
     ):
         super().__init__()
         self.atom_model = atom_model
-        self.atom_model.requires_grad_(False)
+        if freeze_atom_model:
+            self.atom_model.requires_grad_(False)
         self.n_message = n_message
         if type(self.atom_model) in [AtomMPNN, AtomHirshfeldMPNN]:
             self.h_list_ind = -1
@@ -2199,15 +2385,15 @@ def induced_dipole_induction_optimized_no_correction(
     alpha_0_A = torch.zeros_like(hirshfeld_volume_ratio_A)
     alpha_0_B = torch.zeros_like(hirshfeld_volume_ratio_B)
 
-    print(f"{alpha_0_A = }")
-    print(f"{alpha_0_B = }")
+    # print(f"{alpha_0_A = }")
+    # print(f"{alpha_0_B = }")
     # Use index_select for vectorized lookup
     alpha_0_A = torch.index_select(polarizability_table, 0, ZA.long())
     alpha_0_B = torch.index_select(polarizability_table, 0, ZB.long())
-    print(f"{alpha_0_A = }")
-    print(f"{alpha_0_A = }")
-    print(f"{hirshfeld_volume_ratio_A = }")
-    print(f"{hirshfeld_volume_ratio_B = }")
+    # print(f"{alpha_0_A = }")
+    # print(f"{alpha_0_A = }")
+    # print(f"{hirshfeld_volume_ratio_A = }")
+    # print(f"{hirshfeld_volume_ratio_B = }")
     alpha_A = alpha_0_A * hirshfeld_volume_ratio_A ** (4 / 3.0)
     alpha_B = alpha_0_B * hirshfeld_volume_ratio_B ** (4 / 3.0)
 
@@ -2564,6 +2750,7 @@ class AM_DimerParam_Model:
         ds_energy_labels=None,
         dimer_eval_type="elst_damping",
         elst_damping_type="CLIFF",
+        freeze_atom_model=True,
     ):
         """
         Construct an AtomTypeParamModel wrapper that builds or loads an atom-level model, a parameter-predicting model, and optional dimer evaluators and dataset.
@@ -2751,11 +2938,17 @@ class AM_DimerParam_Model:
         self.dimer_eval_type = dimer_eval_type
         self.elst_damping_type = elst_damping_type
         self.dimer_model = DimerProp(
-            self.model, dimer_eval=dimer_eval_type, elst_damping_type=elst_damping_type
+            self.model,
+            dimer_eval=dimer_eval_type,
+            elst_damping_type=elst_damping_type,
+            freeze_atom_model=freeze_atom_model,
         )
         if self.dimer_eval_type in ["elst", "elst_damping"]:
             self.dimer_model_elst = DimerProp(
-                self.model, dimer_eval="elst", elst_damping_type=elst_damping_type
+                self.model,
+                dimer_eval="elst",
+                elst_damping_type=elst_damping_type,
+                freeze_atom_model=freeze_atom_model,
             )
         else:
             self.dimer_model_elst = None
@@ -2933,11 +3126,16 @@ class AM_DimerParam_Model:
         return
 
     def set_pretrained_model(
-        self, ap2_model_path=None, am_model_path=None, model_id=None
+        self,
+        ap2_model_path=None,
+        am_model_path=None,
+        model_id=None,
+        ap2_fused: bool = False,
     ):
         if model_id is not None:
-            ap2_model_path = resources.files("apnet_pt").joinpath(
-                "models", "ap2-fused_ensemble", f"ap2_{model_id}.pt"
+            ensemble_prefix = "ap2-fused_ensemble" if ap2_fused else "ap2_ensemble"
+            ap2_model_path = resolve_pretrained_path(
+                f"{ensemble_prefix}/ap2_{model_id}.pt"
             )
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
@@ -3803,6 +4001,7 @@ class AtomTypeParamModel:
         ds_in_memory=True,
         model_save_path=None,
         monomer_eval_type="hirshfeld_volume_ratio__valence_width",
+        freeze_atom_model=True,
     ):
         """
         If pre_trained_model_path is provided, the model will be loaded from
@@ -3873,6 +4072,7 @@ class AtomTypeParamModel:
                 param_start_mean=config["param_start_mean"],
                 param_start_std=config["param_start_std"],
                 n_params=config.get("n_params", 1),
+                freeze_atom_model=freeze_atom_model,
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)
@@ -3885,6 +4085,7 @@ class AtomTypeParamModel:
                 param_start_mean=param_start_mean,
                 param_start_std=param_start_std,
                 n_params=self.n_params,
+                freeze_atom_model=freeze_atom_model,
             )
         self.n_params = self.n_params
         self.monomer_eval_type = monomer_eval_type

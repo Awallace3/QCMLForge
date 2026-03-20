@@ -32,4 +32,4 @@ dependencies:
       - yarl==1.18.3
       - pytorch-minimize
       - qcportal==0.59
-      - lmdb
+      - lmdb==1.7.5

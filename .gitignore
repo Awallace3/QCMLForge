@@ -229,3 +229,7 @@ data_spice
 tinker
 amoeba
 .sisyphus
+.EDISP
+d3data.json
+simple-dftd3/
+tmp.xyz

@@ -6,6 +6,7 @@ import warnings
 import time
 from ..AtomModels.ap2_atom_model import AtomMPNN, isolate_atomic_property_predictions
 from .. import atomic_datasets
+from ..hf_pretrained import resolve_pretrained_paths
 from .. import pairwise_datasets
 from .. import model_io
 from ..pairwise_datasets import (
@@ -23,7 +24,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 import qcelemental as qcel
-from importlib import resources
 from copy import deepcopy
 from apnet_pt.torch_util import set_weights_to_value
 from apnet_pt.util import scatter_sum_compile
@@ -812,19 +812,13 @@ class APNet2Model:
         self.atom_model.to(device)
         self.model.to(device)
 
-        split_dbs = [2, 5, 6, 7]
-        ds_qcel_split_db = (
-            ds_qcel_molecules is not None
-            and len(ds_qcel_molecules) == 2
-            and isinstance(ds_qcel_molecules[0], list)
+        ds_split_db = apnet2_module_dataset.is_split_db_config(
+            self.ds_spec_type, ds_qcel_molecules
         )
         self.dataset = dataset
-        if (
-            not ignore_database_null
-            and self.dataset is None
-            and self.ds_spec_type not in split_dbs
-            and not ds_qcel_split_db
-        ):
+        if self.dataset is not None:
+            ds_split_db = getattr(self.dataset, "split_db", ds_split_db)
+        if not ignore_database_null and self.dataset is None and not ds_split_db:
 
             def setup_ds(fp=ds_force_reprocess):
                 return apnet2_module_dataset(
@@ -852,11 +846,7 @@ class APNet2Model:
             self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
-        elif (
-            not ignore_database_null
-            and self.dataset is None
-            and (self.ds_spec_type in split_dbs or ds_qcel_split_db)
-        ):
+        elif not ignore_database_null and self.dataset is None and ds_split_db:
             print("Processing Split dataset...")
             if ds_qcel_molecules is None:
                 ds_qcel_molecules = [None, None]
@@ -882,6 +872,7 @@ class APNet2Model:
                         prebatched=ds_prebatched,
                         print_level=print_lvl,
                         qcel_molecules=ds_qcel_molecules[0],
+                        qcel_molecules_raw=ds_qcel_molecules,
                         energy_labels=ds_energy_labels[0],
                     ),
                     apnet2_module_dataset(
@@ -902,6 +893,7 @@ class APNet2Model:
                         prebatched=ds_prebatched,
                         print_level=print_lvl,
                         qcel_molecules=ds_qcel_molecules[1],
+                        qcel_molecules_raw=ds_qcel_molecules,
                         energy_labels=ds_energy_labels[1],
                     ),
                 ]
@@ -970,12 +962,14 @@ class APNet2Model:
             Returns self for method chaining.
         """
         if model_id is not None:
-            am_model_path = resources.files("apnet_pt").joinpath(
-                "models", "am_ensemble", f"am_{model_id}.pt"
+            model_paths = resolve_pretrained_paths(
+                [
+                    f"am_ensemble/am_{model_id}.pt",
+                    f"ap2_ensemble/ap2_{model_id}.pt",
+                ]
             )
-            ap2_model_path = resources.files("apnet_pt").joinpath(
-                "models", "ap2_ensemble", f"ap2_{model_id}.pt"
-            )
+            am_model_path = model_paths[f"am_ensemble/am_{model_id}.pt"]
+            ap2_model_path = model_paths[f"ap2_ensemble/ap2_{model_id}.pt"]
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 

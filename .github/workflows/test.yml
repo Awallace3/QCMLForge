@@ -25,7 +25,7 @@ jobs:
       shell: bash -l {0}
       run: |
         # Install torch-scatter and torch-geometric from pre-built wheels (CPU version for CI)
-        pip install torch-geometric -f https://data.pyg.org/whl/torch-2.5.1+cpu.html
+        pip install torch-geometric huggingface_hub -f https://data.pyg.org/whl/torch-2.7.0+cpu.html
     
     - name: Install package
       shell: bash -l {0}
@@ -37,8 +37,22 @@ jobs:
       run: |
         python -m pip install -r docs/requirements.txt
      
+    - name: Download pretrained models from Hugging Face
+      shell: bash -l {0}
+      run: |
+        python - <<'PY'
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(
+            repo_id="awallace3/qcmlforge",
+            allow_patterns=["am_ensemble/*", "ap2_ensemble/*"],
+        )
+        PY
+    
     - name: Run tests
       shell: bash -l {0}
+      env:
+        QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED: "1"
       run: |
         python -m pytest tests/
 

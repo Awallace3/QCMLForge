@@ -8,13 +8,20 @@ import pandas as pd
 import pytest
 import qcelemental as qcel
 import torch
+from qcml_dftd3.d3 import d3
 
 import apnet_pt
-from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_Model
+from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import (
+    APNet3D3_AtomType_Model,
+    build_exponential_decay_scheduler,
+    exponential_decay_lr,
+)
 from apnet_pt.pt_datasets.ap3_fused_ds import (
     ap3_fused_module_dataset,
     ap3_fused_module_dataset_lmdb,
 )
+from apnet_pt.util import scatter_sum_compile
+from qcml_dftd3.d3 import params_intermolecular_saptpbe0_d3i
 
 torch.manual_seed(42)
 spec_type = 5
@@ -114,6 +121,53 @@ def set_weights_to_value(model, value=0.9):
         for param in model.parameters():
             param.fill_(value)  # Set all elements to the given value
     return
+
+
+def test_exponential_decay_lr_hits_requested_endpoints():
+    start_lr = 5e-4
+    end_lr = 5e-6
+    n_epochs = 5
+
+    lr_values = [
+        exponential_decay_lr(start_lr, end_lr, n_epochs, epoch)
+        for epoch in range(n_epochs)
+    ]
+
+    assert lr_values[0] == pytest.approx(start_lr)
+    assert lr_values[-1] == pytest.approx(end_lr)
+
+    gamma = lr_values[1] / lr_values[0]
+    for prev_lr, next_lr in zip(lr_values, lr_values[1:]):
+        assert next_lr / prev_lr == pytest.approx(gamma)
+
+
+def test_exponential_decay_scheduler_hits_requested_end_lr():
+    start_lr = 5e-4
+    end_lr = 5e-6
+    n_epochs = 5
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.Adam([parameter], lr=start_lr)
+    scheduler = build_exponential_decay_scheduler(
+        optimizer=optimizer,
+        start_lr=start_lr,
+        end_lr=end_lr,
+        n_epochs=n_epochs,
+    )
+
+    lr_values = [optimizer.param_groups[0]["lr"]]
+    for _ in range(n_epochs - 1):
+        optimizer.step()
+        scheduler.step()
+        lr_values.append(optimizer.param_groups[0]["lr"])
+
+    assert lr_values[0] == pytest.approx(start_lr)
+    assert lr_values[-1] == pytest.approx(end_lr)
+def assert_d3_params_equal(actual, expected):
+    assert set(actual) == set(expected)
+    for key in expected:
+        assert np.isclose(actual[key], expected[key]), (
+            f"D3 parameter {key} mismatch: {actual[key]} != {expected[key]}"
+        )
 
 
 def test_ap3_fused_train_qcel_molecules_in_memory():
@@ -405,12 +459,12 @@ def test_classical_ap3():
         [mol], batch_size=1, return_classical_pairs=True
     )
     print(f"AP3 elst = {pred[0][0]:.6f} kcal/mol")
-    print(f"{torch_elst = }")
-    print(f"{pair_elst  = }")
+    print(f"{torch_elst=}")
+    print(f"{pair_elst=}")
     assert np.allclose(torch_elst.cpu().numpy(), pair_elst[0].flatten(), atol=1e-4)
     print(f"AP3 ind = {pred[0][2]:.6f} kcal/mol")
-    print(f"{torch_ind = }")
-    print(f"{pair_ind  = }")
+    print(f"{torch_ind=}")
+    print(f"{pair_ind=}")
     assert np.allclose(torch_ind.cpu().numpy(), pair_ind[0].flatten(), atol=1e-4)
     pred, pair_elst, pair_ind, pair_disp = ap3.predict_qcel_mols(
         [mol, mol_element], batch_size=1, return_classical_pairs=True
@@ -527,12 +581,12 @@ def test_classical_ap3_long_range():
         [mol], batch_size=1, return_classical_pairs=True
     )
     print(f"AP3 elst = {pred[0][0]:.6f} kcal/mol")
-    print(f"{torch_elst = }")
-    print(f"{pair_elst  = }")
+    print(f"{torch_elst=}")
+    print(f"{pair_elst=}")
     assert np.allclose(torch_elst.cpu().numpy(), pair_elst[0].flatten(), atol=1e-4)
     print(f"AP3 ind = {pred[0][2]:.6f} kcal/mol")
-    print(f"{torch_ind = }")
-    print(f"{pair_ind  = }")
+    print(f"{torch_ind=}")
+    print(f"{pair_ind=}")
     assert np.allclose(torch_ind.cpu().numpy(), pair_ind[0].flatten(), atol=1e-4)
     pred, pair_elst, pair_ind, pair_disp = ap3_d3.predict_qcel_mols(
         [mol, mol_element], batch_size=1, return_classical_pairs=True
@@ -823,10 +877,6 @@ def test_classical_ap3_dispersion():
         benzene_pyridine_dimer,
     ]
 
-    # mols = [
-    #     water_water_dimer,
-    # ]
-
     batch = apnet_pt.pt_datasets.ap2_fused_ds.ap2_fused_collate_update_no_target(
         [
             apnet_pt.pt_datasets.ap2_fused_ds.qcel_dimer_to_fused_data(
@@ -835,8 +885,6 @@ def test_classical_ap3_dispersion():
             for n, mol in enumerate(mols)
         ]
     )
-
-    print(dir(batch))
     atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
         ds_root=None,
         use_GPU=False,
@@ -865,44 +913,533 @@ def test_classical_ap3_dispersion():
         am_dimer_param_model=atom_type_elst_model,
         # use_precomputed_classical=False,
     )
-    print(f"{batch.dimer_ind = }")
-    v = ap3.predict_qcel_mols(
-        [
-            water_water_dimer,
-        ],
+    print(f"{batch.dimer_ind=}")
+    E_classical, mA, mB = ap3.dimer_prop_model(batch)
+    print(f"{E_classical[:, 2]=}")
+    torch_disp = E_classical[:, 2]
+    dimer_energies = torch.zeros(3)
+
+    dimer_energies.scatter_add_(0, batch.dimer_ind, torch_disp)
+    print(f"{dimer_energies=}")
+    ap3_disp = dimer_energies.cpu().numpy()
+    # Energies are from simple dftd3
+
+    simple_dftd3_energies = np.array(
+        [-2.4595184, -4.3240623, -7.2716193]
+    )
+    print(f"{simple_dftd3_energies=}")
+    print(f"{ap3_disp=}")
+    assert np.allclose(ap3_disp, simple_dftd3_energies, atol=1e-5), (
+        f"AP3 dispersion energies {ap3_disp} should be close to simple DFTD3 energies {simple_dftd3_energies}"
+    )
+    return
+
+
+def test_ap3_d3_fused_import_qcml_dftd3():
+    """Test that qcml_dftd3.d3 can be imported."""
+    try:
+        from qcml_dftd3.d3 import d3
+
+        assert d3 is not None, "d3 module should not be None"
+    except ImportError as e:
+        pytest.fail(f"Failed to import qcml_dftd3.d3: {e}")
+
+
+def test_ap3_d3_fused_no_disp_nn_architecture():
+    """Test that APNet3D3_AtomType_MPNN with no_disp_nn=True has no dispersion head and returns 3 columns."""
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+
+    # Create model with no_disp_nn=True
+    from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_MPNN
+
+    model = APNet3D3_AtomType_MPNN(
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        use_precomputed_classical=True,
+        no_disp_nn=True,
+    )
+
+    # Verify no dispersion readout layer exists
+    assert not hasattr(model, "readout_layer_disp"), (
+        "Model should not have readout_layer_disp when no_disp_nn=True"
+    )
+
+    # Verify config contains no_disp_nn
+    config = model.get_config()
+    assert "no_disp_nn" in config, "Config should contain no_disp_nn key"
+    assert config["no_disp_nn"] is True, "Config no_disp_nn should be True"
+
+    # Test readouts() returns 3 columns
+    # Generate dummy input with correct feature size by introspecting first Linear in readout_layer_elst
+    first_linear = None
+    for module in model.readout_layer_elst.modules():
+        if isinstance(module, torch.nn.Linear) and hasattr(module, "in_features"):
+            first_linear = module
+            break
+
+    assert first_linear is not None, (
+        "Should find at least one Linear layer in readout_layer_elst"
+    )
+    in_features = first_linear.in_features
+
+    # Create dummy input
+    H = torch.randn(10, in_features)
+    output = model.readouts(H)
+
+    assert output.shape[1] == 3, (
+        f"readouts() should return 3 columns when no_disp_nn=True, got {output.shape[1]}"
+    )
+
+
+def test_ap3_d3_fused_default_architecture():
+    """Test that default APNet3D3_AtomType_MPNN has dispersion head and returns 4 columns."""
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+
+    # Create model with default no_disp_nn=False
+    from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_MPNN
+
+    model = APNet3D3_AtomType_MPNN(
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        use_precomputed_classical=True,
+        no_disp_nn=False,
+    )
+
+    # Verify dispersion readout layer exists
+    assert hasattr(model, "readout_layer_disp"), (
+        "Model should have readout_layer_disp when no_disp_nn=False"
+    )
+
+    # Verify config contains no_disp_nn
+    config = model.get_config()
+    assert "no_disp_nn" in config, "Config should contain no_disp_nn key"
+    assert config["no_disp_nn"] is False, "Config no_disp_nn should be False"
+
+    # Test readouts() returns 4 columns
+    # Generate dummy input with correct feature size
+    first_linear = None
+    for module in model.readout_layer_elst.modules():
+        if isinstance(module, torch.nn.Linear) and hasattr(module, "in_features"):
+            first_linear = module
+            break
+
+    assert first_linear is not None, (
+        "Should find at least one Linear layer in readout_layer_elst"
+    )
+    in_features = first_linear.in_features
+
+    # Create dummy input
+    H = torch.randn(10, in_features)
+    output = model.readouts(H)
+
+    assert (
+        output.shape[1] == 4
+    ), f"readouts() should return 4 columns when no_disp_nn=False, got {
+        output.shape[1]
+    }"
+
+
+def test_ap3_d3_fused_get_config_recreate_model():
+    """Test that get_config() can be used to recreate the MPNN model with dimer_prop_model=None."""
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+
+    # Create model with no_disp_nn=True
+    from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_MPNN
+
+    model = APNet3D3_AtomType_MPNN(
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        use_precomputed_classical=True,
+        no_disp_nn=True,
+        n_message=2,
+        n_rbf=6,
+        n_neuron=64,
+        n_embed=4,
+        r_cut_im=7.0,
+        r_cut=4.5,
+    )
+
+    # Get config
+    config = model.get_config()
+
+    # Verify all important hyperparameters are in config
+    assert config["no_disp_nn"] is True
+    assert config["n_message"] == 2
+    assert config["n_rbf"] == 6
+    assert config["n_neuron"] == 64
+    assert config["n_embed"] == 4
+    assert config["r_cut_im"] == 7.0
+    assert config["r_cut"] == 4.5
+    assert config["use_precomputed_classical"] is True
+    assert config["use_atom_props"] is True  # default
+    # Recreate model with dimer_prop_model=None using config
+    model2 = APNet3D3_AtomType_MPNN(dimer_prop_model=None, **config)
+
+    # Verify recreated model has same config
+    config2 = model2.get_config()
+    assert config == config2, "Recreated model should have same config"
+
+    # Verify architecture matches
+    assert not hasattr(model2, "readout_layer_disp"), (
+        "Recreated model should not have dispersion head"
+    )
+    assert model2.n_message == 2
+    assert model2.n_rbf == 6
+    assert model2.n_neuron == 64
+    assert model2.n_embed == 4
+
+
+def test_ap3_d3_model_d3_damping_parameters_precedence(tmp_path):
+    saved_params = {
+        "s6": 1.0,
+        "s8": 0.91,
+        "a1": 0.44,
+        "a2": 3.8,
+    }
+    override_params = {
+        "s6": 1.0,
+        "s8": 0.88,
+        "a1": 0.61,
+        "a2": 2.9,
+    }
+    checkpoint_path = tmp_path / "ap3d3_saved_d3.pt"
+
+    ap3d3_default = APNet3D3_AtomType_Model(
+        pre_trained_model_path="./models/ap3d3_ensemble/ap3d3_0_no_disp.pt",
+    )
+    assert_d3_params_equal(
+        ap3d3_default.d3_damping_parameters,
+        params_intermolecular_saptpbe0_d3i,
+    )
+    assert_d3_params_equal(
+        ap3d3_default.model.get_config()["d3_damping_parameters"],
+        params_intermolecular_saptpbe0_d3i,
+    )
+
+    ap3d3 = APNet3D3_AtomType_Model(
+        pre_trained_model_path="./models/ap3d3_ensemble/ap3d3_0_no_disp.pt",
+        d3_damping_parameters=saved_params,
+    )
+    ap3d3.save_model(str(checkpoint_path))
+
+    restored_default = APNet3D3_AtomType_Model(
+        pre_trained_model_path=str(checkpoint_path)
+    )
+    assert_d3_params_equal(restored_default.d3_damping_parameters, saved_params)
+    assert_d3_params_equal(
+        restored_default.model.get_config()["d3_damping_parameters"], saved_params
+    )
+
+    restored_override = APNet3D3_AtomType_Model(
+        pre_trained_model_path=str(checkpoint_path),
+        d3_damping_parameters=override_params,
+    )
+    assert_d3_params_equal(restored_override.d3_damping_parameters, override_params)
+    assert_d3_params_equal(
+        restored_override.dimer_prop_model.d3_damping_parameters,
+        override_params,
+    )
+
+
+def test_ap3_d3_fused_predict_expansion_to_4_cols():
+    """Test that predict_qcel_mols always returns 4 columns even when no_disp_nn=True."""
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+
+    # Test with no_disp_nn=True
+    ap3_no_disp = APNet3D3_AtomType_Model(
+        ds_root=None,
+        atom_type_model=atom_type_hf_vw_model.model,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        am_dimer_param_model=atom_type_elst_model,
+        use_precomputed_classical=False,
+        ignore_database_null=True,
+        no_disp_nn=True,
+    )
+
+    # Predict on water dimer
+    predictions_no_disp = ap3_no_disp.predict_qcel_mols(
+        [mol_cliff_water_close], batch_size=1
+    )
+
+    # Should always return 4 columns: [elst, exch, indu, disp]
+    assert predictions_no_disp.shape[1] == 4, (
+        f"predict_qcel_mols should return 4 columns, got {predictions_no_disp.shape[1]}"
+    )
+
+    # Test with no_disp_nn=False (default)
+    ap3_with_disp = APNet3D3_AtomType_Model(
+        ds_root=None,
+        atom_type_model=atom_type_hf_vw_model.model,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        am_dimer_param_model=atom_type_elst_model,
+        use_precomputed_classical=False,
+        ignore_database_null=True,
+        no_disp_nn=False,
+    )
+
+    predictions_with_disp = ap3_with_disp.predict_qcel_mols(
+        [mol_cliff_water_close], batch_size=1
+    )
+
+    # Should also return 4 columns
+    assert (
+        predictions_with_disp.shape[1] == 4
+    ), f"predict_qcel_mols should return 4 columns, got {
+        predictions_with_disp.shape[1]
+    }"
+
+    print(f"no_disp_nn=True predictions shape: {predictions_no_disp.shape}")
+    print(f"no_disp_nn=False predictions shape: {predictions_with_disp.shape}")
+
+
+def test_ap3_d3_fused_component_order_preserved_no_disp_checkpoint():
+    """No-disp checkpoint keeps elst/exch/ind at indices 0/1/2."""
+    ap3d3 = APNet3D3_AtomType_Model(
+        pre_trained_model_path="./models/ap3d3_ensemble/ap3d3_0_no_disp.pt",
+    )
+
+    batch = ap3d3._qcel_example_input(
+        [mol_cliff_water_close],
+        batch_size=1,
+        r_cut=ap3d3.model.r_cut,
+        r_cut_im=ap3d3.model.r_cut_im,
+    )
+    E_out, E_sr, E_elst, E_ind, _, _, _ = ap3d3.model(batch)
+
+    sr_dimer = scatter_sum_compile(E_sr, batch.dimer_ind, 1)
+    elst_dimer = scatter_sum_compile(E_elst, batch.dimer_ind_full, 1)
+    ind_dimer = scatter_sum_compile(E_ind, batch.dimer_ind_full, 1)
+
+    ap3d3.dimer_prop_model.set_forward("ap3_elst_damping__induced_dipole__disp")
+    E_classical, _, _ = ap3d3.dimer_prop_model(batch)
+    ap3d3.dimer_prop_model.set_forward("ap3_elst_damping__induced_dipole")
+    disp_dimer = scatter_sum_compile(E_classical[:, 2], batch.dimer_ind_full, 1)
+
+    predictions = ap3d3.predict_qcel_mols([mol_cliff_water_close], batch_size=1)
+
+    assert np.allclose(
+        predictions[:, 0],
+        (sr_dimer[:, 0] + elst_dimer).detach().cpu().numpy(),
+    )
+    assert np.allclose(predictions[:, 1], sr_dimer[:, 1].detach().cpu().numpy())
+    assert np.allclose(
+        predictions[:, 2],
+        (sr_dimer[:, 2] + ind_dimer).detach().cpu().numpy(),
+    )
+    assert np.allclose(predictions[:, 3], disp_dimer.detach().cpu().numpy())
+    assert np.allclose(predictions[:, :3], E_out.detach().cpu().numpy())
+
+
+def test_ap3_d3_fused_classical_pair_sums_do_not_spoil_exchange():
+    """Classical pair returns sum into elst/ind/disp only, not exchange."""
+    ap3d3 = APNet3D3_AtomType_Model(
+        pre_trained_model_path="./models/ap3d3_ensemble/ap3d3_0_no_disp.pt",
+    )
+
+    predictions, pair_elst, pair_ind, pair_disp = ap3d3.predict_qcel_mols(
+        [mol_cliff_water_close],
         batch_size=1,
         return_classical_pairs=True,
     )
-    E_classical, mA, mB = ap3.dimer_prop_model(batch)
-    ref_disp = 0
-    print(f"{E_classical[:,2]= }")
-    torch_disp = E_classical[:, 2]
-    # print(f"{torch_disp = }")
 
-    dimer_energies = torch.zeros(
-        3,
+    batch = ap3d3._qcel_example_input(
+        [mol_cliff_water_close],
+        batch_size=1,
+        r_cut=ap3d3.model.r_cut,
+        r_cut_im=ap3d3.model.r_cut_im,
     )
+    E_out, E_sr, _, _, _, _, _ = ap3d3.model(batch)
+    sr_dimer = scatter_sum_compile(E_sr, batch.dimer_ind, 1)
 
-    dimer_energies.scatter_add_(0, batch.dimer_ind, torch_disp)
-    print(f"{dimer_energies = }")
-    ap3_disp = dimer_energies.cpu().numpy()
-    # Energies are from simple dftd3
-    
-    simple_dftd3_energies = np.array([-1.6318158037336559, -3.095885350720171, -6.786625297216168])
-    print(f"{simple_dftd3_energies = }")
-    print(f"{ap3_disp = }")
+    assert np.allclose(pair_elst[0].sum(), predictions[0, 0] - sr_dimer[0, 0].item())
+    assert np.allclose(pair_ind[0].sum(), predictions[0, 2] - sr_dimer[0, 2].item())
+    assert np.allclose(pair_disp[0].sum(), predictions[0, 3])
+    assert np.allclose(predictions[0, 1], sr_dimer[0, 1].item())
+    assert np.allclose(predictions[0, 1], E_out[0, 1].item())
+
+
+def test_ap3d3_frozen():
+    import pandas as pd
+
+    mol_cliff_water_close = qcel.models.Molecule.from_data("""
+    0 1
+    O    -1.32695822 -0.10593854  0.01878815
+    H    -1.93166523  1.60017431 -0.02171052
+    H     0.48664427  0.07959810  0.00986248
+    --
+    0 1
+    O     3.90752324  0.05275741  0.00185016
+    H     4.61923494 -0.77566084  1.44961541
+    H     4.61100085 -0.84715468 -1.40675642
+    units bohr
+    no_com
+    no_reorient
+    """)
+    ap3d3 = APNet3D3_AtomType_Model(
+        # pre_trained_model_path="./models/ap3d3_ensemble/ap3d3_0_no_disp.pt",
+        pre_trained_model_path="./models/ap3_ensemble/1/ap3_d3_no_disp_nn_1.pt",
+    )
+    print(ap3d3.model)
+    # print(torch.load("./models/ap3d3_ensemble/ap3d3_0_no_disp.pt"))
+    # pred = ap3d3.predict_qcel_mols([mol_cliff_water_close])
+    df = pd.read_pickle(
+        current_file_path
+        + os.sep
+        + os.path.join("dataset_data", "water_dimer_pes3.pkl")
+    )
+    print(df)
+    from pprint import pprint as pp
+
+    mols = df["qcel_molecule"].tolist()
+    preds, pairwise_elst_energies, pairwise_ind_energies, pairwise_disp_energies = (
+        ap3d3.predict_qcel_mols(
+            mols,
+            batch_size=1,
+            return_pairs=False,
+            return_classical_pairs=True,
+        )
+    )
+    print(preds)
+    print(preds.shape)
+    # df['SAPT0 ELST ENERGY adz'] = df['SAPT0 ELST ENERGY adz'].values * 627.509
+    df["SAPT0 EXCH ENERGY adz"] = df["SAPT0 EXCH ENERGY adz"].values * 627.509
+    df["SAPT0 IND ENERGY adz"] = df["SAPT0 IND ENERGY adz"].values * 627.509
+    df["SAPT0 DISP ENERGY adz"] = df["SAPT0 DISP ENERGY adz"].values * 627.509
+    for n, (id, r) in enumerate(df.iterrows()):
+        # Print 'SAPT0 ELST ENERGY adz', and SAPT0 TOTAL ENERGY adz with pred row
+        # print(
+        #     f"Row {n}:  {r['SAPT0 ELST ENERGY adz']:.6f}, {
+        #         r['SAPT0 TOTAL ENERGY adz']:.6f}, AP3D3 pred = {preds[n, 0]:.6f}"
+        # )
+        print(
+            f"{n}:  {r['SAPT0 ELST ENERGY adz']:.6f}, {
+                r['SAPT0 EXCH ENERGY adz']:.6f}, {r['SAPT0 IND ENERGY adz']:.6f}, {
+                r['SAPT0 DISP ENERGY adz']:.6f}"
+        )
 
     return
 
 
+def test_d3i():
+    """
+    Checks that using saptpbe0-d3i parameters yields the correct result
+    """
+    mol = qcel.models.Molecule.from_data("""
+0 1
+--
+0 1
+O                    -1.326958230000    -0.105938530000     0.018788150000
+H                    -1.931665240000     1.600174320000    -0.021710520000
+H                     0.486644280000     0.079598090000     0.009862480000
+--
+0 1
+O                     4.287563290000     0.049775580000     0.000960040000
+H                     4.999275000000    -0.778642690000     1.448725300000
+H                     4.991040900000    -0.850136520000    -1.407646550000
+units bohr
+no_com
+no_reorient
+""")
+    dimer_batch = apnet_pt.pt_datasets.ap2_fused_ds.ap2_fused_collate_update_no_target(
+        [
+            apnet_pt.pt_datasets.ap2_fused_ds.qcel_dimer_to_fused_data(
+                mol, r_cut_im=99999.0, dimer_ind=0
+            )
+        ]
+    )
+
+    # param = d3_param(a1=0.3385_wp, s8=0.9171_wp, a2=2.8830_wp)
+    d3_pairs = d3(
+        batch=dimer_batch,
+        params={
+            "s6": 1.0,
+            "s8": 0.8614,  # D3(I)
+            "a1": 0.7171,  # D3(I)
+            "a2": 0.5375,  # D3(I)
+        },
+    )
+    d3_energy = torch.sum(d3_pairs).item()
+    print(d3_energy)
+    ref_d3_energy = -2.459578
+    print(f"D3I energy: {d3_energy:.6f} kcal/mol")
+    print(f"Reference D3I energy: {ref_d3_energy:.6f} kcal/mol")
+    assert np.isclose(d3_energy, ref_d3_energy, atol=1e-4), f"D3I energy {
+        d3_energy:.6f} does not match reference {ref_d3_energy:.6f}"
+    return
+
+
 if __name__ == "__main__":
-    # test_classical_ap3()
-    # test_classical_ap3_long_range()
-    # test_ap3_fused_train_qcel_molecules_in_memory()
-    # test_ap3_fused_train_qcel_molecules_in_memory_precompute()
-    # test_classical_ap3_induction()
-    # test_ap3_fused_lmdb_dataset()
-    # test_ap3_fused_train_qcel_molecules_in_memory_precompute_lmdb()
-    # test_classical_ap3_dispersion()
-    # test_ap3_fused_train_qcel_molecules_in_memory()
-    test_classical_ap3_long_range()
+    test_classical_ap3_dispersion()
+    # test_d3i()
+    # test_ap3d3_frozen()
+    # test_ap3_d3_fused_import_qcml_dftd3()
+    # test_ap3_d3_fused_no_disp_nn_architecture()
+    # test_ap3_d3_fused_default_architecture()
+    # test_ap3_d3_fused_get_config_recreate_model()
+    # test_ap3_d3_fused_predict_expansion_to_4_cols()
+    # pytest.main([__file__])

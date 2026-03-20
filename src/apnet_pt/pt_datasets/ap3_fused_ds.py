@@ -12,6 +12,7 @@ from torch_geometric.data import download_url
 
 from .. import util
 from ..AtomModels.ap2_atom_model import AtomModel
+from ..hf_pretrained import resolve_pretrained_path
 from .. import atomic_datasets
 from glob import glob
 import tarfile
@@ -21,6 +22,21 @@ from pathlib import Path
 from importlib import resources
 from apnet_pt import constants
 import h5py
+
+
+AP3_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9, 10})
+
+
+def spec_type_uses_split_files(spec_type):
+    return spec_type in AP3_FUSED_SPLIT_SPEC_TYPES
+
+
+def qcel_inputs_are_split_db(qcel_molecules):
+    return (
+        qcel_molecules is not None
+        and len(qcel_molecules) == 2
+        and isinstance(qcel_molecules[0], list)
+    )
 
 
 def qcel_dimer_to_fused_data(dimer, r_cut=5.0, r_cut_im=8.0, **kwargs):
@@ -116,6 +132,7 @@ def dimer_fused_data(
         **kwargs,  # allows for additional properties to be passed in
     )
 
+
 def natural_key(text):
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", text)]
 
@@ -196,7 +213,9 @@ def ap3_fused_collate_update(batch):
     local_indA = []
     local_indB = []
 
-    has_precomputed = hasattr(batch[0], 'E_classical_elst') and hasattr(batch[0], 'E_classical_ind')
+    has_precomputed = hasattr(batch[0], "E_classical_elst") and hasattr(
+        batch[0], "E_classical_ind"
+    )
     # print(f"Batch has precomputed classical energies: {has_precomputed}")
 
     for i, data in enumerate(batch):
@@ -207,7 +226,11 @@ def ap3_fused_collate_update(batch):
             torch.ones(data.e_ABlr_source.size(0), dtype=data.dimer_ind_lr.dtype) * i
         )
         data.dimer_ind_full = (
-            torch.ones(data.e_ABlr_source.size(0) + data.e_ABsr_source.size(0), dtype=data.dimer_ind_lr.dtype) * i
+            torch.ones(
+                data.e_ABlr_source.size(0) + data.e_ABsr_source.size(0),
+                dtype=data.dimer_ind_lr.dtype,
+            )
+            * i
         )
 
         data.molecule_ind_A = (
@@ -221,8 +244,22 @@ def ap3_fused_collate_update(batch):
         local_e_ABlr_source.append(data.e_ABlr_source.clone() + monA_edge_offset)
         local_e_ABlr_target.append(data.e_ABlr_target.clone() + monB_edge_offset)
 
-        local_e_ABfull_source.append(torch.cat([data.e_ABsr_source.clone() + monA_edge_offset, data.e_ABlr_source.clone() + monA_edge_offset]))
-        local_e_ABfull_target.append(torch.cat([data.e_ABsr_target.clone() + monB_edge_offset, data.e_ABlr_target.clone() + monB_edge_offset]))
+        local_e_ABfull_source.append(
+            torch.cat(
+                [
+                    data.e_ABsr_source.clone() + monA_edge_offset,
+                    data.e_ABlr_source.clone() + monA_edge_offset,
+                ]
+            )
+        )
+        local_e_ABfull_target.append(
+            torch.cat(
+                [
+                    data.e_ABsr_target.clone() + monB_edge_offset,
+                    data.e_ABlr_target.clone() + monB_edge_offset,
+                ]
+            )
+        )
 
         local_e_AA_source.append(data.e_AA_source.clone() + monA_edge_offset)
         local_e_AA_target.append(data.e_AA_target.clone() + monA_edge_offset)
@@ -234,13 +271,13 @@ def ap3_fused_collate_update(batch):
 
         local_indA.append(torch.ones(data.RA.size(0), dtype=torch.long) * i)
         local_indB.append(torch.ones(data.RB.size(0), dtype=torch.long) * i)
-        
+
     molecule_ind_A = torch.cat([data.molecule_ind_A for data in batch], dim=0)
     molecule_ind_B = torch.cat([data.molecule_ind_B for data in batch], dim=0)
     natom_per_mol_A = torch.bincount(molecule_ind_A)
     natom_per_mol_B = torch.bincount(molecule_ind_B)
     y = torch.stack([data.y for data in batch], dim=0)
-    
+
     ZA_cat = torch.cat([data.ZA for data in batch], dim=0)
     RA_cat = torch.cat([data.RA for data in batch], dim=0)
     ZB_cat = torch.cat([data.ZB for data in batch], dim=0)
@@ -255,7 +292,7 @@ def ap3_fused_collate_update(batch):
     total_charge_B_tensor = torch.tensor(
         [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
     )
-    
+
     batch_atomic_A = Data(
         x=ZA_cat,
         edge_index=torch.vstack((e_AA_source_cat, e_AA_target_cat)),
@@ -264,7 +301,7 @@ def ap3_fused_collate_update(batch):
         total_charge=total_charge_A_tensor,
         natom_per_mol=natom_per_mol_A,
     )
-    
+
     batch_atomic_B = Data(
         x=ZB_cat,
         edge_index=torch.vstack((e_BB_source_cat, e_BB_target_cat)),
@@ -273,7 +310,7 @@ def ap3_fused_collate_update(batch):
         total_charge=total_charge_B_tensor,
         natom_per_mol=natom_per_mol_B,
     )
-    
+
     e_ABsr_source_cat = torch.cat(local_e_ABsr_source, dim=0)
     e_ABsr_target_cat = torch.cat(local_e_ABsr_target, dim=0)
     e_ABlr_source_cat = torch.cat(local_e_ABlr_source, dim=0)
@@ -281,18 +318,17 @@ def ap3_fused_collate_update(batch):
 
     e_ABfull_source = torch.cat(local_e_ABfull_source, dim=0)
     e_ABfull_target = torch.cat(local_e_ABfull_target, dim=0)
-    
+
     # e_ABfull_source = torch.cat([e_ABsr_source_cat, e_ABlr_source_cat], dim=0)
     # e_ABfull_target = torch.cat([e_ABsr_target_cat, e_ABlr_target_cat], dim=0)
 
-    
     dimer_ind_cat = torch.cat([data.dimer_ind for data in batch], dim=0)
     dimer_ind_lr_cat = torch.cat([data.dimer_ind_lr for data in batch], dim=0)
     dimer_ind_full_cat = torch.cat([data.dimer_ind_full for data in batch], dim=0)
 
     indA_cat = torch.cat(local_indA, dim=0)
     indB_cat = torch.cat(local_indB, dim=0)
-    
+
     batched_data = Data(
         y=y,
         ZA=ZA_cat,
@@ -323,11 +359,15 @@ def ap3_fused_collate_update(batch):
         indA=indA_cat,
         indB=indB_cat,
     )
-    
+
     if has_precomputed:
-        batched_data.E_classical_elst = torch.tensor([data.E_classical_elst for data in batch])
-        batched_data.E_classical_ind = torch.tensor([data.E_classical_ind for data in batch])
-    
+        batched_data.E_classical_elst = torch.tensor(
+            [data.E_classical_elst for data in batch]
+        )
+        batched_data.E_classical_ind = torch.tensor(
+            [data.E_classical_ind for data in batch]
+        )
+
     return batched_data
 
 
@@ -353,15 +393,33 @@ def ap3_fused_collate_update_no_target(batch):
             torch.ones(data.e_ABlr_source.size(0), dtype=data.dimer_ind_lr.dtype) * i
         )
         data.dimer_ind_full = (
-            torch.ones(data.e_ABlr_source.size(0) + data.e_ABsr_source.size(0), dtype=data.dimer_ind_lr.dtype) * i
+            torch.ones(
+                data.e_ABlr_source.size(0) + data.e_ABsr_source.size(0),
+                dtype=data.dimer_ind_lr.dtype,
+            )
+            * i
         )
 
         local_e_ABsr_source.append(data.e_ABsr_source.clone() + monA_edge_offset)
         local_e_ABsr_target.append(data.e_ABsr_target.clone() + monB_edge_offset)
         local_e_ABlr_source.append(data.e_ABlr_source.clone() + monA_edge_offset)
         local_e_ABlr_target.append(data.e_ABlr_target.clone() + monB_edge_offset)
-        local_e_ABfull_source.append(torch.cat([data.e_ABsr_source.clone() + monA_edge_offset, data.e_ABlr_source.clone() + monA_edge_offset]))
-        local_e_ABfull_target.append(torch.cat([data.e_ABsr_target.clone() + monB_edge_offset, data.e_ABlr_target.clone() + monB_edge_offset]))
+        local_e_ABfull_source.append(
+            torch.cat(
+                [
+                    data.e_ABsr_source.clone() + monA_edge_offset,
+                    data.e_ABlr_source.clone() + monA_edge_offset,
+                ]
+            )
+        )
+        local_e_ABfull_target.append(
+            torch.cat(
+                [
+                    data.e_ABsr_target.clone() + monB_edge_offset,
+                    data.e_ABlr_target.clone() + monB_edge_offset,
+                ]
+            )
+        )
         local_e_AA_source.append(data.e_AA_source.clone() + monA_edge_offset)
         local_e_AA_target.append(data.e_AA_target.clone() + monA_edge_offset)
         local_e_BB_source.append(data.e_BB_source.clone() + monB_edge_offset)
@@ -387,11 +445,17 @@ def ap3_fused_collate_update_no_target(batch):
         [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
     )
     molecule_ind_A = torch.cat(
-        [torch.ones(data.RA.size(0), dtype=torch.long) * i for i, data in enumerate(batch)],
+        [
+            torch.ones(data.RA.size(0), dtype=torch.long) * i
+            for i, data in enumerate(batch)
+        ],
         dim=0,
     )
     molecule_ind_B = torch.cat(
-        [torch.ones(data.RB.size(0), dtype=torch.long) * i for i, data in enumerate(batch)],
+        [
+            torch.ones(data.RB.size(0), dtype=torch.long) * i
+            for i, data in enumerate(batch)
+        ],
         dim=0,
     )
     natom_per_mol_A = torch.tensor(
@@ -400,7 +464,7 @@ def ap3_fused_collate_update_no_target(batch):
     natom_per_mol_B = torch.tensor(
         [data.RB.size(0) for data in batch], dtype=torch.long
     )
-    
+
     batch_atomic_A = Data(
         x=ZA_cat,
         edge_index=torch.vstack((e_AA_source_cat, e_AA_target_cat)),
@@ -409,7 +473,7 @@ def ap3_fused_collate_update_no_target(batch):
         total_charge=total_charge_A_tensor,
         natom_per_mol=natom_per_mol_A,
     )
-    
+
     batch_atomic_B = Data(
         x=ZB_cat,
         edge_index=torch.vstack((e_BB_source_cat, e_BB_target_cat)),
@@ -418,7 +482,7 @@ def ap3_fused_collate_update_no_target(batch):
         total_charge=total_charge_B_tensor,
         natom_per_mol=natom_per_mol_B,
     )
-    
+
     e_ABsr_source_cat = torch.cat(local_e_ABsr_source, dim=0)
     e_ABsr_target_cat = torch.cat(local_e_ABsr_target, dim=0)
     e_ABlr_source_cat = torch.cat(local_e_ABlr_source, dim=0)
@@ -426,11 +490,11 @@ def ap3_fused_collate_update_no_target(batch):
 
     e_ABfull_source = torch.cat(local_e_ABfull_source, dim=0)
     e_ABfull_target = torch.cat(local_e_ABfull_target, dim=0)
-    
+
     dimer_ind_cat = torch.cat([data.dimer_ind for data in batch], dim=0)
     dimer_ind_lr_cat = torch.cat([data.dimer_ind_lr for data in batch], dim=0)
     dimer_ind_full = torch.cat([data.dimer_ind_full for data in batch], dim=0)
-    
+
     batched_data = Data(
         ZA=ZA_cat,
         RA=RA_cat,
@@ -485,14 +549,32 @@ def ap3_fused_collate_update_no_target_monomer_indices(batch):
             torch.ones(data.e_ABlr_source.size(0), dtype=data.dimer_ind_lr.dtype) * i
         )
         data.dimer_ind_full = (
-            torch.ones(data.e_ABlr_source.size(0) + data.e_ABsr_source.size(0), dtype=data.dimer_ind_lr.dtype) * i
+            torch.ones(
+                data.e_ABlr_source.size(0) + data.e_ABsr_source.size(0),
+                dtype=data.dimer_ind_lr.dtype,
+            )
+            * i
         )
         local_e_ABsr_source.append(data.e_ABsr_source.clone() + monA_edge_offset)
         local_e_ABsr_target.append(data.e_ABsr_target.clone() + monB_edge_offset)
         local_e_ABlr_source.append(data.e_ABlr_source.clone() + monA_edge_offset)
         local_e_ABlr_target.append(data.e_ABlr_target.clone() + monB_edge_offset)
-        local_e_ABfull_source.append(torch.cat([data.e_ABsr_source.clone() + monA_edge_offset, data.e_ABlr_source.clone() + monA_edge_offset]))
-        local_e_ABfull_target.append(torch.cat([data.e_ABsr_target.clone() + monB_edge_offset, data.e_ABlr_target.clone() + monB_edge_offset]))
+        local_e_ABfull_source.append(
+            torch.cat(
+                [
+                    data.e_ABsr_source.clone() + monA_edge_offset,
+                    data.e_ABlr_source.clone() + monA_edge_offset,
+                ]
+            )
+        )
+        local_e_ABfull_target.append(
+            torch.cat(
+                [
+                    data.e_ABsr_target.clone() + monB_edge_offset,
+                    data.e_ABlr_target.clone() + monB_edge_offset,
+                ]
+            )
+        )
         local_e_AA_source.append(data.e_AA_source.clone() + monA_edge_offset)
         local_e_AA_target.append(data.e_AA_target.clone() + monA_edge_offset)
         local_e_BB_source.append(data.e_BB_source.clone() + monB_edge_offset)
@@ -521,11 +603,17 @@ def ap3_fused_collate_update_no_target_monomer_indices(batch):
         [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
     )
     molecule_ind_A = torch.cat(
-        [torch.ones(data.RA.size(0), dtype=torch.long) * i for i, data in enumerate(batch)],
+        [
+            torch.ones(data.RA.size(0), dtype=torch.long) * i
+            for i, data in enumerate(batch)
+        ],
         dim=0,
     )
     molecule_ind_B = torch.cat(
-        [torch.ones(data.RB.size(0), dtype=torch.long) * i for i, data in enumerate(batch)],
+        [
+            torch.ones(data.RB.size(0), dtype=torch.long) * i
+            for i, data in enumerate(batch)
+        ],
         dim=0,
     )
     natom_per_mol_A = torch.tensor(
@@ -534,7 +622,7 @@ def ap3_fused_collate_update_no_target_monomer_indices(batch):
     natom_per_mol_B = torch.tensor(
         [data.RB.size(0) for data in batch], dtype=torch.long
     )
-    
+
     batch_atomic_A = Data(
         x=ZA_cat,
         edge_index=torch.vstack((e_AA_source_cat, e_AA_target_cat)),
@@ -543,7 +631,7 @@ def ap3_fused_collate_update_no_target_monomer_indices(batch):
         total_charge=total_charge_A_tensor,
         natom_per_mol=natom_per_mol_A,
     )
-    
+
     batch_atomic_B = Data(
         x=ZB_cat,
         edge_index=torch.vstack((e_BB_source_cat, e_BB_target_cat)),
@@ -552,7 +640,7 @@ def ap3_fused_collate_update_no_target_monomer_indices(batch):
         total_charge=total_charge_B_tensor,
         natom_per_mol=natom_per_mol_B,
     )
-    
+
     e_ABsr_source_cat = torch.cat(local_e_ABsr_source, dim=0)
     e_ABsr_target_cat = torch.cat(local_e_ABsr_target, dim=0)
     e_ABlr_source_cat = torch.cat(local_e_ABlr_source, dim=0)
@@ -560,11 +648,11 @@ def ap3_fused_collate_update_no_target_monomer_indices(batch):
 
     e_ABfull_source = torch.cat(local_e_ABfull_source, dim=0)
     e_ABfull_target = torch.cat(local_e_ABfull_target, dim=0)
-    
+
     dimer_ind_cat = torch.cat([data.dimer_ind for data in batch], dim=0)
     dimer_ind_lr_cat = torch.cat([data.dimer_ind_lr for data in batch], dim=0)
     dimer_ind_full = torch.cat([data.dimer_ind_full for data in batch], dim=0)
-    
+
     batched_data = Data(
         ZA=ZA_cat,
         RA=RA_cat,
@@ -661,17 +749,38 @@ class APNet2_fused_DataLoader(torch.utils.data.DataLoader):
 
 def save_hdf5_data_objects(data_objects, filepath):
     """Save list of data objects to HDF5 format"""
-    with h5py.File(filepath, 'w') as f:
+    with h5py.File(filepath, "w") as f:
         for i, data_obj in enumerate(data_objects):
-            group = f.create_group(f'data_{i}')
+            group = f.create_group(f"data_{i}")
             # Save essential tensor and scalar attributes
             essential_attrs = [
-                'ZA', 'RA', 'ZB', 'RB', 'e_ABsr_source', 'e_ABsr_target',
-                'e_ABlr_source', 'e_ABlr_target', 'e_AA_source', 'e_AA_target',
-                'e_BB_source', 'e_BB_target', 'dimer_ind', 'dimer_ind_lr',
-                'molecule_ind_A', 'molecule_ind_B', 'total_charge_A', 'total_charge_B',
-                'qA', 'muA', 'quadA', 'hlistA', 'qB', 'muB', 'quadB', 'hlistB',
-                'y'  # Essential for training
+                "ZA",
+                "RA",
+                "ZB",
+                "RB",
+                "e_ABsr_source",
+                "e_ABsr_target",
+                "e_ABlr_source",
+                "e_ABlr_target",
+                "e_AA_source",
+                "e_AA_target",
+                "e_BB_source",
+                "e_BB_target",
+                "dimer_ind",
+                "dimer_ind_lr",
+                "molecule_ind_A",
+                "molecule_ind_B",
+                "total_charge_A",
+                "total_charge_B",
+                "qA",
+                "muA",
+                "quadA",
+                "hlistA",
+                "qB",
+                "muB",
+                "quadB",
+                "hlistB",
+                "y",  # Essential for training
             ]
             for attr_name in essential_attrs:
                 if hasattr(data_obj, attr_name):
@@ -685,9 +794,9 @@ def save_hdf5_data_objects(data_objects, filepath):
 def load_hdf5_data_objects(filepath):  # type: ignore
     """Load list of data objects from HDF5 format"""
     data_objects = []
-    with h5py.File(filepath, 'r') as f:
+    with h5py.File(filepath, "r") as f:
         for key in sorted(f.keys()):
-            if key.startswith('data_'):
+            if key.startswith("data_"):
                 group = f[key]
                 data_dict = {}
                 # Load datasets (tensor data)
@@ -706,6 +815,14 @@ def load_hdf5_data_objects(filepath):  # type: ignore
 
 
 class ap3_fused_module_dataset(Dataset):
+    split_spec_types = AP3_FUSED_SPLIT_SPEC_TYPES
+
+    @classmethod
+    def is_split_db_config(cls, spec_type, qcel_molecules=None):
+        return spec_type_uses_split_files(spec_type) or qcel_inputs_are_split_db(
+            qcel_molecules
+        )
+
     def __init__(
         self,
         root,
@@ -719,9 +836,7 @@ class ap3_fused_module_dataset(Dataset):
         skip_processed=True,
         skip_compile=False,
         # only need for processing
-        atom_model_path=resources.files("apnet_pt").joinpath(
-            "models", "am_ensemble", "am_0.pt"
-        ),
+        atom_model_path=None,
         atom_model=None,
         dimer_prop_model=None,
         batch_size=16,
@@ -750,13 +865,15 @@ class ap3_fused_module_dataset(Dataset):
         """
         self.print_level = print_level
         try:
-            assert spec_type in [1, 2, 5, 6, 7, 8, 9, None]
+            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, None]
         except Exception:
             print("Currently spec_type must be 1 or 2 for SAPT0/jun-cc-pVDZ")
             raise ValueError
         self.spec_type = spec_type
-        assert atomic_batch_size <= datapoint_storage_n_objects, "atomic_batch_size must be <= datapoint_storage_n_objects, got {} and {}".format(
-            atomic_batch_size, datapoint_storage_n_objects
+        assert atomic_batch_size <= datapoint_storage_n_objects, (
+            "atomic_batch_size must be <= datapoint_storage_n_objects, got {} and {}".format(
+                atomic_batch_size, datapoint_storage_n_objects
+            )
         )
         # assert datapoint_storage_n_objects % atomic_batch_size == 0, "datapoint_storage_n_objects must be multiple of atomic_batch_size, got {} and {}".format(
         #     datapoint_storage_n_objects, atomic_batch_size
@@ -787,6 +904,9 @@ class ap3_fused_module_dataset(Dataset):
         self.random_seed = random_seed
         self.in_memory = in_memory
         self.split = split
+        self.split_db = spec_type_uses_split_files(self.spec_type) or (
+            self.qcel_molecules is not None and self.split != "all"
+        )
         self.r_cut = r_cut
         self.r_cut_im = r_cut_im
         self.force_reprocess = force_reprocess
@@ -816,7 +936,9 @@ class ap3_fused_module_dataset(Dataset):
                 self.atom_model.model = torch.compile(
                     self.atom_model.model, dynamic=True
                 )
-        elif atom_model_path is not None and not self.skip_processed:
+        elif not self.skip_processed:
+            if atom_model_path is None:
+                atom_model_path = resolve_pretrained_path("am_ensemble/am_0.pt")
             self.atom_model = AtomModel(
                 pre_trained_model_path=atom_model_path,
                 ds_root=None,
@@ -832,13 +954,13 @@ class ap3_fused_module_dataset(Dataset):
                 )
         self.dimer_prop_model = dimer_prop_model
         if self.dimer_prop_model is not None:
-            if hasattr(self.dimer_prop_model, 'eval'):
+            if hasattr(self.dimer_prop_model, "eval"):
                 self.dimer_prop_model.eval()
-            elif hasattr(self.dimer_prop_model, 'model'):
+            elif hasattr(self.dimer_prop_model, "model"):
                 self.dimer_prop_model.model.eval()
-                if hasattr(self.dimer_prop_model, 'dimer_model'):
+                if hasattr(self.dimer_prop_model, "dimer_model"):
                     self.dimer_prop_model.dimer_model.eval()
-                if hasattr(self.dimer_prop_model, 'dimer_model_elst'):
+                if hasattr(self.dimer_prop_model, "dimer_model_elst"):
                     self.dimer_prop_model.dimer_model_elst.eval()
         print(f"{root=}, {self.spec_type=}, {self.in_memory=}")
         super(ap3_fused_module_dataset, self).__init__(root, transform, pre_transform)
@@ -859,9 +981,14 @@ class ap3_fused_module_dataset(Dataset):
         return ".h5" if self.storage_type == "h5" else ".pt"
 
     @property
+    def split_name(self):
+        return f"_{self.split}" if self.split_db and self.split != "all" else ""
+
+    @property
     def raw_file_names(self):
         # TODO: enable users to specify data source via QCArchive, url, or local file
         # spec_1 = "spec_1" # 'SAPT0/jun-cc-pVDZ'
+        # spec 10 SAPT(PBE0)-D4(I)/aug-cc-pVDZ
         if self.spec_type == 2:
             return [
                 "1600K_train_dimers-fixed.pkl",
@@ -891,6 +1018,11 @@ class ap3_fused_module_dataset(Dataset):
                 "t_train_19.pkl",
                 "t_test_19.pkl",
             ]
+        elif self.spec_type == 10:
+            return [
+                "35K_saptpbe0-d4_totals_train.pkl",
+                "35K_saptpbe0-d4_totals_test.pkl",
+            ]
         elif self.spec_type is None:
             os.system(f"touch {self.raw_dir}/tmp.txt")
             return ["tmp.txt"]
@@ -903,14 +1035,12 @@ class ap3_fused_module_dataset(Dataset):
         if self.force_reprocess:
             return ["file"]
         else:
-            if self.split == "train":
+            if self.split_db and self.split == "train":
                 file_cmd = f"{self.root}/processed/dimer_ap3_fused_train_spec_{self.spec_type}_*{self.file_extension}"
-            elif self.split == "test":
+            elif self.split_db and self.split == "test":
                 file_cmd = f"{self.root}/processed/dimer_ap3_fused_test_spec_{self.spec_type}_*{self.file_extension}"
             else:
-                file_cmd = (
-                    f"{self.root}/processed/dimer_ap3_fused_spec_{self.spec_type}_*{self.file_extension}"
-                )
+                file_cmd = f"{self.root}/processed/dimer_ap3_fused_spec_{self.spec_type}_*{self.file_extension}"
             spec_files = glob(file_cmd)
             spec_files = [i.split("/")[-1] for i in spec_files]
             if len(spec_files) > 0:
@@ -918,10 +1048,6 @@ class ap3_fused_module_dataset(Dataset):
                 spec_files.sort(key=natural_key)
                 if self.MAX_SIZE is not None:
                     max_size = int(self.MAX_SIZE / self.datapoint_storage_n_objects)
-                    # if max_size == 0:
-                    #     raise ValueError(
-                    #         "MAX_SIZE must be greater than datapoint_storage_n_objects"
-                    #     )
                 if self.MAX_SIZE is not None:
                     if len(spec_files) > max_size and max_size > 0:
                         spec_files = spec_files[:max_size]
@@ -969,24 +1095,24 @@ class ap3_fused_module_dataset(Dataset):
 
     def _process_dimer_batch(self, batch_data_list):
         from apnet_pt.util import scatter_sum_compile
-        
+
         temp_batch = ap3_fused_collate_update(batch_data_list)
-        
+
         if self.device:
             temp_batch = temp_batch.to(self.device)
-        
+
         with torch.no_grad():
-            if hasattr(self.dimer_prop_model, 'set_forward'):
+            if hasattr(self.dimer_prop_model, "set_forward"):
                 result = self.dimer_prop_model(temp_batch)
                 E_classical = result[0]
-            elif hasattr(self.dimer_prop_model, 'dimer_model'):
+            elif hasattr(self.dimer_prop_model, "dimer_model"):
                 result = self.dimer_prop_model.dimer_model(temp_batch)
                 E_classical = result[0]
             else:
-                raise ValueError("dimer_prop_model must have either set_forward or dimer_model attribute")
-            
-            n_dimers = len(batch_data_list)
-            
+                raise ValueError(
+                    "dimer_prop_model must have either set_forward or dimer_model attribute"
+                )
+
             if E_classical.ndim == 1:
                 E_elst_pairs = E_classical
                 E_ind_pairs = torch.zeros_like(E_classical)
@@ -994,8 +1120,10 @@ class ap3_fused_module_dataset(Dataset):
                 E_elst_pairs = E_classical[:, 0]
                 E_ind_pairs = E_classical[:, 1]
             else:
-                raise ValueError(f"Expected E_classical to be 1D or 2D, got shape {E_classical.shape}")
-            
+                raise ValueError(
+                    f"Expected E_classical to be 1D or 2D, got shape {E_classical.shape}"
+                )
+
             ndimer = temp_batch.total_charge_A.size(0)
             E_elst_full_dimer = scatter_sum_compile(
                 E_elst_pairs, temp_batch.dimer_ind_full, ndimer
@@ -1023,7 +1151,7 @@ class ap3_fused_module_dataset(Dataset):
             # padded = E_ind_dimer.new_zeros((rows, cols + 3))
             # padded[:, 2:3] = E_ind_dimer
             # E_ind_dimer = padded
-            
+
             for j, data in enumerate(batch_data_list):
                 data.E_classical_elst = E_elst_dimer[j].cpu()
                 data.E_classical_ind = E_ind_dimer[j].cpu()
@@ -1036,7 +1164,7 @@ class ap3_fused_module_dataset(Dataset):
         RAs, RBs, ZAs, ZBs, TQAs, TQBs, targets = [], [], [], [], [], [], []
         if self.qcel_molecules is not None and self.energy_labels is not None:
             print("Processing directly from provided QCElemental molecules...")
-            split_name = f"_{self.split}" if self.split != "all" else ""
+            split_name = self.split_name
 
             # Process directly from qcel_mols and energy_labels
             for mol in self.qcel_molecules:
@@ -1076,8 +1204,8 @@ class ap3_fused_module_dataset(Dataset):
         else:
             for raw_path in self.raw_paths:
                 split_name = ""
-                if self.spec_type in [2, 5, 6, 7, 9]:
-                    split_name = f"_{self.split}" if self.split != "all" else ""
+                if spec_type_uses_split_files(self.spec_type):
+                    split_name = self.split_name
                     print(f"{split_name=}")
                     if self.split not in Path(raw_path).stem:
                         print(f"{self.split} is skipping {raw_path}")
@@ -1134,18 +1262,18 @@ class ap3_fused_module_dataset(Dataset):
                 print(data)
                 print(f"Skipping invalid dimer index {i}")
                 continue
-            
+
             if self.dimer_prop_model is not None:
                 batch_data_objects.append(data)
-                
+
                 if len(batch_data_objects) >= self.atomic_batch_size:
                     self._process_dimer_batch(batch_data_objects)
-                    
+
                     for batch_data in batch_data_objects:
                         batch_data_cpu = batch_data.cpu()
                         if self.pre_filter is None or self.pre_filter(batch_data_cpu):
                             data_objects.append(batch_data_cpu)
-                    
+
                     batch_data_objects = []
             else:
                 data = data.cpu()
@@ -1159,10 +1287,10 @@ class ap3_fused_module_dataset(Dataset):
                     self.data.extend(data_objects)
                 else:
                     datapath = osp.join(
-                    self.processed_dir,
-                    f"dimer_ap3_fused{split_name}_spec_{self.spec_type}_{
-                        idx // self.points_per_file
-                    }{self.file_extension}",
+                        self.processed_dir,
+                        f"dimer_ap3_fused{split_name}_spec_{self.spec_type}_{
+                            idx // self.points_per_file
+                        }{self.file_extension}",
                     )
                     if self.print_level >= 2:
                         print(f"Saving to {datapath}")
@@ -1174,15 +1302,15 @@ class ap3_fused_module_dataset(Dataset):
                 if self.MAX_SIZE is not None and idx > self.MAX_SIZE:
                     break
             idx += 1
-        
+
         if self.dimer_prop_model is not None and len(batch_data_objects) > 0:
             self._process_dimer_batch(batch_data_objects)
-            
+
             for batch_data in batch_data_objects:
                 batch_data_cpu = batch_data.cpu()
                 if self.pre_filter is None or self.pre_filter(batch_data_cpu):
                     data_objects.append(batch_data_cpu)
-        
+
         if self.print_level >= 2:
             print(f"{i}/{len(RAs)}, {time() - t2:.2f}s, {time() - t1:.2f}s")
         elif self.print_level >= 1 and idx % 1000:
@@ -1231,8 +1359,8 @@ class ap3_fused_module_dataset(Dataset):
         if self.active_idx_data == idx_datapath:
             return self.active_data[obj_ind]
         split_name = ""
-        if self.spec_type in [2, 5, 6, 7, 9, None]:
-            split_name = f"_{self.split}" if self.split != "all" else ""
+        if self.split_db:
+            split_name = self.split_name
         datapath = osp.join(
             self.processed_dir,
             f"dimer_ap3_fused{split_name}_spec_{self.spec_type}_{idx_datapath}{self.file_extension}",
@@ -1256,6 +1384,14 @@ class ap3_fused_module_dataset(Dataset):
 
 
 class ap3_fused_module_dataset_lmdb(Dataset):
+    split_spec_types = AP3_FUSED_SPLIT_SPEC_TYPES
+
+    @classmethod
+    def is_split_db_config(cls, spec_type, qcel_molecules=None):
+        return spec_type_uses_split_files(spec_type) or qcel_inputs_are_split_db(
+            qcel_molecules
+        )
+
     def __init__(
         self,
         root,
@@ -1268,9 +1404,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         force_reprocess=False,
         skip_processed=True,
         skip_compile=False,
-        atom_model_path=resources.files("apnet_pt").joinpath(
-            "models", "am_ensemble", "am_0.pt"
-        ),
+        atom_model_path=None,
         atom_model=None,
         dimer_prop_model=None,
         batch_size=16,
@@ -1292,7 +1426,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
     ):
         """
         LMDB-based dataset for AP3 fused module training.
-        
+
         Args:
             lmdb_map_size: Maximum size of LMDB database in bytes (default 1TB)
             lmdb_readonly: Open LMDB in read-only mode
@@ -1303,13 +1437,15 @@ class ap3_fused_module_dataset_lmdb(Dataset):
             import lmdb
             import json
         except ImportError:
-            raise ImportError("lmdb package is required. Install with: pip install lmdb")
-        
+            raise ImportError(
+                "lmdb package is required. Install with: pip install lmdb"
+            )
+
         self.lmdb = lmdb
         self.json = json
         self.print_level = print_level
         try:
-            assert spec_type in [1, 2, 5, 6, 7, 8, 9, None]
+            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, None]
         except Exception:
             print("Currently spec_type must be 1 or 2 for SAPT0/jun-cc-pVDZ")
             raise ValueError
@@ -1338,6 +1474,9 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         self.random_seed = random_seed
         self.in_memory = in_memory
         self.split = split
+        self.split_db = spec_type_uses_split_files(self.spec_type) or (
+            self.qcel_molecules is not None and self.split != "all"
+        )
         self.r_cut = r_cut
         self.r_cut_im = r_cut_im
         self.force_reprocess = force_reprocess
@@ -1349,22 +1488,22 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         self.points_per_file = self.datapoint_storage_n_objects
         self.skip_compile = skip_compile
         self.skip_processed = skip_processed
-        
+
         self.lmdb_map_size = lmdb_map_size
         self.lmdb_readonly = lmdb_readonly
         self.fileserver_url = fileserver_url
         self.cache_size = cache_size
         self._cache = {}
         self._cache_keys = []
-        
+
         self.lmdb_env = None
         self.lmdb_path = None
         self._length = None
         self._worker_id = None
-        
+
         if os.path.exists(root) is False:
             os.makedirs(root, exist_ok=True)
-            
+
         if atom_model is not None:
             if isinstance(atom_model, AtomModel):
                 self.atom_model = atom_model
@@ -1378,7 +1517,9 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 self.atom_model.model = torch.compile(
                     self.atom_model.model, dynamic=True
                 )
-        elif atom_model_path is not None and not self.skip_processed:
+        elif not self.skip_processed:
+            if atom_model_path is None:
+                atom_model_path = resolve_pretrained_path("am_ensemble/am_0.pt")
             self.atom_model = AtomModel(
                 pre_trained_model_path=atom_model_path,
                 ds_root=None,
@@ -1392,25 +1533,27 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 self.atom_model.model = torch.compile(
                     self.atom_model.model, dynamic=True
                 )
-                
+
         self.dimer_prop_model = dimer_prop_model
         if self.dimer_prop_model is not None:
-            if hasattr(self.dimer_prop_model, 'eval'):
+            if hasattr(self.dimer_prop_model, "eval"):
                 self.dimer_prop_model.eval()
-            elif hasattr(self.dimer_prop_model, 'model'):
+            elif hasattr(self.dimer_prop_model, "model"):
                 self.dimer_prop_model.model.eval()
-                if hasattr(self.dimer_prop_model, 'dimer_model'):
+                if hasattr(self.dimer_prop_model, "dimer_model"):
                     self.dimer_prop_model.dimer_model.eval()
-                if hasattr(self.dimer_prop_model, 'dimer_model_elst'):
+                if hasattr(self.dimer_prop_model, "dimer_model_elst"):
                     self.dimer_prop_model.dimer_model_elst.eval()
-                    
+
         print(f"{root=}, {self.spec_type=}, {self.in_memory=}")
-        
+
         self._init_lmdb_path(root)
         self._init_lmdb()
-        
-        super(ap3_fused_module_dataset_lmdb, self).__init__(root, transform, pre_transform)
-        
+
+        super(ap3_fused_module_dataset_lmdb, self).__init__(
+            root, transform, pre_transform
+        )
+
         if self.force_reprocess:
             self.force_reprocess = False
             self._close_lmdb()
@@ -1421,18 +1564,19 @@ class ap3_fused_module_dataset_lmdb(Dataset):
 
     def _init_lmdb_path(self, root):
         """Initialize LMDB path before parent class init"""
-        split_name = f"_{self.split}" if self.split != "all" else ""
         self.lmdb_path = osp.join(
-            root,
-            "processed",
-            f"lmdb_ap3_fused{split_name}_spec_{self.spec_type}"
+            root, "processed", f"lmdb_ap3_fused{self.split_name}_spec_{self.spec_type}"
         )
-        
+
+    @property
+    def split_name(self):
+        return f"_{self.split}" if self.split_db and self.split != "all" else ""
+
     def _init_lmdb(self):
         """Initialize LMDB environment"""
         if not osp.exists(self.lmdb_path):
             os.makedirs(self.lmdb_path, exist_ok=True)
-            
+
         try:
             self.lmdb_env = self.lmdb.open(
                 self.lmdb_path,
@@ -1442,12 +1586,12 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 lock=not self.lmdb_readonly,
                 max_readers=256,
             )
-            
+
             with self.lmdb_env.begin() as txn:
-                metadata_bytes = txn.get(b'__metadata__')
+                metadata_bytes = txn.get(b"__metadata__")
                 if metadata_bytes:
-                    metadata = self.json.loads(metadata_bytes.decode('utf-8'))
-                    self._length = metadata.get('length', 0)
+                    metadata = self.json.loads(metadata_bytes.decode("utf-8"))
+                    self._length = metadata.get("length", 0)
                 else:
                     self._length = 0
         except Exception as e:
@@ -1500,6 +1644,11 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 "t_train_19.pkl",
                 "t_test_19.pkl",
             ]
+        elif self.spec_type == 10:
+            return [
+                "35K_saptpbe0-d4_totals_train.pkl",
+                "35K_saptpbe0-d4_totals_test.pkl",
+            ]
         elif self.spec_type is None:
             os.system(f"touch {self.raw_dir}/tmp.txt")
             return ["tmp.txt"]
@@ -1513,27 +1662,39 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         """Check if LMDB database exists and has data"""
         if self.force_reprocess:
             return ["file"]
-        
-        if not hasattr(self, 'lmdb_path') or self.lmdb_path is None:
+
+        if not hasattr(self, "lmdb_path") or self.lmdb_path is None:
             return ["lmdb_missing"]
-            
+
         if osp.exists(self.lmdb_path):
             env = None
             try:
                 import lmdb
-                env = lmdb.open(self.lmdb_path, readonly=True, lock=False, max_dbs=0, create=False, max_readers=256)
+
+                env = lmdb.open(
+                    self.lmdb_path,
+                    readonly=True,
+                    lock=False,
+                    max_dbs=0,
+                    create=False,
+                    max_readers=256,
+                )
                 with env.begin() as txn:
-                    metadata_bytes = txn.get(b'__metadata__')
+                    metadata_bytes = txn.get(b"__metadata__")
                     if metadata_bytes:
                         import json
-                        metadata = json.loads(metadata_bytes.decode('utf-8'))
-                        length = metadata.get('length', 0)
-                        
+
+                        metadata = json.loads(metadata_bytes.decode("utf-8"))
+                        length = metadata.get("length", 0)
+
                         if length > 0:
-                            split_name = f"_{self.split}" if self.split != "all" else ""
                             if self.MAX_SIZE is not None and length >= self.MAX_SIZE:
-                                return [f"lmdb_ap3_fused{split_name}_spec_{self.spec_type}"]
-                            return [f"lmdb_ap3_fused{split_name}_spec_{self.spec_type}"]
+                                return [
+                                    f"lmdb_ap3_fused{self.split_name}_spec_{self.spec_type}"
+                                ]
+                            return [
+                                f"lmdb_ap3_fused{self.split_name}_spec_{self.spec_type}"
+                            ]
             except Exception as e:
                 print(f"Error checking LMDB: {e}")
             finally:
@@ -1542,18 +1703,18 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                         env.close()
                     except:
                         pass
-        
+
         return ["lmdb_missing"]
 
     def download(self):
         """Download data - same as original or from fileserver"""
         if self.energy_labels and self.qcel_molecules:
             return
-            
+
         if self.fileserver_url:
             print(f"Downloading from fileserver: {self.fileserver_url}")
             return
-        
+
         print(
             "Downloading Splinter dataset of ~1.6M Dimers. This might take a while..."
         )
@@ -1583,24 +1744,24 @@ class ap3_fused_module_dataset_lmdb(Dataset):
     def _process_dimer_batch(self, batch_data_list):
         """Process dimer batch with classical energies - same as original"""
         from apnet_pt.util import scatter_sum_compile
-        
+
         temp_batch = ap3_fused_collate_update(batch_data_list)
-        
+
         if self.device:
             temp_batch = temp_batch.to(self.device)
-        
+
         with torch.no_grad():
-            if hasattr(self.dimer_prop_model, 'set_forward'):
+            if hasattr(self.dimer_prop_model, "set_forward"):
                 result = self.dimer_prop_model(temp_batch)
                 E_classical = result[0]
-            elif hasattr(self.dimer_prop_model, 'dimer_model'):
+            elif hasattr(self.dimer_prop_model, "dimer_model"):
                 result = self.dimer_prop_model.dimer_model(temp_batch)
                 E_classical = result[0]
             else:
-                raise ValueError("dimer_prop_model must have either set_forward or dimer_model attribute")
-            
-            n_dimers = len(batch_data_list)
-            
+                raise ValueError(
+                    "dimer_prop_model must have either set_forward or dimer_model attribute"
+                )
+
             if E_classical.ndim == 1:
                 E_elst_pairs = E_classical
                 E_ind_pairs = torch.zeros_like(E_classical)
@@ -1608,8 +1769,10 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 E_elst_pairs = E_classical[:, 0]
                 E_ind_pairs = E_classical[:, 1]
             else:
-                raise ValueError(f"Expected E_classical to be 1D or 2D, got shape {E_classical.shape}")
-            
+                raise ValueError(
+                    f"Expected E_classical to be 1D or 2D, got shape {E_classical.shape}"
+                )
+
             ndimer = temp_batch.total_charge_A.size(0)
             E_elst_full_dimer = scatter_sum_compile(
                 E_elst_pairs, temp_batch.dimer_ind_full, ndimer
@@ -1628,7 +1791,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
             full_expanded = E_ind_full_dimer.new_zeros((ndimer, num_cols))
             full_expanded[:N_full] = E_ind_full_dimer
             E_ind_dimer = full_expanded
-            
+
             for j, data in enumerate(batch_data_list):
                 data.E_classical_elst = E_elst_dimer[j].cpu()
                 data.E_classical_ind = E_ind_dimer[j].cpu()
@@ -1636,48 +1799,48 @@ class ap3_fused_module_dataset_lmdb(Dataset):
     def _store_to_lmdb(self, data_objects, start_idx):
         """Store data objects to LMDB"""
         import pickle
-        
+
         if self.lmdb_env is None:
             raise RuntimeError("LMDB environment not initialized")
-            
+
         with self.lmdb_env.begin(write=True) as txn:
             for i, data_obj in enumerate(data_objects):
                 idx = start_idx + i
-                key = str(idx).encode('utf-8')
+                key = str(idx).encode("utf-8")
                 value = pickle.dumps(data_obj)
                 txn.put(key, value)
-            
+
             metadata = {
-                'length': start_idx + len(data_objects),
-                'r_cut': self.r_cut,
-                'r_cut_im': self.r_cut_im,
-                'spec_type': self.spec_type,
+                "length": start_idx + len(data_objects),
+                "r_cut": self.r_cut,
+                "r_cut_im": self.r_cut_im,
+                "spec_type": self.spec_type,
             }
-            txn.put(b'__metadata__', self.json.dumps(metadata).encode('utf-8'))
-        
+            txn.put(b"__metadata__", self.json.dumps(metadata).encode("utf-8"))
+
         self._length = start_idx + len(data_objects)
 
     def process(self):
         """Process dataset and store in LMDB"""
         idx = 0
         data_objects = []
-        
+
         RAs, RBs, ZAs, ZBs, TQAs, TQBs, targets = [], [], [], [], [], [], []
-        
+
         if self.qcel_molecules is not None and self.energy_labels is not None:
             print("Processing directly from provided QCElemental molecules...")
-            
+
             for mol in self.qcel_molecules:
                 monA, monB = mol.get_fragment(0), mol.get_fragment(1)
-                
+
                 RA = torch.tensor(monA.geometry, dtype=torch.float32) * constants.au2ang
                 RB = torch.tensor(monB.geometry, dtype=torch.float32) * constants.au2ang
                 ZA = torch.tensor(monA.atomic_numbers, dtype=torch.int64)
                 ZB = torch.tensor(monB.atomic_numbers, dtype=torch.int64)
-                
+
                 TQA = torch.tensor(monA.molecular_charge, dtype=torch.float32)
                 TQB = torch.tensor(monB.molecular_charge, dtype=torch.float32)
-                
+
                 RAs.append(RA)
                 RBs.append(RB)
                 ZAs.append(ZA)
@@ -1685,7 +1848,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 TQAs.append(TQA)
                 TQBs.append(TQB)
             targets = self.energy_labels
-            
+
             if self.MAX_SIZE is not None and len(RAs) > self.MAX_SIZE:
                 RAs = RAs[: self.MAX_SIZE]
                 RBs = RBs[: self.MAX_SIZE]
@@ -1694,17 +1857,19 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 TQAs = TQAs[: self.MAX_SIZE]
                 TQBs = TQBs[: self.MAX_SIZE]
                 targets = targets[: self.MAX_SIZE]
-            
-            print(f"Processing {len(RAs)} dimers from provided QCElemental molecules...")
+
+            print(
+                f"Processing {len(RAs)} dimers from provided QCElemental molecules..."
+            )
         else:
             for raw_path in self.raw_paths:
                 split_name = ""
-                if self.spec_type in [2, 5, 6, 7, 9]:
-                    split_name = f"_{self.split}" if self.split != "all" else ""
+                if spec_type_uses_split_files(self.spec_type):
+                    split_name = self.split_name
                     if self.split not in Path(raw_path).stem:
                         print(f"{self.split} is skipping {raw_path}")
                         continue
-                        
+
                 print(f"raw_path: {raw_path}")
                 print("Loading dimers...")
                 RA, RB, ZA, ZB, TQA, TQB, target = util.load_dimer_dataset(
@@ -1722,12 +1887,12 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 TQAs.extend(TQA)
                 TQBs.extend(TQB)
                 targets.extend(target)
-        
+
         print("Creating data objects...")
         t1 = time()
         t2 = time()
         print(f"{len(RAs)=}, {self.atomic_batch_size=}, {self.batch_size=}")
-        
+
         batch_data_objects = []
         for i in range(len(RAs)):
             if self.skip_processed and self._length is not None and idx >= self._length:
@@ -1735,7 +1900,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
             elif self.skip_processed and self._length is not None:
                 idx += 1
                 continue
-                
+
             y = torch.tensor(targets[i], dtype=torch.float32)
             data = dimer_fused_data(
                 RAs[i],
@@ -1750,91 +1915,95 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 check_validity=self.check_monomer_validity,
                 y=y,
             )
-            
+
             if data is None:
                 print(f"Skipping invalid dimer index {i}")
                 continue
-            
+
             if self.dimer_prop_model is not None:
                 batch_data_objects.append(data)
-                
+
                 if len(batch_data_objects) >= self.atomic_batch_size:
                     self._process_dimer_batch(batch_data_objects)
-                    
+
                     for batch_data in batch_data_objects:
                         batch_data_cpu = batch_data.cpu()
                         if self.pre_filter is None or self.pre_filter(batch_data_cpu):
                             data_objects.append(batch_data_cpu)
-                    
+
                     batch_data_objects = []
             else:
                 data = data.cpu()
                 if self.pre_filter is None or self.pre_filter(data):
                     data_objects.append(data)
-            
+
             if len(data_objects) >= self.datapoint_storage_n_objects:
                 start_idx = idx - len(data_objects) + 1
                 self._store_to_lmdb(data_objects, start_idx)
-                
+
                 if self.print_level >= 2:
-                    print(f"Stored {len(data_objects)} objects to LMDB at index {start_idx}")
-                
+                    print(
+                        f"Stored {len(data_objects)} objects to LMDB at index {start_idx}"
+                    )
+
                 data_objects = []
-                
+
                 if self.MAX_SIZE is not None and idx > self.MAX_SIZE:
                     break
-            
+
             idx += 1
-        
+
         if self.dimer_prop_model is not None and len(batch_data_objects) > 0:
             self._process_dimer_batch(batch_data_objects)
-            
+
             for batch_data in batch_data_objects:
                 batch_data_cpu = batch_data.cpu()
                 if self.pre_filter is None or self.pre_filter(batch_data_cpu):
                     data_objects.append(batch_data_cpu)
-        
+
         if len(data_objects) > 0:
             start_idx = idx - len(data_objects)
             self._store_to_lmdb(data_objects, start_idx)
-            
+
             if self.print_level >= 2:
-                print(f"Final: Stored {len(data_objects)} objects to LMDB at index {start_idx}")
-        
+                print(
+                    f"Final: Stored {len(data_objects)} objects to LMDB at index {start_idx}"
+                )
+
         print(f"Processing complete. Total time: {time() - t1:.2f}s")
 
     def len(self):
         """Return dataset length from LMDB metadata"""
         if self._length is not None:
             return self._length
-        
+
         if self.lmdb_env is None:
             return 0
-            
+
         with self.lmdb_env.begin() as txn:
-            metadata_bytes = txn.get(b'__metadata__')
+            metadata_bytes = txn.get(b"__metadata__")
             if metadata_bytes:
-                metadata = self.json.loads(metadata_bytes.decode('utf-8'))
-                self._length = metadata.get('length', 0)
+                metadata = self.json.loads(metadata_bytes.decode("utf-8"))
+                self._length = metadata.get("length", 0)
             else:
                 self._length = 0
-        
+
         return self._length
 
     def _check_worker_init(self):
         """Ensure LMDB env is initialized for current worker process"""
         import torch.utils.data
-        
+
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             worker_id = worker_info.id
         else:
             worker_id = None
-        
+
         if worker_id != self._worker_id:
             if self.lmdb_env is not None:
                 self._close_lmdb()
-            
+
             self._worker_id = worker_id
             self._init_lmdb()
             self._cache = {}
@@ -1843,52 +2012,52 @@ class ap3_fused_module_dataset_lmdb(Dataset):
     def get(self, idx):
         """Retrieve item from LMDB with caching"""
         import pickle
-        
+
         self._check_worker_init()
-        
+
         if idx in self._cache:
             self._cache_keys.remove(idx)
             self._cache_keys.append(idx)
             return self._cache[idx]
-        
+
         if self.lmdb_env is None:
             raise RuntimeError("LMDB environment not initialized")
-        
+
         with self.lmdb_env.begin() as txn:
-            key = str(idx).encode('utf-8')
+            key = str(idx).encode("utf-8")
             value_bytes = txn.get(key)
-            
+
             if value_bytes is None:
                 raise IndexError(f"Index {idx} not found in LMDB database")
-            
+
             data = pickle.loads(value_bytes)
-        
+
         self._cache[idx] = data
         self._cache_keys.append(idx)
-        
+
         if len(self._cache) > self.cache_size:
             oldest_key = self._cache_keys.pop(0)
             del self._cache[oldest_key]
-        
+
         return data
 
     def prefetch(self, indices):
         """Prefetch multiple items into cache"""
         import pickle
-        
+
         if self.lmdb_env is None:
             return
-            
+
         with self.lmdb_env.begin() as txn:
             for idx in indices:
                 if idx not in self._cache:
-                    key = str(idx).encode('utf-8')
+                    key = str(idx).encode("utf-8")
                     value_bytes = txn.get(key)
                     if value_bytes:
                         data = pickle.loads(value_bytes)
                         self._cache[idx] = data
                         self._cache_keys.append(idx)
-        
+
         while len(self._cache) > self.cache_size:
             oldest_key = self._cache_keys.pop(0)
             del self._cache[oldest_key]

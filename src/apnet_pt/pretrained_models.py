@@ -1,30 +1,151 @@
-from . import AtomPairwiseModels
-from . import AtomModels
-from . import atomic_datasets
-from qcelemental.models.molecule import Molecule
-import os
-import numpy as np
 import copy
+import logging
+import os
+import sys
 from importlib import resources
-from apnet_pt.pt_datasets.dapnet_ds import clean_str_for_filename
+
+import numpy as np
 import pandas as pd
+from qcelemental.models.molecule import Molecule
+
+from apnet_pt.pt_datasets.dapnet_ds import clean_str_for_filename
+
+from . import AtomModels
+from . import AtomPairwiseModels
+from . import atomic_datasets
 
 # model_dir = os.path.dirname(os.path.realpath(__file__)) + "/models/"
 model_dir = resources.files("apnet_pt").joinpath("models")
+HF_REPO_ID = "awallace3/qcmlforge"
+_DOWNLOAD_APPROVED = None
+LOGGER = logging.getLogger(__name__)
+
+
+def _hf_hub_download(rel_path: str, local_files_only: bool) -> str:
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise ImportError(
+            "huggingface_hub is required to load pretrained models. "
+            "Install qcmlforge with dependencies or `pip install huggingface_hub`."
+        ) from exc
+
+    return hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=rel_path,
+        local_files_only=local_files_only,
+    )
+
+
+def _packaged_model_path(rel_path: str) -> str | None:
+    model_path = resources.files("apnet_pt").joinpath("models", *rel_path.split("/"))
+    return str(model_path) if model_path.is_file() else None
+
+
+def _allow_model_download(missing_paths: list[str]) -> bool:
+    global _DOWNLOAD_APPROVED
+
+    if _DOWNLOAD_APPROVED is not None:
+        return _DOWNLOAD_APPROVED
+
+    env_value = os.getenv("QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED", "").strip().lower()
+    if env_value in {"1", "true", "yes", "y"}:
+        _DOWNLOAD_APPROVED = True
+        LOGGER.info(
+            "QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED enabled pretrained downloads from %s",
+            HF_REPO_ID,
+        )
+        return True
+    if env_value in {"0", "false", "no", "n"}:
+        _DOWNLOAD_APPROVED = False
+        LOGGER.info(
+            "QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED disabled pretrained downloads from %s",
+            HF_REPO_ID,
+        )
+        return False
+
+    if not sys.stdin.isatty():
+        _DOWNLOAD_APPROVED = False
+        return False
+
+    preview = ", ".join(missing_paths[:3])
+    if len(missing_paths) > 3:
+        preview += ", ..."
+    try:
+        answer = (
+            input(
+                "Pretrained model weights are not available locally and need to be "
+                f"downloaded from https://huggingface.co/{HF_REPO_ID} "
+                f"(missing: {preview}). Download now? [y/N]: "
+            )
+            .strip()
+            .lower()
+        )
+    except (EOFError, KeyboardInterrupt):
+        _DOWNLOAD_APPROVED = False
+        return False
+    _DOWNLOAD_APPROVED = answer in {"y", "yes"}
+    return _DOWNLOAD_APPROVED
+
+
+def _resolve_pretrained_paths(rel_paths: list[str]) -> dict[str, str]:
+    resolved = {}
+    missing = []
+
+    for rel_path in rel_paths:
+        try:
+            resolved[rel_path] = _hf_hub_download(rel_path, local_files_only=True)
+        except ImportError:
+            raise
+        except Exception:
+            missing.append(rel_path)
+
+    if not missing:
+        return resolved
+
+    if not _allow_model_download(missing):
+        for rel_path in missing:
+            fallback = _packaged_model_path(rel_path)
+            if fallback is not None:
+                resolved[rel_path] = fallback
+                continue
+            raise RuntimeError(
+                "Missing pretrained model in local cache. "
+                "Set QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED=1 to auto-download, "
+                f"or run interactively and accept download for '{rel_path}'."
+            )
+        return resolved
+
+    for rel_path in missing:
+        try:
+            resolved[rel_path] = _hf_hub_download(rel_path, local_files_only=False)
+        except ImportError:
+            raise
+        except Exception as exc:
+            fallback = _packaged_model_path(rel_path)
+            if fallback is not None:
+                resolved[rel_path] = fallback
+                continue
+            raise RuntimeError(
+                f"Unable to load pretrained model '{rel_path}' from "
+                f"https://huggingface.co/{HF_REPO_ID}."
+            ) from exc
+
+    return resolved
 
 
 def atom_model_predict(
-    mols: [Molecule],
+    mols: list[Molecule],
     compile: bool = True,
     batch_size: int = 3,
     return_mol_arrays: bool = True,
 ):
     num_models = 5
+    model_paths = _resolve_pretrained_paths(
+        [f"am_ensemble/am_{i}.pt" for i in range(num_models)]
+    )
     am = AtomModels.ap2_atom_model.AtomModel(
-        # pre_trained_model_path=f"{model_dir}am_ensemble/am_0.pt",
-        pre_trained_model_path=resources.files("apnet_pt").joinpath(
-            "models", "am_ensemble", "am_0.pt"
-        ),
+        pre_trained_model_path=model_paths["am_ensemble/am_0.pt"],
     )
     if compile:
         print("Compiling models...")
@@ -32,10 +153,7 @@ def atom_model_predict(
     models = [copy.deepcopy(am) for _ in range(num_models)]
     for i in range(1, num_models):
         models[i].set_pretrained_model(
-            # model_path=f"{model_dir}am_ensemble/am_{i}.pt",
-            model_path=resources.files("apnet_pt").joinpath(
-                "models", "am_ensemble", f"am_{i}.pt"
-            ),
+            model_path=model_paths[f"am_ensemble/am_{i}.pt"],
         )
     print("Processing mols...")
     data = [
@@ -95,7 +213,7 @@ def atom_model_predict(
 
 
 def apnet2_model_predict(
-    mols: [Molecule],
+    mols: list[Molecule],
     compile: bool = True,
     batch_size: int = 16,
     ensemble_model_dir: str = model_dir,
@@ -104,21 +222,23 @@ def apnet2_model_predict(
     if ap2_fused:
         num_models = 4
         additional_models_start = 2
+        model_paths = _resolve_pretrained_paths(
+            ["ap2-fused_ensemble/ap2_1.pt"]
+            + [f"ap2-fused_ensemble/ap2_{i}.pt" for i in range(2, num_models)]
+        )
         ap2 = AtomPairwiseModels.apnet2_fused.APNet2_AM_Model(
-            pre_trained_model_path=resources.files("apnet_pt").joinpath(
-                "models", "ap2-fused_ensemble", "ap2_1.pt"
-            )
+            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
         )
     else:
         num_models = 5
         additional_models_start = 1
+        model_paths = _resolve_pretrained_paths(
+            [f"ap2_ensemble/ap2_{i}.pt" for i in range(num_models)]
+            + [f"am_ensemble/am_{i}.pt" for i in range(num_models)]
+        )
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
-            pre_trained_model_path=resources.files("apnet_pt").joinpath(
-                "models", "ap2_ensemble", "ap2_0.pt"
-            ),
-            atom_model_pre_trained_path=resources.files("apnet_pt").joinpath(
-                "models", "am_ensemble", "am_0.pt"
-            ),
+            pre_trained_model_path=model_paths["ap2_ensemble/ap2_0.pt"],
+            atom_model_pre_trained_path=model_paths["am_ensemble/am_0.pt"],
         )
     if compile:
         print("Compiling models...")
@@ -127,18 +247,12 @@ def apnet2_model_predict(
     for i in range(additional_models_start, num_models):
         if ap2_fused:
             models[i].set_pretrained_model(
-                ap2_model_path=resources.files("apnet_pt").joinpath(
-                    "models", "ap2-fused_ensemble", f"ap2_{i}.pt"
-                )
+                ap2_model_path=model_paths[f"ap2-fused_ensemble/ap2_{i}.pt"]
             )
         else:
             models[i].set_pretrained_model(
-                ap2_model_path=resources.files("apnet_pt").joinpath(
-                    "models", "ap2_ensemble", f"ap2_{i}.pt"
-                ),
-                am_model_path=resources.files("apnet_pt").joinpath(
-                    "models", "am_ensemble", f"am_{i}.pt"
-                ),
+                ap2_model_path=model_paths[f"ap2_ensemble/ap2_{i}.pt"],
+                am_model_path=model_paths[f"am_ensemble/am_{i}.pt"],
             )
     pred_IEs = np.zeros((len(mols), 5))
     print("Processing mols...")
@@ -154,18 +268,18 @@ def apnet2_model_predict(
 
 
 def apnet2_model_predict_pairs(
-    mols: [Molecule],
+    mols: list[Molecule],
     compile: bool = True,
     batch_size: int = 16,
     ensemble_model_dir: str = model_dir,
-    fAs: [{str: [int]}] = None,
-    fBs: [{str: [int]}] = None,
+    fAs: list[dict[str, list[int]]] | None = None,
+    fBs: list[dict[str, list[int]]] | None = None,
     print_results: bool = False,
     ap2_fused: bool = True,
 ):
     """
     Compute ensemble-averaged APNet2 pairwise interaction energies for specified fragment pairs and return per-molecule energies, per-atom pairwise arrays, and a fragment-pair breakdown DataFrame.
-    
+
     Parameters:
         mols: Iterable of Molecule
             Molecules to evaluate.
@@ -183,7 +297,7 @@ def apnet2_model_predict_pairs(
             If True, print a formatted per-fragment summary to stdout.
         ap2_fused: bool, optional
             If True, use the fused APNet2 variant; otherwise use the standard APNet2 ensemble.
-    
+
     Returns:
         pred_IEs (numpy.ndarray):
             Array of shape (N, 5) where N is the number of molecules. Column 0 is the ensemble-averaged total interaction energy; columns 1–4 are the ensemble-averaged energy components in the order: electrostatics, exchange, induction, dispersion.
@@ -202,21 +316,23 @@ def apnet2_model_predict_pairs(
         # Note: experimental, not finalized
         additional_models_start = 2
         num_models = 4
+        model_paths = _resolve_pretrained_paths(
+            ["ap2-fused_ensemble/ap2_1.pt"]
+            + [f"ap2-fused_ensemble/ap2_{i}.pt" for i in range(2, num_models)]
+        )
         ap2 = AtomPairwiseModels.apnet2_fused.APNet2_AM_Model(
-            pre_trained_model_path=resources.files("apnet_pt").joinpath(
-                "models", "ap2-fused_ensemble", "ap2_1.pt"
-            )
+            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
         )
     else:
         additional_models_start = 2
         num_models = 5
+        model_paths = _resolve_pretrained_paths(
+            [f"ap2_ensemble/ap2_{i}.pt" for i in range(num_models)]
+            + [f"am_ensemble/am_{i}.pt" for i in range(num_models)]
+        )
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
-            pre_trained_model_path=resources.files("apnet_pt").joinpath(
-                "models", "ap2_ensemble", "ap2_0.pt"
-            ),
-            atom_model_pre_trained_path=resources.files("apnet_pt").joinpath(
-                "models", "am_ensemble", "am_0.pt"
-            ),
+            pre_trained_model_path=model_paths["ap2_ensemble/ap2_0.pt"],
+            atom_model_pre_trained_path=model_paths["am_ensemble/am_0.pt"],
         )
     if compile:
         print("Compiling models...")
@@ -225,18 +341,12 @@ def apnet2_model_predict_pairs(
     for i in range(additional_models_start, num_models):
         if ap2_fused:
             models[i].set_pretrained_model(
-                ap2_model_path=resources.files("apnet_pt").joinpath(
-                    "models", "ap2-fused_ensemble", f"ap2_{i}.pt"
-                )
+                ap2_model_path=model_paths[f"ap2-fused_ensemble/ap2_{i}.pt"]
             )
         else:
             models[i].set_pretrained_model(
-                ap2_model_path=resources.files("apnet_pt").joinpath(
-                    "models", "ap2_ensemble", f"ap2_{i}.pt"
-                ),
-                am_model_path=resources.files("apnet_pt").joinpath(
-                    "models", "am_ensemble", f"am_{i}.pt"
-                ),
+                ap2_model_path=model_paths[f"ap2_ensemble/ap2_{i}.pt"],
+                am_model_path=model_paths[f"am_ensemble/am_{i}.pt"],
             )
     pred_IEs = np.zeros((len(mols), 5))
     print("Processing mols...")
@@ -247,20 +357,22 @@ def apnet2_model_predict_pairs(
     )
     pred_IEs[:, 1:] += IEs
     pred_IEs[:, 0] += np.sum(IEs, axis=1)
-    for i in range(1, num_models):
-        IEs, pairs = models[i].predict_qcel_mols(
+    for model_idx in range(1, num_models):
+        IEs, pairs = models[model_idx].predict_qcel_mols(
             mols,
             batch_size=batch_size,
             return_pairs=True,
         )
-        for i in range(len(pairs)):
-            for j in range(len(pairs[i])):
-                pairwise_energies[i][j] += pairs[i][j]
+        for pair_idx in range(len(pairs)):
+            for component_idx in range(len(pairs[pair_idx])):
+                pairwise_energies[pair_idx][component_idx] += pairs[pair_idx][
+                    component_idx
+                ]
         pred_IEs[:, 1:] += IEs
         pred_IEs[:, 0] += np.sum(IEs, axis=1)
-    for i in range(len(pairs)):
-        for j in range(len(pairs[i])):
-            pairwise_energies[i][j] /= num_models
+    for pair_idx in range(len(pairwise_energies)):
+        for component_idx in range(len(pairwise_energies[pair_idx])):
+            pairwise_energies[pair_idx][component_idx] /= num_models
     pred_IEs /= num_models
 
     data_dict = {
@@ -290,7 +402,9 @@ monA-monB full IE: {pred_IEs[i]}
             for kB, vB in fBs[i].items():
                 print(f"{kA}, {vA}, {kB}, {vB}")
                 print(monA, nA, monB, nB)
-                assert min(vB) > nA, ("fB atom indices must be for fragment B. min(vB) <= nA, meaning atom index in fragment A. Please check your input.")
+                assert min(vB) > nA, (
+                    "fB atom indices must be for fragment B. min(vB) <= nA, meaning atom index in fragment A. Please check your input."
+                )
                 elst_sum = 0.0
                 exch_sum = 0.0
                 indu_sum = 0.0
@@ -321,12 +435,12 @@ monA-monB full IE: {pred_IEs[i]}
 
 
 def apnet3_model_predict_pairs(
-    mols: [Molecule],
+    mols: list[Molecule],
     compile: bool = True,
     batch_size: int = 16,
     ensemble_model_dir: str = model_dir,
-    fAs: [{str: [int]}] = None,
-    fBs: [{str: [int]}] = None,
+    fAs: list[dict[str, list[int]]] | None = None,
+    fBs: list[dict[str, list[int]]] | None = None,
     print_results: bool = False,
 ):
     """
@@ -338,8 +452,12 @@ def apnet3_model_predict_pairs(
 
     current_file_path = os.path.dirname(os.path.realpath(__file__))
     am_path = f"{current_file_path}/../../tests/test_models/ap3_ensemble_0/am_3.pt"
-    at_hf_vw_path = f"{current_file_path}/../../tests/test_models/ap3_ensemble_0/am_h+1_3.pt"
-    at_elst_path = f"{current_file_path}/../../tests/test_models/ap3_ensemble_0/am_elst_h+1_3.pt"
+    at_hf_vw_path = (
+        f"{current_file_path}/../../tests/test_models/ap3_ensemble_0/am_h+1_3.pt"
+    )
+    at_elst_path = (
+        f"{current_file_path}/../../tests/test_models/ap3_ensemble_0/am_elst_h+1_3.pt"
+    )
     ap3_path = f"{current_file_path}/../../tests/test_models/ap3_ensemble_0/ap3_.pt"
     print("THIS MODEL IS EXPERIMENTAL AND MAY NOT YIELD ACCURATE RESULTS")
     atom_type_hf_vw_model = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
@@ -407,12 +525,14 @@ monA-monB full IE: {pred_IEs[i]}
             """
             print(header)
         if print_results:
-            print(mol.to_string('psi4'))
+            print(mol.to_string("psi4"))
         monA = mol.get_fragment([0])
         nA = len(monA.atomic_numbers)
         for kA, vA in fAs[i].items():
             for kB, vB in fBs[i].items():
-                assert min(vB) > nA, ("fB atom indices must be for fragment B. min(vB) <= nA, meaning atom index in fragment A. Please check your input.")
+                assert min(vB) > nA, (
+                    "fB atom indices must be for fragment B. min(vB) <= nA, meaning atom index in fragment A. Please check your input."
+                )
                 elst_sum = 0.0
                 exch_sum = 0.0
                 indu_sum = 0.0
@@ -459,7 +579,7 @@ def dapnet2_levels_of_theory_pretrained():
 
 
 def dapnet2_model_predict(
-    mols: [Molecule],
+    mols: list[Molecule],
     m1: str,
     m2: str,
     compile: bool = True,
@@ -467,15 +587,21 @@ def dapnet2_model_predict(
     batch_size: int = 16,
     use_GPU: bool = None,
 ) -> np.ndarray:
+    base_model_paths = _resolve_pretrained_paths(
+        ["am_ensemble/am_0.pt", "ap2_ensemble/ap2_0.pt"]
+    )
     atom_model = AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
         ignore_database_null=True,
         use_GPU=use_GPU,
-    ).set_pretrained_model(model_id=0)
+    ).set_pretrained_model(model_path=base_model_paths["am_ensemble/am_0.pt"])
     apnet2 = AtomPairwiseModels.apnet2.APNet2Model(
         atom_model=atom_model.model,
         use_GPU=use_GPU,
-    ).set_pretrained_model(model_id=0)
+    ).set_pretrained_model(
+        ap2_model_path=base_model_paths["ap2_ensemble/ap2_0.pt"],
+        am_model_path=base_model_paths["am_ensemble/am_0.pt"],
+    )
     apnet2.model.return_hidden_states = True
     if pre_trained_model_path is None:
         assert m1 in dapnet2_levels_of_theory_pretrained(), (
@@ -485,11 +611,12 @@ def dapnet2_model_predict(
         assert m2 == "CCSD(T)/CBS/CP", (
             "Pretrained models only predict m2=CCSD(T)/CBS/CP"
         )
-        pre_trained_model_path = resources.files("apnet_pt").joinpath(
-            "models",
-            "dapnet2",
-            f"{clean_str_for_filename(m1)}_to_{clean_str_for_filename(m2)}_0.pt",
+        dapnet_rel_path = (
+            f"dapnet2/{clean_str_for_filename(m1)}_to_{clean_str_for_filename(m2)}_0.pt"
         )
+        pre_trained_model_path = _resolve_pretrained_paths([dapnet_rel_path])[
+            dapnet_rel_path
+        ]
     dapnet2 = AtomPairwiseModels.dapnet2.dAPNet2Model(
         atom_model=atom_model,
         apnet2_model=apnet2,

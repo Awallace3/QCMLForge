@@ -24,15 +24,14 @@ from torch_geometric.data import download_url
 
 from .. import util
 from ..AtomModels.ap2_atom_model import AtomModel
+from ..hf_pretrained import resolve_pretrained_path
 from .. import atomic_datasets
 import tarfile
 from time import time
 from pathlib import Path
 from importlib import resources
 from apnet_pt import constants
-from .ap3_fused_ds import (
-    dimer_fused_data,
-)
+from .ap3_fused_ds import dimer_fused_data, qcel_inputs_are_split_db
 import json
 
 ###############################
@@ -663,7 +662,22 @@ class APNet2_fused_DataLoader(torch.utils.data.DataLoader):
         )
 
 
+AP3_FUSED_FSAPT_SPLIT_SPEC_TYPES = frozenset({5, 6, 7, 8})
+
+
+def fsapt_spec_type_uses_split_files(spec_type):
+    return spec_type in AP3_FUSED_FSAPT_SPLIT_SPEC_TYPES
+
+
 class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
+    split_spec_types = AP3_FUSED_FSAPT_SPLIT_SPEC_TYPES
+
+    @classmethod
+    def is_split_db_config(cls, spec_type, qcel_molecules=None):
+        return fsapt_spec_type_uses_split_files(spec_type) or qcel_inputs_are_split_db(
+            qcel_molecules
+        )
+
     def __init__(
         self,
         root,
@@ -676,9 +690,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
         force_reprocess=False,
         skip_processed=True,
         skip_compile=False,
-        atom_model_path=resources.files("apnet_pt").joinpath(
-            "models", "am_ensemble", "am_0.pt"
-        ),
+        atom_model_path=None,
         atom_model=None,
         dimer_prop_model=None,
         batch_size=16,
@@ -702,9 +714,9 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
     ):
         """
         Create an LMDB-backed dataset for AP3-fused FSAPT training that prepares and serves per-dimer fused data objects.
-        
+
         Initializes dataset configuration, optional preloaded QCElemental inputs, model references (atomic model and optional dimer property model), LMDB storage, and an in-memory access cache. This constructor does not perform full dataset processing unless process() is invoked later; it only prepares runtime state and opens the LMDB environment when available.
-        
+
         Parameters:
             root (str): Filesystem path for dataset storage and LMDB files.
             transform: Optional graph transform applied on-the-fly (kept for compatibility).
@@ -737,7 +749,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
             lmdb_readonly (bool): Whether to open LMDB in read-only mode.
             fileserver_url (str or None): Optional URL for retrieving raw data from a fileserver.
             cache_size (int): Number of recently accessed items to retain in the in-memory LRU cache.
-        
+
         Notes:
             - If qcel_molecules and energy_labels are both provided, frag1_indices and frag2_indices are required and lengths of molecules and labels must match.
             - The constructor will attempt to import and use the lmdb package; absence of lmdb will raise ImportError.
@@ -792,6 +804,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
         self.random_seed = random_seed
         self.in_memory = in_memory
         self.split = split
+        self.split_db = self.is_split_db_config(self.spec_type, self.qcel_molecules)
         self.r_cut = r_cut
         self.r_cut_im = r_cut_im
         self.force_reprocess = force_reprocess
@@ -832,7 +845,9 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
                 self.atom_model.model = torch.compile(
                     self.atom_model.model, dynamic=True
                 )
-        elif atom_model_path is not None and not self.skip_processed:
+        elif not self.skip_processed:
+            if atom_model_path is None:
+                atom_model_path = resolve_pretrained_path("am_ensemble/am_0.pt")
             self.atom_model = AtomModel(
                 pre_trained_model_path=atom_model_path,
                 ds_root=None,
@@ -926,14 +941,14 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
     def raw_file_names(self):
         """
         Return the expected raw dataset file names for the dataset's spec_type.
-        
+
         The returned list contains the training and test filenames corresponding to
         the configured spec_type:
         - spec_type == 5: "fsapt_train_data.pkl", "fsapt_test_data.pkl"
         - spec_type == 6: "fsapt_train_simple.pkl", "fsapt_test_simple.pkl"
         - spec_type == 7: "fsapt_train_simple_2.pkl", "fsapt_test_simple_2.pkl"
         - spec_type == 8: "90K_fsaptpbe0-d4_fsapt_train.pkl", "90K_fsaptpbe0-d4_fsapt_test.pkl"
-        
+
         Returns:
             list[str]: Two filenames [train, test] for the current spec_type.
         """
@@ -962,12 +977,12 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
     def processed_file_names(self):
         """
         Determine the dataset's processed file names based on the LMDB presence and metadata.
-        
+
         Checks whether the LMDB at the configured lmdb_path exists and contains at least one entry; if so returns the expected MDB and lock file paths for this dataset split and spec type. If force_reprocess is set, returns ["file"] to signal reprocessing. If the LMDB is missing or empty, returns ["lmdb_missing"].
-        
+
         Returns:
-            list[str]: A list containing either the two expected LMDB filenames for this dataset (e.g. 
-            "lmdb_ap3_fused_fsapt[_<split>]_spec_<spec_type>/data.mdb" and the corresponding "lock.mdb"), 
+            list[str]: A list containing either the two expected LMDB filenames for this dataset (e.g.
+            "lmdb_ap3_fused_fsapt[_<split>]_spec_<spec_type>/data.mdb" and the corresponding "lock.mdb"),
             or the marker lists ["file"] (when force_reprocess is true) or ["lmdb_missing"] (when no valid LMDB is found).
         """
         if self.force_reprocess:
@@ -1018,9 +1033,9 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
     def download(self):
         """
         Prepare or fetch the raw data files required by the dataset.
-        
+
         If both `energy_labels` and `qcel_molecules` are present on the instance, this method returns without action. Otherwise it prints `processed_paths` and `raw_file_names` and raises NotImplementedError indicating that the dataset must be provided via QCElemental inputs or available raw files for the chosen `spec_type`.
-        
+
         Raises:
             NotImplementedError: If required data are not provided via `qcel_molecules` and `energy_labels`.
         """
@@ -1031,7 +1046,6 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
         raise NotImplementedError(
             "Download method not implemented. Provide qcel_molecules and energy_labels or named spec type with corresponding data files."
         )
-
 
     def _process_dimer_batch(self, batch_data_list):
         """Process dimer batch with classical energies - same as original"""
@@ -1114,7 +1128,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
     def process(self):
         """
         Process dataset entries into fused dimer Data objects and store them in the LMDB backend.
-        
+
         This method reads dimers either from provided QCElemental molecules with corresponding energy labels
         or from the configured raw data paths, constructs fused dimer Data objects (via dimer_fused_data),
         optionally augments them by computing classical interaction components using the configured

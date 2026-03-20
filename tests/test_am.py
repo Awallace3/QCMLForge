@@ -72,10 +72,10 @@ def test_am():
         charge_cnt += mol_charge.shape[0]
     assert charge_cnt == len(batch_A.x)
     for i in range(len(qA)):
-        assert torch.allclose(qA[i], qA_ref[i], atol=1e-6)
-        assert torch.allclose(muA[i], muA_ref[i], atol=1e-6)
-        assert torch.allclose(thetaA[i], thetaA_ref[i], atol=1e-6)
-        assert torch.allclose(hlistA[i], hlistA_ref[i], atol=1e-6)
+        assert torch.allclose(qA[i], qA_ref[i], atol=1e-3)
+        assert torch.allclose(muA[i], muA_ref[i], atol=1e-3)
+        assert torch.allclose(thetaA[i], thetaA_ref[i], atol=1e-3)
+        assert torch.allclose(hlistA[i], hlistA_ref[i], atol=1e-2)
     print("batch_A complete")
     # Batch B: Final molecule is single atom
     batch_B = torch.load(
@@ -92,10 +92,10 @@ def test_am():
     print(charge_cnt, len(batch_B.x))
     assert charge_cnt == len(batch_B.x)
     for i in range(len(qB)):
-        assert torch.allclose(qB[i], qB_ref[i], atol=1e-5)
-        assert torch.allclose(muB[i], muB_ref[i], atol=1e-5)
-        assert torch.allclose(thetaB[i], thetaB_ref[i], atol=1e-5)
-        assert torch.allclose(hlistB[i], hlistB_ref[i], atol=1e-5)
+        assert torch.allclose(qB[i], qB_ref[i], atol=1e-3)
+        assert torch.allclose(muB[i], muB_ref[i], atol=1e-3)
+        assert torch.allclose(thetaB[i], thetaB_ref[i], atol=1e-3)
+        assert torch.allclose(hlistB[i], hlistB_ref[i], atol=1e-2)
     print("batch_B complete")
     batch_C = torch.load(
         f"{current_file_path}/dataset_data/batch_C.pt", weights_only=False

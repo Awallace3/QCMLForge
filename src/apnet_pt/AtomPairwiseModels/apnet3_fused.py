@@ -15,12 +15,14 @@ from ..pt_datasets.ap3_fused_ds import (
     ap3_fused_module_dataset,
     ap3_fused_collate_update,
     ap3_fused_collate_update_no_target,
+    qcel_inputs_are_split_db,
 )
 from ..pt_datasets.ap3_fused_fsapt_ds import (
     ap3_fused_fsapt_collate_update,
     ap3_fused_fsapt_module_dataset_lmdb,
 )
 from .. import constants
+from ..hf_pretrained import resolve_pretrained_path
 from .. import model_io
 from apnet_pt.util import scatter_sum_compile
 import os
@@ -31,7 +33,12 @@ import qcelemental as qcel
 from importlib import resources
 from copy import deepcopy
 from apnet_pt.torch_util import set_weights_to_value
-from .mtp_mtp import AtomTypeParamNN, DimerProp, AtomTypeParamModel
+from .mtp_mtp import (
+    AtomTypeParamNN,
+    DimerProp,
+    AtomTypeParamModel,
+    load_dimer_prop_from_checkpoint,
+)
 
 
 def inverse_time_decay(step, initial_lr, decay_steps, decay_rate, staircase=True):
@@ -138,13 +145,14 @@ class APNet3_AtomType_MPNN(nn.Module):
         return_hidden_states=False,
         use_precomputed_classical=False,
         use_atom_props=True,
+        freeze_dimer_prop_model=True,
     ):
         # super().__init__(aggr="add")
         """
         Initialize the APNet3_AtomType_MPNN module and configure its architecture and behavior.
 
         Parameters:
-            dimer_prop_model (DimerProp): Optional pretrained dimer property model whose parameters will be frozen if provided.
+            dimer_prop_model (DimerProp): Optional pretrained dimer property model whose parameters will be frozen if provided (controlled by freeze_dimer_prop_model).
             n_message (int): Number of message-passing iterations.
             n_rbf (int): Number of radial basis functions for distance embeddings.
             n_neuron (int): Base width for hidden layers in MLP blocks.
@@ -154,14 +162,26 @@ class APNet3_AtomType_MPNN(nn.Module):
             return_hidden_states (bool): If True, forward will return intermediate hidden representations alongside predictions.
             use_precomputed_classical (bool): If True, model expects precomputed classical energy contributions to be provided/used.
             use_atom_props (bool): If True, atom-level classical properties (e.g., charges, polarizabilities) will be included in pair feature construction.
+            freeze_dimer_prop_model (bool): If True (default), freeze all parameters of dimer_prop_model to prevent gradient updates.
 
         Behavior:
-            - Freezes parameters of the provided dimer_prop_model (if any) to prevent gradient updates.
+            - Freezes parameters of the provided dimer_prop_model (if any and if freeze_dimer_prop_model is True) to prevent gradient updates.
             - Constructs distance embedding layers, an atom embedding layer, readout MLPs for energy components (electrostatics, exchange, induction, dispersion), and per-iteration update and directional MLP stacks according to the provided hyperparameters.
         """
         super().__init__()
         self.dimer_prop_model = dimer_prop_model
-        if self.dimer_prop_model is not None:
+        self.n_message = n_message
+        self.n_rbf = n_rbf
+        self.n_neuron = n_neuron
+        self.n_embed = n_embed
+        self.r_cut_im = r_cut_im
+        self.r_cut = r_cut
+        self.return_hidden_states = return_hidden_states
+        self.use_precomputed_classical = use_precomputed_classical
+        self.use_atom_props = use_atom_props
+        self.freeze_dimer_prop_model = freeze_dimer_prop_model
+
+        if self.freeze_dimer_prop_model and self.dimer_prop_model is not None:
             if hasattr(self.dimer_prop_model, "parameters"):
                 for param in self.dimer_prop_model.parameters():
                     param.requires_grad = False
@@ -174,17 +194,6 @@ class APNet3_AtomType_MPNN(nn.Module):
                 if hasattr(self.dimer_prop_model, "dimer_model_elst"):
                     for param in self.dimer_prop_model.dimer_model_elst.parameters():
                         param.requires_grad = False
-
-        self.n_message = n_message
-        self.n_rbf = n_rbf
-        self.n_neuron = n_neuron
-        self.n_embed = n_embed
-        self.r_cut_im = r_cut_im
-        self.r_cut = r_cut
-        self.return_hidden_states = return_hidden_states
-        self.use_precomputed_classical = use_precomputed_classical
-        self.use_atom_props = use_atom_props
-
         layer_nodes_hidden = [
             # input_layer_size,
             n_neuron * 2,
@@ -268,6 +277,7 @@ class APNet3_AtomType_MPNN(nn.Module):
             "r_cut": self.r_cut,
             "use_atom_props": self.use_atom_props,
             "use_precomputed_classical": self.use_precomputed_classical,
+            "freeze_dimer_prop_model": self.freeze_dimer_prop_model,
         }
 
     def get_messages(self, h0, h, rbf, e_source, e_target):
@@ -660,6 +670,7 @@ class APNet3_AtomType_Model:
         use_precomputed_classical=False,
         ds_class_type="lmdb",  # "pt" or "lmdb"
         use_atom_props=True,
+        freeze_dimer_prop_model=True,
     ):
         """
         Initialize the APNet3_AtomType_Model, set device and model components, optionally load pretrained weights, and prepare or load the dataset(s).
@@ -699,6 +710,7 @@ class APNet3_AtomType_Model:
         self.atom_type_model = AtomTypeParamModel()
         self.dimer_prop_model = DimerProp(ATParam=self.atom_type_model.model)
         self.am_dimer_param_model = am_dimer_param_model
+        dimer_prop_model_loaded_from_embed = False
 
         self.ds_class_type = ds_class_type
         if self.ds_class_type not in ["pt", "lmdb"]:
@@ -756,9 +768,33 @@ class APNet3_AtomType_Model:
             print(
                 f"Loading pre-trained APNet3_AtomType_MPNN model from {pre_trained_model_path}"
             )
-            checkpoint = torch.load(pre_trained_model_path, weights_only=False)
-            config = checkpoint["config"]
+            checkpoint = model_io.load_checkpoint(
+                pre_trained_model_path,
+                map_location=device,
+            )
+            version = model_io.get_checkpoint_version(checkpoint)
+            if version >= 2 and model_io.has_embedded_submodel(
+                checkpoint,
+                "dimer_prop_model",
+            ):
+                if dimer_prop_model_pre_trained_path:
+                    model_io.warn_submodel_override(
+                        "dimer_prop_model",
+                        embedded_type="DimerProp",
+                        external_path=dimer_prop_model_pre_trained_path,
+                    )
+                dimer_checkpoint = model_io.get_submodel_checkpoint(
+                    checkpoint,
+                    "dimer_prop_model",
+                )
+                self.dimer_prop_model = load_dimer_prop_from_checkpoint(
+                    dimer_checkpoint,
+                    freeze_atom_model=False,
+                )
+                dimer_prop_model_loaded_from_embed = True
+            config = model_io.load_config_from_checkpoint(checkpoint) or {}
             use_atom_props = config.get("use_atom_props", True)
+            freeze_dimer_prop_model = config.get("freeze_dimer_prop_model", True)
             self.model = APNet3_AtomType_MPNN(
                 dimer_prop_model=self.dimer_prop_model,
                 n_message=config["n_message"],
@@ -769,11 +805,9 @@ class APNet3_AtomType_Model:
                 r_cut=config["r_cut"],
                 use_precomputed_classical=use_precomputed_classical,
                 use_atom_props=use_atom_props,
+                freeze_dimer_prop_model=freeze_dimer_prop_model,
             )
-            model_state_dict = {
-                k.replace("_orig_mod.", ""): v
-                for k, v in checkpoint["model_state_dict"].items()
-            }
+            model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)
         else:
             self.model = APNet3_AtomType_MPNN(
@@ -786,6 +820,7 @@ class APNet3_AtomType_Model:
                 r_cut=r_cut,
                 use_precomputed_classical=use_precomputed_classical,
                 use_atom_props=use_atom_props,
+                freeze_dimer_prop_model=freeze_dimer_prop_model,
             )
         if n_rbf != self.model.n_rbf:
             print(f"Changing n_rbf from {self.model.n_rbf} to {n_rbf}")
@@ -825,25 +860,31 @@ class APNet3_AtomType_Model:
                 self.dimer_prop_model.dimer_model.polarizability_table.to(self.device)
             )
 
+        if dimer_prop_model_loaded_from_embed:
+            print("Loaded embedded DimerProp from checkpoint")
+
         self.model.to(device)
 
-        split_dbs = [2, 5, 6, 7, 8]
-        ds_qcel_split_db = (
-            ds_qcel_molecules is not None
-            and len(ds_qcel_molecules) == 2
-            and isinstance(ds_qcel_molecules[0], list)
+        is_split_db_config = getattr(self.dataset_class, "is_split_db_config", None)
+        ds_split_db = (
+            is_split_db_config(self.ds_spec_type, ds_qcel_molecules)
+            if is_split_db_config is not None
+            else False
         )
+        ds_qcel_split_db = qcel_inputs_are_split_db(ds_qcel_molecules)
         self.dataset = dataset
+        if self.dataset is not None:
+            ds_split_db = getattr(self.dataset, "split_db", ds_split_db)
         print(
             not ignore_database_null,
             self.dataset is None,
-            self.ds_spec_type not in split_dbs,
+            not ds_split_db,
             not ds_qcel_split_db,
         )
         if (
             not ignore_database_null
             and self.dataset is None
-            and self.ds_spec_type not in split_dbs
+            and not ds_split_db
             and not ds_qcel_split_db
         ):
 
@@ -908,11 +949,7 @@ class APNet3_AtomType_Model:
             self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
-        elif (
-            not ignore_database_null
-            and self.dataset is None
-            and (self.ds_spec_type in split_dbs or ds_qcel_split_db)
-        ):
+        elif not ignore_database_null and self.dataset is None and ds_split_db:
             print("Processing Split dataset...")
             if ds_qcel_molecules is None:
                 ds_qcel_molecules = [None, None]
@@ -1083,8 +1120,8 @@ class APNet3_AtomType_Model:
             The model instance with loaded weights
         """
         if model_id is not None:
-            ap2_model_path = resources.files("apnet_pt").joinpath(
-                "models", "ap2-fused_ensemble", f"ap2_{model_id}.pt"
+            ap2_model_path = resolve_pretrained_path(
+                f"ap2-fused_ensemble/ap2_{model_id}.pt"
             )
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")

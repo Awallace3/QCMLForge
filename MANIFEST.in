@@ -3,3 +3,4 @@ recursive-include src/apnet_pt/data *
 recursive-include src/apnet_pt/models *
 
 global-exclude *.py[cod] __pycache__ *.so
+recursive-include src/qcml_dftd3/data *

@@ -12,6 +12,7 @@ from torch_geometric.data import download_url
 
 from .. import util
 from ..AtomModels.ap2_atom_model import AtomModel
+from ..hf_pretrained import resolve_pretrained_path
 from .. import atomic_datasets
 from glob import glob
 import tarfile
@@ -21,6 +22,21 @@ from pathlib import Path
 from importlib import resources
 from apnet_pt import constants
 import h5py
+
+
+AP2_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9})
+
+
+def spec_type_uses_split_files(spec_type):
+    return spec_type in AP2_FUSED_SPLIT_SPEC_TYPES
+
+
+def qcel_inputs_are_split_db(qcel_molecules):
+    return (
+        qcel_molecules is not None
+        and len(qcel_molecules) == 2
+        and isinstance(qcel_molecules[0], list)
+    )
 
 
 def qcel_dimer_to_fused_data(dimer, r_cut=5.0, r_cut_im=8.0, **kwargs):
@@ -76,9 +92,9 @@ def dimer_fused_data(
 ):
     """
     Constructs a PyG Data object representing a fused dimer from two monomer specifications.
-    
+
     Creates per-monomer atomic features, optionally validates featurization, computes intra-monomer edges and inter-monomer short- and long-range edges, and returns a Data object containing atom tensors, edge index tensors, molecule indices, and total charges. Returns `None` if validity checks fail.
-    
+
     Parameters:
         RA (Tensor): Positions for monomer A (cartesian coordinates, expected in angstroms).
         ZA (Tensor or sequence): Atomic numbers or one-hot/feature tensor for monomer A.
@@ -91,7 +107,7 @@ def dimer_fused_data(
         r_cut_im (float, optional): Distance threshold separating short- and long-range inter-monomer AB edges. Default 8.0.
         check_validity (bool, optional): If True, validate that each atom in a monomer has at least one edge; return `None` when invalid. Default True.
         **kwargs: Additional attributes to include in the returned Data object.
-    
+
     Returns:
         Data or None: A PyG Data object containing at least the following fields when successful:
             - ZA, RA, ZB, RB: atom features and positions for monomers A and B
@@ -151,10 +167,10 @@ def dimer_fused_data(
 def natural_key(text):
     """
     Create a sort key that splits a string into alternating non-numeric and numeric parts, converting numeric parts to integers for natural ordering.
-    
+
     Parameters:
         text (str): Input string to be split into components.
-    
+
     Returns:
         list: A list of parts where contiguous digit sequences are converted to `int` and all other segments remain `str`, suitable for natural/alphanumeric sorting.
     """
@@ -218,10 +234,10 @@ def pairwise_edges_im(RA, RB, r_cut_im, full_indices=False):
 def ap2_fused_collate_update(batch):
     """
     Merge a list of per-dimer PyG Data objects into a single batched Data with unique, offset atom and edge indices.
-    
+
     Parameters:
         batch (list[Data]): List of per-dimer Data objects containing fields for monomers A and B (ZA, RA, ZB, RB), per-monomer edge indices (e_AA_*, e_BB_*), inter-monomer edge lists (e_ABsr_*, e_ABlr_*), molecule and dimer index tensors, charges, and target y.
-    
+
     Returns:
         Data: A single PyG Data object containing:
             - y: stacked targets for the batch.
@@ -233,7 +249,7 @@ def ap2_fused_collate_update(batch):
             - natom_per_mol_A, natom_per_mol_B: number of atoms per molecule for A and B.
             - total_charge_A, total_charge_B: per-dimer total charges for A and B.
             - batch_atomic_A, batch_atomic_B: Data sub-objects for the batched monomer A and B atom graphs (x, edge_index, R, molecule_ind, total_charge, natom_per_mol).
-    
+
     Behavior notes:
         - Per-item molecule and dimer index tensors are replaced with batch-local indices (0..batch_size-1).
         - All atom indices in edge lists are offset so atoms from different batch entries do not collide.
@@ -345,9 +361,9 @@ def ap2_fused_collate_update(batch):
 def ap2_fused_collate_update_no_target(batch):
     """
     Batch-collate a list of fused Data objects into a single batched Data without target labels.
-    
+
     This function offsets and concatenates per-item atom and edge indices so every atom in the batch has a unique global index, assembles per-monomer (A and B) batched subgraphs, and produces combined inter-monomer edge lists. The resulting Data includes short- and long-range AB edges, a concatenated full AB edge list, corresponding dimer index vectors (including `dimer_ind_full`), per-molecule indices and counts, total charges, and the per-monomer Data objects `batch_atomic_A` and `batch_atomic_B`.
-    
+
     Returns:
         Data: A PyG Data object containing the following notable fields:
             - ZA, RA, ZB, RB: concatenated atomic numbers and coordinates for monomers A and B
@@ -488,10 +504,10 @@ def ap2_fused_collate_update_no_target(batch):
 def ap2_fused_collate_update_no_target_monomer_indices(batch):
     """
     Merge a list of fused-dimer Data objects (no target) into a single batched Data with unique global atom and edge indices and explicit per-monomer molecule indices.
-    
+
     Parameters:
         batch (list[torch_geometric.data.Data]): List of per-dimer Data objects containing atomic features, intra- and inter-monomer edge indices, per-dimer indices, and monomer properties.
-    
+
     Returns:
         torch_geometric.data.Data: A single Data object containing concatenated/offset fields:
             - ZA, RA, ZB, RB: concatenated atomic numbers and positions for monomers A and B.
@@ -605,10 +621,10 @@ def ap2_fused_collate_update_no_target_monomer_indices(batch):
 def ap3_fused_collate_update(batch):
     """
     Batch-collate a list of fused dimer Data objects into a single batched Data with adjusted intra- and inter-monomer indices.
-    
+
     Parameters:
         batch (list[Data]): List of per-dimer PyG Data objects containing atom features, coordinates, intra-monomer edges (e_AA*, e_BB*), inter-monomer edges (e_ABsr_*, e_ABlr_*), dimer index fields, charges, and target `y`.
-    
+
     Returns:
         Data: A single PyG Data object that contains:
             - concatenated atom features and coordinates for monomers A and B (ZA, RA, ZB, RB)
@@ -870,13 +886,13 @@ def ap2_fused_setup(molA_data, molB_data, atom_model, r_cut, r_cut_im, index=0):
 def save_hdf5_data_objects(data_objects, filepath):
     """
     Save a list of PyG Data objects into an HDF5 file where each object is stored as a separate group.
-    
+
     Each data object is written to a group named "data_<index>". The following attributes, when present on a data object, are persisted: ZA, RA, ZB, RB, e_ABsr_source, e_ABsr_target, e_ABlr_source, e_ABlr_target, e_AA_source, e_AA_target, e_BB_source, e_BB_target, dimer_ind, dimer_ind_lr, molecule_ind_A, molecule_ind_B, total_charge_A, total_charge_B, qA, muA, quadA, hlistA, qB, muB, quadB, hlistB, and y. Tensor attributes are converted to NumPy arrays and saved as datasets; numeric scalar attributes (int/float) are saved as group attributes.
-    
+
     Parameters:
         data_objects (Sequence): Sequence of PyG Data-like objects to save. Objects should expose the attributes listed above when applicable.
         filepath (str or os.PathLike): Destination HDF5 file path.
-    
+
     """
     with h5py.File(filepath, "w") as f:
         for i, data_obj in enumerate(data_objects):
@@ -923,12 +939,12 @@ def save_hdf5_data_objects(data_objects, filepath):
 def load_hdf5_data_objects(filepath):  # type: ignore
     """
     Load a list of PyG Data objects stored in an HDF5 file.
-    
+
     Reads groups whose names start with "data_" (sorted lexicographically). For each such group, datasets are converted to torch tensors (array datasets become tensor arrays; scalar datasets become 0-dim tensors) and group attributes are copied as scalar fields. Each group's combined data is used to construct a torch_geometric.data.Data object; the function returns the list of these Data objects in the sorted group order.
-    
+
     Parameters:
         filepath (str or os.PathLike): Path to the HDF5 file to read.
-    
+
     Returns:
         list[torch_geometric.data.Data]: List of reconstructed Data objects.
     """
@@ -954,6 +970,14 @@ def load_hdf5_data_objects(filepath):  # type: ignore
 
 
 class ap2_fused_module_dataset(Dataset):
+    split_spec_types = AP2_FUSED_SPLIT_SPEC_TYPES
+
+    @classmethod
+    def is_split_db_config(cls, spec_type, qcel_molecules=None):
+        return spec_type_uses_split_files(spec_type) or qcel_inputs_are_split_db(
+            qcel_molecules
+        )
+
     def __init__(
         self,
         root,
@@ -967,9 +991,7 @@ class ap2_fused_module_dataset(Dataset):
         skip_processed=True,
         skip_compile=False,
         # only need for processing
-        atom_model_path=resources.files("apnet_pt").joinpath(
-            "models", "am_ensemble", "am_0.pt"
-        ),
+        atom_model_path=None,
         atom_model=None,
         batch_size=16,
         atomic_batch_size=200,
@@ -1026,6 +1048,7 @@ class ap2_fused_module_dataset(Dataset):
         self.random_seed = random_seed
         self.in_memory = in_memory
         self.split = split
+        self.split_db = self.is_split_db_config(self.spec_type, self.qcel_molecules)
         self.r_cut = r_cut
         self.r_cut_im = r_cut_im
         self.force_reprocess = force_reprocess
@@ -1055,7 +1078,9 @@ class ap2_fused_module_dataset(Dataset):
                 self.atom_model.model = torch.compile(
                     self.atom_model.model, dynamic=True
                 )
-        elif atom_model_path is not None and not self.skip_processed:
+        elif not self.skip_processed:
+            if atom_model_path is None:
+                atom_model_path = resolve_pretrained_path("am_ensemble/am_0.pt")
             self.atom_model = AtomModel(
                 pre_trained_model_path=atom_model_path,
                 ds_root=None,
@@ -1086,6 +1111,10 @@ class ap2_fused_module_dataset(Dataset):
     def file_extension(self):
         """Return the file extension based on storage type"""
         return ".h5" if self.storage_type == "h5" else ".pt"
+
+    @property
+    def split_name(self):
+        return f"_{self.split}" if self.split_db and self.split != "all" else ""
 
     @property
     def raw_file_names(self):
@@ -1131,9 +1160,9 @@ class ap2_fused_module_dataset(Dataset):
     def reprocess_file_names(self):
         """
         Determine which processed file names should be used (or signal that reprocessing is required).
-        
+
         If force_reprocess is True, returns ["file"]. Otherwise, searches the processed directory for files matching the dataset split and spec_type, sorts them using natural_key, and trims the list according to MAX_SIZE and datapoint_storage_n_objects. If matching files are found, returns the ordered list of file basenames; if none are found, returns a single marker filename indicating missing data (e.g., "dimer_missing" plus the file extension).
-        
+
         Returns:
             list[str]: Ordered list of processed file basenames to use, or a single-element list
             signaling reprocessing (either ["file"] for forced reprocess or ["dimer_missing{ext}"] when no files exist).
@@ -1141,11 +1170,11 @@ class ap2_fused_module_dataset(Dataset):
         if self.force_reprocess:
             return ["file"]
         else:
-            if self.split == "train":
+            if self.split_db and self.split == "train":
                 file_cmd = f"{self.root}/processed/dimer_ap2_fused_train_spec_{
                     self.spec_type
                 }_*{self.file_extension}"
-            elif self.split == "test":
+            elif self.split_db and self.split == "test":
                 file_cmd = f"{self.root}/processed/dimer_ap2_fused_test_spec_{
                     self.spec_type
                 }_*{self.file_extension}"
@@ -1210,11 +1239,11 @@ class ap2_fused_module_dataset(Dataset):
     def process(self):
         """
         Builds fused PyG Data objects from raw dimers or provided QCElemental molecules and writes them to disk or stores them in memory.
-        
+
         Processes either self.qcel_molecules with self.energy_labels or files listed in self.raw_paths, converts each dimer into a fused Data object via dimer_fused_data (respecting r_cut, r_cut_im, and monomer-validity checks), applies self.pre_filter when provided, and accumulates data objects in chunks of self.points_per_file. Depending on configuration, the method:
         - appends chunks to self.data when in_memory is True, or
         - saves chunks to processed files under self.processed_dir using either HDF5 or PT format per self.storage_type.
-        
+
         Behavioral details:
         - Honors self.MAX_SIZE to limit the number of processed dimers.
         - Skips already-processed files when self.skip_processed is True.
@@ -1230,7 +1259,7 @@ class ap2_fused_module_dataset(Dataset):
         RAs, RBs, ZAs, ZBs, TQAs, TQBs, targets = [], [], [], [], [], [], []
         if self.qcel_molecules is not None and self.energy_labels is not None:
             print("Processing directly from provided QCElemental molecules...")
-            split_name = f"_{self.split}" if self.split != "all" else ""
+            split_name = self.split_name
 
             # Process directly from qcel_mols and energy_labels
             for mol in self.qcel_molecules:
@@ -1270,8 +1299,8 @@ class ap2_fused_module_dataset(Dataset):
         else:
             for raw_path in self.raw_paths:
                 split_name = ""
-                if self.spec_type in [2, 5, 6, 7, 9]:
-                    split_name = f"_{self.split}" if self.split != "all" else ""
+                if self.split_db:
+                    split_name = self.split_name
                     print(f"{split_name=}")
                     if self.split not in Path(raw_path).stem:
                         print(f"{self.split} is skipping {raw_path}")
@@ -1405,8 +1434,8 @@ class ap2_fused_module_dataset(Dataset):
         if self.active_idx_data == idx_datapath:
             return self.active_data[obj_ind]
         split_name = ""
-        if self.spec_type in [2, 5, 6, 7, 9, None]:
-            split_name = f"_{self.split}" if self.split != "all" else ""
+        if self.split_db:
+            split_name = self.split_name
         datapath = osp.join(
             self.processed_dir,
             f"dimer_ap2_fused{split_name}_spec_{self.spec_type}_{idx_datapath}{self.file_extension}",

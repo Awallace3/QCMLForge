@@ -7,6 +7,7 @@ import numpy as np
 import warnings
 from .. import multipole
 from .. import model_io
+from ..hf_pretrained import resolve_pretrained_path
 import time
 from ..atomic_datasets import (
     atomic_module_dataset,
@@ -20,7 +21,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
-from importlib import resources
 import qcelemental as qcel
 from pprint import pprint as pp
 
@@ -647,9 +647,7 @@ class AtomModel:
             Returns self for method chaining
         """
         if model_id is not None:
-            model_path = resources.files("apnet_pt").joinpath(
-                "models", "am_ensemble", f"am_{model_id}.pt"
-            )
+            model_path = resolve_pretrained_path(f"am_ensemble/am_{model_id}.pt")
         elif model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 

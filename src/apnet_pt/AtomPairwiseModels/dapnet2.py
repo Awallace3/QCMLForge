@@ -6,6 +6,7 @@ import numpy as np
 import time
 from ..AtomModels.ap2_atom_model import AtomMPNN, isolate_atomic_property_predictions
 from .. import atomic_datasets
+from ..hf_pretrained import resolve_pretrained_paths
 from .. import pairwise_datasets
 from .. import model_io
 from ..pairwise_datasets import (
@@ -30,7 +31,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 import qcelemental as qcel
-from importlib import resources
 from copy import deepcopy
 
 
@@ -537,14 +537,18 @@ class APNet2_dAPNet2Model:
             The model instance with loaded weights
         """
         if model_id is not None:
-            am_model_path = resources.files("apnet_pt").joinpath(
-                "models", "am_ensemble", f"am_{model_id}.pt"
+            model_paths = resolve_pretrained_paths(
+                [
+                    f"am_ensemble/am_{model_id}.pt",
+                    f"ap2_ensemble/ap2_{model_id}.pt",
+                ]
             )
-            ap2_model_path = resources.files("apnet_pt").joinpath(
-                "models", "ap2_ensemble", f"ap2_{model_id}.pt"
+            am_model_path = model_paths[f"am_ensemble/am_{model_id}.pt"]
+            ap2_model_path = model_paths[f"ap2_ensemble/ap2_{model_id}.pt"]
+        elif ap2_model_path is None or am_model_path is None:
+            raise ValueError(
+                "Provide both ap2_model_path and am_model_path, or set model_id."
             )
-        elif ap2_model_path is None and model_id is None:
-            raise ValueError("Either model_path or model_id must be provided.")
 
         # Load main model checkpoint
         checkpoint = model_io.load_checkpoint(ap2_model_path, map_location=self.device)
@@ -1662,14 +1666,18 @@ class dAPNet2Model:
         self, ap2_model_path=None, am_model_path=None, model_id=None
     ):
         if model_id is not None:
-            am_model_path = resources.files("apnet_pt").joinpath(
-                "models", "am_ensemble", f"am_{model_id}.pt"
+            model_paths = resolve_pretrained_paths(
+                [
+                    f"am_ensemble/am_{model_id}.pt",
+                    f"ap2_ensemble/ap2_{model_id}.pt",
+                ]
             )
-            ap2_model_path = resources.files("apnet_pt").joinpath(
-                "models", "ap2_ensemble", f"ap2_{model_id}.pt"
+            am_model_path = model_paths[f"am_ensemble/am_{model_id}.pt"]
+            ap2_model_path = model_paths[f"ap2_ensemble/ap2_{model_id}.pt"]
+        elif ap2_model_path is None or am_model_path is None:
+            raise ValueError(
+                "Provide both ap2_model_path and am_model_path, or set model_id."
             )
-        elif ap2_model_path is None and model_id is None:
-            raise ValueError("Either model_path or model_id must be provided.")
 
         checkpoint = torch.load(ap2_model_path)
         print(checkpoint)

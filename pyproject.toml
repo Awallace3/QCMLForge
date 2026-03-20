@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qcmlforge"
-version = "0.1.0"
+version = "0.1.1"
 authors = [
   { name="Austin M. Wallace", email="awallace43@gatech.edu" },
 ]
@@ -23,6 +23,9 @@ dependencies = [
     "torch-geometric==2.6.1",
     "pytorch-minimize",
     "qcportal>=0.59",
+    "huggingface_hub>=0.30.0",
+    "lmdb==1.7.5",
+    "h5py",
 ]
 license = {text = "MIT"}
 

@@ -10,13 +10,14 @@ from apnet_pt.pt_datasets.ap2_fused_ds import (
 )
 from apnet_pt.AtomPairwiseModels.apnet2_fused import APNet2_AM_Model
 from glob import glob
+import pandas as pd
 
 torch.manual_seed(42)
 spec_type = 5
 current_file_path = os.path.dirname(os.path.realpath(__file__))
 data_path = f"{current_file_path}/test_data_path"
-am_path = f"{current_file_path}/../src/apnet_pt/models/am_ensemble/am_0.pt"
-am_hf_path = f"{current_file_path}/../src/apnet_pt/models/am_hf_ensemble/am_0.pt"
+am_path = f"{current_file_path}/../pretrain_models/am_ensemble/am_0.pt"
+am_hf_path = f"{current_file_path}/../pretrain_models/am_hf_ensemble/am_0.pt"
 
 mol_dimer = qcel.models.Molecule.from_data("""
 0 1
@@ -239,49 +240,6 @@ def test_ap2_fused_architecture():
     print(target_energies)
     print(output[0])
     assert np.allclose(output[0], target_energies, atol=1e-6)
-
-
-def test_ap2_fused_ensemble_water_dimer():
-    import torch
-    import pandas as pd
-
-    df = pd.read_pickle(
-        current_file_path
-        + os.sep
-        + os.path.join("dataset_data", "water_dimer_pes3.pkl")
-    )
-    df = df[df["system_id"].str.contains("01_Water-Water")].copy()
-    df = df.sort_values(by="system_id")
-    Ks = [
-        [1.14769962, 0.685558974, 0.685558974],
-        [1.14769962, 0.685558974, 0.685558974],
-    ]
-    for n, r in df.iterrows():
-        sapt0_elst = r["SAPT0 ELST ENERGY adz"]
-        sapt0_total = r["SAPT0 TOTAL ENERGY adz"] * qcel.constants.conversion_factor(
-            "hartree", "kcal/mol"
-        )
-        sapt0_exch = r["SAPT0 EXCH ENERGY adz"] * qcel.constants.conversion_factor(
-            "hartree", "kcal/mol"
-        )
-        sapt0_ind = r["SAPT0 IND ENERGY adz"] * qcel.constants.conversion_factor(
-            "hartree", "kcal/mol"
-        )
-        sapt0_disp = r["SAPT0 DISP ENERGY adz"] * qcel.constants.conversion_factor(
-            "hartree", "kcal/mol"
-        )
-        mol = r["qcel_molecule"]
-        interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
-            [mol],
-            compile=False,
-            batch_size=2,
-            ap2_fused=True,
-        )
-        print(
-            f"TOTAL = {sapt0_total:.6f}\n ELST = {sapt0_elst:.6f}\n EXCH = {
-                sapt0_exch:.6f}\n DISP = {sapt0_disp:.6f}\n IND = {sapt0_ind:.6f}"
-        )
-        print(interaction_energies)
 
 
 def test_ap2_fused_ensemble_water_dimer():
