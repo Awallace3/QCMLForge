@@ -42,6 +42,7 @@ jobs:
         with:
           environment-file: devtools/conda-envs/test_env.yaml
           environment-name: test
+          generate-run-shell: false
           condarc: |
             channels:
               - conda-forge

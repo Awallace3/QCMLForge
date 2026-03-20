@@ -1,9 +1,12 @@
-apnet\_pt.AtomModels.ap2\_hirshfeld\_atom\_model.AtomHirshfeldModel
+﻿apnet\_pt.AtomModels.ap2\_hirshfeld\_atom\_model.AtomHirshfeldModel
 ===================================================================
 
 .. currentmodule:: apnet_pt.AtomModels.ap2_hirshfeld_atom_model
 
 .. autoclass:: AtomHirshfeldModel
+
+   
+   .. automethod:: __init__
 
    
    .. rubric:: Methods
