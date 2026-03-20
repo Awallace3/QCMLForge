@@ -81,63 +81,6 @@ class AsymptoticDecayLR(torch.optim.lr_scheduler._LRScheduler):
         ]
 
 
-def _validate_exponential_decay_args(
-    start_lr: float,
-    end_lr: float,
-    n_epochs: int,
-) -> None:
-    if start_lr <= 0 or end_lr <= 0:
-        raise ValueError("start_lr and end_lr must both be > 0.")
-    if n_epochs < 1:
-        raise ValueError("n_epochs must be >= 1.")
-
-
-def exponential_decay_lr(
-    start_lr: float,
-    end_lr: float,
-    n_epochs: int,
-    epoch: int | torch.Tensor,
-) -> float | torch.Tensor:
-    """
-    Exponentially decay learning rate from start_lr to end_lr over n_epochs.
-
-    Assumes:
-      - epoch 0 -> start_lr
-      - epoch n_epochs - 1 -> end_lr
-    """
-    _validate_exponential_decay_args(start_lr, end_lr, n_epochs)
-
-    if n_epochs == 1:
-        if isinstance(epoch, torch.Tensor):
-            return torch.ones_like(epoch, dtype=torch.float32) * start_lr
-        return start_lr
-
-    gamma = (end_lr / start_lr) ** (1.0 / (n_epochs - 1))
-    return start_lr * (gamma**epoch)
-
-
-def build_exponential_decay_scheduler(
-    optimizer: torch.optim.Optimizer,
-    start_lr: float,
-    end_lr: float,
-    n_epochs: int,
-) -> torch.optim.lr_scheduler.LRScheduler:
-    """
-    Build an epoch-wise exponential scheduler that reaches end_lr on the last
-    training epoch.
-    """
-    _validate_exponential_decay_args(start_lr, end_lr, n_epochs)
-
-    if n_epochs == 1:
-        return torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=lambda epoch: 1.0,
-        )
-
-    gamma = (end_lr / start_lr) ** (1.0 / (n_epochs - 1))
-    return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
-
-
 class Envelope(nn.Module):
     """
     Envelope function that ensures a smooth cutoff in PyTorch.
@@ -2056,7 +1999,6 @@ units angstrom
         pin_memory,
         num_workers,
         lr_decay=None,
-        end_lr=None,
     ):
         print(f"{self.device.type=}")
         if self.device.type == "cpu":
@@ -2130,16 +2072,7 @@ units angstrom
             print("Loaders setup\n")
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        if end_lr is not None:
-            if lr_decay is not None and rank == 0:
-                print("Using end_lr exponential decay; ignoring lr_decay.")
-            scheduler = build_exponential_decay_scheduler(
-                optimizer=optimizer,
-                start_lr=lr,
-                end_lr=end_lr,
-                n_epochs=n_epochs,
-            )
-        elif lr_decay:
+        if lr_decay:
             scheduler = InverseTimeDecayLR(
                 optimizer, lr, len(train_loader) * 60, lr_decay
             )
@@ -2248,7 +2181,6 @@ units angstrom
         pin_memory,
         num_workers,
         lr_decay=None,
-        end_lr=None,
         skip_compile=False,
         transfer_learning=False,
     ):
@@ -2304,21 +2236,12 @@ units angstrom
 
         # (3) Optim/Scheduler
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        if end_lr is not None:
-            if lr_decay is not None:
-                print("Using end_lr exponential decay; ignoring lr_decay.")
-            scheduler = build_exponential_decay_scheduler(
-                optimizer=optimizer,
-                start_lr=lr,
-                end_lr=end_lr,
-                n_epochs=n_epochs,
-            )
-        else:
-            scheduler = (
-                InverseTimeDecayLR(optimizer, lr, len(train_loader) * 2, lr_decay)
-                if lr_decay
-                else None
-            )
+        # scheduler = ModLambdaDecayLR(optimizer, lr_decay, lr) if lr_decay else None
+        scheduler = (
+            InverseTimeDecayLR(optimizer, lr, len(train_loader) * 2, lr_decay)
+            if lr_decay
+            else None
+        )
         # criterion = None  # defaults to MSE
         criterion = torch.nn.MSELoss()
 
@@ -2480,7 +2403,6 @@ units angstrom
         world_size=1,
         omp_num_threads_per_process=6,
         lr_decay=None,
-        end_lr=None,
         random_seed=42,
         skip_compile=True,
         transfer_learning=False,
@@ -2543,7 +2465,6 @@ units angstrom
         print(f"  {n_epochs=}", flush=True)
         print(f"  {lr=}\n", flush=True)
         print(f"  {lr_decay=}\n", flush=True)
-        print(f"  {end_lr=}\n", flush=True)
         print(f"  {batch_size=}", flush=True)
 
         if self.device.type == "cuda":
@@ -2574,7 +2495,6 @@ units angstrom
                     pin_memory,
                     dataloader_num_workers,
                     lr_decay,
-                    end_lr,
                 ),
                 nprocs=world_size,
                 join=True,
@@ -2591,7 +2511,6 @@ units angstrom
                 pin_memory=pin_memory,
                 num_workers=dataloader_num_workers,
                 lr_decay=lr_decay,
-                end_lr=end_lr,
                 skip_compile=skip_compile,
                 transfer_learning=transfer_learning,
             )

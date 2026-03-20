@@ -11,11 +11,7 @@ import torch
 from qcml_dftd3.d3 import d3
 
 import apnet_pt
-from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import (
-    APNet3D3_AtomType_Model,
-    build_exponential_decay_scheduler,
-    exponential_decay_lr,
-)
+from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_Model
 from apnet_pt.pt_datasets.ap3_fused_ds import (
     ap3_fused_module_dataset,
     ap3_fused_module_dataset_lmdb,
@@ -123,45 +119,6 @@ def set_weights_to_value(model, value=0.9):
     return
 
 
-def test_exponential_decay_lr_hits_requested_endpoints():
-    start_lr = 5e-4
-    end_lr = 5e-6
-    n_epochs = 5
-
-    lr_values = [
-        exponential_decay_lr(start_lr, end_lr, n_epochs, epoch)
-        for epoch in range(n_epochs)
-    ]
-
-    assert lr_values[0] == pytest.approx(start_lr)
-    assert lr_values[-1] == pytest.approx(end_lr)
-
-    gamma = lr_values[1] / lr_values[0]
-    for prev_lr, next_lr in zip(lr_values, lr_values[1:]):
-        assert next_lr / prev_lr == pytest.approx(gamma)
-
-
-def test_exponential_decay_scheduler_hits_requested_end_lr():
-    start_lr = 5e-4
-    end_lr = 5e-6
-    n_epochs = 5
-    parameter = torch.nn.Parameter(torch.tensor(1.0))
-    optimizer = torch.optim.Adam([parameter], lr=start_lr)
-    scheduler = build_exponential_decay_scheduler(
-        optimizer=optimizer,
-        start_lr=start_lr,
-        end_lr=end_lr,
-        n_epochs=n_epochs,
-    )
-
-    lr_values = [optimizer.param_groups[0]["lr"]]
-    for _ in range(n_epochs - 1):
-        optimizer.step()
-        scheduler.step()
-        lr_values.append(optimizer.param_groups[0]["lr"])
-
-    assert lr_values[0] == pytest.approx(start_lr)
-    assert lr_values[-1] == pytest.approx(end_lr)
 def assert_d3_params_equal(actual, expected):
     assert set(actual) == set(expected)
     for key in expected:

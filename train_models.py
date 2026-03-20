@@ -164,7 +164,6 @@ def train_pairwise_model(
     data_dir="./data_pairwise",
     n_epochs=50,
     lr=5e-4,
-    end_lr=None,
     lr_decay=None,
     random_seed=42,
     spec_type=2,
@@ -197,7 +196,7 @@ def train_pairwise_model(
     This function selects and configures an APNet variant (e.g., APNet2, dAPNet2, APNet3-fused, AM-DimerParam, AtomTypeParamModel), prepares any required submodels or pretrained weights, configures dataset and training hyperparameters, and runs training to save the resulting model to model_out.
 
     Parameters:
-        apnet_model_type (str): Which APNet variant to train (e.g., "APNet2", "dAPNet2", "APNet3-fused", "APNetD3", "AM-DimerParam", "AtomTypeParamModel").
+        apnet_model_type (str): Which APNet variant to train (e.g., "APNet2", "dAPNet2", "APNet3-fused", "AM-DimerParam", "AtomTypeParamModel").
         model_out (str): Path where the trained APNet model will be written.
         am_model_path (str): Path to a pretrained single-atom model used by APNet as needed.
         atom_type_param_model_path (str): Path to a pretrained AtomTypeParamModel (used by some fused/dimer variants).
@@ -205,7 +204,6 @@ def train_pairwise_model(
         data_dir (str): Root directory of the pairwise dataset.
         n_epochs (int): Number of training epochs.
         lr (float): Initial learning rate.
-        end_lr (float or None): Final learning rate for exponential decay over n_epochs; currently supported for APNetD3.
         lr_decay (float or None): Learning-rate decay factor (unused by default in this function).
         random_seed (int): Seed for dataset/model randomness.
         spec_type (int): Dataset specification/type identifier passed to dataset constructors.
@@ -236,7 +234,6 @@ def train_pairwise_model(
         param_start_std = [param_start_std] * n_params
     ds_atomic_batch_size = 4 * 256
     ds_datapoint_storage_n_objects = 16
-    ds_batch_size = 16
     if no_disp_nn and apnet_model_type != "APNet3-fused-d3":
         print(
             f"WARNING: --no_disp_nn applies only to APNet3-fused-d3 (requested {apnet_model_type}); ignoring flag."
@@ -250,11 +247,6 @@ def train_pairwise_model(
         APNet = AtomPairwiseModels.apnet3_fused.APNet3_AtomType_Model
         # Note: presently ap3_fused_ds requires atomic batch size to be <=
         # n_objects. NEDS FIXED
-        ds_atomic_batch_size = 16
-        ds_datapoint_storage_n_objects = 16
-        ds_batch_size = 16
-    elif apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
-        APNet = AtomPairwiseModels.apnet3_d3_fused.APNet3D3_AtomType_Model
         ds_atomic_batch_size = 16
         ds_datapoint_storage_n_objects = 16
         ds_batch_size = 16
@@ -290,12 +282,6 @@ def train_pairwise_model(
         APNet = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel
     else:
         raise ValueError("Invalid Atom Model Type")
-    if end_lr is not None and apnet_model_type not in [
-        "APNetD3",
-        "APNet3D3",
-        "APNet3-d3-fused",
-    ]:
-        raise ValueError("end_lr is currently only supported for APNetD3 training")
     print("Training {}...".format(apnet_model_type))
     if torch.cuda.is_available():
         world_size = torch.cuda.device_count()
@@ -483,56 +469,6 @@ def train_pairwise_model(
         if ap2_pretrained_model_only is not None:
             print(f"Loading AP2 pretrained weights from {ap2_pretrained_model_only}")
             apnet.load_ap2_pretrained_weights(ap2_pretrained_model_only)
-    elif apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
-        print("Setting AtomTypeParams...")
-        atom_type_hf_vw_model = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
-            ds_root=None,
-            use_GPU=False,
-            ignore_database_null=True,
-            atom_model_pre_trained_path=am_model_path,
-            pre_trained_model_path=atom_type_param_model_path,
-        )
-        atom_type_elst_model = AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
-            ds_root=None,
-            use_GPU=False,
-            ignore_database_null=True,
-            atom_model=atom_type_hf_vw_model.model,
-            atom_model_type="AtomTypeParamNN",
-            pre_trained_model_path=atom_type_param_model_path2,
-            elst_damping_type=elst_damping_type,
-        )
-        am_model_path = None
-        print(f"{ds_atomic_batch_size=}, {ds_datapoint_storage_n_objects=}")
-        if ds_type == "fsapt_energies":
-            use_precomputed_classical = False
-        else:
-            use_precomputed_classical = True
-        apnet = APNet(
-            atom_type_model=atom_type_hf_vw_model.model,
-            dimer_prop_model=atom_type_elst_model.dimer_model,
-            am_dimer_param_model=atom_type_elst_model,
-            pre_trained_model_path=pretrained_model,
-            n_rbf=n_rbf,
-            n_neuron=n_neuron,
-            n_embed=n_embed,
-            r_cut=r_cut,
-            ds_spec_type=spec_type,
-            ds_root=data_dir,
-            ignore_database_null=False,
-            ds_atomic_batch_size=ds_atomic_batch_size,
-            ds_num_devices=1,
-            ds_skip_process=False,
-            ds_datapoint_storage_n_objects=ds_datapoint_storage_n_objects,
-            ds_prebatched=False,
-            ds_random_seed=random_seed,
-            ds_class_type=ds_class_type,
-            use_precomputed_classical=use_precomputed_classical,
-            ds_type=ds_type,
-            ds_batch_size=ds_batch_size,
-        )
-        if ap2_pretrained_model_only is not None:
-            print(f"Loading AP2 pretrained weights from {ap2_pretrained_model_only}")
-            apnet.load_ap2_pretrained_weights(ap2_pretrained_model_only)
     elif apnet_model_type in ["AtomTypeParamModel"]:
         apnet = APNet(
             atom_model_pre_trained_path=am_model_path,
@@ -568,20 +504,16 @@ def train_pairwise_model(
             ds_prebatched=True,
             ds_random_seed=random_seed,
         )
-    train_kwargs = dict(
+    apnet.train(
         model_path=model_out,
         n_epochs=n_epochs,
         world_size=world_size,
         omp_num_threads_per_process=omp_num_threads_per_process,
         lr=lr,
+        # lr_decay=lr_decay,
         dataloader_num_workers=4,
         random_seed=random_seed,
     )
-    if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
-        train_kwargs["end_lr"] = end_lr
-    else:
-        train_kwargs["lr_decay"] = lr_decay
-    apnet.train(**train_kwargs)
     return
 
 
@@ -720,12 +652,6 @@ def main():
     )
     args.add_argument(
         "--lr", type=float, default=5e-4, help="Learning Rate: (5e-4 is default)"
-    )
-    args.add_argument(
-        "--end_lr",
-        type=float,
-        default=None,
-        help="Final learning rate for exponential decay over n_epochs (APNetD3 only)",
     )
     args.add_argument(
         "--lr_decay",
@@ -914,7 +840,6 @@ def main():
             data_dir=args.data_dir,
             n_epochs=args.n_epochs,
             lr=args.lr,
-            end_lr=args.end_lr,
             lr_decay=args.lr_decay,
             random_seed=args.random_seed,
             spec_type=args.spec_type_ap,
