@@ -42,6 +42,9 @@ jobs:
         with:
           environment-file: devtools/conda-envs/test_env.yaml
           environment-name: test
+          # GitHub-hosted runners are ephemeral, so skipping shell deinit avoids
+          # the macOS post-job cleanup failure without leaving persistent state.
+          post-cleanup: none
           generate-run-shell: false
           condarc: |
             channels:
