@@ -16,7 +16,7 @@ dependencies:
   - requests=2.32.3
   - setuptools=72.1.0
   - torchaudio
-  - torchtriton
+  # - torchtriton
   - torchvision
   - matplotlib
   - pydantic=2.*
