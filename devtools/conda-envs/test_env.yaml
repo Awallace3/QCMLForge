@@ -1,0 +1,40 @@
+name: test
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - flask=3.1.0
+  - jinja2=3.1.4
+  - numpy=2.2.*
+  - pandas=2.2.*
+  - pip
+  - psycopg2=2.9.9
+  - pytest=7.4.4
+  - python=3.12.8
+  - pytorch=2.5.1
+  - pytorch-mutex=1.0
+  - requests=2.32.3
+  - setuptools=72.1.0
+  - sympy=1.13.3
+  - torchaudio
+  - torchtriton
+  - torchvision
+  - matplotlib=3.10.0
+  - pydantic=2.*
+  - scipy=1.15.*
+  - tqdm=4.*
+
+    # Testing
+  - pytest-cov
+  - codecov
+
+  - pip:
+      - qcelemental==0.29.0
+      - qm-tools-aw==1.4.5
+      - torch-geometric==2.6.1
+      - waitress==3.0.2
+      - yarl==1.18.3
+      - pytorch-minimize
+      - qcportal==0.59

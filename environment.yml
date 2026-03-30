@@ -9,26 +9,25 @@ dependencies:
   - pandas=2.*
   - pip
   - pytest=7.4.4
-  - python=3.12.8
-  - pytorch=2.7.0
+  - python>=3.12
+  - pytorch=2.5.1
   - cuda=12.6.*
   - pytorch-mutex=1.0
   - requests=2.32.3
   - setuptools=72.1.0
   - torchaudio
-  - torchtriton
+  # - torchtriton
   - torchvision
   - matplotlib
-  - pydantic==2.*
+  - pydantic=2.*
   - scipy
   - tqdm
   - h5py
   - pip:
       - qcelemental==0.29.0
       - qm-tools-aw==1.4.5
-      # torch-geometric and torch-scatter with explicit wheel URLs for CUDA 12.8
-      # For CPU-only systems, change +cu128 to +cpu in the URLs below
-      # - torch-geometric==2.6.1 -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
+      # For CPU-only systems, change +cu126 to +cpu in the URLs below
+      # - torch-geometric==2.6.1 -f https://data.pyg.org/whl/torch-2.5.1+cu126.html
       - waitress==3.0.2
       - yarl==1.18.3
       - pytorch-minimize

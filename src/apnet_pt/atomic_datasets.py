@@ -40,6 +40,29 @@ def qcel_monomer_to_atomic_data(monomer, r_cut=5.0, **kwargs):
 
 
 def natural_key(text):
+    """Sort strings containing numbers in a natural order.
+
+    This function splits a string into a list of strings and integers, which
+    can be used as a key for sorting, providing a more intuitive, natural
+    ordering for alphanumeric strings.
+
+    Parameters
+    ----------
+    text : str
+        The string to be converted into a natural sorting key.
+
+    Returns
+    -------
+    list
+        A list of strings and integers representing the input text, suitable
+        for natural sorting.
+
+    Examples
+    --------
+    >>> sorted(['file1.txt', 'file10.txt', 'file2.txt'], key=natural_key)
+    ['file1.txt', 'file2.txt', 'file10.txt']
+
+    """
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", text)]
 
 
@@ -54,8 +77,7 @@ def distance_matrix_torch(r):
 
 
 def generate_monomer_multipole_dataset(file):
-    monomers, cartesian_multipoles, _, _ = util.load_monomer_dataset("mon200.pkl")
-    return
+    return util.load_monomer_dataset(file)
 
 
 def vec_func(R_ij, R_c=5.0, n_bessel=8):
