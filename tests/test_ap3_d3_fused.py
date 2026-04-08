@@ -929,9 +929,11 @@ def test_classical_ap3_dispersion():
     simple_dftd3_energies = np.array([-2.4595184, -4.3240623, -7.2716193])
     print(f"{simple_dftd3_energies=}")
     print(f"{ap3_disp=}")
-    assert np.allclose(ap3_disp, simple_dftd3_energies, atol=1e-5), (
-        f"AP3 dispersion energies {ap3_disp} should be close to simple DFTD3 energies {simple_dftd3_energies}"
-    )
+    assert np.allclose(
+        ap3_disp, simple_dftd3_energies, atol=1e-5
+    ), f"AP3 dispersion energies {ap3_disp} should be close to simple DFTD3 energies {
+        simple_dftd3_energies
+    }"
     return
 
 
@@ -1002,9 +1004,9 @@ def test_ap3_d3_fused_no_disp_nn_architecture():
     H = torch.randn(10, in_features)
     output = model.readouts(H)
 
-    assert output.shape[1] == 3, (
-        f"readouts() should return 3 columns when no_disp_nn=True, got {output.shape[1]}"
-    )
+    assert (
+        output.shape[1] == 3
+    ), f"readouts() should return 3 columns when no_disp_nn=True, got {output.shape[1]}"
 
 
 def test_ap3_d3_fused_default_architecture():
@@ -1227,9 +1229,9 @@ def test_ap3_d3_fused_predict_expansion_to_4_cols():
     )
 
     # Should always return 4 columns: [elst, exch, indu, disp]
-    assert predictions_no_disp.shape[1] == 4, (
-        f"predict_qcel_mols should return 4 columns, got {predictions_no_disp.shape[1]}"
-    )
+    assert (
+        predictions_no_disp.shape[1] == 4
+    ), f"predict_qcel_mols should return 4 columns, got {predictions_no_disp.shape[1]}"
 
     # Test with no_disp_nn=False (default)
     ap3_with_disp = APNet3D3_AtomType_Model(
@@ -1342,7 +1344,7 @@ def test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice():
         pre_trained_model_path="./models/ap3_ensemble/1/ap3_d3_nn_1.pt",
     )
 
-    assert ap3d3.use_precomputed_classical is True
+    assert ap3d3.use_precomputed_classical is False
 
     batch = ap3d3._qcel_example_input(
         [mol_cliff_water_close],
@@ -1350,31 +1352,49 @@ def test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice():
         r_cut=ap3d3.model.r_cut,
         r_cut_im=ap3d3.model.r_cut_im,
     )
-    E_out, _, _, _, _, _, _ = ap3d3.model(batch)
+    E_out, E_sr_NN, _, _, _, _, _ = ap3d3.model(batch)
 
     ap3d3.dimer_prop_model.set_forward("ap3_elst_damping__induced_dipole__disp")
     E_classical, _, _ = ap3d3.dimer_prop_model(batch)
-    ap3d3.dimer_prop_model.set_forward("ap3_atomMPNN")
+    # ap3d3.dimer_prop_model.set_forward("ap3_atomMPNN")
 
     elst_dimer = scatter_sum_compile(E_classical[:, 0], batch.dimer_ind_full, 1)
     ind_dimer = scatter_sum_compile(E_classical[:, 1], batch.dimer_ind_full, 1)
     disp_dimer = scatter_sum_compile(E_classical[:, 2], batch.dimer_ind_full, 1)
 
+    print("forward:", ap3d3.dimer_prop_model.forward_name)
     predictions = ap3d3.predict_qcel_mols([mol_cliff_water_close], batch_size=1)
+    print(f"AP3-D3 prediction:\n{predictions}")
 
-    assert np.allclose(
-        predictions[:, 0],
-        (E_out[:, 0] + elst_dimer).detach().cpu().numpy(),
+    print()
+    print(
+        E_out,
+        predictions,
+        E_sr_NN,
+        sep="\n",
     )
-    assert np.allclose(predictions[:, 1], E_out[:, 1].detach().cpu().numpy())
+    print(f"{elst_dimer=}, {ind_dimer=}, {disp_dimer=}")
     assert np.allclose(
-        predictions[:, 2],
-        (E_out[:, 2] + ind_dimer).detach().cpu().numpy(),
+        E_out.detach().cpu().numpy(),
+        predictions,
+    ), "AP3-D3 batch == predict_qcel_mols"
+    E_sr_NN_sum = E_sr_NN.sum(dim=0).detach().cpu().numpy()
+    print(f"E_sr_NN sum: {E_sr_NN_sum}")
+    classical_terms = np.array(
+        [elst_dimer[0], 0, ind_dimer[0], disp_dimer[0]]
     )
+    print(f"classical_terms: {classical_terms}")
+    E_sr_NN_plus_classical = E_sr_NN_sum + classical_terms
     assert np.allclose(
-        predictions[:, 3],
-        (E_out[:, 3] + disp_dimer).detach().cpu().numpy(),
-    )
+        E_sr_NN_plus_classical,
+        predictions,
+    ), "AP3-D3 NN + classical == predict_qcel_mols"
+
+    # run AP2 pretrained model_id=1
+    ap2 = apnet_pt.AtomPairwiseModels.apnet2_fused.APNet2_AM_Model()
+    ap2.set_pretrained_model(model_id=1)
+    ap2_pred = ap2.predict_qcel_mols([mol_cliff_water_close])
+    print(f"AP2 prediction:\n{ap2_pred}")
 
 
 def test_ap3_d3_precomputed_train_and_infer_small_dataset(tmp_path):
@@ -1492,6 +1512,138 @@ def test_ap3_d3_precomputed_train_and_infer_small_dataset(tmp_path):
         (E_residual[:, 3] + disp_dimer).detach().cpu().numpy(),
         atol=1e-5,
     )
+
+
+def test_ap3_d3_checkpoint_respects_constructor_precomputed_flag(tmp_path):
+    batch_size = 2
+    qcel_molecules = [mol_cliff_water_close] * 4
+    energy_labels = [
+        np.array(
+            [
+                -10.779292828139122,
+                11.390991215401051,
+                -3.414543432719425,
+                -2.436025699701581,
+            ]
+        )
+        for _ in qcel_molecules
+    ]
+
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+
+    root = tmp_path / "ap3d3_checkpoint_flag_ds"
+    (root / "raw").mkdir(parents=True, exist_ok=True)
+    ds = ap3_fused_module_dataset(
+        root=str(root),
+        r_cut=5.0,
+        r_cut_im=8.0,
+        spec_type=None,
+        max_size=None,
+        force_reprocess=True,
+        atomic_batch_size=4,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        datapoint_storage_n_objects=6,
+        batch_size=batch_size,
+        num_devices=1,
+        skip_processed=True,
+        skip_compile=True,
+        print_level=0,
+        qcel_molecules=qcel_molecules,
+        energy_labels=energy_labels,
+        in_memory=True,
+        random_seed=None,
+    )
+
+    ap3d3 = APNet3D3_AtomType_Model(
+        dataset=ds,
+        ds_root=None,
+        atom_type_model=atom_type_hf_vw_model.model,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        am_dimer_param_model=atom_type_elst_model,
+        use_precomputed_classical=True,
+        ignore_database_null=True,
+        use_GPU=False,
+        no_disp_nn=False,
+    )
+    ap3d3.train(
+        ds,
+        n_epochs=1,
+        skip_compile=True,
+        transfer_learning=False,
+        lr=5e-4,
+        split_percent=0.5,
+        dataloader_num_workers=0,
+    )
+
+    direct_atom_type_hf_vw_model = (
+        apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+            ds_root=None,
+            use_GPU=False,
+            ignore_database_null=True,
+            atom_model_pre_trained_path=am_path,
+            pre_trained_model_path=at_hf_vw_path,
+        )
+    )
+    direct_atom_type_elst_model = (
+        apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+            ds_root=None,
+            use_GPU=False,
+            ignore_database_null=True,
+            atom_model=direct_atom_type_hf_vw_model.model,
+            atom_model_type="AtomTypeParamNN",
+            pre_trained_model_path=at_elst_path,
+        )
+    )
+    direct_inference = APNet3D3_AtomType_Model(
+        ds_root=None,
+        atom_type_model=direct_atom_type_hf_vw_model.model,
+        dimer_prop_model=direct_atom_type_elst_model.dimer_model,
+        am_dimer_param_model=direct_atom_type_elst_model,
+        use_precomputed_classical=False,
+        ignore_database_null=True,
+        use_GPU=False,
+        no_disp_nn=False,
+    )
+    direct_inference.model.load_state_dict(ap3d3.model.state_dict())
+    direct_inference.dimer_prop_model.load_state_dict(
+        ap3d3.dimer_prop_model.state_dict()
+    )
+    direct_predictions = direct_inference.predict_qcel_mols(
+        qcel_molecules, batch_size=batch_size
+    )
+
+    checkpoint_path = tmp_path / "ap3d3_checkpoint_flag.pt"
+    ap3d3.save_model(str(checkpoint_path))
+
+    restored = APNet3D3_AtomType_Model(
+        pre_trained_model_path=str(checkpoint_path),
+        use_precomputed_classical=False,
+        use_GPU=False,
+        ignore_database_null=True,
+    )
+
+    assert restored.use_precomputed_classical is False
+    assert restored.model.use_precomputed_classical is False
+
+    restored_predictions = restored.predict_qcel_mols(
+        qcel_molecules, batch_size=batch_size
+    )
+
+    assert np.allclose(restored_predictions, direct_predictions, atol=1e-5)
 
 
 def test_ap3_d3_live_classical_forward_includes_all_classical_terms():
@@ -1718,4 +1870,9 @@ if __name__ == "__main__":
     # test_ap3_d3_fused_get_config_recreate_model()
     # test_ap3_d3_fused_predict_expansion_to_4_cols()
     # pytest.main([__file__])
-    test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice()
+    # test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice()
+    from pathlib import Path
+    tmp_dir = Path("tmp_ap3d3_test")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    test_ap3_d3_precomputed_train_and_infer_small_dataset(tmp_dir)
+

@@ -1788,12 +1788,13 @@ class ap3_fused_module_dataset_lmdb(Dataset):
 
         with torch.no_grad():
             if hasattr(self.dimer_prop_model, "set_forward"):
-                self.dimer_prop_model.set_forward(
-                    "ap3_elst_damping__induced_dipole__disp"
-                )
+                # self.dimer_prop_model.set_forward(
+                #     "ap3_elst_damping__induced_dipole__disp"
+                # )
                 result = self.dimer_prop_model(temp_batch)
-                self.dimer_prop_model.set_forward("ap3_atomMPNN")
+                # self.dimer_prop_model.set_forward("ap3_atomMPNN")
                 E_classical = result[0]
+                print(f"DS {E_classical=}")
             elif hasattr(self.dimer_prop_model, "dimer_model"):
                 result = self.dimer_prop_model.dimer_model(temp_batch)
                 E_classical = result[0]

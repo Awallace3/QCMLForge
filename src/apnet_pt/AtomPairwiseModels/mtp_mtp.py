@@ -130,6 +130,7 @@ class DimerProp(nn.Module):
             - For modes that compute induction ("induced_dipole", "induced_dipole_param", and the combined induction modes), this method also clones the global polarizability table into self.polarizability_table.
             - Raises ValueError if dimer_eval is not one of the accepted mode strings.
         """
+        self.forward_name = dimer_eval
         if dimer_eval == "elst_damping":
             self.forward = self._elst_damping_forward
         elif dimer_eval == "elst_damping_AMOEBA":
@@ -191,7 +192,7 @@ class DimerProp(nn.Module):
                         atom_model_config["r_cut"] = nested_r_cut
 
         return {
-            "dimer_eval": getattr(getattr(self, "forward", None), "__name__", None),
+            "dimer_eval": getattr(self, "forward_name", None),
             "elst_damping_type": self.elst_damping_type,
             "d3_damping_parameters": deepcopy(self.d3_damping_parameters),
             "atom_type_param_type": atom_type_param_type,

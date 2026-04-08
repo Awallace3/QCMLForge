@@ -621,6 +621,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
         if self.use_precomputed_classical:
             E_output = E_sr_dimer
+            print(f"{E_output = }")
             return E_output, E_sr, 0, 0, 0, hAB, hBA
         else:
             E_elst_full_dimer = scatter_sum_compile(
@@ -674,6 +675,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
                 padded[:, 3:4] = E_disp_dimer
                 E_disp_dimer = padded
 
+                # print(f"{E_sr_dimer = }")
+                # print(f"{E_disp_dimer = }")
                 E_output = E_sr_dimer + E_elst_dimer + E_ind_dimer + E_disp_dimer
         if self.return_hidden_states:
             return (
@@ -686,6 +689,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
                 hBA,
                 cutoff,
             )
+        print(f"{E_output = }")
+        print(f"{E_sr = }")
         return E_output, E_sr, E_elst, E_ind, E_disp, hAB, hBA
 
 
@@ -836,9 +841,6 @@ class APNet3D3_AtomType_Model:
             config = model_io.load_config_from_checkpoint(checkpoint) or {}
             use_atom_props = config.get("use_atom_props", True)
             no_disp_nn = config.get("no_disp_nn", False)
-            use_precomputed_classical = config.get(
-                "use_precomputed_classical", use_precomputed_classical
-            )
             if freeze_dimer_prop_model is None:
                 freeze_dimer_prop_model = config.get("freeze_dimer_prop_model", True)
             resolved_d3_damping_parameters = resolve_d3_damping_parameters(
@@ -1833,9 +1835,7 @@ class APNet3D3_AtomType_Model:
                             [np.nan, np.nan, np.nan, np.nan]
                         )
             if verbose:
-                print(
-                    f"Predictions for {i} to {i + effective_batch_size} out of {N}"
-                )
+                print(f"Predictions for {i} to {i + effective_batch_size} out of {N}")
         if self.model.return_hidden_states:
             return predictions, h_ABs, h_BAs, cutoffs, dimer_inds, ndimers
         if return_pairs:
