@@ -1,6 +1,5 @@
-import numpy as np
 import qcelemental as qcel
-from typing import List, Tuple, Dict
+from typing import Dict
 from pprint import pprint as pp
 from mcp.server.fastmcp import FastMCP
 import apnet_pt
@@ -16,26 +15,6 @@ except ImportError:
 
 # Create an MCP server
 mcp = FastMCP("QCMLForge", port=8001)
-
-
-@mcp.tool()
-def add(a: int, b: int) -> int:
-    """
-    Add two numbers.
-
-    Parameters
-    ----------
-    a : int
-        First number to add.
-    b : int
-        Second number to add.
-
-    Returns
-    -------
-    int
-        Sum of a and b.
-    """
-    return a + b
 
 
 @mcp.tool()
@@ -96,22 +75,6 @@ units angstrom
         "AM-MBIS QUADRUPOLES": list(quadrupoles),
         "geometry": mol.to_string("psi4"),
     }
-
-
-@mcp.tool()
-def secret_word():
-    """
-    Return the secret word for QCMLForge to test server.
-
-    Parameters
-    ----------
-    None
-
-    Returns
-    -------
-    str
-    """
-    return "QCMLForgeRocks!"
 
 
 @mcp.tool()
@@ -465,10 +428,4 @@ units angstrom
 
 if __name__ == "__main__":
     print("Starting MCP server...")
-    # pp(estimate_timing_for_qcel_molecule(benzene_dimer_geometry(), method="hf", basis_set="aug-cc-pVDZ", manybody=True))
-    # pp(estimate_timing_for_qcel_molecule(benzene_dimer_geometry(), method="fno-ccsd(t)", basis_set="aug-cc-pVDZ", manybody=True))
-    # pp(predict_dAPNet2_error_estimates_QCMLForge(benzene_dimer_geometry(), starting_level_of_theory="HF/aug-cc-pVDZ/CP"))
-    # pp(predict_AM_multipoles_QCMLForge())
-    # pp(predict_APNet2_IE_QCMLForge())
-    # pp(predict_dAPNet2_error_estimates_QCMLForge())
-    # pp(estimate_timing_for_qcel_molecule())
+    pp(estimate_timing_for_qcel_molecule(benzene_dimer_geometry(), method="hf", basis_set="aug-cc-pVDZ", manybody=True))

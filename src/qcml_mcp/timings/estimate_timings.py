@@ -1,13 +1,9 @@
-import psi4
-from psi4 import core
 import math
 import qcelemental as qcel
 import numpy as np
 import pandas as pd
 from pprint import pprint as pp
-from .all_polynomial_fits import fit_data, dft_methods, wfn_methods
-
-psi4.core.be_quiet()
+from .all_polynomial_fits import fit_data
 
 
 def compute_psi4_time_estimation_variables(
@@ -17,6 +13,8 @@ def compute_psi4_time_estimation_variables(
     """
     create_mp_js_grimme turns mp_js object into a psi4 job and runs it
     """
+    import psi4
+    psi4.core.be_quiet()
     n_atoms = len(mol_qcel.atomic_numbers)
     mol = psi4.core.Molecule.from_schema(mol_qcel.dict())
     psi4.set_options({"basis": basis_set})
@@ -25,12 +23,12 @@ def compute_psi4_time_estimation_variables(
     n_occupied = math.ceil((wfn.nalpha() + wfn.nbeta()) / 2)
     n_virtual = bs.nbf() - n_occupied
     np_total = 2 * n_atoms * 75 * 302 * 0.32
-    aux_basis = core.BasisSet.build(
+    aux_basis = psi4.core.BasisSet.build(
         wfn.molecule(),
         "DF_BASIS_MP2",
-        core.get_option("DFMP2", "DF_BASIS_MP2"),
+        psi4.core.get_option("DFMP2", "DF_BASIS_MP2"),
         "RIFIT",
-        core.get_global_option("BASIS"),
+        psi4.core.get_global_option("BASIS"),
     )
     nbf_aux = aux_basis.nbf()
     return n_occupied, n_virtual, np_total, nbf_aux
