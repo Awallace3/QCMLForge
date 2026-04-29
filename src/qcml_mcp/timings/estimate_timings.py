@@ -14,6 +14,7 @@ def compute_psi4_time_estimation_variables(
     create_mp_js_grimme turns mp_js object into a psi4 job and runs it
     """
     import psi4
+
     psi4.core.be_quiet()
     n_atoms = len(mol_qcel.atomic_numbers)
     mol = psi4.core.Molecule.from_schema(mol_qcel.dict())
@@ -34,83 +35,96 @@ def compute_psi4_time_estimation_variables(
     return n_occupied, n_virtual, np_total, nbf_aux
 
 
+def _normalize_method(method: str) -> str:
+    """Normalize a method name for lookup in timing fit data."""
+    return method.lower()
+
+
+def _evaluate_moo_time_polynomial(method_key: str, coeffs, input_values) -> float:
+    """Evaluate the raw seconds polynomial from ``moo.py`` for one data point."""
+    p = [float(x) for x in coeffs]
+    nocc = float(input_values["nocc"])
+    nvirt = float(input_values["nvirt"])
+    nbf_aux = float(input_values["nbf_aux"])
+    np_total = float(input_values.get("np_total", 0.0))
+    nbf = nocc + nvirt
+
+    if method_key == "hf":
+        return (
+            p[0]
+            + p[1] * (nbf ** p[4] * nbf_aux**2)
+            + p[2] * (nbf ** p[4] * nbf_aux)
+            + p[3] * (nocc * nbf_aux * nbf**2)
+        )
+    if method_key == "pbe-d3":
+        return (
+            p[0] + p[1] * (np_total * nbf ** p[3]) + p[2] * (nbf ** p[4] * nbf_aux**2)
+        )
+    if method_key == "wb97x-d":
+        return p[0] + p[1] * (np_total * nbf ** p[3]) + p[2] * (nocc * nbf_aux * nbf**2)
+    if method_key == "wb97x-v":
+        return (
+            p[0]
+            + p[1] * (nbf ** p[4] * nbf_aux**2)
+            + p[2] * (nocc * nbf_aux * nbf**2)
+            + p[3] * (np_total**2)
+        )
+    if method_key == "mp2":
+        return p[0] + p[1] * (nocc * nbf**2 * nbf_aux) + p[2] * (nbf**2 * nbf_aux)
+    if method_key in {"b3lyp-d3", "b2plyp-d3", "m05-2x"}:
+        return p[0] + p[1] * (np_total * nbf ** p[3]) + p[2] * (nocc * nbf_aux * nbf**2)
+    if method_key == "fno-ccsd":
+        return p[0] + p[1] * (nocc * nbf**2 * nbf_aux) + p[2] * (nocc**2 * nvirt**4)
+    if method_key == "fno-ccsd(t)":
+        return (
+            p[0]
+            + p[1] * (nocc * nbf**2 * nbf_aux)
+            + p[2] * (nocc**2 * nvirt**4)
+            + p[3] * (nocc**3 * nvirt**4)
+        )
+    raise ValueError(f"No moo.py timing polynomial evaluator for method '{method_key}'")
+
+
 def predict_timing(method, input_values):
     """
-    Predict timing for a given method and input variables using saved polynomial fits.
+    Predict timing for a given method and input variables using saved fits.
 
-    Args:
-        method (str): The computational method name (e.g., 'MP2', 'B3LYP-D3')
-        input_values (dict): Dictionary with variable names as keys and values as values
-                           e.g., {'nocc': 10, 'nvirt': 50, 'nbf_aux': 200}
-
-    Returns:
-        dict: Dictionary containing:
-            - 'log_time': Predicted log10(time in seconds)
-            - 'time_seconds': Predicted time in seconds
-            - 'variables_used': List of variables used in the prediction
-            - 'method': Method name used
+    The current fits follow the ``moo.py`` logic: first evaluate a raw fitted
+    polynomial for time in seconds, then compute ``log10(abs(raw_seconds))``
+    with a lower clip of ``1e-12`` for the reported log value.
     """
 
-    # Check if method exists in the data
-    if method not in fit_data["methods"]:
+    method_key = _normalize_method(method)
+    if method_key not in fit_data["methods"]:
         available_methods = list(fit_data["methods"].keys())
         raise ValueError(
             f"Method '{method}' not found. Available methods: {available_methods}"
         )
 
-    method_data = fit_data["methods"][method]
-
-    # Extract polynomial parameters
+    method_data = fit_data["methods"][method_key]
     variables = method_data["variables"]
-    degrees = method_data["degrees"]
-    operators = method_data["operators"]
     coefficients = method_data["coefficients"]
 
-    # Validate input variables
     missing_vars = [var for var in variables if var not in input_values]
     if missing_vars:
         raise ValueError(
-            f"Missing required variables for method '{method}': {missing_vars}"
+            f"Missing required variables for method '{method_key}': {missing_vars}"
         )
 
-    # Extract variable values in the correct order
-    X_vars = []
-    for var in variables:
-        X_vars.append(input_values[var])
-
-    # Evaluate the polynomial combination
-    def evaluate_polynomial_combination(coeffs_list, X_values, degrees, operators):
-        """Evaluate the polynomial model for a single data point"""
-        prediction = 0.0
-
-        for i, (X_val, degree, poly_coeffs) in enumerate(
-            zip(X_values, degrees, coeffs_list)
-        ):
-            # Evaluate polynomial for this variable
-            poly_val = 0.0
-            for j, coeff in enumerate(poly_coeffs):
-                poly_val += coeff * (X_val**j)
-
-            if i == 0:
-                prediction = poly_val
-            elif operators[i - 1] == "*":
-                prediction *= poly_val
-            elif operators[i - 1] == "+":
-                prediction += poly_val
-
-        return prediction
-
-    # Make prediction
-    log_time_pred = evaluate_polynomial_combination(
-        coefficients, X_vars, degrees, operators
+    raw_time_pred = _evaluate_moo_time_polynomial(
+        method_key,
+        coefficients,
+        input_values,
     )
-    time_pred = 10**log_time_pred  # Convert from log10 back to actual time
+    time_pred = float(np.clip(abs(raw_time_pred), 1.0e-12, None))
+    log_time_pred = float(np.log10(time_pred))
 
     result = {
         "log_time": log_time_pred,
         "time_seconds": time_pred,
+        "raw_time_seconds": float(raw_time_pred),
         "variables_used": variables,
-        "method": method,
+        "method": method_key,
         "input_values": {var: input_values[var] for var in variables},
     }
 
@@ -131,13 +145,14 @@ def predict_timing_batch(method, input_dataframe):
 
     df_copy = input_dataframe.copy()
 
-    if method not in fit_data["methods"]:
+    method_key = _normalize_method(method)
+    if method_key not in fit_data["methods"]:
         available_methods = list(fit_data["methods"].keys())
         raise ValueError(
             f"Method '{method}' not found. Available methods: {available_methods}"
         )
 
-    method_data = fit_data["methods"][method]
+    method_data = fit_data["methods"][method_key]
     variables = method_data["variables"]
 
     # Check if all required variables are in the dataframe
@@ -151,7 +166,7 @@ def predict_timing_batch(method, input_dataframe):
     predictions = []
     for _, row in df_copy.iterrows():
         input_values = {var: row[var] for var in variables}
-        pred = predict_timing(method, input_values)
+        pred = predict_timing(method_key, input_values)
         predictions.append(pred)
 
     # Add predictions to dataframe
@@ -214,9 +229,11 @@ def estimate_timing_for_qcel_molecule(
 
     time_seconds = 0.0
     for mol in mols:
-        n_occupied, n_virtual, np_total, nbf_aux = compute_psi4_time_estimation_variables(
-            mol,
-            "aug-cc-pVDZ",
+        n_occupied, n_virtual, np_total, nbf_aux = (
+            compute_psi4_time_estimation_variables(
+                mol,
+                basis_set,
+            )
         )
         input_vars = {
             "nocc": n_occupied,

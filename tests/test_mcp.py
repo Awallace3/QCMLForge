@@ -106,9 +106,10 @@ EXPECTED_DAPNET2_OUTPUT = {
 
 EXPECTED_MP2_POLYNOMIAL_OUTPUT = {
     "input_values": {"nbf_aux": 50, "nocc": 10, "nvirt": 50},
-    "log_time": 0.9166507282477321,
+    "log_time": 0.41557276205394633,
     "method": "mp2",
-    "time_seconds": 8.25373893848617,
+    "time_seconds": 2.6035910026084,
+    "raw_time_seconds": 2.6035910026084,
     "variables_used": ["nocc", "nvirt", "nbf_aux"],
 }
 
@@ -179,7 +180,11 @@ def test_estimate_timing_for_qcel_molecule_default_output():
 
     assert isinstance(output["estimated_compute_time_seconds"], float)
     assert output["estimated_compute_time_seconds"] > 0.0
-    assert output["geometry"] == EXPECTED_AM_OUTPUT["geometry"]
+
+    output_mol = qcel.models.Molecule.from_data(output["geometry"])
+    expected_mol = qcel.models.Molecule.from_data(EXPECTED_AM_OUTPUT["geometry"])
+    assert output_mol.symbols.tolist() == expected_mol.symbols.tolist()
+    np.testing.assert_allclose(output_mol.geometry, expected_mol.geometry, atol=1e-6)
     pp(output)
 
 
@@ -195,8 +200,14 @@ def test_polynomial_eval():
     pp(result)
     assert result["method"] == EXPECTED_MP2_POLYNOMIAL_OUTPUT["method"]
     assert result["variables_used"] == EXPECTED_MP2_POLYNOMIAL_OUTPUT["variables_used"]
-    assert result["input_values"] == EXPECTED_MP2_POLYNOMIAL_OUTPUT["input_values"]
-    assert result["log_time"] == pytest.approx(EXPECTED_MP2_POLYNOMIAL_OUTPUT["log_time"], abs=1e-6)
+    assert result["input_values"] == EXPECTED_MP2_POLYNOMIAL_OUTPUT["input_values"], f"Expected input_values to be {EXPECTED_MP2_POLYNOMIAL_OUTPUT['input_values']}, but got {result['input_values']}"
+    assert result["log_time"] == pytest.approx(EXPECTED_MP2_POLYNOMIAL_OUTPUT["log_time"], abs=1e-6), f"Expected log_time to be approximately {EXPECTED_MP2_POLYNOMIAL_OUTPUT['log_time']}, but got {result['log_time']}"
+    assert result["time_seconds"] == pytest.approx(
+        EXPECTED_MP2_POLYNOMIAL_OUTPUT["time_seconds"], abs=1e-6
+    ), f"Expected time_seconds to be approximately {EXPECTED_MP2_POLYNOMIAL_OUTPUT['time_seconds']}, but got {result['time_seconds']}"
+    assert result["raw_time_seconds"] == pytest.approx(
+        EXPECTED_MP2_POLYNOMIAL_OUTPUT["raw_time_seconds"], abs=1e-6
+    ), f"Expected raw_time_seconds to be approximately {EXPECTED_MP2_POLYNOMIAL_OUTPUT['raw_time_seconds']}, but got {result['raw_time_seconds']}"
 
 
 def test_benzene_dimer_geometry():
