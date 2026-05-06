@@ -11,7 +11,7 @@ dependencies:
   - pytest=7.4.4
   - python=3.12.8
   - pytorch=2.10.*
-  - cuda=12.6.*
+  # - cuda=12.6.*
   - pytorch-mutex=1.0
   - requests=2.32.3
   - setuptools=72.1.0

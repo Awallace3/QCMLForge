@@ -200,14 +200,26 @@ def test_polynomial_eval():
     pp(result)
     assert result["method"] == EXPECTED_MP2_POLYNOMIAL_OUTPUT["method"]
     assert result["variables_used"] == EXPECTED_MP2_POLYNOMIAL_OUTPUT["variables_used"]
-    assert result["input_values"] == EXPECTED_MP2_POLYNOMIAL_OUTPUT["input_values"], f"Expected input_values to be {EXPECTED_MP2_POLYNOMIAL_OUTPUT['input_values']}, but got {result['input_values']}"
-    assert result["log_time"] == pytest.approx(EXPECTED_MP2_POLYNOMIAL_OUTPUT["log_time"], abs=1e-6), f"Expected log_time to be approximately {EXPECTED_MP2_POLYNOMIAL_OUTPUT['log_time']}, but got {result['log_time']}"
+    assert (
+        result["input_values"] == EXPECTED_MP2_POLYNOMIAL_OUTPUT["input_values"]
+    ), f"Expected input_values to be {
+        EXPECTED_MP2_POLYNOMIAL_OUTPUT['input_values']
+    }, but got {result['input_values']}"
+    assert result["log_time"] == pytest.approx(
+        EXPECTED_MP2_POLYNOMIAL_OUTPUT["log_time"], abs=1e-6
+    ), f"Expected log_time to be approximately {
+        EXPECTED_MP2_POLYNOMIAL_OUTPUT['log_time']
+    }, but got {result['log_time']}"
     assert result["time_seconds"] == pytest.approx(
         EXPECTED_MP2_POLYNOMIAL_OUTPUT["time_seconds"], abs=1e-6
-    ), f"Expected time_seconds to be approximately {EXPECTED_MP2_POLYNOMIAL_OUTPUT['time_seconds']}, but got {result['time_seconds']}"
+    ), (
+        f"Expected time_seconds to be approximately {EXPECTED_MP2_POLYNOMIAL_OUTPUT['time_seconds']}, but got {result['time_seconds']}"
+    )
     assert result["raw_time_seconds"] == pytest.approx(
         EXPECTED_MP2_POLYNOMIAL_OUTPUT["raw_time_seconds"], abs=1e-6
-    ), f"Expected raw_time_seconds to be approximately {EXPECTED_MP2_POLYNOMIAL_OUTPUT['raw_time_seconds']}, but got {result['raw_time_seconds']}"
+    ), (
+        f"Expected raw_time_seconds to be approximately {EXPECTED_MP2_POLYNOMIAL_OUTPUT['raw_time_seconds']}, but got {result['raw_time_seconds']}"
+    )
 
 
 def test_benzene_dimer_geometry():
@@ -220,6 +232,10 @@ def test_benzene_dimer_geometry():
     assert mol.atomic_numbers.tolist().count(6) == 12
     assert mol.atomic_numbers.tolist().count(1) == 12
     print(mol)
+
+
+def test_xyz_directory():
+    return
 
 
 if __name__ == "__main__":
