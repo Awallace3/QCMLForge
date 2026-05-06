@@ -6,6 +6,7 @@ import warnings
 import time
 from ..pt_datasets.ap2_fused_ds import (
     ap2_fused_module_dataset,
+    ap2_fused_module_dataset_lmdb,
     APNet2_fused_DataLoader,
     qcel_dimer_to_fused_data,
 )
@@ -37,6 +38,7 @@ from .mtp_mtp import (
     AtomTypeParamNN,
     DimerProp,
     AtomTypeParamModel,
+    isolate_atom_parameter_predictions_ap3,
     load_dimer_prop_from_checkpoint,
 )
 
@@ -67,6 +69,21 @@ max_Z = 118
 def lr_lambda(epoch, decay_factor, initial_lr, min_lr=4e-5):
     lr = initial_lr * (decay_factor**epoch)
     return max(lr, min_lr) / initial_lr
+
+
+def compute_component_mse_loss(preds, labels, loss_fn=None, include_total_mse=False):
+    """Compute component MSE and optionally add a total-energy MSE term."""
+    comp_errors = preds - labels
+    batch_loss = (
+        torch.mean(torch.square(comp_errors))
+        if loss_fn is None
+        else loss_fn(preds, labels)
+    )
+    if include_total_mse:
+        total_preds = torch.sum(preds, dim=1)
+        total_labels = torch.sum(labels, dim=1)
+        batch_loss = batch_loss + torch.mean(torch.square(total_preds - total_labels))
+    return batch_loss, comp_errors
 
 
 class AsymptoticDecayLR(torch.optim.lr_scheduler._LRScheduler):
@@ -205,7 +222,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         r_cut_im=8.0,
         r_cut=5.0,
         return_hidden_states=False,
-        use_precomputed_classical=False,
+        use_precomputed_classical=None,
         use_atom_props=True,
         no_disp_nn=False,
         freeze_dimer_prop_model=None,
@@ -365,6 +382,12 @@ class APNet3D3_AtomType_MPNN(nn.Module):
                 "before pairwise readout"
             ),
         )
+
+    def info(self):
+        """Print a Unicode model tree for this model."""
+        from apnet_pt.model_print import model_tree_string
+
+        print(model_tree_string(self, unicode=True))
 
     def get_messages(self, h0, h, rbf, e_source, e_target):
         nedge = e_source.numel()
@@ -621,6 +644,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
         if self.use_precomputed_classical:
             E_output = E_sr_dimer
+            if self.return_hidden_states:
+                return E_output, E_sr, 0, 0, 0, hAB, hBA, cutoff
             return E_output, E_sr, 0, 0, 0, hAB, hBA
         else:
             E_elst_full_dimer = scatter_sum_compile(
@@ -771,6 +796,11 @@ class APNet3D3_AtomType_Model:
         print(f"{self.ds_type = }")
         print(f"{self.ds_class_type = }")
         print(f"{self.dataset_class = }")
+        ap2_dataset_class = (
+            ap2_fused_module_dataset_lmdb
+            if self.ds_class_type == "lmdb"
+            else ap2_fused_module_dataset
+        )
 
         if dimer_prop_model_pre_trained_path:
             print(
@@ -836,9 +866,10 @@ class APNet3D3_AtomType_Model:
             config = model_io.load_config_from_checkpoint(checkpoint) or {}
             use_atom_props = config.get("use_atom_props", True)
             no_disp_nn = config.get("no_disp_nn", False)
-            use_precomputed_classical = config.get(
-                "use_precomputed_classical", use_precomputed_classical
-            )
+            if use_precomputed_classical is None:
+                use_precomputed_classical = config.get(
+                    "use_precomputed_classical", False
+                )
             if freeze_dimer_prop_model is None:
                 freeze_dimer_prop_model = config.get("freeze_dimer_prop_model", True)
             resolved_d3_damping_parameters = resolve_d3_damping_parameters(
@@ -865,6 +896,8 @@ class APNet3D3_AtomType_Model:
         else:
             if freeze_dimer_prop_model is None:
                 freeze_dimer_prop_model = True
+            if use_precomputed_classical is None:
+                use_precomputed_classical = False
             resolved_d3_damping_parameters = resolve_d3_damping_parameters(
                 d3_damping_parameters
             )
@@ -989,7 +1022,7 @@ class APNet3D3_AtomType_Model:
                         device=self.device,
                     )
                 else:
-                    return ap2_fused_module_dataset(
+                    return ap2_dataset_class(
                         root=ds_root,
                         r_cut=r_cut,
                         r_cut_im=r_cut_im,
@@ -1072,7 +1105,7 @@ class APNet3D3_AtomType_Model:
                     ]
                 else:
                     return [
-                        ap2_fused_module_dataset(
+                        ap2_dataset_class(
                             root=ds_root,
                             r_cut=r_cut,
                             r_cut_im=r_cut_im,
@@ -1092,7 +1125,7 @@ class APNet3D3_AtomType_Model:
                             energy_labels=ds_energy_labels[0],
                             in_memory=ds_in_memory,
                         ),
-                        ap2_fused_module_dataset(
+                        ap2_dataset_class(
                             root=ds_root,
                             r_cut=r_cut,
                             r_cut_im=r_cut_im,
@@ -1254,6 +1287,12 @@ class APNet3D3_AtomType_Model:
             n_params_total=n_total,
             children=children,
         )
+
+    def info(self):
+        """Print a Unicode model tree for this model."""
+        from apnet_pt.model_print import model_tree_string
+
+        print(model_tree_string(self, unicode=True))
 
     def compile_model(self):
         self.model.to(self.device)
@@ -1449,6 +1488,36 @@ class APNet3D3_AtomType_Model:
             E_disp = torch.zeros_like(E_elst)
         return E_elst, E_ind, E_disp
 
+    def _predict_all_classical_and_submodel_properties(self, dimer_batch):
+        if not hasattr(self.dimer_prop_model, "set_forward"):
+            raise ValueError(
+                "Prediction-time classical reconstruction requires a DimerProp"
+            )
+
+        restore_name = (
+            "ap3_atomMPNN"
+            if self.use_precomputed_classical
+            else (
+                "ap3_elst_damping__induced_dipole"
+                if self.model.no_disp_nn
+                else "ap3_elst_damping__induced_dipole__disp"
+            )
+        )
+
+        self.dimer_prop_model.set_forward("ap3_elst_damping__induced_dipole__disp")
+        with torch.no_grad():
+            E_classical, v_A, v_B = self.dimer_prop_model(dimer_batch)
+        self.dimer_prop_model.set_forward(restore_name)
+
+        return E_classical[:, 0], E_classical[:, 1], E_classical[:, 2], v_A, v_B
+
+    def _ensure_hidden_state_preds(self, preds):
+        if len(preds) == 8:
+            return preds
+        if len(preds) == 7:
+            return (*preds, None)
+        raise ValueError(f"Unexpected prediction tuple length: {len(preds)}")
+
     def _assemble_pairs(
         self,
         inp_batch,
@@ -1642,6 +1711,15 @@ class APNet3D3_AtomType_Model:
                     )
                 # create a new data list with only valid data
                 data = [data[j] for j in valid_indices]
+            if len(data) == 0:
+                predictions[i : upper_bound] = np.nan
+                if return_pairs:
+                    pairwise_energies.extend([None] * (upper_bound - i))
+                if return_classical_pairs:
+                    pairwise_elst_energies.extend([None] * (upper_bound - i))
+                    pairwise_ind_energies.extend([None] * (upper_bound - i))
+                    pairwise_disp_energies.extend([None] * (upper_bound - i))
+                continue
             dimer_batch = ap3_fused_collate_update_no_target(data)
             dimer_batch.to(device=self.device)
             preds = self.model(dimer_batch)
@@ -1788,14 +1866,14 @@ class APNet3D3_AtomType_Model:
                     E_ind.cpu(),
                     E_disp.cpu(),
                 )
-                for idx, valid_idx in enumerate(valid_indices):
-                    predictions[i + valid_idx] = E_sr_dimer[idx].cpu().numpy()
-                cnt = 0
+                valid_lookup = {
+                    valid_idx: cnt for cnt, valid_idx in enumerate(valid_indices)
+                }
                 for idx in all_indices:
                     if idx in valid_indices:
+                        cnt = valid_lookup[idx]
                         predictions[i + idx] = E_sr_dimer[cnt].cpu().numpy()
                         pairwise_energies.append(v[cnt])
-                        cnt += 1
                     else:
                         predictions[i + idx] = np.array(
                             [np.nan, np.nan, np.nan, np.nan]
@@ -1809,14 +1887,16 @@ class APNet3D3_AtomType_Model:
                     E_ind,
                     E_disp,
                 )
-                cnt = 0
+                valid_lookup = {
+                    valid_idx: cnt for cnt, valid_idx in enumerate(valid_indices)
+                }
                 for idx in all_indices:
                     if idx in valid_indices:
+                        cnt = valid_lookup[idx]
                         predictions[i + idx] = E_sr_dimer[cnt].cpu().numpy()
                         pairwise_elst_energies.append(v[0][cnt])
                         pairwise_ind_energies.append(v[1][cnt])
                         pairwise_disp_energies.append(v[2][cnt])
-                        cnt += 1
                     else:
                         predictions[i + idx] = np.array(
                             [np.nan, np.nan, np.nan, np.nan]
@@ -1825,17 +1905,19 @@ class APNet3D3_AtomType_Model:
                         pairwise_ind_energies.append([])
                         pairwise_disp_energies.append([])
             else:
-                for cnt, idx in enumerate(all_indices):
+                valid_lookup = {
+                    valid_idx: cnt for cnt, valid_idx in enumerate(valid_indices)
+                }
+                for idx in all_indices:
                     if idx in valid_indices:
+                        cnt = valid_lookup[idx]
                         predictions[i + idx] = preds[0][cnt].cpu().numpy()
                     else:
                         predictions[i + idx] = np.array(
                             [np.nan, np.nan, np.nan, np.nan]
                         )
             if verbose:
-                print(
-                    f"Predictions for {i} to {i + effective_batch_size} out of {N}"
-                )
+                print(f"Predictions for {i} to {i + effective_batch_size} out of {N}")
         if self.model.return_hidden_states:
             return predictions, h_ABs, h_BAs, cutoffs, dimer_inds, ndimers
         if return_pairs:
@@ -1848,6 +1930,262 @@ class APNet3D3_AtomType_Model:
                 pairwise_disp_energies,
             )
         return predictions
+
+    @torch.inference_mode()
+    def predict_qcel_mols_properties(
+        self,
+        mols,
+        batch_size=1,
+        r_cut=None,
+        r_cut_im=None,
+        verbose=False,
+    ):
+        print(
+            "Warning: predict_qcel_mols_properties is not for performance; "
+            "it recomputes extra submodel outputs to return all properties."
+        )
+
+        if r_cut is None:
+            r_cut = self.model.r_cut
+        if r_cut_im is None:
+            r_cut_im = self.model.r_cut_im
+
+        N = len(mols)
+        effective_batch_size = N if self.use_precomputed_classical else batch_size
+        predictions = np.zeros((N, 4))
+        pairwise_energies = []
+        pairwise_elst_energies = []
+        pairwise_ind_energies = []
+        pairwise_disp_energies = []
+        h_ABs, h_BAs, cutoffs, dimer_inds, ndimers = [], [], [], [], []
+        classical_components = {
+            "elst": [None] * N,
+            "ind": [None] * N,
+            "disp": [None] * N,
+        }
+        submodel_properties = {
+            "A": [None] * N,
+            "B": [None] * N,
+        }
+
+        previous_return_hidden_states = self.model.return_hidden_states
+        self.model.return_hidden_states = True
+
+        try:
+            self.dimer_prop_model.to(self.device)
+            for i in range(0, N, effective_batch_size):
+                upper_bound = min(i + effective_batch_size, N)
+                data = [
+                    qcel_dimer_to_fused_data(
+                        dimer,
+                        r_cut=r_cut,
+                        r_cut_im=r_cut_im,
+                        dimer_ind=n,
+                        check_validity=True,
+                    )
+                    for n, dimer in enumerate(mols[i:upper_bound])
+                ]
+                valid_indices = [j for j, d in enumerate(data) if d is not None]
+                all_indices = list(range(len(data)))
+                if len(valid_indices) < len(data):
+                    if verbose:
+                        print(
+                            f"Skipping {len(data) - len(valid_indices)} invalid dimers in batch {i} to {upper_bound}"
+                        )
+                    data = [data[j] for j in valid_indices]
+
+                if len(data) == 0:
+                    for idx in all_indices:
+                        predictions[i + idx] = np.array(
+                            [np.nan, np.nan, np.nan, np.nan]
+                        )
+                        pairwise_energies.append([])
+                        pairwise_elst_energies.append([])
+                        pairwise_ind_energies.append([])
+                        pairwise_disp_energies.append([])
+                    continue
+
+                dimer_batch = ap3_fused_collate_update_no_target(data)
+                dimer_batch.to(device=self.device)
+                preds = self._ensure_hidden_state_preds(self.model(dimer_batch))
+
+                E_elst_all, E_ind_all, E_disp_all, v_A, v_B = (
+                    self._predict_all_classical_and_submodel_properties(dimer_batch)
+                )
+
+                if self.use_precomputed_classical:
+                    ndimer = dimer_batch.total_charge_A.size(0)
+                    E_elst_dimer = scatter_sum_compile(
+                        E_elst_all, dimer_batch.dimer_ind_full, ndimer
+                    )
+                    E_ind_dimer = scatter_sum_compile(
+                        E_ind_all, dimer_batch.dimer_ind_full, ndimer
+                    )
+                    if self.model.no_disp_nn:
+                        E_disp_dimer = scatter_sum_compile(
+                            E_disp_all, dimer_batch.dimer_ind_full, ndimer
+                        )
+                        E_sr_dimer_3col = preds[0]
+                        E_out4 = torch.zeros((ndimer, 4), device=E_sr_dimer_3col.device)
+                        E_out4[:, :3] = E_sr_dimer_3col
+                        E_out4[:, 0] += E_elst_dimer
+                        E_out4[:, 2] += E_ind_dimer
+                        E_out4[:, 3] = E_disp_dimer
+                        E_sr_3col = preds[1]
+                        E_sr_out4 = torch.zeros(
+                            (E_sr_3col.size(0), 4), device=E_sr_3col.device
+                        )
+                        E_sr_out4[:, :3] = E_sr_3col
+                        preds = (
+                            E_out4,
+                            E_sr_out4,
+                            E_elst_all,
+                            E_ind_all,
+                            E_disp_all,
+                            preds[5],
+                            preds[6],
+                            preds[7],
+                        )
+                    else:
+                        E_out4 = preds[0].clone()
+                        E_out4[:, 0] += E_elst_dimer
+                        E_out4[:, 2] += E_ind_dimer
+                        E_disp_dimer = scatter_sum_compile(
+                            E_disp_all, dimer_batch.dimer_ind_full, ndimer
+                        )
+                        E_out4[:, 3] += E_disp_dimer
+                        preds = (
+                            E_out4,
+                            preds[1],
+                            E_elst_all,
+                            E_ind_all,
+                            E_disp_all,
+                            preds[5],
+                            preds[6],
+                            preds[7],
+                        )
+
+                if self.model.no_disp_nn and not self.use_precomputed_classical:
+                    ndimer = dimer_batch.total_charge_A.size(0)
+                    E_disp_dimer = scatter_sum_compile(
+                        E_disp_all, dimer_batch.dimer_ind_full, ndimer
+                    )
+                    E_sr_dimer_3col = preds[0]
+                    E_out4 = torch.zeros((ndimer, 4), device=E_sr_dimer_3col.device)
+                    E_out4[:, :3] = E_sr_dimer_3col
+                    E_out4[:, 3] = E_disp_dimer
+                    E_sr_3col = preds[1]
+                    E_sr_out4 = torch.zeros(
+                        (E_sr_3col.size(0), 4), device=E_sr_3col.device
+                    )
+                    E_sr_out4[:, :3] = E_sr_3col
+                    preds = (
+                        E_out4,
+                        E_sr_out4,
+                        preds[2],
+                        preds[3],
+                        E_disp_all,
+                        preds[5],
+                        preds[6],
+                        preds[7],
+                    )
+
+                E_sr_dimer, E_sr, E_elst, E_ind, E_disp, hAB, hBA, cutoff = preds
+                h_ABs.append(hAB)
+                h_BAs.append(hBA)
+                cutoffs.append(cutoff)
+                dimer_inds.append(dimer_batch.dimer_ind)
+                ndimers.append(dimer_batch.total_charge_A.size(0))
+
+                pairwise_batch = self._assemble_pairs(
+                    dimer_batch.cpu(),
+                    E_sr_dimer.cpu(),
+                    E_sr.cpu(),
+                    E_elst.cpu(),
+                    E_ind.cpu(),
+                    E_disp.cpu(),
+                )
+                classical_pair_batch = self._assemble_mtp_pairs(
+                    dimer_batch.cpu(),
+                    E_elst_all.cpu(),
+                    E_ind_all.cpu(),
+                    E_disp_all.cpu(),
+                )
+                mol_props_A = isolate_atom_parameter_predictions_ap3(
+                    dimer_batch.batch_atomic_A.cpu(),
+                    tuple(t.detach().cpu() for t in v_A),
+                )
+                mol_props_B = isolate_atom_parameter_predictions_ap3(
+                    dimer_batch.batch_atomic_B.cpu(),
+                    tuple(t.detach().cpu() for t in v_B),
+                )
+
+                cnt = 0
+                for idx in all_indices:
+                    if idx in valid_indices:
+                        predictions[i + idx] = E_sr_dimer[cnt].cpu().numpy()
+                        pairwise_energies.append(pairwise_batch[cnt])
+                        pairwise_elst_energies.append(classical_pair_batch[0][cnt])
+                        pairwise_ind_energies.append(classical_pair_batch[1][cnt])
+                        pairwise_disp_energies.append(classical_pair_batch[2][cnt])
+                        classical_components["elst"][i + idx] = classical_pair_batch[0][
+                            cnt
+                        ].sum()
+                        classical_components["ind"][i + idx] = classical_pair_batch[1][
+                            cnt
+                        ].sum()
+                        classical_components["disp"][i + idx] = classical_pair_batch[2][
+                            cnt
+                        ].sum()
+                        submodel_properties["A"][i + idx] = {
+                            "charges": mol_props_A[0][cnt],
+                            "dipoles": mol_props_A[1][cnt],
+                            "quadrupoles": mol_props_A[2][cnt],
+                            "hidden_states": mol_props_A[3][cnt],
+                            "hirshfeld_volume_ratios": mol_props_A[4][cnt],
+                            "valence_widths": mol_props_A[5][cnt],
+                            "electrostatic_damping_parameters": mol_props_A[6][cnt],
+                        }
+                        submodel_properties["B"][i + idx] = {
+                            "charges": mol_props_B[0][cnt],
+                            "dipoles": mol_props_B[1][cnt],
+                            "quadrupoles": mol_props_B[2][cnt],
+                            "hidden_states": mol_props_B[3][cnt],
+                            "hirshfeld_volume_ratios": mol_props_B[4][cnt],
+                            "valence_widths": mol_props_B[5][cnt],
+                            "electrostatic_damping_parameters": mol_props_B[6][cnt],
+                        }
+                        cnt += 1
+                    else:
+                        predictions[i + idx] = np.array(
+                            [np.nan, np.nan, np.nan, np.nan]
+                        )
+                        pairwise_energies.append([])
+                        pairwise_elst_energies.append([])
+                        pairwise_ind_energies.append([])
+                        pairwise_disp_energies.append([])
+
+                if verbose:
+                    print(
+                        f"Predictions for {i} to {i + effective_batch_size} out of {N}"
+                    )
+        finally:
+            self.model.return_hidden_states = previous_return_hidden_states
+
+        return {
+            "predictions": predictions,
+            "pairwise_energies": pairwise_energies,
+            "pairwise_elst_energies": pairwise_elst_energies,
+            "pairwise_ind_energies": pairwise_ind_energies,
+            "pairwise_disp_energies": pairwise_disp_energies,
+            "h_ABs": h_ABs,
+            "h_BAs": h_BAs,
+            "cutoffs": cutoffs,
+            "dimer_inds": dimer_inds,
+            "ndimers": ndimers,
+            "classical_components": classical_components,
+            "submodel_properties": submodel_properties,
+        }
 
     def example_input(
         self,
@@ -1889,7 +2227,13 @@ units angstrom
         dist.destroy_process_group()
 
     def __train_batches_single_proc(
-        self, dataloader, loss_fn, optimizer, rank_device, scheduler
+        self,
+        dataloader,
+        loss_fn,
+        optimizer,
+        rank_device,
+        scheduler,
+        include_total_mse=False,
     ):
         """
         Single-process training loop body.
@@ -1912,11 +2256,11 @@ units angstrom
                 labels[:, 2] -= batch.E_classical_ind
                 if not self.model.no_disp_nn:
                     labels[:, 3] -= batch.E_classical_disp
-            comp_errors = preds - labels
-            batch_loss = (
-                torch.mean(torch.square(comp_errors))
-                if (loss_fn is None)
-                else loss_fn(preds, labels)
+            batch_loss, comp_errors = compute_component_mse_loss(
+                preds,
+                labels,
+                loss_fn=loss_fn,
+                include_total_mse=include_total_mse,
             )
             batch_loss.backward()
             optimizer.step()
@@ -1940,7 +2284,9 @@ units angstrom
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     # @torch.inference_mode()
-    def __evaluate_batches_single_proc(self, dataloader, loss_fn, rank_device):
+    def __evaluate_batches_single_proc(
+        self, dataloader, loss_fn, rank_device, include_total_mse=False
+    ):
         n_comp = 3 if self.model.no_disp_nn else 4
         self.model.eval()
         comp_errors_t = []
@@ -1956,11 +2302,11 @@ units angstrom
                     labels[:, 2] -= batch.E_classical_ind
                     if not self.model.no_disp_nn:
                         labels[:, 3] -= batch.E_classical_disp
-                comp_errors = preds - labels
-                batch_loss = (
-                    torch.mean(torch.square(comp_errors))
-                    if (loss_fn is None)
-                    else loss_fn(preds, labels)
+                batch_loss, comp_errors = compute_component_mse_loss(
+                    preds,
+                    labels,
+                    loss_fn=loss_fn,
+                    include_total_mse=include_total_mse,
                 )
                 total_loss += batch_loss.item()
                 comp_errors_t.append(comp_errors.detach().cpu())
@@ -2032,7 +2378,13 @@ units angstrom
         return total_loss, total_MAE_t
 
     def __train_batches_fsapt_single_proc(
-        self, dataloader, loss_fn, optimizer, rank_device, scheduler
+        self,
+        dataloader,
+        loss_fn,
+        optimizer,
+        rank_device,
+        scheduler,
+        include_total_mse=False,
     ):
         """
         Single-process training loop for FSAPT fragment energies.
@@ -2047,7 +2399,7 @@ units angstrom
         for n, batch in enumerate(dataloader):
             optimizer.zero_grad()
             batch = batch.to(rank_device, non_blocking=True)
-            E_sr_dimer, E_sr, E_elst, E_ind, hAB, hBA = self.model(batch)
+            E_sr_dimer, E_sr, E_elst, E_ind, E_disp, hAB, hBA = self.model(batch)
             # For FSAPT training, use only MPNN predictions (E_sr),
             # not classical frozen components (E_elst, E_ind)
             full_pairwise_energies = torch.zeros(
@@ -2055,6 +2407,7 @@ units angstrom
             )
             full_pairwise_energies[:, 0] = E_elst
             full_pairwise_energies[:, 2] = E_ind
+            full_pairwise_energies[:, 3] = E_disp
             # Everything is ordered based on e_ABfull_source/target, so we
             # need to map e_ABsr edges to full edges. We can do this by
             # learning the mapping from e_ABsr to e_ABfull.
@@ -2097,11 +2450,11 @@ units angstrom
 
             # Labels are [batch_size, 5], we use first n_comp components
             labels = batch.y[:, :n_comp]
-            comp_errors = preds - labels
-            batch_loss = (
-                torch.mean(torch.square(comp_errors))
-                if (loss_fn is None)
-                else loss_fn(preds, labels)
+            batch_loss, comp_errors = compute_component_mse_loss(
+                preds,
+                labels,
+                loss_fn=loss_fn,
+                include_total_mse=include_total_mse,
             )
             batch_loss.backward()
             optimizer.step()
@@ -2123,7 +2476,9 @@ units angstrom
         )
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
-    def __evaluate_batches_fsapt_single_proc(self, dataloader, loss_fn, rank_device):
+    def __evaluate_batches_fsapt_single_proc(
+        self, dataloader, loss_fn, rank_device, include_total_mse=False
+    ):
         """
         Single-process evaluation loop for FSAPT fragment energies.
         """
@@ -2134,7 +2489,7 @@ units angstrom
         with torch.no_grad():
             for n, batch in enumerate(dataloader):
                 batch = batch.to(rank_device, non_blocking=True)
-                E_sr_dimer, E_sr, E_elst, E_ind, hAB, hBA = self.model(batch)
+                E_sr_dimer, E_sr, E_elst, E_ind, E_disp, hAB, hBA = self.model(batch)
                 # For FSAPT evaluation, use only MPNN predictions (E_sr),
                 # not classical frozen components (E_elst, E_ind)
                 full_pairwise_energies = torch.zeros(
@@ -2143,6 +2498,7 @@ units angstrom
                 # Don't initialize with frozen classical values
                 full_pairwise_energies[:, 0] = E_elst
                 full_pairwise_energies[:, 2] = E_ind
+                full_pairwise_energies[:, 3] = E_disp
                 # Everything is ordered based on e_ABfull_source/target, so we
                 # need to map e_ABsr edges to full edges. We can do this by
                 # learning the mapping from e_ABsr to e_ABfull.
@@ -2191,11 +2547,11 @@ units angstrom
                 #     labels[:, 0] -= batch.E_classical_elst if hasattr(batch, 'E_classical_elst') else 0
                 #     labels[:, 2] -= batch.E_classical_ind if hasattr(batch, 'E_classical_ind') else 0
 
-                comp_errors = preds - labels
-                batch_loss = (
-                    torch.mean(torch.square(comp_errors))
-                    if (loss_fn is None)
-                    else loss_fn(preds, labels)
+                batch_loss, comp_errors = compute_component_mse_loss(
+                    preds,
+                    labels,
+                    loss_fn=loss_fn,
+                    include_total_mse=include_total_mse,
                 )
                 total_loss += batch_loss.item()
                 comp_errors_t.append(comp_errors.detach().cpu())
@@ -2217,7 +2573,14 @@ units angstrom
     ########################################################################
 
     def __train_batches(
-        self, rank, dataloader, loss_fn, optimizer, rank_device, scheduler
+        self,
+        rank,
+        dataloader,
+        loss_fn,
+        optimizer,
+        rank_device,
+        scheduler,
+        include_total_mse=False,
     ):
         n_comp = 3 if self.model.no_disp_nn else 4
         self.model.train()
@@ -2240,11 +2603,12 @@ units angstrom
                 labels[:, 2] -= batch.E_classical_ind
                 if not self.model.no_disp_nn:
                     labels[:, 3] -= batch.E_classical_disp
-            comp_errors = preds - labels
-            if loss_fn is None:
-                batch_loss = torch.mean(torch.square(comp_errors))
-            else:
-                batch_loss = loss_fn(preds.flatten(), labels.flatten())
+            batch_loss, comp_errors = compute_component_mse_loss(
+                preds,
+                labels,
+                loss_fn=loss_fn,
+                include_total_mse=include_total_mse,
+            )
 
             batch_loss.backward()
             optimizer.step()
@@ -2287,7 +2651,9 @@ units angstrom
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     # @torch.inference_mode()
-    def __evaluate_batches(self, rank, dataloader, loss_fn, rank_device):
+    def __evaluate_batches(
+        self, rank, dataloader, loss_fn, rank_device, include_total_mse=False
+    ):
         n_comp = 3 if self.model.no_disp_nn else 4
         self.model.eval()
         total_loss = 0.0
@@ -2309,11 +2675,12 @@ units angstrom
                     labels[:, 2] -= batch.E_classical_ind
                     if not self.model.no_disp_nn:
                         labels[:, 3] -= batch.E_classical_disp
-                comp_errors = preds - labels
-                if loss_fn is None:
-                    batch_loss = torch.mean(torch.square(comp_errors))
-                else:
-                    batch_loss = loss_fn(preds.flatten(), labels.flatten())
+                batch_loss, comp_errors = compute_component_mse_loss(
+                    preds,
+                    labels,
+                    loss_fn=loss_fn,
+                    include_total_mse=include_total_mse,
+                )
 
                 total_loss += batch_loss.item()
                 total_errors = preds.sum(dim=1) - labels.sum(dim=1)
@@ -2363,6 +2730,7 @@ units angstrom
         num_workers,
         lr_decay=None,
         end_lr=None,
+        include_total_mse=False,
     ):
         print(f"{self.device.type=}")
         if self.device.type == "cpu":
@@ -2469,10 +2837,22 @@ units angstrom
         t1 = time.time()
         with torch.no_grad():
             train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
-                self.__evaluate_batches(rank, train_loader, criterion, rank_device)
+                self.__evaluate_batches(
+                    rank,
+                    train_loader,
+                    criterion,
+                    rank_device,
+                    include_total_mse=include_total_mse,
+                )
             )
             test_loss, total_MAE_v, elst_MAE_v, exch_MAE_v, indu_MAE_v, disp_MAE_v = (
-                self.__evaluate_batches(rank, test_loader, criterion, rank_device)
+                self.__evaluate_batches(
+                    rank,
+                    test_loader,
+                    criterion,
+                    rank_device,
+                    include_total_mse=include_total_mse,
+                )
             )
             dt = time.time() - t1
             if rank == 0:
@@ -2486,6 +2866,7 @@ units angstrom
                         f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                         flush=True,
                     )
+        model_saved = False
         for epoch in range(n_epochs):
             t1 = time.time()
             test_lowered = False
@@ -2497,10 +2878,17 @@ units angstrom
                     optimizer,
                     rank_device,
                     scheduler,
+                    include_total_mse=include_total_mse,
                 )
             )
             test_loss, total_MAE_v, elst_MAE_v, exch_MAE_v, indu_MAE_v, disp_MAE_v = (
-                self.__evaluate_batches(rank, test_loader, criterion, rank_device)
+                self.__evaluate_batches(
+                    rank,
+                    test_loader,
+                    criterion,
+                    rank_device,
+                    include_total_mse=include_total_mse,
+                )
             )
 
             if rank == 0:
@@ -2513,6 +2901,7 @@ units angstrom
                             self.model_save_path,
                             metadata={"training_mode": "ddp", "epoch": epoch},
                         )
+                        model_saved = True
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
@@ -2539,6 +2928,18 @@ units angstrom
 
         if world_size > 1:
             self.__cleanup()
+        if rank == 0 and self.model_save_path and not model_saved:
+            print(
+                "Saving final model (no validation improvement checkpoint was written)"
+            )
+            self.save_model(
+                self.model_save_path,
+                metadata={
+                    "training_mode": "ddp",
+                    "epoch": n_epochs - 1,
+                    "checkpoint_reason": "final_no_improvement",
+                },
+            )
         return
 
     ########################################################################
@@ -2557,6 +2958,7 @@ units angstrom
         end_lr=None,
         skip_compile=False,
         transfer_learning=False,
+        include_total_mse=False,
     ):
         # (1) Compile Model
         rank_device = self.device
@@ -2665,8 +3067,23 @@ units angstrom
 
         # (5) Evaluate once pre-training
         t0 = time.time()
-        t_out = __evaluate_batch(train_loader, criterion, rank_device)
-        v_out = __evaluate_batch(test_loader, criterion, rank_device)
+        component_batch_kwargs = (
+            {"include_total_mse": include_total_mse}
+            if is_fsapt or not transfer_learning
+            else {}
+        )
+        t_out = __evaluate_batch(
+            train_loader,
+            criterion,
+            rank_device,
+            **component_batch_kwargs,
+        )
+        v_out = __evaluate_batch(
+            test_loader,
+            criterion,
+            rank_device,
+            **component_batch_kwargs,
+        )
         if is_fsapt or not transfer_learning:
             train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
                 t_out
@@ -2701,12 +3118,23 @@ units angstrom
 
         # (6) Main training loop
         lowest_test_loss = test_loss
+        model_saved = False
         for epoch in range(n_epochs):
             t1 = time.time()
             t_out = __train_batch(
-                train_loader, criterion, optimizer, rank_device, scheduler
+                train_loader,
+                criterion,
+                optimizer,
+                rank_device,
+                scheduler,
+                **component_batch_kwargs,
             )
-            v_out = __evaluate_batch(test_loader, criterion, rank_device)
+            v_out = __evaluate_batch(
+                test_loader,
+                criterion,
+                rank_device,
+                **component_batch_kwargs,
+            )
             if is_fsapt or not transfer_learning:
                 (
                     train_loss,
@@ -2743,6 +3171,7 @@ units angstrom
                             "epoch": epoch,
                         },
                     )
+                    model_saved = True
                 self.model.to(rank_device)
 
             if is_fsapt or not transfer_learning:
@@ -2770,6 +3199,21 @@ units angstrom
                 )
             if not self.device == "CPU":
                 torch.cuda.empty_cache()
+        if self.model_save_path and not model_saved:
+            print(
+                "Saving final model (no validation improvement checkpoint was written)"
+            )
+            self.save_model(
+                self.model_save_path,
+                metadata={
+                    "training_mode": "single_proc",
+                    "epoch": n_epochs - 1,
+                    "checkpoint_reason": "final_no_improvement",
+                },
+            )
+            cpu_model = model_io.unwrap_model(self.model).to("cpu")
+            best_model = deepcopy(cpu_model)
+            self.model.to(rank_device)
         self.model = best_model
         self.model.to(rank_device)
         return
@@ -2790,6 +3234,7 @@ units angstrom
         random_seed=42,
         skip_compile=True,
         transfer_learning=False,
+        include_total_mse=False,
     ):
         """
         hyperparameters match the defaults in the original code:
@@ -2850,6 +3295,7 @@ units angstrom
         print(f"  {lr=}\n", flush=True)
         print(f"  {lr_decay=}\n", flush=True)
         print(f"  {end_lr=}\n", flush=True)
+        print(f"  {include_total_mse=}\n", flush=True)
         print(f"  {batch_size=}", flush=True)
 
         if self.device.type == "cuda":
@@ -2881,6 +3327,7 @@ units angstrom
                     dataloader_num_workers,
                     lr_decay,
                     end_lr,
+                    include_total_mse,
                 ),
                 nprocs=world_size,
                 join=True,
@@ -2900,6 +3347,7 @@ units angstrom
                 end_lr=end_lr,
                 skip_compile=skip_compile,
                 transfer_learning=transfer_learning,
+                include_total_mse=include_total_mse,
             )
         return
 

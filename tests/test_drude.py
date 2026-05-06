@@ -91,7 +91,7 @@ data_dir = os.path.join(os.path.dirname(__file__), "drude_test_data/")
     ],
 )
 @pytest.mark.skip(reason="Drude not used in codebase")
-def test_water_drude(
+def skip_test_water_drude(
     molecule,  # name of molecule
     ref_uind,  # kJ/mol
 ):

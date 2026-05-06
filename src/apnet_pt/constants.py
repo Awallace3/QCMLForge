@@ -97,3 +97,5 @@ max_z = max(free_atom_polarizabilities.keys())
 polarizability_table = torch.zeros(max_z + 1)
 for z, value in free_atom_polarizabilities.items():
     polarizability_table[z] = value
+
+ALLOWED_ELEMENTS = set(z_to_elem.keys())

@@ -6,6 +6,7 @@ import os
 from apnet_pt.pt_datasets.ap3_fused_ds import (
     ap3_fused_module_dataset,
     ap3_fused_module_dataset_lmdb,
+    dimer_fused_data,
 )
 from apnet_pt.AtomPairwiseModels.apnet3_fused import APNet3_AtomType_Model
 from glob import glob
@@ -74,6 +75,16 @@ mol_element = qcel.models.Molecule.from_data("""
 1   2.641145101   -0.449872874   -0.744894473
 """)
 
+mol_unsupported_element = qcel.models.Molecule.from_data("""
+0 1
+2   -0.902196054   -0.106060256   0.009942262
+--
+0 1
+8   2.268880784   0.026340101   0.000508029
+1   2.645502399   -0.412039965   0.766632411
+1   2.641145101   -0.449872874   -0.744894473
+""")
+
 mol3 = qcel.models.Molecule.from_data(
     """
     1 1
@@ -112,6 +123,23 @@ def set_weights_to_value(model, value=0.9):
         for param in model.parameters():
             param.fill_(value)  # Set all elements to the given value
     return
+
+
+def test_ap3_fused_dimer_data_skips_unsupported_elements():
+    mon_a = mol_unsupported_element.get_fragment(0)
+    mon_b = mol_unsupported_element.get_fragment(1)
+
+    data = dimer_fused_data(
+        RA=mon_a.geometry * apnet_pt.constants.au2ang,
+        ZA=mon_a.atomic_numbers,
+        TQA=mon_a.molecular_charge,
+        RB=mon_b.geometry * apnet_pt.constants.au2ang,
+        ZB=mon_b.atomic_numbers,
+        TQB=mon_b.molecular_charge,
+        dimer_ind=0,
+    )
+
+    assert data is None
 
 
 def test_ap3_fused_train_qcel_molecules_in_memory():

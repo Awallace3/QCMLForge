@@ -1069,14 +1069,27 @@ class APNet2_AM_Model:
         self.atom_model.to(self.device)
         for i in range(0, N, batch_size):
             upper_bound = min(i + batch_size, N)
-            dimer_batch = ap2_fused_collate_update_no_target(
-                [
-                    qcel_dimer_to_fused_data(
-                        dimer, r_cut=r_cut, r_cut_im=r_cut_im, dimer_ind=n
+            data = [
+                qcel_dimer_to_fused_data(
+                    dimer, r_cut=r_cut, r_cut_im=r_cut_im, dimer_ind=n
+                )
+                for n, dimer in enumerate(mols[i:upper_bound])
+            ]
+            valid_indices = [j for j, d in enumerate(data) if d is not None]
+            all_indices = list(range(len(data)))
+            if len(valid_indices) < len(data):
+                if verbose:
+                    print(
+                        f"Skipping {len(data) - len(valid_indices)} invalid dimers in batch {i} to {upper_bound}"
                     )
-                    for n, dimer in enumerate(mols[i:upper_bound])
-                ]
-            )
+                data = [data[j] for j in valid_indices]
+            if len(data) == 0:
+                for idx in all_indices:
+                    predictions[i + idx] = np.array([np.nan, np.nan, np.nan, np.nan])
+                    if return_pairs or return_elst:
+                        pairwise_energies.append([])
+                continue
+            dimer_batch = ap2_fused_collate_update_no_target(data)
             dimer_batch.to(device=self.device)
             preds = self.model(dimer_batch)
             if self.model.return_hidden_states:
@@ -1086,31 +1099,63 @@ class APNet2_AM_Model:
                 cutoffs.append(cutoff)
                 dimer_inds.append(dimer_batch.dimer_ind)
                 ndimers.append(dimer_batch.total_charge_A.size(0))
-                predictions[i : i + batch_size] = E_sr_dimer.cpu().numpy()
+                cnt = 0
+                for idx in all_indices:
+                    if idx in valid_indices:
+                        predictions[i + idx] = E_sr_dimer[cnt].cpu().numpy()
+                        cnt += 1
+                    else:
+                        predictions[i + idx] = np.array(
+                            [np.nan, np.nan, np.nan, np.nan]
+                        )
             elif return_pairs:
                 E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = preds
-                predictions[i : i + batch_size] = E_sr_dimer.cpu().numpy()
-                pairwise_energies.extend(
-                    self._assemble_pairs(
-                        dimer_batch.cpu(),
-                        E_sr_dimer.cpu(),
-                        E_sr.cpu(),
-                        E_elst_sr.cpu(),
-                        E_elst_lr.cpu(),
-                    )
+                v = self._assemble_pairs(
+                    dimer_batch.cpu(),
+                    E_sr_dimer.cpu(),
+                    E_sr.cpu(),
+                    E_elst_sr.cpu(),
+                    E_elst_lr.cpu(),
                 )
+                cnt = 0
+                for idx in all_indices:
+                    if idx in valid_indices:
+                        predictions[i + idx] = E_sr_dimer[cnt].cpu().numpy()
+                        pairwise_energies.append(v[cnt])
+                        cnt += 1
+                    else:
+                        predictions[i + idx] = np.array(
+                            [np.nan, np.nan, np.nan, np.nan]
+                        )
+                        pairwise_energies.append([])
             elif return_elst:
                 E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = preds
-                predictions[i : i + batch_size] = E_sr_dimer.cpu().numpy()
-                pairwise_energies.extend(
-                    self._assemble_mtp_pairs(
-                        dimer_batch,
-                        E_elst_sr,
-                        E_elst_lr,
-                    )
+                v = self._assemble_mtp_pairs(
+                    dimer_batch,
+                    E_elst_sr,
+                    E_elst_lr,
                 )
+                cnt = 0
+                for idx in all_indices:
+                    if idx in valid_indices:
+                        predictions[i + idx] = E_sr_dimer[cnt].cpu().numpy()
+                        pairwise_energies.append(v[cnt])
+                        cnt += 1
+                    else:
+                        predictions[i + idx] = np.array(
+                            [np.nan, np.nan, np.nan, np.nan]
+                        )
+                        pairwise_energies.append([])
             else:
-                predictions[i : i + batch_size] = preds[0].cpu().numpy()
+                cnt = 0
+                for idx in all_indices:
+                    if idx in valid_indices:
+                        predictions[i + idx] = preds[0][cnt].cpu().numpy()
+                        cnt += 1
+                    else:
+                        predictions[i + idx] = np.array(
+                            [np.nan, np.nan, np.nan, np.nan]
+                        )
         if verbose:
             print(f"Predictions for {i} to {i + batch_size} out of {N}")
         if self.model.return_hidden_states:

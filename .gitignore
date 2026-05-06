@@ -235,3 +235,5 @@ simple-dftd3/
 tmp.xyz
 .nfs*
 train_saptdft.py
+tests/dataset_data/ap2_fused_ensemble_test.pt
+

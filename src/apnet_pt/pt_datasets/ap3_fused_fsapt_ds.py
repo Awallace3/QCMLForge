@@ -828,6 +828,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
         self.lmdb_env = None
         self.lmdb_path = None
         self._length = None
+        self._raw_cursor = None
         self._worker_id = None
 
         if os.path.exists(root) is False:
@@ -920,8 +921,12 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
                     if metadata_bytes:
                         metadata = self.json.loads(metadata_bytes.decode("utf-8"))
                         self._length = metadata.get("length", 0)
+                        self._raw_cursor = metadata.get(
+                            "raw_cursor", self._length
+                        )
                     else:
                         self._length = 0
+                        self._raw_cursor = 0
                 return
             except Exception as e:
                 if attempt == 0 and "already open in this process" in str(e):
@@ -931,6 +936,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
                         release_lmdb_env(self.lmdb_path, self.lmdb_env)
                         self.lmdb_env = None
                         self._length = 0
+                        self._raw_cursor = 0
                     gc.collect()
                     continue
                 print(f"Error initializing LMDB: {e}")
@@ -938,6 +944,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
                     release_lmdb_env(self.lmdb_path, self.lmdb_env)
                 self.lmdb_env = None
                 self._length = 0
+                self._raw_cursor = 0
                 return
 
     def _close_lmdb(self):
@@ -1111,7 +1118,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
                 data.E_classical_elst = E_elst_dimer[j].cpu()
                 data.E_classical_ind = E_ind_dimer[j].cpu()
 
-    def _store_to_lmdb(self, data_objects, start_idx):
+    def _store_to_lmdb(self, data_objects, start_idx, raw_cursor):
         """Store data objects to LMDB"""
         import pickle
 
@@ -1127,6 +1134,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
 
             metadata = {
                 "length": start_idx + len(data_objects),
+                "raw_cursor": raw_cursor,
                 "r_cut": self.r_cut,
                 "r_cut_im": self.r_cut_im,
                 "spec_type": self.spec_type,
@@ -1134,6 +1142,7 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
             txn.put(b"__metadata__", self.json.dumps(metadata).encode("utf-8"))
 
         self._length = start_idx + len(data_objects)
+        self._raw_cursor = raw_cursor
 
     def process(self):
         """
@@ -1147,7 +1156,10 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
         datapoint_storage_n_objects, and atomic_batch_size. Progress and diagnostic messages are printed
         according to the instance's print_level.
         """
-        idx = 0
+        stored_idx = self._length if self.skip_processed and self._length else 0
+        resume_raw_cursor = (
+            self._raw_cursor if self.skip_processed and self._raw_cursor else 0
+        )
         data_objects = []
 
         RAs, RBs, ZAs, ZBs, TQAs, TQBs, targets = [], [], [], [], [], [], []
@@ -1232,12 +1244,11 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
         print(f"{len(RAs)=}, {self.atomic_batch_size=}, {self.batch_size=}")
 
         batch_data_objects = []
+        processed_raw_cursor = resume_raw_cursor
         for i in range(len(RAs)):
-            if self.skip_processed and self._length is not None and idx >= self._length:
-                pass
-            elif self.skip_processed and self._length is not None:
-                idx += 1
+            if self.skip_processed and i < resume_raw_cursor:
                 continue
+            processed_raw_cursor = i + 1
 
             y = torch.tensor(targets[i], dtype=torch.float32)
             data = dimer_fused_data(
@@ -1278,20 +1289,18 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
                     data_objects.append(data)
 
             if len(data_objects) >= self.datapoint_storage_n_objects:
-                start_idx = idx - len(data_objects) + 1
-                self._store_to_lmdb(data_objects, start_idx)
+                self._store_to_lmdb(data_objects, stored_idx, i + 1)
 
                 if self.print_level >= 2:
                     print(
-                        f"Stored {len(data_objects)} objects to LMDB at index {start_idx}"
+                        f"Stored {len(data_objects)} objects to LMDB at index {stored_idx}"
                     )
 
+                stored_idx += len(data_objects)
                 data_objects = []
 
-                if self.MAX_SIZE is not None and idx > self.MAX_SIZE:
+                if self.MAX_SIZE is not None and i > self.MAX_SIZE:
                     break
-
-            idx += 1
 
         if self.dimer_prop_model is not None and len(batch_data_objects) > 0:
             self._process_dimer_batch(batch_data_objects)
@@ -1302,13 +1311,14 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
                     data_objects.append(batch_data_cpu)
 
         if len(data_objects) > 0:
-            start_idx = idx - len(data_objects)
-            self._store_to_lmdb(data_objects, start_idx)
+            self._store_to_lmdb(data_objects, stored_idx, processed_raw_cursor)
 
             if self.print_level >= 2:
                 print(
-                    f"Final: Stored {len(data_objects)} objects to LMDB at index {start_idx}"
+                    f"Final: Stored {len(data_objects)} objects to LMDB at index {stored_idx}"
                 )
+        elif processed_raw_cursor > resume_raw_cursor:
+            self._store_to_lmdb([], stored_idx, processed_raw_cursor)
 
         print(f"Processing complete. Total time: {time() - t1:.2f}s")
 
@@ -1325,8 +1335,10 @@ class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
             if metadata_bytes:
                 metadata = self.json.loads(metadata_bytes.decode("utf-8"))
                 self._length = metadata.get("length", 0)
+                self._raw_cursor = metadata.get("raw_cursor", self._length)
             else:
                 self._length = 0
+                self._raw_cursor = 0
 
         return self._length
 

@@ -275,6 +275,12 @@ class AtomMPNN(MessagePassing):
             n_calls=1,
         )
 
+    def info(self):
+        """Print a Unicode model tree for this model."""
+        from apnet_pt.model_print import model_tree_string
+
+        print(model_tree_string(self, unicode=True))
+
     def _make_layers(self, layer_nodes, activations):
         layers = []
         for i in range(len(layer_nodes) - 1):

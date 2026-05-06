@@ -8,6 +8,7 @@ call patterns as an ASCII/Unicode tree.
 
 from __future__ import annotations
 
+import io
 import sys
 from dataclasses import dataclass, field
 
@@ -87,6 +88,13 @@ def print_model_tree(model_or_info, file=None, unicode: bool = True) -> None:
     print(f"{info.name} ({_fmt_params(info.n_params_total)} params)", file=file)
     for i, child in enumerate(info.children):
         _render(child, prefix="", last=(i == len(info.children) - 1), file=file, C=C)
+
+
+def model_tree_string(model_or_info, unicode: bool = True) -> str:
+    """Return the rendered model tree as a string."""
+    buf = io.StringIO()
+    print_model_tree(model_or_info, file=buf, unicode=unicode)
+    return buf.getvalue().rstrip("\n")
 
 
 # ── internal helpers ───────────────────────────────────────────────────────────

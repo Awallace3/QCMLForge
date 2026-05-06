@@ -110,6 +110,12 @@ class DimerProp(nn.Module):
         )
         return
 
+    def info(self):
+        """Print a Unicode model tree for this model."""
+        from apnet_pt.model_print import model_tree_string
+
+        print(model_tree_string(self, unicode=True))
+
     def set_forward(self, dimer_eval):
         """
         Configure which forward method the instance will use and set related resources.
@@ -766,41 +772,32 @@ def load_dimer_prop_from_checkpoint(
     atom_type_param_state = _substate_dict(state_dict, "AtomTypeParam.")
 
     atom_type_param_config = config.get("atom_type_param_config") or {}
-    atom_type_param_type = config.get("atom_type_param_type", "AtomTypeParamNN")
     atom_model_config = config.get("atom_model_config") or {}
-    atom_model_type = config.get("atom_model_type")
     r_cut = atom_model_config.get("r_cut", config.get("r_cut", 5.0))
 
-    if atom_type_param_type == "AtomTypeParamNN" and atom_type_param_config:
-        atom_model_state = _substate_dict(atom_type_param_state, "atom_model.")
-        if atom_model_type == "AtomMPNN" and atom_model_config:
-            atom_model = AtomMPNN(
-                n_message=atom_model_config["n_message"],
-                n_rbf=atom_model_config["n_rbf"],
-                n_neuron=atom_model_config["n_neuron"],
-                n_embed=atom_model_config["n_embed"],
-                r_cut=atom_model_config["r_cut"],
-            )
-        else:
-            atom_model = _infer_atomtypeparamnn_from_state_dict(
-                atom_model_state, r_cut=r_cut
-            )
-
-        atom_type_param = AtomTypeParamNN(
-            atom_model=atom_model,
-            n_message=atom_type_param_config["n_message"],
-            n_neuron=atom_type_param_config["n_neuron"],
-            n_embed=atom_type_param_config["n_embed"],
-            param_start_mean=atom_type_param_config["param_start_mean"],
-            param_start_std=atom_type_param_config["param_start_std"],
-            n_params=atom_type_param_config.get("n_params", 1),
-            freeze_atom_model=False,
-        )
-    else:
-        atom_type_param = _infer_atomtypeparamnn_from_state_dict(
-            atom_type_param_state,
-            r_cut=r_cut,
-        )
+    inferred_atom_type_param = _infer_atomtypeparamnn_from_state_dict(
+        atom_type_param_state,
+        r_cut=r_cut,
+    )
+    atom_type_param = AtomTypeParamNN(
+        atom_model=inferred_atom_type_param.atom_model,
+        n_message=inferred_atom_type_param.n_message,
+        n_neuron=inferred_atom_type_param.n_neuron,
+        n_embed=inferred_atom_type_param.n_embed,
+        param_start_mean=atom_type_param_config.get(
+            "param_start_mean",
+            inferred_atom_type_param.param_start_mean,
+        ),
+        param_start_std=atom_type_param_config.get(
+            "param_start_std",
+            inferred_atom_type_param.param_start_std,
+        ),
+        n_params=atom_type_param_config.get(
+            "n_params",
+            inferred_atom_type_param.n_params,
+        ),
+        freeze_atom_model=False,
+    )
 
     dimer_prop = DimerProp(
         ATParam=atom_type_param,
@@ -956,6 +953,12 @@ class AtomTypeParamNN(nn.Module):
             children=children,
         )
 
+    def info(self):
+        """Print a Unicode model tree for this model."""
+        from apnet_pt.model_print import model_tree_string
+
+        print(model_tree_string(self, unicode=True))
+
     def forward(
         self,
         batch,
@@ -994,8 +997,9 @@ class AtomTypeParamNN(nn.Module):
                 K.squeeze(-1) if self.n_params == 1 else K,
             )
         K_filtered = K[keep_mask]  # shape (n_atoms_filtered, n_params)
+        n_message_steps = min(self.n_message + 1, h_list.size(1))
         for p in range(self.n_params):
-            for i in range(self.n_message + 1):
+            for i in range(n_message_steps):
                 param_update = self.param_readout_layers[p][i](h_list[:, i, :])
                 K_filtered[:, p] += param_update.squeeze(-1)
         # K[keep_mask] = torch.relu(K_filtered)  # + 1.00001

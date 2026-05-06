@@ -4,6 +4,7 @@ from apnet_pt.pt_datasets.ap3_fused_fsapt_ds import (
     ap3_fused_fsapt_collate_update,
 )
 from apnet_pt.AtomPairwiseModels.apnet3_fused import APNet3_AtomType_Model
+from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_Model
 import os
 import numpy as np
 import pytest
@@ -26,6 +27,7 @@ am_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_3.pt"
 at_hf_vw_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_h+1_3.pt"
 at_elst_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_elst_h+1_3.pt"
 ap3_path = f"{current_file_path}/test_models/ap3_ensemble_0/ap3_.pt"
+ap3d3_path = f"{current_file_path}/test_models/ap3d3_1_saptpbe0.pt"
 am_hf_path = f"{current_file_path}/test_models/am_hf_0.pt"
 
 
@@ -402,6 +404,49 @@ def test_ap3_fused_fsapt_training():
     return
 
 
+@pytest.mark.skip("incomplete functionality")
+def test_ap3d3_fused_fsapt_training():
+    """
+    Test training AP3 fused model on FSAPT fragment energy data on
+    simple system dataset to ensure training loop works.
+    """
+    temp_dir = tempfile.mkdtemp()
+    test_df_path = f"{data_path}/raw/fsapt_test_simple.pkl"
+    train_df_path = f"{data_path}/raw/fsapt_train_simple.pkl"
+    # mkdir raw under temp_dir and copy test_df there
+    raw_dir = os.path.join(temp_dir, "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+    print(f"Copying test dataframe to {raw_dir}")
+    shutil.copy(test_df_path, raw_dir)
+    shutil.copy(train_df_path, raw_dir)
+    try:
+        # Initialize AP3 model for FSAPT training
+        ap3 = APNet3D3_AtomType_Model(
+            ds_root=data_path,
+            use_precomputed_classical=False,
+            pre_trained_model_path=ap3d3_path,
+            ignore_database_null=False,
+            ds_spec_type=6,
+            ds_type="fsapt_energies",  # Important: set ds_type for FSAPT
+            ds_batch_size=16,
+        )
+
+        print("\nStarting FSAPT training...")
+
+        # Train for a few epochs
+        ap3.train(
+            n_epochs=100,
+            lr=5e-3,
+            skip_compile=True,  # Skip compilation for faster testing
+        )
+
+        print("\nFSAPT training test completed successfully!")
+    finally:
+        # Clean up temporary directory
+        shutil.rmtree(temp_dir)
+    return
+
+
 @pytest.mark.skip("data analysis")
 def test_ap2_ap3_fused_fsapt_energies():
     """Test training AP3 fused model on FSAPT fragment energy data"""
@@ -480,4 +525,4 @@ if __name__ == "__main__":
     # test_ap3_fused_fsapt_energies()
     # test_ap3_fused_fsapt_energies_mocking_test()
     # test_ap3_fused_fsapt_training_mock()
-    test_ap3_fused_fsapt_training()
+    test_ap3d3_fused_fsapt_training()

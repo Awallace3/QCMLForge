@@ -1,11 +1,13 @@
 from apnet_pt import AtomModels
 from apnet_pt import AtomPairwiseModels
-import torch
 import argparse
-import numpy as np
-import random
+import inspect
 import os
+import random
 from pprint import pprint
+
+import numpy as np
+import torch
 
 
 def maybe_skip_training_after_dataset_setup(model_name, dataset, build_dataset_only):
@@ -211,9 +213,11 @@ def train_pairwise_model(
     ap2_pretrained_model_only=None,
     ds_type="total_component_energies",
     no_disp_nn=False,
+    use_precomputed_classical=None,
     freeze_dimer_prop_model=True,
     freeze_atom_model=True,
     build_dataset_only=False,
+    include_total_mse=False,
 ):
     # Ensure param_start_mean and param_start_std are lists
     """
@@ -254,6 +258,7 @@ def train_pairwise_model(
         ds_type (str): Dataset energy-type selector (e.g., "total_component_energies", "fsapt_energies").
         no_disp_nn (bool): Skip the dispersion readout when training APNet3-fused-d3 and compute D3 at predict time instead.
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
+        include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms.
 
     """
     if not isinstance(param_start_mean, (list, tuple)):
@@ -429,10 +434,11 @@ def train_pairwise_model(
         )
         am_model_path = None
         print(f"{ds_atomic_batch_size=}, {ds_datapoint_storage_n_objects=}")
-        if ds_type == "fsapt_energies":
-            use_precomputed_classical = False
-        else:
-            use_precomputed_classical = True
+        if use_precomputed_classical is None:
+            if ds_type == "fsapt_energies":
+                use_precomputed_classical = False
+            else:
+                use_precomputed_classical = True
         apnet = APNet(
             atom_type_model=atom_type_hf_vw_model.model,
             dimer_prop_model=atom_type_elst_model.dimer_model,
@@ -481,10 +487,11 @@ def train_pairwise_model(
         )
         am_model_path = None
         print(f"{ds_atomic_batch_size=}, {ds_datapoint_storage_n_objects=}")
-        if ds_type == "fsapt_energies":
-            use_precomputed_classical = False
-        else:
-            use_precomputed_classical = True
+        if use_precomputed_classical is None:
+            if ds_type == "fsapt_energies":
+                use_precomputed_classical = False
+            else:
+                use_precomputed_classical = True
         apnet = APNet(
             atom_type_model=atom_type_hf_vw_model.model,
             dimer_prop_model=atom_type_elst_model.dimer_model,
@@ -534,10 +541,11 @@ def train_pairwise_model(
         )
         am_model_path = None
         print(f"{ds_atomic_batch_size=}, {ds_datapoint_storage_n_objects=}")
-        if ds_type == "fsapt_energies":
-            use_precomputed_classical = False
-        else:
-            use_precomputed_classical = True
+        if use_precomputed_classical is None:
+            if ds_type == "fsapt_energies":
+                use_precomputed_classical = False
+            else:
+                use_precomputed_classical = True
         apnet = APNet(
             atom_type_model=atom_type_hf_vw_model.model,
             dimer_prop_model=atom_type_elst_model.dimer_model,
@@ -614,11 +622,26 @@ def train_pairwise_model(
         lr=lr,
         dataloader_num_workers=4,
         random_seed=random_seed,
+        include_total_mse=include_total_mse,
     )
     if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
         train_kwargs["end_lr"] = end_lr
     else:
         train_kwargs["lr_decay"] = lr_decay
+    supported_train_kwargs = inspect.signature(apnet.train).parameters
+    unsupported_train_kwargs = sorted(
+        key for key in train_kwargs if key not in supported_train_kwargs
+    )
+    if unsupported_train_kwargs:
+        print(
+            "Skipping unsupported train() kwargs for "
+            f"{apnet_model_type}: {', '.join(unsupported_train_kwargs)}"
+        )
+        train_kwargs = {
+            key: value
+            for key, value in train_kwargs.items()
+            if key in supported_train_kwargs
+        }
     apnet.train(**train_kwargs)
     return
 
@@ -878,6 +901,16 @@ def main():
         help="Load dataset in memory (default: False).",
     )
     args.add_argument(
+        "--use_precomputed_classical",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override whether APNet3-fused/APNet3-fused-d3 uses precomputed "
+            "classical terms. When unset, the existing model-specific default "
+            "behavior is used."
+        ),
+    )
+    args.add_argument(
         "--ds_class_type",
         type=str,
         default="pt",
@@ -894,6 +927,15 @@ def main():
         type=str,
         default="total_component_energies",
         help="Dataset type for APNet3-fused only (default: total_component_energies, other options: fsapt_energies)",
+    )
+    args.add_argument(
+        "--include_total_mse",
+        action="store_true",
+        default=False,
+        help=(
+            "AP2/AP3-D3 training: add a fifth MSE term on the total energy "
+            "in addition to the four component losses."
+        ),
     )
     args.add_argument(
         "--no_disp_nn",
@@ -982,9 +1024,11 @@ def main():
             ap2_pretrained_model_only=args.ap2_pretrained_model_only,
             ds_type=args.ds_type,
             no_disp_nn=args.no_disp_nn,
+            use_precomputed_classical=args.use_precomputed_classical,
             freeze_dimer_prop_model=not args.unfreeze_dimer_prop_model,
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
+            include_total_mse=args.include_total_mse,
         )
     return
 

@@ -33,6 +33,26 @@ at_hf_vw_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_h+1_3.pt"
 at_elst_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_elst_h+1_3.pt"
 ap3_path = f"{current_file_path}/test_models/ap3_ensemble_0/ap3_.pt"
 
+unsupported_atom = qcel.models.Molecule.from_data("""
+1 1
+Fr                    0.132649237698     0.248352749998     1.293562398841
+--
+0 1
+C                     0.127833582203     1.521670971926    -0.710208861443
+C                    -1.116188669662     0.851566858457    -0.633982021977
+C                    -1.154785172625    -0.559237751843    -0.531142580122
+C                     0.050646582439    -1.299957008006    -0.504487072045
+C                     1.294679269678    -0.629853349628    -0.580606298034
+C                     1.333272597578     0.780957949471    -0.683472839053
+H                     2.226154770962    -1.202579029514    -0.564278799787
+H                     2.294571558061     1.298493467886    -0.746639420915
+H                     0.157561239160     2.611622940231    -0.794159148134
+H                    -2.047854568906     1.423668140984    -0.658987042209
+H                    -2.116273462130    -1.077410817669    -0.476711327564
+H                     0.020727347457    -2.390553551195    -0.429450547922
+units angstrom
+""")
+
 mol_cliff_water_close = qcel.models.Molecule.from_data("""
 0 1
 O                    -1.326958220000    -0.105938540000     0.018788150000
@@ -929,8 +949,11 @@ def test_classical_ap3_dispersion():
     simple_dftd3_energies = np.array([-2.4595184, -4.3240623, -7.2716193])
     print(f"{simple_dftd3_energies=}")
     print(f"{ap3_disp=}")
-    assert np.allclose(ap3_disp, simple_dftd3_energies, atol=1e-5), (
-        f"AP3 dispersion energies {ap3_disp} should be close to simple DFTD3 energies {simple_dftd3_energies}"
+    assert np.allclose(
+        ap3_disp, simple_dftd3_energies, atol=1e-5
+    ), (
+        f"AP3 dispersion energies {ap3_disp} should be close to "
+        f"simple DFTD3 energies {simple_dftd3_energies}"
     )
     return
 
@@ -1002,9 +1025,9 @@ def test_ap3_d3_fused_no_disp_nn_architecture():
     H = torch.randn(10, in_features)
     output = model.readouts(H)
 
-    assert output.shape[1] == 3, (
-        f"readouts() should return 3 columns when no_disp_nn=True, got {output.shape[1]}"
-    )
+    assert (
+        output.shape[1] == 3
+    ), f"readouts() should return 3 columns when no_disp_nn=True, got {output.shape[1]}"
 
 
 def test_ap3_d3_fused_default_architecture():
@@ -1227,9 +1250,9 @@ def test_ap3_d3_fused_predict_expansion_to_4_cols():
     )
 
     # Should always return 4 columns: [elst, exch, indu, disp]
-    assert predictions_no_disp.shape[1] == 4, (
-        f"predict_qcel_mols should return 4 columns, got {predictions_no_disp.shape[1]}"
-    )
+    assert (
+        predictions_no_disp.shape[1] == 4
+    ), f"predict_qcel_mols should return 4 columns, got {predictions_no_disp.shape[1]}"
 
     # Test with no_disp_nn=False (default)
     ap3_with_disp = APNet3D3_AtomType_Model(
@@ -1340,6 +1363,7 @@ def test_ap3_d3_fused_classical_pair_sums_do_not_spoil_exchange():
 def test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice():
     ap3d3 = APNet3D3_AtomType_Model(
         pre_trained_model_path="./models/ap3_ensemble/1/ap3_d3_nn_1.pt",
+        use_precomputed_classical=True,
     )
 
     assert ap3d3.use_precomputed_classical is True
@@ -1708,8 +1732,45 @@ no_reorient
     return
 
 
+def test_unsupported_element():
+    torch.manual_seed(42)
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=data_path,
+        use_GPU=False,
+        n_neuron=64,
+        n_params=1,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+    ap3_d3 = APNet3D3_AtomType_Model(
+        ds_root=None,
+        atom_type_model=atom_type_hf_vw_model.model,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        am_dimer_param_model=atom_type_elst_model,
+    )
+    preds = ap3_d3.predict_qcel_mols(
+        mols=[mol_cliff_water_close, unsupported_atom], batch_size=1
+    )
+    print(preds)
+    assert np.isfinite(preds[0]).all(), (
+        f"Supported molecule should return finite predictions, got {preds[0]}"
+    )
+    assert np.isnan(preds[1]).all(), (
+        f"Unsupported molecule should return all-NaN predictions, got {preds[1]}"
+    )
+
+
 if __name__ == "__main__":
-    # test_classical_ap3_dispersion()
+    test_unsupported_element()
     # test_d3i()
     # test_ap3d3_frozen()
     # test_ap3_d3_fused_import_qcml_dftd3()
@@ -1718,4 +1779,4 @@ if __name__ == "__main__":
     # test_ap3_d3_fused_get_config_recreate_model()
     # test_ap3_d3_fused_predict_expansion_to_4_cols()
     # pytest.main([__file__])
-    test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice()
+    # test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice()

@@ -11,6 +11,7 @@ import torch
 from torch_geometric.data import download_url
 
 from .. import util
+from ..lmdb_utils import acquire_lmdb_env, release_lmdb_env
 from ..AtomModels.ap2_atom_model import AtomModel
 from ..hf_pretrained import resolve_pretrained_path
 from .. import atomic_datasets
@@ -24,7 +25,7 @@ from apnet_pt import constants
 import h5py
 
 
-AP2_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9})
+AP2_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9, 10})
 
 
 def spec_type_uses_split_files(spec_type):
@@ -123,6 +124,11 @@ def dimer_fused_data(
     """
     atomic_props_A = atomic_datasets.create_atomic_data(ZA, RA, TQA, r_cut=r_cut)
     atomic_props_B = atomic_datasets.create_atomic_data(ZB, RB, TQB, r_cut=r_cut)
+    if atomic_props_A is None or atomic_props_B is None:
+        print(
+            f"Unsupported element in dimer with dimer_ind {dimer_ind}. Skipping this data point:\n  {constants.ALLOWED_ELEMENTS=}\n  {ZA=}\n  {ZB=}"
+        )
+        return None
     if check_validity:
         valid = assert_molecule_featurization_is_valid(atomic_props_A, dimer_ind)
         if not valid:
@@ -1018,7 +1024,7 @@ class ap2_fused_module_dataset(Dataset):
         """
         self.print_level = print_level
         try:
-            assert spec_type in [1, 2, 5, 6, 7, 8, 9, None]
+            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, None]
         except Exception:
             print("Currently spec_type must be 1 or 2 for SAPT0/jun-cc-pVDZ")
             raise ValueError
@@ -1148,6 +1154,11 @@ class ap2_fused_module_dataset(Dataset):
             return [
                 "t_train_19.pkl",
                 "t_test_19.pkl",
+            ]
+        elif self.spec_type == 10:
+            return [
+                "225K_saptpbe0-d4_totals_train.pkl",
+                "225K_saptpbe0-d4_totals_test.pkl",
             ]
         elif self.spec_type is None:
             os.system(f"touch {self.raw_dir}/tmp.txt")
@@ -1456,3 +1467,408 @@ class ap2_fused_module_dataset(Dataset):
     def get_in_memory(self, idx):
         """Method for retrieving data when in_memory=True"""
         return self.data[idx]
+
+
+class ap2_fused_module_dataset_lmdb(Dataset):
+    split_spec_types = AP2_FUSED_SPLIT_SPEC_TYPES
+
+    @classmethod
+    def is_split_db_config(cls, spec_type, qcel_molecules=None):
+        return spec_type_uses_split_files(spec_type) or qcel_inputs_are_split_db(
+            qcel_molecules
+        )
+
+    def __init__(
+        self,
+        root,
+        transform=None,
+        pre_transform=None,
+        r_cut=5.0,
+        r_cut_im=8.0,
+        spec_type=1,
+        max_size=None,
+        force_reprocess=False,
+        skip_processed=True,
+        skip_compile=False,
+        atom_model_path=None,
+        atom_model=None,
+        batch_size=16,
+        atomic_batch_size=256,
+        datapoint_storage_n_objects=256,
+        in_memory=False,
+        num_devices=1,
+        split="all",
+        print_level=2,
+        qcel_molecules: Optional[List[qcel.models.Molecule]] = None,
+        energy_labels: Optional[List[float]] = None,
+        random_seed=42,
+        check_monomer_validity=True,
+        lmdb_map_size=1099511627776,
+        lmdb_readonly=False,
+        cache_size=1000,
+    ):
+        try:
+            import json
+            import lmdb
+        except ImportError as exc:
+            raise ImportError(
+                "lmdb package is required. Install with: pip install lmdb"
+            ) from exc
+
+        self.json = json
+        self.lmdb = lmdb
+        self.print_level = print_level
+        try:
+            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, None]
+        except Exception:
+            print("Currently spec_type must be 1 or 2 for SAPT0/jun-cc-pVDZ")
+            raise ValueError
+        self.spec_type = spec_type
+        self.qcel_molecules = None
+        self.energy_labels = None
+        if qcel_molecules is not None and energy_labels is not None:
+            self.qcel_molecules = qcel_molecules
+            self.energy_labels = energy_labels
+            if len(qcel_molecules) != len(energy_labels):
+                raise ValueError(
+                    "Length of qcel_molecules and energy_labels must match"
+                )
+            print(
+                f"Received {len(qcel_molecules)}"
+                " QCElemental molecules with energy labels"
+            )
+
+        self.MAX_SIZE = max_size
+        self.random_seed = random_seed
+        self.in_memory = in_memory
+        self.split = split
+        self.split_db = self.is_split_db_config(self.spec_type, self.qcel_molecules)
+        self.r_cut = r_cut
+        self.r_cut_im = r_cut_im
+        self.force_reprocess = force_reprocess
+        self.atomic_batch_size = atomic_batch_size
+        self.check_monomer_validity = check_monomer_validity
+        self.batch_size = batch_size
+        self.training_batch_size = batch_size
+        self.datapoint_storage_n_objects = datapoint_storage_n_objects
+        self.skip_compile = skip_compile
+        self.skip_processed = skip_processed
+        self.lmdb_map_size = lmdb_map_size
+        self.lmdb_readonly = lmdb_readonly
+        self.cache_size = cache_size
+        self._cache = {}
+        self._cache_keys = []
+        self.lmdb_env = None
+        self.lmdb_path = None
+        self._length = None
+        self._raw_cursor = None
+        self._worker_id = None
+
+        if os.path.exists(root) is False:
+            os.makedirs(root, exist_ok=True)
+        if atom_model is not None:
+            if isinstance(atom_model, AtomModel):
+                self.atom_model = atom_model
+            else:
+                self.atom_model = AtomModel(
+                    ds_root=None,
+                    ignore_database_null=True,
+                )
+                self.atom_model.model = atom_model
+            if not skip_compile:
+                self.atom_model.model = torch.compile(
+                    self.atom_model.model, dynamic=True
+                )
+        elif not self.skip_processed:
+            if atom_model_path is None:
+                atom_model_path = resolve_pretrained_path("am_ensemble/am_0.pt")
+            self.atom_model = AtomModel(
+                pre_trained_model_path=atom_model_path,
+                ds_root=None,
+                ignore_database_null=True,
+            )
+            self.atom_model.model.to(self.atom_model.device)
+            torch._dynamo.config.dynamic_shapes = True
+            torch._dynamo.config.capture_dynamic_output_shape_ops = True
+            torch._dynamo.config.capture_scalar_outputs = True
+            if not skip_compile:
+                self.atom_model.model = torch.compile(
+                    self.atom_model.model, dynamic=True
+                )
+
+        print(f"{root=}, {self.spec_type=}, {self.in_memory=}")
+        self._init_lmdb_path(root)
+        self._init_lmdb()
+        super(ap2_fused_module_dataset_lmdb, self).__init__(
+            root, transform, pre_transform
+        )
+        if self.force_reprocess:
+            self.force_reprocess = False
+            self._close_lmdb()
+            super(ap2_fused_module_dataset_lmdb, self).__init__(
+                root, transform, pre_transform
+            )
+            self._init_lmdb()
+
+    def _init_lmdb_path(self, root):
+        self.lmdb_path = osp.join(
+            root, "processed", f"lmdb_ap2_fused{self.split_name}_spec_{self.spec_type}"
+        )
+
+    @property
+    def split_name(self):
+        return f"_{self.split}" if self.split_db and self.split != "all" else ""
+
+    def _init_lmdb(self):
+        if not osp.exists(self.lmdb_path):
+            os.makedirs(self.lmdb_path, exist_ok=True)
+
+        for attempt in range(2):
+            env = None
+            try:
+                env = acquire_lmdb_env(
+                    self.lmdb,
+                    self.lmdb_path,
+                    map_size=self.lmdb_map_size,
+                    readonly=self.lmdb_readonly,
+                    max_dbs=0,
+                    lock=not self.lmdb_readonly,
+                    max_readers=256,
+                )
+                with env.begin() as txn:
+                    metadata_bytes = txn.get(b"__metadata__")
+                    if metadata_bytes:
+                        metadata = self.json.loads(metadata_bytes.decode("utf-8"))
+                        self._length = metadata.get("length", 0)
+                        self._raw_cursor = metadata.get(
+                            "raw_cursor", self._length
+                        )
+                    else:
+                        self._length = 0
+                        self._raw_cursor = 0
+                self.lmdb_env = env
+                return
+            except Exception as e:
+                if env is not None:
+                    release_lmdb_env(self.lmdb_path, env)
+                if attempt == 0 and "already open in this process" in str(e):
+                    import gc
+
+                    gc.collect()
+                    continue
+                print(f"Error initializing LMDB: {e}")
+                self.lmdb_env = None
+                self._length = 0
+                self._raw_cursor = 0
+                return
+
+    def _close_lmdb(self):
+        if self.lmdb_env is not None:
+            release_lmdb_env(self.lmdb_path, self.lmdb_env)
+            self.lmdb_env = None
+
+    def __del__(self):
+        try:
+            self._close_lmdb()
+        except Exception:
+            pass
+
+    @property
+    def raw_file_names(self):
+        return ap2_fused_module_dataset.raw_file_names.fget(self)
+
+    @property
+    def processed_file_names(self):
+        if self.force_reprocess:
+            return ["file"]
+        if not hasattr(self, "lmdb_path") or self.lmdb_path is None:
+            return ["lmdb_missing"]
+        if osp.exists(self.lmdb_path):
+            env = None
+            try:
+                env = acquire_lmdb_env(
+                    self.lmdb,
+                    self.lmdb_path,
+                    readonly=True,
+                    lock=False,
+                    max_dbs=0,
+                    map_size=self.lmdb_map_size,
+                    max_readers=256,
+                )
+                with env.begin() as txn:
+                    metadata_bytes = txn.get(b"__metadata__")
+                    if metadata_bytes:
+                        metadata = self.json.loads(metadata_bytes.decode("utf-8"))
+                        length = metadata.get("length", 0)
+                        if length > 0:
+                            return [
+                                f"lmdb_ap2_fused{self.split_name}_spec_{self.spec_type}"
+                            ]
+            finally:
+                if env is not None:
+                    release_lmdb_env(self.lmdb_path, env)
+        return ["lmdb_missing"]
+
+    def download(self):
+        return ap2_fused_module_dataset.download(self)
+
+    def _store_to_lmdb(self, data_objects, start_idx, raw_cursor):
+        import pickle
+
+        if self.lmdb_env is None:
+            raise RuntimeError("LMDB environment not initialized")
+        with self.lmdb_env.begin(write=True) as txn:
+            for i, data_obj in enumerate(data_objects):
+                idx = start_idx + i
+                txn.put(str(idx).encode("utf-8"), pickle.dumps(data_obj))
+            metadata = {
+                "length": start_idx + len(data_objects),
+                "raw_cursor": raw_cursor,
+                "r_cut": self.r_cut,
+                "r_cut_im": self.r_cut_im,
+                "spec_type": self.spec_type,
+            }
+            txn.put(b"__metadata__", self.json.dumps(metadata).encode("utf-8"))
+        self._length = start_idx + len(data_objects)
+        self._raw_cursor = raw_cursor
+
+    def process(self):
+        stored_idx = self._length if self.skip_processed and self._length else 0
+        resume_raw_cursor = (
+            self._raw_cursor if self.skip_processed and self._raw_cursor else 0
+        )
+        data_objects = []
+        RAs, RBs, ZAs, ZBs, TQAs, TQBs, targets = [], [], [], [], [], [], []
+        if self.qcel_molecules is not None and self.energy_labels is not None:
+            print("Processing directly from provided QCElemental molecules...")
+            for mol in self.qcel_molecules:
+                monA, monB = mol.get_fragment(0), mol.get_fragment(1)
+                RA = torch.tensor(monA.geometry, dtype=torch.float32) * constants.au2ang
+                RB = torch.tensor(monB.geometry, dtype=torch.float32) * constants.au2ang
+                ZA = torch.tensor(monA.atomic_numbers, dtype=torch.int64)
+                ZB = torch.tensor(monB.atomic_numbers, dtype=torch.int64)
+                TQA = torch.tensor(monA.molecular_charge, dtype=torch.float32)
+                TQB = torch.tensor(monB.molecular_charge, dtype=torch.float32)
+                RAs.append(RA)
+                RBs.append(RB)
+                ZAs.append(ZA)
+                ZBs.append(ZB)
+                TQAs.append(TQA)
+                TQBs.append(TQB)
+            targets = self.energy_labels
+            if self.MAX_SIZE is not None and len(RAs) > self.MAX_SIZE:
+                RAs = RAs[: self.MAX_SIZE]
+                RBs = RBs[: self.MAX_SIZE]
+                ZAs = ZAs[: self.MAX_SIZE]
+                ZBs = ZBs[: self.MAX_SIZE]
+                TQAs = TQAs[: self.MAX_SIZE]
+                TQBs = TQBs[: self.MAX_SIZE]
+                targets = targets[: self.MAX_SIZE]
+        else:
+            for raw_path in self.raw_paths:
+                if self.split_db and self.split not in Path(raw_path).stem:
+                    continue
+                RA, RB, ZA, ZB, TQA, TQB, target = util.load_dimer_dataset(
+                    raw_path,
+                    self.MAX_SIZE,
+                    return_qcel_mols=False,
+                    return_qcel_mons=False,
+                    columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
+                    random_seed_shuffle=self.random_seed,
+                )
+                RAs.extend(RA)
+                RBs.extend(RB)
+                ZAs.extend(ZA)
+                ZBs.extend(ZB)
+                TQAs.extend(TQA)
+                TQBs.extend(TQB)
+                targets.extend(target)
+
+        print("Creating data objects...")
+        processed_raw_cursor = resume_raw_cursor
+        for i in range(len(RAs)):
+            if self.skip_processed and i < resume_raw_cursor:
+                continue
+            processed_raw_cursor = i + 1
+            y = torch.tensor(targets[i], dtype=torch.float32)
+            data = dimer_fused_data(
+                RAs[i],
+                ZAs[i],
+                TQAs[i],
+                RBs[i],
+                ZBs[i],
+                TQBs[i],
+                dimer_ind=i,
+                r_cut=self.r_cut,
+                r_cut_im=self.r_cut_im,
+                check_validity=self.check_monomer_validity,
+                y=y,
+            )
+            if data is None:
+                continue
+            data = data.cpu()
+            if self.pre_filter is not None and not self.pre_filter(data):
+                continue
+            data_objects.append(data)
+            if len(data_objects) >= self.datapoint_storage_n_objects:
+                self._store_to_lmdb(data_objects, stored_idx, i + 1)
+                stored_idx += len(data_objects)
+                data_objects = []
+                if self.MAX_SIZE is not None and i > self.MAX_SIZE:
+                    break
+
+        if len(data_objects) > 0:
+            self._store_to_lmdb(data_objects, stored_idx, processed_raw_cursor)
+        elif processed_raw_cursor > resume_raw_cursor:
+            self._store_to_lmdb([], stored_idx, processed_raw_cursor)
+
+    def len(self):
+        if self._length is not None:
+            return self._length
+        if self.lmdb_env is None:
+            return 0
+        with self.lmdb_env.begin() as txn:
+            metadata_bytes = txn.get(b"__metadata__")
+            if metadata_bytes:
+                metadata = self.json.loads(metadata_bytes.decode("utf-8"))
+                self._length = metadata.get("length", 0)
+                self._raw_cursor = metadata.get("raw_cursor", self._length)
+            else:
+                self._length = 0
+                self._raw_cursor = 0
+        return self._length
+
+    def _check_worker_init(self):
+        import torch.utils.data
+
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else None
+        if worker_id != self._worker_id:
+            if self.lmdb_env is not None:
+                self._close_lmdb()
+            self._worker_id = worker_id
+            self._init_lmdb()
+            self._cache = {}
+            self._cache_keys = []
+
+    def get(self, idx):
+        import pickle
+
+        self._check_worker_init()
+        if idx in self._cache:
+            self._cache_keys.remove(idx)
+            self._cache_keys.append(idx)
+            return self._cache[idx]
+        if self.lmdb_env is None:
+            raise RuntimeError("LMDB environment not initialized")
+        with self.lmdb_env.begin() as txn:
+            value_bytes = txn.get(str(idx).encode("utf-8"))
+            if value_bytes is None:
+                raise IndexError(f"Index {idx} not found in LMDB database")
+            data = pickle.loads(value_bytes)
+        self._cache[idx] = data
+        self._cache_keys.append(idx)
+        if len(self._cache) > self.cache_size:
+            oldest_key = self._cache_keys.pop(0)
+            del self._cache[oldest_key]
+        return data

@@ -20,13 +20,16 @@ from apnet_pt.pt_datasets.dapnet_ds import (
     dapnet2_collate_update_no_target,
 )
 import os
+import shutil
 import numpy as np
 import pytest
 from glob import glob
+from pathlib import Path
 import qcelemental as qcel
 import torch
 import pandas as pd
 from pprint import pprint as pp
+from apnet_pt.pt_datasets.ap2_fused_ds import ap2_fused_module_dataset_lmdb
 from .mols import (
     # mol_mon,
     mol_dimer,
@@ -1602,6 +1605,72 @@ def test_ap3_spec7():
     )
     for i in glob(f"{data_path}/processed/dimer_ap2_spec_*.pt"):
         os.remove(i)
+
+
+def test_ap3d3_spec5_non_precomputed_lmdb_training(tmp_path):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        Path(data_path) / "raw" / "t_train_19.pkl",
+        raw_dir / "t_train.pkl",
+    )
+    shutil.copy2(
+        Path(data_path) / "raw" / "t_test_19.pkl",
+        raw_dir / "t_test.pkl",
+    )
+
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+        freeze_atom_model=True,
+    )
+    ap3d3 = apnet_pt.AtomPairwiseModels.apnet3_d3_fused.APNet3D3_AtomType_Model(
+        ds_root=str(tmp_path),
+        ignore_database_null=False,
+        ds_force_reprocess=True,
+        use_GPU=False,
+        ds_spec_type=5,
+        ds_in_memory=False,
+        ds_class_type="lmdb",
+        ds_atomic_batch_size=4,
+        ds_batch_size=2,
+        ds_datapoint_storage_n_objects=4,
+        atom_type_model=atom_type_hf_vw_model.model,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        use_precomputed_classical=False,
+        freeze_dimer_prop_model=False,
+        n_rbf=4,
+        n_neuron=16,
+        n_embed=4,
+    )
+
+    assert isinstance(ap3d3.dataset, list)
+    assert isinstance(ap3d3.dataset[0], ap2_fused_module_dataset_lmdb)
+    assert isinstance(ap3d3.dataset[1], ap2_fused_module_dataset_lmdb)
+    assert len(ap3d3.dataset[0]) > 0
+    assert len(ap3d3.dataset[1]) > 0
+
+    ap3d3.train(
+        n_epochs=1,
+        skip_compile=True,
+        lr=5e-4,
+        dataloader_num_workers=0,
+        shuffle=False,
+    )
+
+    assert (tmp_path / "processed" / "lmdb_ap2_fused_train_spec_5").exists()
+    assert (tmp_path / "processed" / "lmdb_ap2_fused_test_spec_5").exists()
 
 
 def test_ap2_spec7():

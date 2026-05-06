@@ -564,6 +564,11 @@ def create_atomic_data(
         node_features = Z.long()
     else:
         node_features = torch.tensor(Z, dtype=torch.int64)
+    # check to ensure node_features are all in ALLOWED_ELEMENTS
+    constants.ALLOWED_ELEMENTS
+    for z in node_features:
+        if z.item() not in constants.ALLOWED_ELEMENTS:
+            return None
     if isinstance(R, np.ndarray):
         R = torch.tensor(R, dtype=torch.float32)
     if isinstance(total_charge, torch.Tensor):
