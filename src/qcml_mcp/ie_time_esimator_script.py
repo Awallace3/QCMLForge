@@ -5,8 +5,9 @@ import math
 import numpy as np
 import pandas as pd
 import qcelemental as qcel
-import apnet_pt                                                          # need to add qcml_forge. prefix if outside of src/
-from qcml_mcp.timings.polynomial_fit_data import polynomial_expressions  # need to add qcml_forge. prefix if outside of src/
+import apnet_pt                                                          
+from qcml_mcp.timings.polynomial_fit_data import polynomial_expressions
+from importlib import resources
 from pprint import pprint as pp
 
 def parse_geoms(
@@ -79,7 +80,8 @@ def parse_geoms(
 
 
                     fragments = mol_qcel.fragments
-                    assert len(fragments) == 2, "input geometry must be a dimer"
+                    if len(fragments) != 2:
+                        raise ValueError("input geometry must be a dimer")
 
                     qcel_dimer.append(mol_qcel)
                     qcel_monA.append(mol_qcel.get_fragment(0))
@@ -180,6 +182,18 @@ def build_inference_table(
     lotr_strings = lotr_strings * len(df)
 
     df_copy = df.copy()
+
+    if df_copy.empty:
+        return df_copy.reindex(
+            columns=[
+                *df_copy.columns,
+                "dimer_tvars",
+                "monA_tvars",
+                "monB_tvars",
+                "Level of Theory",
+            ]
+        )
+
     df_copy = df_copy.loc[df.index.repeat(len(bases))].copy()
 
     dimer_tvars = []
@@ -264,9 +278,15 @@ def predict_ie_errors_batch(
     return
 
 def load_coeffs(
-    path: str
+    restricted: bool
 ) -> pd.DataFrame:
-    return pd.read_pickle(path).set_index("method")
+    un = "" if restricted else "un"
+
+    ref_path = resources.files("qcml_mcp.data").joinpath(f"time_fit_inference_df_{un}restricted.pkl")
+    with ref_path.open("rb") as handle:
+        df = pd.read_pickle(handle).set_index("method")
+
+    return df
 
 def predict_timing(
     method: str,
@@ -291,14 +311,14 @@ def predict_timing(
 
     if uhf_ref: 
         if coeffs_from_pkl:
-            df = pd.read_pickle("./time_fit_inference_df_unrestricted.pkl").set_index("method")
-            coeffs = df.at[method, "coefficients"]
+            # df = pd.read_pickle("./time_fit_inference_df_unrestricted.pkl").set_index("method")
+            coeffs = unr_coeffs.at[method, "coefficients"]
         else:
             coeffs = polynomial_expressions[method]["unr_coeffs"]
     else:
         if coeffs_from_pkl:
-            df = pd.read_pickle("./time_fit_inference_df_restricted.pkl").set_index("method")
-            coeffs = df.at[method, "coefficients"]
+            # df = pd.read_pickle("./time_fit_inference_df_restricted.pkl").set_index("method")
+            coeffs = res_coeffs.at[method, "coefficients"]
         else:
             coeffs = polynomial_expressions[method]["res_coeffs"]
 
@@ -401,6 +421,10 @@ def main():
         using_CP)
     
     # Run infrence on rows of the dataframe in batch mode (energies and timings)
+    global res_coeffs, unr_coeffs
+    res_coeffs = load_coeffs(1)
+    unr_coeffs = load_coeffs(0)
+
     predict_ie_errors_batch(df2)
     predict_timings_batch(df2)
     pd.set_option("display.max_rows", None)
