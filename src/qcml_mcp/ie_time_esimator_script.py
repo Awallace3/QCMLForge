@@ -10,6 +10,23 @@ from qcml_mcp.timings.polynomial_fit_data import polynomial_expressions
 from importlib import resources
 from pprint import pprint as pp
 
+
+def load_coeffs(
+    restricted: bool
+    ) -> pd.DataFrame:
+
+    un = "" if restricted else "un"
+    ref_path = resources.files("qcml_mcp.data").joinpath(
+        f"time_fit_inference_df_{un}restricted.pkl"
+    )
+    with ref_path.open("rb") as handle:
+        return pd.read_pickle(handle).set_index("method")
+
+
+_res_coeffs: pd.DataFrame = load_coeffs(1)
+_unr_coeffs: pd.DataFrame = load_coeffs(0)
+
+
 def parse_geoms(
     path: str,
     ) -> pd.DataFrame:
@@ -240,6 +257,8 @@ def predict_ie_errors_batch(
     in Psi4 format.
 
     Acceptable starting_level_of_theory values currently only include:
+
+    ***NOTE: THIS LIST MAY NOT BE UP TO DATE***
     [
     "B3LYP-D3/aug-cc-pVTZ/unCP",
     "B2PLYP-D3/aug-cc-pVTZ/unCP",
@@ -277,50 +296,20 @@ def predict_ie_errors_batch(
     df["ERROR ESTIMATES (kcal/mol)"] = errors
     return
 
-def load_coeffs(
-    restricted: bool
-) -> pd.DataFrame:
-    un = "" if restricted else "un"
-
-    ref_path = resources.files("qcml_mcp.data").joinpath(f"time_fit_inference_df_{un}restricted.pkl")
-    with ref_path.open("rb") as handle:
-        df = pd.read_pickle(handle).set_index("method")
-
-    return df
-
 def predict_timing(
     method: str,
     uhf_ref: bool,
     t_vars: np.ndarray,
-    coeffs_from_pkl: bool
 ) -> float:
-    """
-    Predict timing for a given method and input variables using dictionary of saved 
-    polynomial fits.
-    
-    Returns the predicted log10(time (s)), where "time (s)" is the output 
-    of the polynomial function for a particular method and choice of timing variables. 
-    Timings for calculations run with an unrestricted reference were fit separately. 
-    Functional forms of timing polynomials for each method are provided below:
-    """
-
     if uhf_ref and (method == "FNO-CCSD" or method == "FNO-CCSD(T)"):
         raise ValueError(f"Polynomial expressions for unrestricted {method} not implemented yet")
 
     polynomial_lambda_expr = polynomial_expressions[method]["poly"]
 
-    if uhf_ref: 
-        if coeffs_from_pkl:
-            # df = pd.read_pickle("./time_fit_inference_df_unrestricted.pkl").set_index("method")
-            coeffs = unr_coeffs.at[method, "coefficients"]
-        else:
-            coeffs = polynomial_expressions[method]["unr_coeffs"]
+    if uhf_ref:
+        coeffs = _unr_coeffs.at[method, "coefficients"]
     else:
-        if coeffs_from_pkl:
-            # df = pd.read_pickle("./time_fit_inference_df_restricted.pkl").set_index("method")
-            coeffs = res_coeffs.at[method, "coefficients"]
-        else:
-            coeffs = polynomial_expressions[method]["res_coeffs"]
+        coeffs = _res_coeffs.at[method, "coefficients"]
 
     return np.log10(polynomial_lambda_expr(coeffs, t_vars))
 
@@ -345,24 +334,21 @@ def predict_timings_batch(
 
         try:
             a = predict_timing(
-                method, 
-                (0 if row["qcel_dimer"].molecular_multiplicity == 1 else 1), 
+                method,
+                (0 if row["qcel_dimer"].molecular_multiplicity == 1 else 1),
                 d_tvars,
-                0
             )
 
             b = predict_timing(
-                method, 
-                (0 if row["qcel_monA"].molecular_multiplicity == 1 else 1), 
+                method,
+                (0 if row["qcel_monA"].molecular_multiplicity == 1 else 1),
                 a_tvars,
-                0
             )
-            
+
             c = predict_timing(
-                method, 
-                (0 if row["qcel_monB"].molecular_multiplicity == 1 else 1), 
+                method,
+                (0 if row["qcel_monB"].molecular_multiplicity == 1 else 1),
                 b_tvars,
-                0
             )
 
             supermolecular_times.append(np.log10(10**a + 10**b + 10**c))
@@ -374,63 +360,58 @@ def predict_timings_batch(
     df["ESTIMATED CPU TIMES (log10(s))"] = supermolecular_times
     return
 
-geom_path = "./test_geoms"
-n_threads = 4 # testing purposes
-using_CP = 1
+default_methods = [
+    "HF",
+    "PBE-D3",
+    "wB97X-D",
+    "wB97X-V",
+    "MP2",
+    "B3LYP-D3",
+    "B2PLYP-D3",
+    "M05-2X",
+    "FNO-CCSD",
+    "FNO-CCSD(T)",
+]
 
-method_list = [
-    "HF", 
-    "PBE-D3", 
-    "wB97X-D", 
-    "wB97X-V", 
-    "MP2", 
-    "B3LYP-D3", 
-    "B2PLYP-D3", 
-    "M05-2X", 
-    "FNO-CCSD", 
-    "FNO-CCSD(T)"
-    ]
-
-basis_list = [
-    "cc-pVDZ", 
-    "cc-pVTZ", 
-    "cc-pVQZ", 
-    "aug-cc-pVQZ", 
-    "aug-cc-pVTZ", 
-    "aug-cc-pVDZ"
-    ]
+default_bases = [
+    "cc-pVDZ",
+    "cc-pVTZ",
+    "cc-pVQZ",
+    "aug-cc-pVQZ",
+    "aug-cc-pVTZ",
+    "aug-cc-pVDZ",
+]
 
 
-def main():
-    # set threads and supress output
+def main(
+    geom_path: str | None = None,
+    n_threads: int = 4,
+    using_cp: bool = False,
+    methods: list[str] | None = None,
+    bases: list[str] | None = None,
+    auto_download: bool = False,    # set to True to avoid TTY prompting
+) -> pd.DataFrame:
+    if geom_path is None:
+        raise ValueError("geom_path must be set")
+    if methods is None:
+        methods = default_methods
+    if bases is None:
+        bases = default_bases
+    if auto_download:
+        os.environ["QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED"] = "1"
+
     psi4.core.be_quiet()
     psi4.set_num_threads(n_threads)
 
-    # load coeffs
-    # restricted_coeffs = load_coeffs("./time_fit_inference_df_restricted.pkl")
-    # unrestricted_coeffs = load_coeffs("./time_fit_inference_df_unrestricted.pkl")
-
-    # Parse through a database of dimer geometry files, build initial dataframe
     df1 = parse_geoms(geom_path)
 
-    # calculate timing variables and format dataframe for batch inference
-    df2 = build_inference_table(
-        df1,
-        method_list,
-        basis_list,
-        using_CP)
-    
-    # Run infrence on rows of the dataframe in batch mode (energies and timings)
-    global res_coeffs, unr_coeffs
-    res_coeffs = load_coeffs(1)
-    unr_coeffs = load_coeffs(0)
+    df2 = build_inference_table(df1, methods, bases, using_cp)
 
     predict_ie_errors_batch(df2)
     predict_timings_batch(df2)
     pd.set_option("display.max_rows", None)
     pd.set_option("display.max_columns", None)
     pp(df2)
-    # pp(df2.iloc[80:99])
 
     return df2
 
