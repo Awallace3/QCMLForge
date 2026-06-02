@@ -23,8 +23,9 @@ def load_coeffs(
         return pd.read_pickle(handle).set_index("method")
 
 
-_res_coeffs: pd.DataFrame = load_coeffs(1)
-_unr_coeffs: pd.DataFrame = load_coeffs(0)
+# _res_coeffs: pd.DataFrame = load_coeffs(1)
+print("Warning, I have removed UHF functionality for now")
+_coeffs: pd.DataFrame = load_coeffs(0)
 
 
 def parse_geoms(
@@ -298,18 +299,21 @@ def predict_ie_errors_batch(
 
 def predict_timing(
     method: str,
-    uhf_ref: bool,
+    basis: str,
     t_vars: np.ndarray,
 ) -> float:
-    if uhf_ref and (method == "FNO-CCSD" or method == "FNO-CCSD(T)"):
-        raise ValueError(f"Polynomial expressions for unrestricted {method} not implemented yet")
+    # if uhf_ref and (method == "FNO-CCSD" or method == "FNO-CCSD(T)"):
+    #     raise ValueError(f"Polynomial expressions for unrestricted {method} not implemented yet")
 
     polynomial_lambda_expr = polynomial_expressions[method]["poly"]
 
-    if uhf_ref:
-        coeffs = _unr_coeffs.at[method, "coefficients"]
-    else:
-        coeffs = _res_coeffs.at[method, "coefficients"]
+    fit_label = "Augmented" if "aug" in basis else "Non-augmented"
+    mask = (_coeffs["method"] == method) & (_coeffs["fit_label"] == fit_label)
+
+    if not mask.any():
+        mask = (_coeffs["method"] == method) & (_coeffs["fit_label"] == "All data")
+
+    coeffs = _coeffs.loc[mask, "coefficients"].values[0]
 
     return np.log10(polynomial_lambda_expr(coeffs, t_vars))
 
@@ -327,6 +331,7 @@ def predict_timings_batch(
 
     for _, row in df.iterrows():
         method = row["Level of Theory"].split("/")[0]
+        basis = row["Level of Theory"].split("/")[1]
         
         d_tvars = row["dimer_tvars"]
         a_tvars = row["monA_tvars"]
@@ -335,19 +340,19 @@ def predict_timings_batch(
         try:
             a = predict_timing(
                 method,
-                (0 if row["qcel_dimer"].molecular_multiplicity == 1 else 1),
+                basis,
                 d_tvars,
             )
 
             b = predict_timing(
                 method,
-                (0 if row["qcel_monA"].molecular_multiplicity == 1 else 1),
+                basis,
                 a_tvars,
             )
 
             c = predict_timing(
                 method,
-                (0 if row["qcel_monB"].molecular_multiplicity == 1 else 1),
+                basis,
                 b_tvars,
             )
 
