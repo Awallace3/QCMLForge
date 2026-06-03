@@ -25,7 +25,7 @@ def load_coeffs(
 
 # _res_coeffs: pd.DataFrame = load_coeffs(1)
 print("Warning, I have removed UHF functionality for now")
-_coeffs: pd.DataFrame = load_coeffs(0)
+_coeffs: pd.DataFrame | None = None
 
 
 def parse_geoms(
@@ -64,50 +64,46 @@ def parse_geoms(
         filepath = os.path.join(path, file)
 
         if os.path.isfile(filepath):
-            try:
-                with open(filepath, "r", errors="ignore") as f:
-                    raw_geom_str = f.read()
+            with open(filepath, "r", errors="ignore") as f:
+                raw_geom_str = f.read()
 
-                    chgmult = 0 # will not catch 
-                    for line in raw_geom_str.splitlines():
-                        if chgmult_pattern.match(line):
-                            chgmult = 1 
-                            break
-                    
-                    units = 0
-                    for line in reversed(raw_geom_str.splitlines()):
-                        if "units" in line:
-                            units = 1
-                            break                    
+                chgmult = 0 # will not catch 
+                for line in raw_geom_str.splitlines():
+                    if chgmult_pattern.match(line):
+                        chgmult = 1 
+                        break
+                
+                units = 0
+                for line in reversed(raw_geom_str.splitlines()):
+                    if "units" in line:
+                        units = 1
+                        break                    
 
-                    if not units:
-                        print("Warning: units may not be specified, assuming Angstroms by default")
+                if not units:
+                    print("Warning: units may not be specified, assuming Angstroms by default")
 
-                    if not chgmult:
-                        print("Warning: charge/multiplicity may not be specified, molparse may default to incorrect values")
+                if not chgmult:
+                    print("Warning: charge/multiplicity may not be specified, molparse may default to incorrect values")
 
-                    try:
-                        mol_qcel = qcel.models.Molecule.from_data(raw_geom_str)
+                try:
+                    mol_qcel = qcel.models.Molecule.from_data(raw_geom_str)
 
-                    except Exception as e:
-                        print(f"Error converting raw string to qcelemental.models.Molecule: \n {e}")
-                        continue
-                    
-                    id.append(file.strip().split(".")[0])
-                    n_atoms.append(len(mol_qcel.atomic_numbers))
+                except Exception as e:
+                    print(f"Error converting raw string to qcelemental.models.Molecule: \n {e}")
+                    continue
+
+                id.append(file.strip().split(".")[0])
+                n_atoms.append(len(mol_qcel.atomic_numbers))
 
 
-                    fragments = mol_qcel.fragments
-                    if len(fragments) != 2:
-                        raise ValueError("input geometry must be a dimer")
+                fragments = mol_qcel.fragments
+                if len(fragments) != 2:
+                    raise ValueError("input geometry must be a dimer")
 
-                    qcel_dimer.append(mol_qcel)
-                    qcel_monA.append(mol_qcel.get_fragment(0))
-                    qcel_monB.append(mol_qcel.get_fragment(1))
-                    print(f"succesfully built molecule and fragments for geometry found at {filepath}")
-
-            except Exception as e:
-                print(f"Error processing file at {filepath}: \n {e}")
+                qcel_dimer.append(mol_qcel)
+                qcel_monA.append(mol_qcel.get_fragment(0))
+                qcel_monB.append(mol_qcel.get_fragment(1))
+                print(f"succesfully built molecule and fragments for geometry found at {filepath}")
 
     return pd.DataFrame({
         "id": id,
@@ -136,39 +132,30 @@ def compute_psi4_time_estimation_variables(
     
     except Exception as e:
         print(f"Error when creating the Psi4 molecule object from QCElemental Schema: \n {e}")
+        return np.array([np.nan] * 4)
 
     psi4.set_options({
         "basis": basis_set,
         "dft_pruning_scheme": "robust",
     })
 
-    try: 
-        wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
-        bs = wfn.basisset()
-        grid = psi4.core.DFTGrid.build(mol, bs)
-        print("compute vars: built wfn & grid")
-
-    except Exception as e:
-        print(f"Error when building grid or wavefunction: \n {e}")
-        return np.array([np.nan] * 4)
+    wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
+    bs = wfn.basisset()
+    grid = psi4.core.DFTGrid.build(mol, bs)
+    print("compute vars: built wfn & grid")
 
     n_occupied = math.ceil((wfn.nalpha() + wfn.nbeta()) / 2)
     n_virtual = bs.nbf() - n_occupied
     np_total = grid.npoints()
 
-    try: 
-        aux_basis = psi4.core.BasisSet.build(
-            wfn.molecule(),
-            "DF_BASIS_SCF",
-            psi4.core.get_option("SCF", "DF_BASIS_SCF"),
-            "JKFIT",
-            psi4.core.get_global_option("BASIS"),
-        )
-        print("compute vars: built aux basis")
-
-    except Exception as e:
-        print(f"Error when building the auxillary basis: \n {e}")
-        return np.array([np.nan] * 4)
+    aux_basis = psi4.core.BasisSet.build(
+        wfn.molecule(),
+        "DF_BASIS_SCF",
+        psi4.core.get_option("SCF", "DF_BASIS_SCF"),
+        "JKFIT",
+        psi4.core.get_global_option("BASIS"),
+    )
+    print("compute vars: built aux basis")
 
     nbf_aux = aux_basis.nbf()
     psi4.core.clean()
@@ -304,14 +291,23 @@ def predict_timing(
 ) -> float:
     # if uhf_ref and (method == "FNO-CCSD" or method == "FNO-CCSD(T)"):
     #     raise ValueError(f"Polynomial expressions for unrestricted {method} not implemented yet")
+    if method not in polynomial_expressions:
+        print("No timing model is available for the requested method")
+        return np.nan
 
     polynomial_lambda_expr = polynomial_expressions[method]["poly"]
+    
+    global _coeffs
+    if _coeffs is None: 
+        _coeffs = load_coeffs(0)
+        # print(_coeffs.columns)
+        # print(_coeffs.index.name)
 
     fit_label = "Augmented" if "aug" in basis else "Non-augmented"
-    mask = (_coeffs["method"] == method) & (_coeffs["fit_label"] == fit_label)
+    mask = (_coeffs.index == method) & (_coeffs["fit_label"] == fit_label)
 
     if not mask.any():
-        mask = (_coeffs["method"] == method) & (_coeffs["fit_label"] == "All data")
+        mask = (_coeffs.index == method) & (_coeffs["fit_label"] == "All data")
 
     coeffs = _coeffs.loc[mask, "coefficients"].values[0]
 
@@ -337,30 +333,26 @@ def predict_timings_batch(
         a_tvars = row["monA_tvars"]
         b_tvars = row["monB_tvars"]
 
-        try:
-            a = predict_timing(
-                method,
-                basis,
-                d_tvars,
-            )
 
-            b = predict_timing(
-                method,
-                basis,
-                a_tvars,
-            )
+        a = predict_timing(
+            method,
+            basis,
+            d_tvars,
+        )
 
-            c = predict_timing(
-                method,
-                basis,
-                b_tvars,
-            )
+        b = predict_timing(
+            method,
+            basis,
+            a_tvars,
+        )
 
-            supermolecular_times.append(np.log10(10**a + 10**b + 10**c))
+        c = predict_timing(
+            method,
+            basis,
+            b_tvars,
+        )
 
-        except Exception as e:
-            print(f"timing polynomial error: \n {e}")
-            supermolecular_times.append(np.nan)
+        supermolecular_times.append(np.log10(10**a + 10**b + 10**c))
 
     df["ESTIMATED CPU TIMES (log10(s))"] = supermolecular_times
     return
