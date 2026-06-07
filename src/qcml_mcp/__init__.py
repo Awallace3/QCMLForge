@@ -1,2 +1,8 @@
-from . import server
-from . import timings
+try:
+    from . import server
+except ImportError:
+    pass
+try:
+    from . import timings
+except ImportError:
+    pass

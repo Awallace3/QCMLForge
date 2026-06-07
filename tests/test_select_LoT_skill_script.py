@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pytest
 import pandas as pd
-from qcml_mcp.ie_time_esimator_script import main
+from qcml_mcp import ie_time_esimator
 
 # Maybe it's a bit redundant to set up a folder of dimer geoms when there is data in .mols, but the inteded usage is to parse through a database of geometries
 
@@ -14,9 +14,16 @@ two_geom_path = f"{test_geoms_path}/two_geom"
 many_geom_path = f"{test_geoms_path}/many_geom"
 
 expected_columns = {
-    "id", "n_atoms", "qcel_dimer", "qcel_monA", "qcel_monB",
-    "dimer_tvars", "monA_tvars", "monB_tvars",
-    "Level of Theory", "ERROR ESTIMATES (kcal/mol)",
+    "id",
+    "n_atoms",
+    "qcel_dimer",
+    "qcel_monA",
+    "qcel_monB",
+    "dimer_tvars",
+    "monA_tvars",
+    "monB_tvars",
+    "Level of Theory",
+    "ERROR ESTIMATES (kcal/mol)",
     "ESTIMATED CPU TIMES (log10(s))",
 }
 
@@ -43,38 +50,43 @@ def _check_df_shape_and_cols(df, n_expected_rows, label):
 
 @pytest.mark.slow
 def test_one_geom():
-    df = main(
+    df = ie_time_esimator.estimate(
         geom_path=one_geom_path,
         n_threads=4,
         using_cp=True,
         methods=None,
         bases=["aug-cc-pVTZ"],
         auto_download=True,
-        )
+    )
     _check_df_shape_and_cols(df, 10, "1 geom, 1 basis, 10 methods")
 
 
 @pytest.mark.slow
 def test_two_geom():
-    df = main(
+    df = ie_time_esimator.estimate(
         geom_path=two_geom_path,
         n_threads=4,
         using_cp=True,
         methods=None,
         bases=["aug-cc-pVTZ", "aug-cc-pVQZ"],
         auto_download=True,
-        )
+    )
     _check_df_shape_and_cols(df, 40, "2 geoms, 2 bases, 10 methods")
 
 
 @pytest.mark.slow
 def test_many_geom():
-    df = main(
+    df = ie_time_esimator.estimate(
         geom_path=many_geom_path,
         n_threads=4,
         using_cp=True,
         methods=None,
         bases=None,
         auto_download=True,
-        )
+    )
     _check_df_shape_and_cols(df, 420, "7 geoms, 6 bases, 10 methods")
+
+if __name__ == "__main__":
+    test_one_geom()
+    # test_two_geom()
+    # test_many_geom()

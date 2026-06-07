@@ -16,7 +16,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch>=2.10,<2.11",
+    "torch>=2.10",
     "qm_tools_aw",
     "numpy>=2.2.0",
     "qcelemental>=0.29.0",
@@ -26,6 +26,7 @@ dependencies = [
     "huggingface_hub>=0.30.0",
     "lmdb==2.1.1",
     "h5py",
+    'fastmcp',
 ]
 license = {text = "MIT"}
 

@@ -35,3 +35,4 @@ dependencies:
       - pytorch-minimize
       - qcportal==0.59
       - lmdb==2.1.1
+      - fastmcp
