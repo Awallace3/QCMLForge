@@ -1821,6 +1821,459 @@ def distance_tensors(
     return dR, dR_xyz, oodR, T1, T2
 
 
+def _rackers_distance_tensors(
+    Ri: torch.Tensor,
+    Rj: torch.Tensor,
+    e_source: torch.Tensor,
+    e_target: torch.Tensor,
+    alpha_i: torch.Tensor,
+    alpha_j: torch.Tensor,
+    thole_edge_values: torch.Tensor,
+    damping_type: str,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Build direct or mutual Thole tensors from edge damping values."""
+    dR_ang, dR_xyz_ang = get_distances(Ri, Rj, e_source, e_target)
+    dR_xyz = dR_xyz_ang / constants.au2ang
+    dR = dR_ang / constants.au2ang
+    alpha_source = alpha_i.index_select(0, e_source)
+    alpha_target = alpha_j.index_select(0, e_target)
+
+    if damping_type == "direct":
+        _, lam_3, lam_5 = thole_damping_direct_torch(
+            dR,
+            alpha_source,
+            alpha_target,
+            thole_edge_values,
+        )
+    elif damping_type == "mutual":
+        _, lam_3, lam_5 = thole_damping_mutual_torch(
+            dR,
+            alpha_source,
+            alpha_target,
+            thole_edge_values,
+        )
+    else:
+        raise ValueError(
+            f"Invalid Rackers damping type: {damping_type!r}"
+        )
+
+    delta = torch.eye(3, device=dR.device, dtype=dR.dtype)
+    oodR = 1.0 / dR
+    T1 = torch.einsum(
+        "x,xy,x->xy", oodR**3, -1.0 * dR_xyz, lam_3
+    )
+    T2 = 3 * torch.einsum(
+        "xy,xz,x->xyz", dR_xyz, dR_xyz, lam_5
+    ) - torch.einsum("x,x,yz,x->xyz", dR, dR, delta, lam_3)
+    T2 = torch.einsum("x,xyz->xyz", oodR**5, T2)
+    return dR, dR_xyz, oodR, T1, T2
+
+
+def _rackers_initial_permanent_fields(
+    alpha_A: torch.Tensor,
+    alpha_B: torch.Tensor,
+    qA: torch.Tensor,
+    muA: torch.Tensor,
+    qB: torch.Tensor,
+    muB: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_source: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_source: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    T1_AB: torch.Tensor,
+    T2_AB: torch.Tensor,
+    T1_AA: torch.Tensor,
+    T2_AA: torch.Tensor,
+    T1_BB: torch.Tensor,
+    T2_BB: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build permanent-multipole fields using only direct tensors."""
+    n_atoms_A = alpha_A.shape[0]
+    n_atoms_B = alpha_B.shape[0]
+    qA = qA.reshape(-1)
+    qB = qB.reshape(-1)
+
+    alpha_A_source = alpha_A.index_select(0, e_AB_source)
+    alpha_B_target = alpha_B.index_select(0, e_AB_target)
+    qA_source = qA.index_select(0, e_AB_source)
+    qB_target = qB.index_select(0, e_AB_target)
+    muA_source = muA.index_select(0, e_AB_source)
+    muB_target = muB.index_select(0, e_AB_target)
+
+    mu_charge_A = torch.einsum(
+        "a,ai,a->ai", alpha_A_source, T1_AB, qB_target
+    )
+    mu_induced_0_A = scatter_sum_compile(
+        mu_charge_A, e_AB_source, dim_size=n_atoms_A
+    )
+    mu_dipole_A = torch.einsum(
+        "a,aij,aj->ai", alpha_A_source, T2_AB, muB_target
+    )
+    mu_induced_0_A += scatter_sum_compile(
+        mu_dipole_A, e_AB_source, dim_size=n_atoms_A
+    )
+
+    mu_charge_B = torch.einsum(
+        "a,ai,a->ai", alpha_B_target, -T1_AB, qA_source
+    )
+    mu_induced_0_B = scatter_sum_compile(
+        mu_charge_B, e_AB_target, dim_size=n_atoms_B
+    )
+    mu_dipole_B = torch.einsum(
+        "a,aij,aj->ai", alpha_B_target, T2_AB, muA_source
+    )
+    mu_induced_0_B += scatter_sum_compile(
+        mu_dipole_B, e_AB_target, dim_size=n_atoms_B
+    )
+
+    alpha_AA_target = alpha_A.index_select(0, e_AA_target)
+    qA_AA_source = qA.index_select(0, e_AA_source)
+    muA_AA_source = muA.index_select(0, e_AA_source)
+    mu_charge_AA = torch.einsum(
+        "a,ai,a->ai", alpha_AA_target, -T1_AA, qA_AA_source
+    )
+    mu_dipole_AA = torch.einsum(
+        "a,aij,aj->ai", alpha_AA_target, T2_AA, muA_AA_source
+    )
+    mu_induced_0_A += scatter_sum_compile(
+        mu_charge_AA + mu_dipole_AA,
+        e_AA_target,
+        dim_size=n_atoms_A,
+    )
+
+    alpha_BB_target = alpha_B.index_select(0, e_BB_target)
+    qB_BB_source = qB.index_select(0, e_BB_source)
+    muB_BB_source = muB.index_select(0, e_BB_source)
+    mu_charge_BB = torch.einsum(
+        "a,ai,a->ai", alpha_BB_target, -T1_BB, qB_BB_source
+    )
+    mu_dipole_BB = torch.einsum(
+        "a,aij,aj->ai", alpha_BB_target, T2_BB, muB_BB_source
+    )
+    mu_induced_0_B += scatter_sum_compile(
+        mu_charge_BB + mu_dipole_BB,
+        e_BB_target,
+        dim_size=n_atoms_B,
+    )
+    return mu_induced_0_A, mu_induced_0_B
+
+
+def _rackers_scf_update(
+    alpha_A: torch.Tensor,
+    alpha_B: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_source: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_source: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    T2_AB: torch.Tensor,
+    T2_AA: torch.Tensor,
+    T2_BB: torch.Tensor,
+    mu_induced_A: torch.Tensor,
+    mu_induced_B: torch.Tensor,
+    mu_induced_0_A: torch.Tensor,
+    mu_induced_0_B: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply one unmixed induced-dipole update using mutual tensors."""
+    n_atoms_A = alpha_A.shape[0]
+    n_atoms_B = alpha_B.shape[0]
+    alpha_A_source = alpha_A.index_select(0, e_AB_source)
+    alpha_B_target = alpha_B.index_select(0, e_AB_target)
+    alpha_AA_target = alpha_A.index_select(0, e_AA_target)
+    alpha_BB_target = alpha_B.index_select(0, e_BB_target)
+
+    mu_induced_A_due_B = torch.einsum(
+        "a,aij,aj->ai",
+        alpha_A_source,
+        T2_AB,
+        mu_induced_B.index_select(0, e_AB_target),
+    )
+    mu_induced_A_new = scatter_sum_compile(
+        mu_induced_A_due_B, e_AB_source, dim_size=n_atoms_A
+    )
+    mu_induced_A_due_A = torch.einsum(
+        "a,aij,aj->ai",
+        alpha_AA_target,
+        T2_AA,
+        mu_induced_A.index_select(0, e_AA_source),
+    )
+    mu_induced_A_new += scatter_sum_compile(
+        mu_induced_A_due_A, e_AA_target, dim_size=n_atoms_A
+    )
+    mu_induced_A_new += mu_induced_0_A
+
+    mu_induced_B_due_A = torch.einsum(
+        "a,aij,aj->ai",
+        alpha_B_target,
+        T2_AB,
+        mu_induced_A.index_select(0, e_AB_source),
+    )
+    mu_induced_B_new = scatter_sum_compile(
+        mu_induced_B_due_A, e_AB_target, dim_size=n_atoms_B
+    )
+    mu_induced_B_due_B = torch.einsum(
+        "a,aij,aj->ai",
+        alpha_BB_target,
+        T2_BB,
+        mu_induced_B.index_select(0, e_BB_source),
+    )
+    mu_induced_B_new += scatter_sum_compile(
+        mu_induced_B_due_B, e_BB_target, dim_size=n_atoms_B
+    )
+    mu_induced_B_new += mu_induced_0_B
+    return mu_induced_A_new, mu_induced_B_new
+
+
+def rackers_thole_induction(
+    ZA: torch.Tensor,
+    RA: torch.Tensor,
+    qA: torch.Tensor,
+    muA: torch.Tensor,
+    quadA: torch.Tensor,
+    ZB: torch.Tensor,
+    RB: torch.Tensor,
+    qB: torch.Tensor,
+    muB: torch.Tensor,
+    quadB: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_source: torch.Tensor,
+    e_BB_source: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    hirshfeld_volume_ratio_A: torch.Tensor,
+    hirshfeld_volume_ratio_B: torch.Tensor,
+    valence_widths_A: torch.Tensor,
+    valence_widths_B: torch.Tensor,
+    thole_direct_A: torch.Tensor,
+    thole_direct_B: torch.Tensor,
+    thole_mutual_A: torch.Tensor,
+    thole_mutual_B: torch.Tensor,
+    ind_overlap_A: torch.Tensor,
+    ind_overlap_B: torch.Tensor,
+    include_overlap: bool = False,
+    max_iterations: int = 200,
+    convergence_threshold: float = 1e-8,
+    omega: float = 0.7,
+    polarizability_table: torch.Tensor = constants.polarizability_table,
+) -> torch.Tensor:
+    """Compute Rackers induction with distinct direct and mutual damping."""
+    del quadA, quadB
+    polarizability_table = _polarizability_table_on_device(
+        polarizability_table,
+        ZA.device,
+    )
+    alpha_0_A = torch.index_select(polarizability_table, 0, ZA.long())
+    alpha_0_B = torch.index_select(polarizability_table, 0, ZB.long())
+    alpha_A = alpha_0_A * hirshfeld_volume_ratio_A ** (4 / 3.0)
+    alpha_B = alpha_0_B * hirshfeld_volume_ratio_B ** (4 / 3.0)
+
+    direct_AB = geometric_mean_edge_values(
+        thole_direct_A,
+        thole_direct_B,
+        e_AB_source,
+        e_AB_target,
+    )
+    direct_AA = geometric_mean_edge_values(
+        thole_direct_A,
+        thole_direct_A,
+        e_AA_source,
+        e_AA_target,
+    )
+    direct_BB = geometric_mean_edge_values(
+        thole_direct_B,
+        thole_direct_B,
+        e_BB_source,
+        e_BB_target,
+    )
+    direct_tensors_AB = _rackers_distance_tensors(
+        RA,
+        RB,
+        e_AB_source,
+        e_AB_target,
+        alpha_A,
+        alpha_B,
+        direct_AB,
+        "direct",
+    )
+    direct_tensors_AA = _rackers_distance_tensors(
+        RA,
+        RA,
+        e_AA_source,
+        e_AA_target,
+        alpha_A,
+        alpha_A,
+        direct_AA,
+        "direct",
+    )
+    direct_tensors_BB = _rackers_distance_tensors(
+        RB,
+        RB,
+        e_BB_source,
+        e_BB_target,
+        alpha_B,
+        alpha_B,
+        direct_BB,
+        "direct",
+    )
+
+    mutual_AB = geometric_mean_edge_values(
+        thole_mutual_A,
+        thole_mutual_B,
+        e_AB_source,
+        e_AB_target,
+    )
+    mutual_AA = geometric_mean_edge_values(
+        thole_mutual_A,
+        thole_mutual_A,
+        e_AA_source,
+        e_AA_target,
+    )
+    mutual_BB = geometric_mean_edge_values(
+        thole_mutual_B,
+        thole_mutual_B,
+        e_BB_source,
+        e_BB_target,
+    )
+    mutual_tensors_AB = _rackers_distance_tensors(
+        RA,
+        RB,
+        e_AB_source,
+        e_AB_target,
+        alpha_A,
+        alpha_B,
+        mutual_AB,
+        "mutual",
+    )
+    mutual_tensors_AA = _rackers_distance_tensors(
+        RA,
+        RA,
+        e_AA_source,
+        e_AA_target,
+        alpha_A,
+        alpha_A,
+        mutual_AA,
+        "mutual",
+    )
+    mutual_tensors_BB = _rackers_distance_tensors(
+        RB,
+        RB,
+        e_BB_source,
+        e_BB_target,
+        alpha_B,
+        alpha_B,
+        mutual_BB,
+        "mutual",
+    )
+
+    mu_induced_0_A, mu_induced_0_B = (
+        _rackers_initial_permanent_fields(
+            alpha_A,
+            alpha_B,
+            qA,
+            muA,
+            qB,
+            muB,
+            e_AB_source,
+            e_AB_target,
+            e_AA_source,
+            e_AA_target,
+            e_BB_source,
+            e_BB_target,
+            direct_tensors_AB[3],
+            direct_tensors_AB[4],
+            direct_tensors_AA[3],
+            direct_tensors_AA[4],
+            direct_tensors_BB[3],
+            direct_tensors_BB[4],
+        )
+    )
+    mu_induced_A = mu_induced_0_A.clone()
+    mu_induced_B = mu_induced_0_B.clone()
+
+    for _ in range(max_iterations):
+        mu_induced_A_old = mu_induced_A.clone()
+        mu_induced_B_old = mu_induced_B.clone()
+        mu_induced_A_new, mu_induced_B_new = _rackers_scf_update(
+            alpha_A,
+            alpha_B,
+            e_AB_source,
+            e_AB_target,
+            e_AA_source,
+            e_AA_target,
+            e_BB_source,
+            e_BB_target,
+            mutual_tensors_AB[4],
+            mutual_tensors_AA[4],
+            mutual_tensors_BB[4],
+            mu_induced_A,
+            mu_induced_B,
+            mu_induced_0_A,
+            mu_induced_0_B,
+        )
+        mu_induced_A = (
+            (1 - omega) * mu_induced_A_old + omega * mu_induced_A_new
+        )
+        mu_induced_B = (
+            (1 - omega) * mu_induced_B_old + omega * mu_induced_B_new
+        )
+        delta_A = torch.norm(mu_induced_A - mu_induced_A_old)
+        delta_B = torch.norm(mu_induced_B - mu_induced_B_old)
+        if max(delta_A, delta_B) < convergence_threshold:
+            break
+
+    qA_source = qA.reshape(-1).index_select(0, e_AB_source)
+    qB_target = qB.reshape(-1).index_select(0, e_AB_target)
+    muA_source = muA.index_select(0, e_AB_source)
+    muB_target = muB.index_select(0, e_AB_target)
+    muA_induced_source = mu_induced_A.index_select(0, e_AB_source)
+    muB_induced_target = mu_induced_B.index_select(0, e_AB_target)
+    qu = torch.einsum(
+        "x,xy->xy", qA_source, muB_induced_target
+    ) - torch.einsum("x,xy->xy", qB_target, muA_induced_source)
+    E_qu = (
+        torch.einsum("xy,xy->x", direct_tensors_AB[3], qu)
+        * constants.h2kcalmol
+    )
+    E_uu = -1.0 * (
+        torch.einsum(
+            "xy,xz,xyz->x",
+            muA_induced_source,
+            muB_target,
+            direct_tensors_AB[4],
+        )
+        + torch.einsum(
+            "xy,xz,xyz->x",
+            muA_source,
+            muB_induced_target,
+            direct_tensors_AB[4],
+        )
+    ) * constants.h2kcalmol
+    E_ind = (E_qu + E_uu) / 2.0
+
+    if include_overlap:
+        sigma_A = valence_widths_A.index_select(0, e_AB_source)
+        sigma_B = valence_widths_B.index_select(0, e_AB_target)
+        B_ij = torch.sqrt(1.0 / (sigma_A * sigma_B))
+        dR_AB = direct_tensors_AB[0]
+        S_ij = (
+            (B_ij * dR_AB) ** 2 / 3.0 + B_ij * dR_AB + 1.0
+        ) * torch.exp(-B_ij * dR_AB)
+        K_A = ind_overlap_A.index_select(0, e_AB_source)
+        K_B = ind_overlap_B.index_select(0, e_AB_target)
+        E_ind -= K_A * S_ij * K_B * constants.h2kcalmol
+    return E_ind
+
+
 # @torch.compile
 def induced_dipole_induction(
     ZA,
