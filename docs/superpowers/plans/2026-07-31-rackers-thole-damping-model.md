@@ -255,7 +255,6 @@ Store all three full-domain fields in the returned `Data`. Update the collator d
 
 ```bash
 python -m pytest tests/test_rackers_thole_damping.py::test_target_collate_emits_full_edge_domain -v
-python -m pytest tests/test_pt_dataset.py -k "collate" -v
 ```
 
 Expected: the new contract test passes; existing collator tests remain unchanged.
@@ -1273,7 +1272,7 @@ python -m pytest tests/test_rackers_thole_damping.py -v
 python -m pytest tests/test_atomtype_props.py::test_elst_multipoles_MTP_torch_damping_AM_DimerParam -v
 python -m pytest tests/test_polarization.py -k "thole" -v
 python -m pytest tests/test_model_io.py -v
-python -m pytest tests/test_pt_dataset.py -k "collate" -v
+python -m pytest tests/test_rackers_thole_damping.py::test_target_collate_emits_full_edge_domain -v
 python -m pytest tests/test_freeze_unfreeze.py -v
 python train_models.py --help
 git status --short

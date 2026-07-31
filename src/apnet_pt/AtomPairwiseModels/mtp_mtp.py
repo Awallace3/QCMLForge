@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import time
@@ -144,12 +145,20 @@ class DimerProp(nn.Module):
                 - "induced_dipole": compute induction via induced dipoles (_indu_induced_dipole_forward)
                 - "induced_dipole_param": induction using parameterized polarizabilities (_indu_induced_dipole_param_forward)
                 - "elst_damping__induced_dipole": combined damped electrostatics and induction (_elst_damping_indu_induced_dipole_forward)
+                - "rackers_thole": combined Rackers electrostatics and pure
+                  induced-point-dipole induction (_rackers_thole_forward)
+                - "rackers_thole_overlap": combined Rackers electrostatics and
+                  overlap-augmented induction (_rackers_thole_overlap_forward)
                 - "ap3_elst_damping__induced_dipole": AP3-specific damped electrostatics plus induction (_ap3_elst_damping_indu_induced_dipole_forward)
                 - "ap3_atomMPNN": return AP3 atom multipole parameters only (_ap3_atomMPNN)
 
         Notes:
             - This method sets self.forward to the corresponding internal forward implementation.
-            - For modes that compute induction ("induced_dipole", "induced_dipole_param", and the combined induction modes), this method also clones the global polarizability table into self.polarizability_table.
+            - Induction modes clone the global polarizability table into
+              self.polarizability_table. Both Rackers modes scale
+              polarizabilities with Hirshfeld volume ratios; only
+              "rackers_thole_overlap" uses valence widths in its energy
+              expression.
             - Raises ValueError if dimer_eval is not one of the accepted mode strings.
         """
         if dimer_eval == "elst_damping":
@@ -1167,6 +1176,64 @@ def _rebuild_nested_atom_model(
     raise ValueError(f"Unsupported nested atom model type: {model_type!r}")
 
 
+def _validate_rackers_initialization(
+    param_start_mean,
+    param_start_std,
+    positivity_epsilon,
+) -> tuple[list[float], list[float], float]:
+    """Validate and normalize the Rackers positive-parameter initialization."""
+    if not isinstance(param_start_mean, (list, tuple)) or len(
+        param_start_mean
+    ) != 4:
+        raise ValueError("param_start_mean must contain exactly four values")
+    if not isinstance(param_start_std, (list, tuple)) or len(
+        param_start_std
+    ) != 4:
+        raise ValueError("param_start_std must contain exactly four values")
+
+    try:
+        epsilon = float(positivity_epsilon)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "positivity_epsilon must be finite and strictly greater than zero"
+        ) from exc
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError(
+            "positivity_epsilon must be finite and strictly greater than zero"
+        )
+
+    try:
+        positive_means = [float(value) for value in param_start_mean]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "param_start_mean values must be finite and strictly greater than "
+            "positivity_epsilon"
+        ) from exc
+    if any(
+        not math.isfinite(value) or value <= epsilon
+        for value in positive_means
+    ):
+        raise ValueError(
+            "param_start_mean values must be finite and strictly greater than "
+            "positivity_epsilon"
+        )
+
+    try:
+        raw_stds = [float(value) for value in param_start_std]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "param_start_std values must be finite and greater than or equal "
+            "to zero"
+        ) from exc
+    if any(not math.isfinite(value) or value < 0.0 for value in raw_stds):
+        raise ValueError(
+            "param_start_std values must be finite and greater than or equal "
+            "to zero"
+        )
+
+    return positive_means, raw_stds, epsilon
+
+
 def _inverse_softplus(value: float) -> float:
     tensor = torch.tensor(value, dtype=torch.float64)
     return torch.log(torch.expm1(tensor)).item()
@@ -1190,21 +1257,17 @@ class RackersTholeDampingNN(AtomTypeParamNN):
     ):
         if type(atom_model) is not AtomTypeParamNN:
             raise ValueError("atom_model must be an AtomTypeParamNN")
-        if not isinstance(param_start_mean, (list, tuple)) or len(
-            param_start_mean
-        ) != 4:
-            raise ValueError("param_start_mean must contain exactly four values")
-        if not isinstance(param_start_std, (list, tuple)) or len(
-            param_start_std
-        ) != 4:
-            raise ValueError("param_start_std must contain exactly four values")
-
-        positive_means = list(param_start_mean)
+        positive_means, raw_stds, positivity_epsilon = (
+            _validate_rackers_initialization(
+                param_start_mean,
+                param_start_std,
+                positivity_epsilon,
+            )
+        )
         raw_means = [
             _inverse_softplus(value - positivity_epsilon)
             for value in positive_means
         ]
-        raw_stds = list(param_start_std)
         super().__init__(
             atom_model=atom_model,
             n_message=n_message,
@@ -4840,14 +4903,13 @@ class _RackersTholeDampingModelBase(AM_DimerParam_Model):
         freeze_atom_model: bool = True,
         **dataset_kwargs,
     ):
-        if not isinstance(param_start_mean, (list, tuple)) or len(
-            param_start_mean
-        ) != 4:
-            raise ValueError("param_start_mean must contain exactly four values")
-        if not isinstance(param_start_std, (list, tuple)) or len(
-            param_start_std
-        ) != 4:
-            raise ValueError("param_start_std must contain exactly four values")
+        param_start_mean, param_start_std, positivity_epsilon = (
+            _validate_rackers_initialization(
+                param_start_mean,
+                param_start_std,
+                positivity_epsilon,
+            )
+        )
         super().__init__(
             dataset=dataset,
             atom_model=atom_model,

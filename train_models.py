@@ -294,6 +294,13 @@ def train_pairwise_model(
             raise ValueError("param_start_std must contain exactly four values")
         else:
             param_start_std = list(param_start_std)
+        param_start_mean, param_start_std, _ = (
+            AtomPairwiseModels.mtp_mtp._validate_rackers_initialization(
+                param_start_mean,
+                param_start_std,
+                AtomPairwiseModels.mtp_mtp.RACKERS_POSITIVITY_EPSILON,
+            )
+        )
     else:
         if param_start_mean is None:
             param_start_mean = 1.5

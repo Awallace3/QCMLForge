@@ -426,6 +426,24 @@ def test_rackers_compiled_checkpoint_round_trip(
             ].__setitem__("model_type", "UnsupportedNestedModel"),
             "Unsupported nested atom model type",
         ),
+        (
+            lambda checkpoint: checkpoint["config"][
+                "param_start_mean"
+            ].__setitem__(0, 0.0),
+            "param_start_mean values must be finite and strictly greater",
+        ),
+        (
+            lambda checkpoint: checkpoint["config"][
+                "param_start_std"
+            ].__setitem__(1, float("inf")),
+            "param_start_std values must be finite and greater than or equal",
+        ),
+        (
+            lambda checkpoint: checkpoint["config"].__setitem__(
+                "positivity_epsilon", float("nan")
+            ),
+            "positivity_epsilon must be finite and strictly greater than zero",
+        ),
     ],
 )
 def test_rackers_checkpoint_rejects_invalid_metadata(
@@ -711,6 +729,81 @@ def test_rackers_parameter_head_contract(
         parameter.requires_grad
         for parameter in unfrozen.atom_model.parameters()
     )
+
+
+@pytest.mark.parametrize(
+    "positivity_epsilon",
+    [0.0, -1e-8, float("nan"), float("inf"), -float("inf")],
+)
+def test_rackers_initialization_rejects_invalid_positivity_epsilon(
+    nested_hfvr_vw_model, positivity_epsilon
+):
+    with pytest.raises(
+        ValueError,
+        match="positivity_epsilon must be finite and strictly greater than zero",
+    ):
+        RackersTholeDampingNN(
+            atom_model=nested_hfvr_vw_model,
+            positivity_epsilon=positivity_epsilon,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_mean",
+    [0.0, -0.1, 1e-8, float("nan"), float("inf"), -float("inf")],
+)
+def test_rackers_initialization_rejects_invalid_means(
+    nested_hfvr_vw_model, invalid_mean
+):
+    means = list(RACKERS_INITIAL_VALUES)
+    means[1] = invalid_mean
+    with pytest.raises(
+        ValueError,
+        match="param_start_mean values must be finite and strictly greater",
+    ):
+        RackersTholeDampingNN(
+            atom_model=nested_hfvr_vw_model,
+            param_start_mean=means,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_std",
+    [-0.1, float("nan"), float("inf"), -float("inf")],
+)
+def test_rackers_initialization_rejects_invalid_raw_stds(
+    nested_hfvr_vw_model, invalid_std
+):
+    stds = list(RACKERS_INITIAL_STDS)
+    stds[2] = invalid_std
+    with pytest.raises(
+        ValueError,
+        match="param_start_std values must be finite and greater than or equal",
+    ):
+        RackersTholeDampingNN(
+            atom_model=nested_hfvr_vw_model,
+            param_start_std=stds,
+        )
+
+
+def test_rackers_initialization_accepts_valid_custom_exact_four_values(
+    nested_hfvr_vw_model,
+):
+    means = [0.25, 0.5, 0.75, 1.0]
+    stds = [0.0, 0.02, 0.0, 0.04]
+    epsilon = 1e-6
+    model = RackersTholeDampingNN(
+        atom_model=nested_hfvr_vw_model,
+        param_start_mean=means,
+        param_start_std=stds,
+        positivity_epsilon=epsilon,
+    )
+
+    config = model.get_config()
+    assert config["param_start_mean"] == means
+    assert config["param_start_std"] == stds
+    assert config["positivity_epsilon"] == epsilon
+    assert torch.isfinite(torch.tensor(model.raw_param_start_mean)).all()
 
 
 def test_rackers_parameter_head_freeze_and_validation(
@@ -1111,18 +1204,34 @@ def test_rackers_joint_forward_scatter_and_gradients(
     nested_hfvr_vw_model,
     synthetic_dimer_batch,
 ):
-    model = RackersTholeDampingNN(
-        atom_model=copy.deepcopy(nested_hfvr_vw_model),
-        n_message=1,
-        n_neuron=8,
-        n_embed=4,
-        freeze_atom_model=True,
-    )
+    # Keep initialization deterministic while checking the gradient seam below.
+    # A random ReLU readout may be entirely dead and legitimately have zero
+    # parameter gradients, so activity is asserted at each raw guess embedding
+    # output instead of requiring every random MLP parameter to be nonzero.
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        model = RackersTholeDampingNN(
+            atom_model=copy.deepcopy(nested_hfvr_vw_model),
+            n_message=1,
+            n_neuron=8,
+            n_embed=4,
+            freeze_atom_model=True,
+        )
     dimer = DimerProp(
         ATParam=model,
         dimer_eval=mode,
         freeze_atom_model=True,
     )
+    guess_outputs = [[] for _ in model.guess_layer]
+    hook_handles = []
+    for index, guess_layer in enumerate(model.guess_layer):
+        def capture_guess_output(module, inputs, output, head_index=index):
+            output.retain_grad()
+            guess_outputs[head_index].append(output)
+
+        hook_handles.append(
+            guess_layer.register_forward_hook(capture_guess_output)
+        )
 
     edge_energy, output_A, output_B = dimer(synthetic_dimer_batch)
     assert edge_energy.shape == (
@@ -1140,19 +1249,28 @@ def test_rackers_joint_forward_scatter_and_gradients(
     assert torch.isfinite(dimer_energy).all()
 
     dimer_energy.square().mean().backward()
-    for index, head in enumerate(model.param_readout_layers):
+    for handle in hook_handles:
+        handle.remove()
+    for index, outputs in enumerate(guess_outputs):
+        assert len(outputs) == 2
+        assert all(output.grad is not None for output in outputs)
+        assert all(torch.isfinite(output.grad).all() for output in outputs)
+        has_nonzero_gradient = any(
+            torch.count_nonzero(output.grad) > 0 for output in outputs
+        )
+        assert has_nonzero_gradient == (index in expected_active_heads)
+
+    for head in model.param_readout_layers:
         gradients = [
             parameter.grad
             for readout in head
             for parameter in readout.parameters()
         ]
-        has_nonzero_gradient = any(
-            gradient is not None
-            and torch.isfinite(gradient).all()
-            and torch.count_nonzero(gradient) > 0
+        assert all(
+            torch.isfinite(gradient).all()
             for gradient in gradients
+            if gradient is not None
         )
-        assert has_nonzero_gradient == (index in expected_active_heads)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     optimizer.step()
@@ -2120,6 +2238,87 @@ def test_rackers_dispatch_rejects_ambiguous_parameter_lists(field, value):
     kwargs[field] = value
     with pytest.raises(ValueError, match="exactly four"):
         train_models.train_pairwise_model(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field,index,value,match",
+    [
+        (
+            "param_start_mean",
+            0,
+            0.0,
+            "param_start_mean values must be finite and strictly greater",
+        ),
+        (
+            "param_start_mean",
+            1,
+            -0.1,
+            "param_start_mean values must be finite and strictly greater",
+        ),
+        (
+            "param_start_mean",
+            2,
+            float("nan"),
+            "param_start_mean values must be finite and strictly greater",
+        ),
+        (
+            "param_start_mean",
+            3,
+            float("inf"),
+            "param_start_mean values must be finite and strictly greater",
+        ),
+        (
+            "param_start_std",
+            0,
+            -0.1,
+            "param_start_std values must be finite and greater than or equal",
+        ),
+        (
+            "param_start_std",
+            1,
+            float("nan"),
+            "param_start_std values must be finite and greater than or equal",
+        ),
+        (
+            "param_start_std",
+            2,
+            float("inf"),
+            "param_start_std values must be finite and greater than or equal",
+        ),
+    ],
+)
+def test_rackers_dispatch_rejects_invalid_initialization_domains(
+    monkeypatch, field, index, value, match
+):
+    _patch_rackers_dispatch_fakes(monkeypatch)
+    kwargs = {
+        "apnet_model_type": "RackersTholeDampingModel",
+        "pre_trained_model_path": None,
+        "param_start_mean": list(RACKERS_INITIAL_VALUES),
+        "param_start_std": list(RACKERS_INITIAL_STDS),
+    }
+    kwargs[field][index] = value
+
+    with pytest.raises(ValueError, match=match):
+        train_models.train_pairwise_model(**kwargs)
+
+    assert _FakeAtomTypeParamModel.calls == []
+    assert _FakeRackersTholeDampingModel.calls == []
+
+
+def test_rackers_dispatch_accepts_zero_raw_std(monkeypatch, tmp_path):
+    _patch_rackers_dispatch_fakes(monkeypatch)
+    stds = [0.0, 0.01, 0.0, 0.02]
+    train_models.train_pairwise_model(
+        apnet_model_type="RackersTholeDampingModel",
+        model_out=str(tmp_path / "valid-zero-std.pt"),
+        pre_trained_model_path=None,
+        param_start_std=stds,
+    )
+
+    assert _FakeRackersTholeDampingModel.calls[0].kwargs[
+        "param_start_std"
+    ] == stds
 
 
 class _FakeLegacyPairwiseHarness:
