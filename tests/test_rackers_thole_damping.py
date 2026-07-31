@@ -17,11 +17,13 @@ from apnet_pt.AtomPairwiseModels.mtp_mtp import (
     RACKERS_THOLE_DIRECT_INDEX,
     RACKERS_THOLE_MUTUAL_INDEX,
     AtomTypeParamNN,
+    DimerProp,
     RackersTholeDampingNN,
     geometric_mean_edge_values,
 )
 from apnet_pt.pt_datasets.ap2_fused_ds import ap2_fused_collate_update
 from apnet_pt.torch_util import set_weights_to_value
+from apnet_pt.util import scatter_sum_compile
 
 
 def _make_collate_item(y_scale: float) -> Data:
@@ -75,6 +77,17 @@ def test_target_collate_emits_full_edge_domain():
     )
     assert batch.e_ABfull_source.numel() == batch.dimer_ind_full.numel()
     assert batch.dimer_ind_full.tolist() == [0, 0, 1, 1, 0, 0, 1, 1]
+
+
+@pytest.fixture
+def synthetic_dimer_batch() -> Data:
+    items = [_make_collate_item(1.0), _make_collate_item(2.0)]
+    for item in items:
+        item.RB = torch.tensor(
+            [[1.8, 0.3, 0.0], [2.7, -0.2, 0.0]],
+            dtype=torch.float32,
+        )
+    return ap2_fused_collate_update(items)
 
 
 @pytest.fixture
@@ -331,6 +344,272 @@ def _analytic_rackers_tensors(
         * lam_3[:, None, None]
     ) * inverse_distance.pow(5)[:, None, None]
     return displacement, T1, T2
+
+
+class _ControlledRackersAtomParam(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.atom_model = torch.nn.Identity()
+
+    def forward(self, batch):
+        atom_index = torch.arange(
+            batch.x.numel(), dtype=batch.R.dtype, device=batch.x.device
+        )
+        charge = 0.1 + 0.05 * atom_index
+        dipole = torch.stack(
+            (charge, charge + 0.1, charge + 0.2), dim=1
+        )
+        quadrupole = torch.zeros(
+            (batch.x.numel(), 3, 3),
+            dtype=batch.R.dtype,
+            device=batch.x.device,
+        )
+        hfvr_vw = torch.stack(
+            (-(0.8 + 0.1 * atom_index), 0.4 + 0.05 * atom_index),
+            dim=1,
+        )
+        parameters = torch.stack(
+            tuple(1.0 + column + 0.1 * atom_index for column in range(4)),
+            dim=1,
+        )
+        return charge, dipole, quadrupole, hfvr_vw, parameters
+
+
+@pytest.mark.parametrize(
+    "mode,include_overlap",
+    [("rackers_thole", False), ("rackers_thole_overlap", True)],
+)
+@pytest.mark.parametrize("elst_damping_type", ["CLIFF", "AMOEBA"])
+def test_rackers_dimer_forward_routes_columns_edges_and_preserves_charge(
+    mode,
+    include_overlap,
+    elst_damping_type,
+    synthetic_dimer_batch,
+    monkeypatch,
+):
+    electrostatic_calls = {"CLIFF": [], "AMOEBA": []}
+    induction_calls = []
+
+    def electrostatic_stub(damping_type):
+        def evaluate(**kwargs):
+            electrostatic_calls[damping_type].append(
+                {
+                    key: value.detach().clone()
+                    for key, value in kwargs.items()
+                    if isinstance(value, torch.Tensor)
+                }
+            )
+            kwargs["qA_0"].add_(100.0)
+            kwargs["qB_0"].sub_(100.0)
+            return torch.ones_like(kwargs["e_AB_source"], dtype=kwargs["RA"].dtype)
+
+        return evaluate
+
+    def induction_stub(**kwargs):
+        induction_calls.append(
+            {
+                key: value.detach().clone()
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in kwargs.items()
+            }
+        )
+        return torch.full_like(
+            kwargs["e_AB_source"], 2.0, dtype=kwargs["RA"].dtype
+        )
+
+    monkeypatch.setattr(
+        mtp_mtp, "mtp_elst_damping", electrostatic_stub("CLIFF")
+    )
+    monkeypatch.setattr(
+        mtp_mtp,
+        "mtp_elst_damping_AMOEBA",
+        electrostatic_stub("AMOEBA"),
+    )
+    monkeypatch.setattr(
+        mtp_mtp, "rackers_thole_induction", induction_stub
+    )
+
+    dimer = DimerProp(
+        ATParam=_ControlledRackersAtomParam(),
+        dimer_eval=mode,
+        elst_damping_type=elst_damping_type,
+    )
+    edge_energy, output_A, output_B = dimer(synthetic_dimer_batch)
+
+    other_damping_type = (
+        "AMOEBA" if elst_damping_type == "CLIFF" else "CLIFF"
+    )
+    assert len(electrostatic_calls[elst_damping_type]) == 1
+    assert electrostatic_calls[other_damping_type] == []
+    assert len(induction_calls) == 1
+    electrostatic = electrostatic_calls[elst_damping_type][0]
+    induction = induction_calls[0]
+
+    assert torch.equal(
+        electrostatic["Ka"], output_A[-1][:, RACKERS_ELST_INDEX]
+    )
+    assert torch.equal(
+        electrostatic["Kb"], output_B[-1][:, RACKERS_ELST_INDEX]
+    )
+    assert torch.equal(
+        induction["thole_direct_A"],
+        output_A[-1][:, RACKERS_THOLE_DIRECT_INDEX],
+    )
+    assert torch.equal(
+        induction["thole_direct_B"],
+        output_B[-1][:, RACKERS_THOLE_DIRECT_INDEX],
+    )
+    assert torch.equal(
+        induction["thole_mutual_A"],
+        output_A[-1][:, RACKERS_THOLE_MUTUAL_INDEX],
+    )
+    assert torch.equal(
+        induction["thole_mutual_B"],
+        output_B[-1][:, RACKERS_THOLE_MUTUAL_INDEX],
+    )
+    assert torch.equal(
+        induction["ind_overlap_A"],
+        output_A[-1][:, RACKERS_IND_OVERLAP_INDEX],
+    )
+    assert torch.equal(
+        induction["ind_overlap_B"],
+        output_B[-1][:, RACKERS_IND_OVERLAP_INDEX],
+    )
+    assert torch.equal(
+        induction["hirshfeld_volume_ratio_A"],
+        output_A[-2][:, 0].abs(),
+    )
+    assert torch.equal(
+        induction["hirshfeld_volume_ratio_B"],
+        output_B[-2][:, 0].abs(),
+    )
+    assert torch.equal(
+        induction["valence_widths_A"], output_A[-2][:, 1]
+    )
+    assert torch.equal(
+        induction["valence_widths_B"], output_B[-2][:, 1]
+    )
+    assert induction["include_overlap"] is include_overlap
+    assert torch.equal(induction["qA"], electrostatic["qA_0"])
+    assert torch.equal(induction["qB"], electrostatic["qB_0"])
+    assert torch.equal(induction["qA"], output_A[0])
+    assert torch.equal(induction["qB"], output_B[0])
+    for call in (electrostatic, induction):
+        assert torch.equal(
+            call["e_AB_source"], synthetic_dimer_batch.e_ABfull_source
+        )
+        assert torch.equal(
+            call["e_AB_target"], synthetic_dimer_batch.e_ABfull_target
+        )
+    assert edge_energy.shape == (
+        synthetic_dimer_batch.dimer_ind_full.numel(),
+        2,
+    )
+    assert torch.equal(edge_energy[:, 0], torch.ones_like(edge_energy[:, 0]))
+    assert torch.equal(
+        edge_energy[:, 1], torch.full_like(edge_energy[:, 1], 2.0)
+    )
+
+
+def test_rackers_dimer_forward_rejects_unknown_elst_damping(
+    synthetic_dimer_batch,
+):
+    dimer = DimerProp(
+        ATParam=_ControlledRackersAtomParam(),
+        dimer_eval="rackers_thole",
+        elst_damping_type="unsupported",
+    )
+    with pytest.raises(ValueError, match="Unsupported elst_damping_type"):
+        dimer(synthetic_dimer_batch)
+
+
+def test_rackers_dimer_forward_valence_width_energy_activity():
+    inputs = _rackers_kernel_inputs()
+    changed_width_inputs = {
+        **inputs,
+        "valence_widths_A": inputs["valence_widths_A"] * 1.7,
+        "valence_widths_B": inputs["valence_widths_B"] * 0.6,
+    }
+
+    pure_energy = mtp_mtp.rackers_thole_induction(
+        **inputs, include_overlap=False, max_iterations=4
+    )
+    changed_pure_energy = mtp_mtp.rackers_thole_induction(
+        **changed_width_inputs, include_overlap=False, max_iterations=4
+    )
+    overlap_energy = mtp_mtp.rackers_thole_induction(
+        **inputs, include_overlap=True, max_iterations=4
+    )
+    changed_overlap_energy = mtp_mtp.rackers_thole_induction(
+        **changed_width_inputs, include_overlap=True, max_iterations=4
+    )
+
+    assert torch.equal(pure_energy, changed_pure_energy)
+    assert not torch.allclose(overlap_energy, changed_overlap_energy)
+
+
+@pytest.mark.parametrize(
+    "mode,expected_active_heads",
+    [
+        ("rackers_thole", {0, 1, 2}),
+        ("rackers_thole_overlap", {0, 1, 2, 3}),
+    ],
+)
+def test_rackers_joint_forward_scatter_and_gradients(
+    mode,
+    expected_active_heads,
+    nested_hfvr_vw_model,
+    synthetic_dimer_batch,
+):
+    model = RackersTholeDampingNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model),
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        freeze_atom_model=True,
+    )
+    dimer = DimerProp(
+        ATParam=model,
+        dimer_eval=mode,
+        freeze_atom_model=True,
+    )
+
+    edge_energy, output_A, output_B = dimer(synthetic_dimer_batch)
+    assert edge_energy.shape == (
+        synthetic_dimer_batch.e_ABfull_source.numel(),
+        2,
+    )
+    assert torch.isfinite(edge_energy).all()
+
+    dimer_energy = scatter_sum_compile(
+        edge_energy,
+        synthetic_dimer_batch.dimer_ind_full,
+        dim_size=synthetic_dimer_batch.total_charge_A.size(0),
+    )
+    assert dimer_energy.shape == (2, 2)
+    assert torch.isfinite(dimer_energy).all()
+
+    dimer_energy.square().mean().backward()
+    for index, head in enumerate(model.param_readout_layers):
+        gradients = [
+            parameter.grad
+            for readout in head
+            for parameter in readout.parameters()
+        ]
+        has_nonzero_gradient = any(
+            gradient is not None
+            and torch.isfinite(gradient).all()
+            and torch.count_nonzero(gradient) > 0
+            for gradient in gradients
+        )
+        assert has_nonzero_gradient == (index in expected_active_heads)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer.step()
+    updated_parameters = model(synthetic_dimer_batch.batch_atomic_A)[-1]
+    assert torch.isfinite(updated_parameters).all()
+    assert torch.all(updated_parameters > 0)
 
 
 def test_rackers_kernel_routes_distinct_parameters_and_overlap(monkeypatch):

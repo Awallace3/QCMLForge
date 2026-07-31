@@ -167,6 +167,12 @@ class DimerProp(nn.Module):
         elif dimer_eval == "elst_damping__induced_dipole":
             self.forward = self._elst_damping_indu_induced_dipole_forward
             self.polarizability_table = constants.polarizability_table.clone()
+        elif dimer_eval == "rackers_thole":
+            self.forward = self._rackers_thole_forward
+            self.polarizability_table = constants.polarizability_table.clone()
+        elif dimer_eval == "rackers_thole_overlap":
+            self.forward = self._rackers_thole_overlap_forward
+            self.polarizability_table = constants.polarizability_table.clone()
         elif dimer_eval == "ap3_elst_damping__induced_dipole":
             self.forward = self._ap3_elst_damping_indu_induced_dipole_forward
             self.polarizability_table = constants.polarizability_table.clone()
@@ -179,6 +185,84 @@ class DimerProp(nn.Module):
             self.forward = self._ap3_atomMPNN
         else:
             raise ValueError(f"Unknown dimer_eval: {dimer_eval}")
+
+    def _rackers_thole_forward(self, batch):
+        return self._rackers_thole_common_forward(
+            batch, include_overlap=False
+        )
+
+    def _rackers_thole_overlap_forward(self, batch):
+        return self._rackers_thole_common_forward(
+            batch, include_overlap=True
+        )
+
+    def _rackers_thole_common_forward(self, batch, include_overlap):
+        output_A = self.AtomTypeParam(batch.batch_atomic_A)
+        output_B = self.AtomTypeParam(batch.batch_atomic_B)
+        parameters_A = output_A[-1]
+        parameters_B = output_B[-1]
+        hfvr_A = torch.abs(output_A[-2][:, 0])
+        hfvr_B = torch.abs(output_B[-2][:, 0])
+        valence_widths_A = output_A[-2][:, 1]
+        valence_widths_B = output_B[-2][:, 1]
+
+        if self.elst_damping_type == "AMOEBA":
+            damping_fn = mtp_elst_damping_AMOEBA
+        elif self.elst_damping_type == "CLIFF":
+            damping_fn = mtp_elst_damping
+        else:
+            raise ValueError(
+                "Unsupported elst_damping_type: "
+                f"{self.elst_damping_type}"
+            )
+
+        Elst = damping_fn(
+            ZA=batch.ZA,
+            RA=batch.RA,
+            qA_0=output_A[0].clone(),
+            muA=output_A[1],
+            quadA=output_A[2],
+            Ka=parameters_A[:, RACKERS_ELST_INDEX],
+            ZB=batch.ZB,
+            RB=batch.RB,
+            qB_0=output_B[0].clone(),
+            muB=output_B[1],
+            quadB=output_B[2],
+            Kb=parameters_B[:, RACKERS_ELST_INDEX],
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
+        )
+        Indu = rackers_thole_induction(
+            ZA=batch.ZA,
+            RA=batch.RA,
+            qA=output_A[0],
+            muA=output_A[1],
+            quadA=output_A[2],
+            ZB=batch.ZB,
+            RB=batch.RB,
+            qB=output_B[0],
+            muB=output_B[1],
+            quadB=output_B[2],
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
+            e_AA_source=batch.e_AA_source,
+            e_BB_source=batch.e_BB_source,
+            e_AA_target=batch.e_AA_target,
+            e_BB_target=batch.e_BB_target,
+            hirshfeld_volume_ratio_A=hfvr_A,
+            hirshfeld_volume_ratio_B=hfvr_B,
+            valence_widths_A=valence_widths_A,
+            valence_widths_B=valence_widths_B,
+            thole_direct_A=parameters_A[:, RACKERS_THOLE_DIRECT_INDEX],
+            thole_direct_B=parameters_B[:, RACKERS_THOLE_DIRECT_INDEX],
+            thole_mutual_A=parameters_A[:, RACKERS_THOLE_MUTUAL_INDEX],
+            thole_mutual_B=parameters_B[:, RACKERS_THOLE_MUTUAL_INDEX],
+            ind_overlap_A=parameters_A[:, RACKERS_IND_OVERLAP_INDEX],
+            ind_overlap_B=parameters_B[:, RACKERS_IND_OVERLAP_INDEX],
+            include_overlap=include_overlap,
+            polarizability_table=self.polarizability_table,
+        )
+        return torch.vstack((Elst, Indu)).T, output_A, output_B
 
     def get_config(self) -> dict:
         """
