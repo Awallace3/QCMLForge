@@ -1176,11 +1176,18 @@ def _rebuild_nested_atom_model(
     raise ValueError(f"Unsupported nested atom model type: {model_type!r}")
 
 
+def _inverse_softplus(value: float) -> float:
+    """Return inverse softplus without overflowing for large finite inputs."""
+    if value > 20.0:
+        return value + math.log1p(-math.exp(-value))
+    return math.log(math.expm1(value))
+
+
 def _validate_rackers_initialization(
     param_start_mean,
     param_start_std,
     positivity_epsilon,
-) -> tuple[list[float], list[float], float]:
+) -> tuple[list[float], list[float], float, list[float]]:
     """Validate and normalize the Rackers positive-parameter initialization."""
     if not isinstance(param_start_mean, (list, tuple)) or len(
         param_start_mean
@@ -1231,12 +1238,26 @@ def _validate_rackers_initialization(
             "to zero"
         )
 
-    return positive_means, raw_stds, epsilon
+    raw_means = [
+        _inverse_softplus(value - epsilon) for value in positive_means
+    ]
+    embedding_dtype = torch.get_default_dtype()
+    embedding_limit = torch.finfo(embedding_dtype).max
+    if any(
+        not math.isfinite(value) or abs(value) > embedding_limit
+        for value in raw_means
+    ):
+        raise ValueError(
+            "transformed param_start_mean values must be finite and "
+            f"representable in the {embedding_dtype} embedding dtype"
+        )
+    if any(value > embedding_limit for value in raw_stds):
+        raise ValueError(
+            "param_start_std values must be representable in the "
+            f"{embedding_dtype} embedding dtype"
+        )
 
-
-def _inverse_softplus(value: float) -> float:
-    tensor = torch.tensor(value, dtype=torch.float64)
-    return torch.log(torch.expm1(tensor)).item()
+    return positive_means, raw_stds, epsilon, raw_means
 
 
 class RackersTholeDampingNN(AtomTypeParamNN):
@@ -1257,17 +1278,13 @@ class RackersTholeDampingNN(AtomTypeParamNN):
     ):
         if type(atom_model) is not AtomTypeParamNN:
             raise ValueError("atom_model must be an AtomTypeParamNN")
-        positive_means, raw_stds, positivity_epsilon = (
+        positive_means, raw_stds, positivity_epsilon, raw_means = (
             _validate_rackers_initialization(
                 param_start_mean,
                 param_start_std,
                 positivity_epsilon,
             )
         )
-        raw_means = [
-            _inverse_softplus(value - positivity_epsilon)
-            for value in positive_means
-        ]
         super().__init__(
             atom_model=atom_model,
             n_message=n_message,
@@ -1278,6 +1295,13 @@ class RackersTholeDampingNN(AtomTypeParamNN):
             n_params=4,
             freeze_atom_model=freeze_atom_model,
         )
+        if any(
+            not torch.isfinite(layer.weight).all().item()
+            for layer in self.guess_layer
+        ):
+            raise ValueError(
+                "Rackers embedding initialization produced non-finite parameters"
+            )
         self.raw_param_start_mean = raw_means
         self.param_start_mean = positive_means
         self.param_start_std = raw_stds
@@ -4903,7 +4927,7 @@ class _RackersTholeDampingModelBase(AM_DimerParam_Model):
         freeze_atom_model: bool = True,
         **dataset_kwargs,
     ):
-        param_start_mean, param_start_std, positivity_epsilon = (
+        param_start_mean, param_start_std, positivity_epsilon, _ = (
             _validate_rackers_initialization(
                 param_start_mean,
                 param_start_std,

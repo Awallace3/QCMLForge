@@ -218,6 +218,52 @@ def test_rackers_harness_contract(
     "harness_type",
     [RackersTholeDampingModel, RackersTholeDampingOverlapModel],
 )
+def test_rackers_harness_large_initialization_boundaries(
+    harness_type, nested_hfvr_vw_model
+):
+    harness = harness_type(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model),
+        dataset=None,
+        ignore_database_null=True,
+        use_GPU=False,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        param_start_mean=[1000.0, 1.0, 1.0, 1.0],
+        param_start_std=[0.0, 0.0, 0.0, 0.0],
+    )
+    assert all(
+        torch.isfinite(layer.weight).all()
+        for layer in harness.model.guess_layer
+    )
+
+    invalid_values = (
+        (
+            "param_start_mean",
+            [1e39, 1.0, 1.0, 1.0],
+            "transformed param_start_mean values must be finite and representable",
+        ),
+        (
+            "param_start_std",
+            [1e39, 0.0, 0.0, 0.0],
+            "param_start_std values must be representable",
+        ),
+    )
+    for field, values, match in invalid_values:
+        with pytest.raises(ValueError, match=match):
+            harness_type(
+                atom_model=copy.deepcopy(nested_hfvr_vw_model),
+                dataset=None,
+                ignore_database_null=True,
+                use_GPU=False,
+                **{field: values},
+            )
+
+
+@pytest.mark.parametrize(
+    "harness_type",
+    [RackersTholeDampingModel, RackersTholeDampingOverlapModel],
+)
 @pytest.mark.parametrize("freeze_atom_model", [True, False])
 def test_rackers_harness_freeze_round_trip(
     tmp_path,
@@ -443,6 +489,18 @@ def test_rackers_compiled_checkpoint_round_trip(
                 "positivity_epsilon", float("nan")
             ),
             "positivity_epsilon must be finite and strictly greater than zero",
+        ),
+        (
+            lambda checkpoint: checkpoint["config"][
+                "param_start_mean"
+            ].__setitem__(0, 1e39),
+            "transformed param_start_mean values must be finite and representable",
+        ),
+        (
+            lambda checkpoint: checkpoint["config"][
+                "param_start_std"
+            ].__setitem__(0, 1e39),
+            "param_start_std values must be representable",
         ),
     ],
 )
@@ -804,6 +862,71 @@ def test_rackers_initialization_accepts_valid_custom_exact_four_values(
     assert config["param_start_std"] == stds
     assert config["positivity_epsilon"] == epsilon
     assert torch.isfinite(torch.tensor(model.raw_param_start_mean)).all()
+
+
+def test_rackers_initialization_accepts_large_representable_mean(
+    atomic_batch, nested_hfvr_vw_model
+):
+    model = RackersTholeDampingNN(
+        atom_model=nested_hfvr_vw_model,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        param_start_mean=[1000.0, 1.0, 1.0, 1.0],
+        param_start_std=[0.0, 0.0, 0.0, 0.0],
+    )
+
+    parameters = model(atomic_batch)[-1]
+    assert torch.isfinite(torch.tensor(model.raw_param_start_mean)).all()
+    assert torch.isfinite(parameters).all()
+    assert torch.all(parameters > 0)
+
+
+@pytest.mark.parametrize(
+    "field,values,match",
+    [
+        (
+            "param_start_mean",
+            [1e39, 1.0, 1.0, 1.0],
+            "transformed param_start_mean values must be finite and representable",
+        ),
+        (
+            "param_start_std",
+            [1e39, 0.0, 0.0, 0.0],
+            "param_start_std values must be representable",
+        ),
+    ],
+)
+def test_rackers_initialization_rejects_embedding_dtype_overflow(
+    nested_hfvr_vw_model, field, values, match
+):
+    kwargs = {
+        "param_start_mean": list(RACKERS_INITIAL_VALUES),
+        "param_start_std": list(RACKERS_INITIAL_STDS),
+    }
+    kwargs[field] = values
+    with pytest.raises(ValueError, match=match):
+        RackersTholeDampingNN(
+            atom_model=nested_hfvr_vw_model,
+            **kwargs,
+        )
+
+
+def test_rackers_initialization_rejects_generated_non_finite_embedding(
+    monkeypatch, nested_hfvr_vw_model
+):
+    def non_finite_noise(tensor):
+        return torch.full_like(tensor, float("inf"))
+
+    monkeypatch.setattr(torch, "randn_like", non_finite_noise)
+    with pytest.raises(
+        ValueError,
+        match="Rackers embedding initialization produced non-finite parameters",
+    ):
+        RackersTholeDampingNN(
+            atom_model=nested_hfvr_vw_model,
+            param_start_std=[0.0, 0.0, 0.0, 0.0],
+        )
 
 
 def test_rackers_parameter_head_freeze_and_validation(
@@ -2304,6 +2427,58 @@ def test_rackers_dispatch_rejects_invalid_initialization_domains(
 
     assert _FakeAtomTypeParamModel.calls == []
     assert _FakeRackersTholeDampingModel.calls == []
+
+
+@pytest.mark.parametrize(
+    "field,values,match",
+    [
+        (
+            "param_start_mean",
+            [1e39, 1.0, 1.0, 1.0],
+            "transformed param_start_mean values must be finite and representable",
+        ),
+        (
+            "param_start_std",
+            [1e39, 0.0, 0.0, 0.0],
+            "param_start_std values must be representable",
+        ),
+    ],
+)
+def test_rackers_dispatch_rejects_embedding_dtype_overflow(
+    monkeypatch, field, values, match
+):
+    _patch_rackers_dispatch_fakes(monkeypatch)
+    kwargs = {
+        "apnet_model_type": "RackersTholeDampingModel",
+        "pre_trained_model_path": None,
+        "param_start_mean": list(RACKERS_INITIAL_VALUES),
+        "param_start_std": list(RACKERS_INITIAL_STDS),
+    }
+    kwargs[field] = values
+
+    with pytest.raises(ValueError, match=match):
+        train_models.train_pairwise_model(**kwargs)
+
+    assert _FakeAtomTypeParamModel.calls == []
+    assert _FakeRackersTholeDampingModel.calls == []
+
+
+def test_rackers_dispatch_accepts_large_representable_mean(
+    monkeypatch, tmp_path
+):
+    _patch_rackers_dispatch_fakes(monkeypatch)
+    means = [1000.0, 1.0, 1.0, 1.0]
+    train_models.train_pairwise_model(
+        apnet_model_type="RackersTholeDampingModel",
+        model_out=str(tmp_path / "valid-large-mean.pt"),
+        pre_trained_model_path=None,
+        param_start_mean=means,
+        param_start_std=[0.0, 0.0, 0.0, 0.0],
+    )
+
+    assert _FakeRackersTholeDampingModel.calls[0].kwargs[
+        "param_start_mean"
+    ] == means
 
 
 def test_rackers_dispatch_accepts_zero_raw_std(monkeypatch, tmp_path):
