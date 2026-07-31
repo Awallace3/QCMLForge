@@ -1,10 +1,12 @@
 import copy
 
+import numpy as np
 import pytest
+import qcelemental as qcel
 import torch
 from torch_geometric.data import Data
 
-from apnet_pt import constants
+from apnet_pt import constants, model_io
 from apnet_pt.AtomModels.ap2_atom_model import AtomMPNN
 from apnet_pt.AtomPairwiseModels import mtp_mtp
 from apnet_pt.AtomPairwiseModels.mtp_mtp import (
@@ -16,9 +18,12 @@ from apnet_pt.AtomPairwiseModels.mtp_mtp import (
     RACKERS_POSITIVITY_EPSILON,
     RACKERS_THOLE_DIRECT_INDEX,
     RACKERS_THOLE_MUTUAL_INDEX,
+    AM_DimerParam_Model,
     AtomTypeParamNN,
     DimerProp,
+    RackersTholeDampingModel,
     RackersTholeDampingNN,
+    RackersTholeDampingOverlapModel,
     geometric_mean_edge_values,
 )
 from apnet_pt.pt_datasets.ap2_fused_ds import ap2_fused_collate_update
@@ -113,6 +118,35 @@ def atomic_batch() -> Data:
 
 
 @pytest.fixture
+def synthetic_qcel_dimers():
+    first = qcel.models.Molecule.from_data("""
+0 1
+O  0.000000  0.000000  0.000000
+H  0.758602  0.000000  0.504284
+H -0.260455  0.000000 -0.872893
+--
+0 1
+O  3.000000  0.500000  0.000000
+H  3.758602  0.500000  0.504284
+H  2.739545  0.500000 -0.872893
+units angstrom
+""")
+    second = qcel.models.Molecule.from_data("""
+0 1
+O  0.000000  0.000000  0.000000
+H  0.758602  0.000000  0.504284
+H -0.260455  0.000000 -0.872893
+--
+0 1
+O  3.500000 -0.250000  0.100000
+H  4.258602 -0.250000  0.604284
+H  3.239545 -0.250000 -0.772893
+units angstrom
+""")
+    return [first, second]
+
+
+@pytest.fixture
 def nested_hfvr_vw_model() -> AtomTypeParamNN:
     atom_model = AtomMPNN(
         n_message=1,
@@ -133,6 +167,289 @@ def nested_hfvr_vw_model() -> AtomTypeParamNN:
     )
     set_weights_to_value(nested, 0.01)
     return nested
+
+
+@pytest.mark.parametrize(
+    "harness_type,expected_mode",
+    [
+        (RackersTholeDampingModel, "rackers_thole"),
+        (
+            RackersTholeDampingOverlapModel,
+            "rackers_thole_overlap",
+        ),
+    ],
+)
+def test_rackers_harness_contract(
+    harness_type, expected_mode, nested_hfvr_vw_model
+):
+    harness = harness_type(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model),
+        dataset=None,
+        ignore_database_null=True,
+        use_GPU=False,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+
+    assert type(harness.model) is RackersTholeDampingNN
+    assert harness.dimer_eval_type == expected_mode
+    assert harness.n_params == 4
+    assert harness.model.n_params == 4
+    assert all(
+        not parameter.requires_grad
+        for parameter in harness.model.atom_model.parameters()
+    )
+
+    for keyword in ("param_start_mean", "param_start_std"):
+        with pytest.raises(ValueError, match="exactly four"):
+            harness_type(
+                atom_model=copy.deepcopy(nested_hfvr_vw_model),
+                dataset=None,
+                ignore_database_null=True,
+                use_GPU=False,
+                **{keyword: [0.1, 0.2, 0.3]},
+            )
+
+
+@pytest.mark.parametrize(
+    "harness_type,expected_mode",
+    [
+        (RackersTholeDampingModel, "rackers_thole"),
+        (
+            RackersTholeDampingOverlapModel,
+            "rackers_thole_overlap",
+        ),
+    ],
+)
+def test_rackers_checkpoint_round_trip(
+    tmp_path,
+    harness_type,
+    expected_mode,
+    nested_hfvr_vw_model,
+    synthetic_qcel_dimers,
+):
+    harness = harness_type(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model),
+        dataset=None,
+        ignore_database_null=True,
+        use_GPU=False,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    before = harness.predict_qcel_mols_dimer(
+        synthetic_qcel_dimers, batch_size=2
+    )
+
+    checkpoint_path = tmp_path / f"{expected_mode}.pt"
+    harness.save_model(checkpoint_path)
+
+    checkpoint = model_io.load_checkpoint(checkpoint_path)
+    assert checkpoint["model_type"] == "RackersTholeDampingNN"
+    assert checkpoint["config"]["parameter_names"] == list(
+        RACKERS_PARAMETER_NAMES
+    )
+    assert checkpoint["config"]["dimer_eval"] == expected_mode
+
+    loaded = harness_type(
+        pre_trained_model_path=checkpoint_path,
+        atom_model=None,
+        dataset=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    assert (loaded.model.n_message, loaded.model.n_neuron, loaded.model.n_embed) == (
+        1,
+        8,
+        4,
+    )
+    after = loaded.predict_qcel_mols_dimer(
+        synthetic_qcel_dimers, batch_size=2
+    )
+    assert np.allclose(before, after, atol=1e-6)
+
+    second_path = tmp_path / f"{expected_mode}-second.pt"
+    loaded.save_model(second_path)
+    reloaded = harness_type(
+        pre_trained_model_path=second_path,
+        atom_model=None,
+        dataset=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    assert reloaded.model.get_config() == loaded.model.get_config()
+    second_predictions = reloaded.predict_qcel_mols_dimer(
+        synthetic_qcel_dimers, batch_size=2
+    )
+    assert np.allclose(after, second_predictions, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "tamper,match",
+    [
+        (
+            lambda checkpoint: checkpoint["config"].__setitem__(
+                "parameter_names", list(reversed(RACKERS_PARAMETER_NAMES))
+            ),
+            "parameter_names",
+        ),
+        (
+            lambda checkpoint: checkpoint["config"].pop("parameter_names"),
+            "parameter_names",
+        ),
+        (
+            lambda checkpoint: checkpoint.__setitem__(
+                "model_type", "AtomTypeParamNN"
+            ),
+            "model_type",
+        ),
+        (
+            lambda checkpoint: checkpoint["config"].pop(
+                "nested_atom_model"
+            ),
+            "nested_atom_model",
+        ),
+        (
+            lambda checkpoint: checkpoint["config"][
+                "nested_atom_model"
+            ].__setitem__("model_type", "UnsupportedNestedModel"),
+            "Unsupported nested atom model type",
+        ),
+    ],
+)
+def test_rackers_checkpoint_rejects_invalid_metadata(
+    tmp_path, nested_hfvr_vw_model, tamper, match
+):
+    harness = RackersTholeDampingModel(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model),
+        dataset=None,
+        ignore_database_null=True,
+        use_GPU=False,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    checkpoint = harness._create_checkpoint()
+    tamper(checkpoint)
+    path = tmp_path / "tampered.pt"
+    model_io.save_checkpoint(checkpoint, path)
+
+    with pytest.raises(ValueError, match=match):
+        RackersTholeDampingModel(
+            pre_trained_model_path=path,
+            atom_model=None,
+            dataset=None,
+            ignore_database_null=True,
+            use_GPU=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "source_type,destination_type",
+    [
+        (RackersTholeDampingModel, RackersTholeDampingOverlapModel),
+        (RackersTholeDampingOverlapModel, RackersTholeDampingModel),
+    ],
+)
+def test_rackers_checkpoint_rejects_wrong_harness_mode(
+    tmp_path, nested_hfvr_vw_model, source_type, destination_type
+):
+    harness = source_type(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model),
+        dataset=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    path = tmp_path / "wrong-mode.pt"
+    harness.save_model(path)
+
+    with pytest.raises(ValueError, match="dimer_eval"):
+        destination_type(
+            pre_trained_model_path=path,
+            atom_model=None,
+            dataset=None,
+            ignore_database_null=True,
+            use_GPU=False,
+        )
+
+
+class _FullEdgeTrainModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, batch):
+        output = self.scale * torch.ones(
+            (batch.dimer_ind_full.numel(), 2),
+            dtype=self.scale.dtype,
+            device=self.scale.device,
+        )
+        return (output,)
+
+
+@pytest.mark.parametrize(
+    "mode", ["rackers_thole", "rackers_thole_overlap"]
+)
+def test_rackers_training_uses_full_edge_aggregation(
+    mode, synthetic_dimer_batch
+):
+    synthetic_dimer_batch.dimer_ind = torch.zeros(1, dtype=torch.long)
+    synthetic_dimer_batch.y = torch.zeros((2, 4), dtype=torch.float32)
+    harness = AM_DimerParam_Model.__new__(AM_DimerParam_Model)
+    harness.model = _FullEdgeTrainModel()
+    harness.dimer_model = harness.model
+    harness.dimer_eval_type = mode
+    optimizer = torch.optim.SGD(harness.model.parameters(), lr=0.01)
+
+    train_result = harness._AM_DimerParam_Model__train_batches_single_proc(
+        [synthetic_dimer_batch],
+        loss_fn=torch.nn.MSELoss(),
+        optimizer=optimizer,
+        rank_device=torch.device("cpu"),
+        scheduler=None,
+        y_ind=torch.tensor([0, 2]),
+    )
+    eval_result = harness._AM_DimerParam_Model__evaluate_batches_single_proc(
+        [synthetic_dimer_batch],
+        loss_fn=torch.nn.MSELoss(),
+        rank_device=torch.device("cpu"),
+        y_ind=torch.tensor([0, 2]),
+    )
+
+    assert np.isfinite(train_result[0])
+    assert torch.isfinite(train_result[1]).all()
+    assert np.isfinite(eval_result[0])
+    assert torch.isfinite(eval_result[1]).all()
+
+
+@pytest.mark.parametrize(
+    "mode,expected_index",
+    [
+        ("rackers_thole", "dimer_ind_full"),
+        ("rackers_thole_overlap", "dimer_ind_full"),
+        ("elst_damping", "dimer_ind"),
+    ],
+)
+def test_dimer_aggregation_selector_preserves_legacy_short_edges(
+    mode, expected_index, synthetic_dimer_batch
+):
+    harness = AM_DimerParam_Model.__new__(AM_DimerParam_Model)
+    harness.dimer_eval_type = mode
+    selected = harness._dimer_index_for_output(synthetic_dimer_batch)
+
+    assert selected is getattr(synthetic_dimer_batch, expected_index)
+    if mode.startswith("rackers"):
+        dimer = DimerProp(
+            ATParam=_ControlledRackersAtomParam(), dimer_eval=mode
+        )
+        edge_output = dimer(synthetic_dimer_batch)[0]
+        assert synthetic_dimer_batch.e_ABlr_source.numel() > 0
+    else:
+        edge_output = torch.empty(
+            synthetic_dimer_batch.e_ABsr_source.numel(), 1
+        )
+    assert edge_output.size(0) == selected.numel()
 
 
 def test_rackers_parameter_head_contract(

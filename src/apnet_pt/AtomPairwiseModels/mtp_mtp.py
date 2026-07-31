@@ -1137,6 +1137,36 @@ def _serialize_nested_atom_model(model: nn.Module) -> dict:
     )
 
 
+def _rebuild_nested_atom_model(
+    metadata: dict,
+    freeze_atom_model: bool,
+) -> nn.Module:
+    if not isinstance(metadata, dict):
+        raise ValueError("nested_atom_model metadata must be a dictionary")
+    model_type = metadata.get("model_type")
+    config = metadata.get("config")
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"Nested {model_type!r} metadata must contain a config dictionary"
+        )
+    if model_type == "AtomMPNN":
+        return AtomMPNN(**config)
+    if model_type == "AtomTypeParamNN":
+        if "atom_model" not in metadata:
+            raise ValueError(
+                "Nested AtomTypeParamNN metadata must contain atom_model"
+            )
+        atom_model = _rebuild_nested_atom_model(
+            metadata["atom_model"], freeze_atom_model
+        )
+        return AtomTypeParamNN(
+            atom_model=atom_model,
+            freeze_atom_model=freeze_atom_model,
+            **config,
+        )
+    raise ValueError(f"Unsupported nested atom model type: {model_type!r}")
+
+
 def _inverse_softplus(value: float) -> float:
     tensor = torch.tensor(value, dtype=torch.float64)
     return torch.log(torch.expm1(tensor)).item()
@@ -3471,6 +3501,7 @@ class AM_DimerParam_Model:
         dimer_eval_type="elst_damping",
         elst_damping_type="CLIFF",
         freeze_atom_model=True,
+        positivity_epsilon=RACKERS_POSITIVITY_EPSILON,
     ):
         """
         Construct an AtomTypeParamModel wrapper that builds or loads an atom-level model, a parameter-predicting model, and optional dimer evaluators and dataset.
@@ -3527,7 +3558,39 @@ class AM_DimerParam_Model:
             device = torch.device("cpu")
             print("running on the CPU")
         self.ds_spec_type = ds_spec_type
-        if atom_model_type == "AtomMPNN":
+        rackers_checkpoint = None
+        rackers_config = None
+        if pre_trained_model_path and model_type == "RackersTholeDampingNN":
+            rackers_checkpoint = model_io.load_checkpoint(
+                pre_trained_model_path, map_location=device
+            )
+            model_io.validate_checkpoint(
+                rackers_checkpoint,
+                expected_type="RackersTholeDampingNN",
+            )
+            rackers_config = rackers_checkpoint["config"]
+            if rackers_config.get("parameter_names") != list(
+                RACKERS_PARAMETER_NAMES
+            ):
+                raise ValueError(
+                    "Rackers checkpoint parameter_names must exactly match "
+                    f"{list(RACKERS_PARAMETER_NAMES)}"
+                )
+            if rackers_config.get("dimer_eval") != dimer_eval_type:
+                raise ValueError(
+                    "Rackers checkpoint dimer_eval mismatch: expected "
+                    f"{dimer_eval_type}, got "
+                    f"{rackers_config.get('dimer_eval')!r}"
+                )
+            if "nested_atom_model" not in rackers_config:
+                raise ValueError(
+                    "Rackers checkpoint missing nested_atom_model metadata"
+                )
+            self.atom_model = _rebuild_nested_atom_model(
+                rackers_config["nested_atom_model"], freeze_atom_model
+            )
+            am_type = AtomTypeParamNN
+        elif atom_model_type == "AtomMPNN":
             self.atom_model = AtomMPNN()
             am_type = AtomMPNN
         elif atom_model_type == "AtomHirshfeldMPNN":
@@ -3544,7 +3607,9 @@ class AM_DimerParam_Model:
         else:
             raise ValueError(f"Unknown atom_model_type: {atom_model_type}")
 
-        if atom_model_pre_trained_path:
+        if rackers_checkpoint is not None:
+            pass
+        elif atom_model_pre_trained_path:
             print(
                 f"Loading pre-trained AtomMPNN model from {atom_model_pre_trained_path}"
             )
@@ -3572,18 +3637,6 @@ class AM_DimerParam_Model:
                     n_params=am_config["n_params"],
                     freeze_atom_model=freeze_atom_model,
                 )
-            # elif atom_model_type == "AtomTypeParamMPNN":
-            #     self.atom_model = am_type(
-            #         n_message=checkpoint["config"]["n_message"],
-            #         n_rbf=checkpoint["config"]["n_rbf"],
-            #         n_neuron=checkpoint["config"]["n_neuron"],
-            #         n_embed=checkpoint["config"]["n_embed"],
-            #         r_cut=checkpoint["config"]["r_cut"],
-            #         param_start_mean=checkpoint["config"]["param_start_mean"],
-            #         param_start_std=checkpoint["config"]["param_start_std"],
-            #         n_params=checkpoint["config"]["n_params"],
-            #     )
-            # model_state_dict = checkpoint["model_state_dict"]
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.atom_model.load_state_dict(model_state_dict)
         elif atom_model:
@@ -3600,8 +3653,12 @@ class AM_DimerParam_Model:
             print(
                 f"Loading pre-trained MTP-MTP {model_type} from {pre_trained_model_path}"
             )
-            checkpoint = model_io.load_checkpoint(pre_trained_model_path)
-            config = model_io.load_config_from_checkpoint(checkpoint)
+            checkpoint = rackers_checkpoint or model_io.load_checkpoint(
+                pre_trained_model_path
+            )
+            config = rackers_config or model_io.load_config_from_checkpoint(
+                checkpoint
+            )
             if config is None:
                 config = checkpoint.get("config", {})
             # Load elst_damping_type from checkpoint if available, otherwise use default
@@ -3615,6 +3672,17 @@ class AM_DimerParam_Model:
                     param_start_mean=config["param_start_mean"],
                     param_start_std=config["param_start_std"],
                     n_params=config.get("n_params", 1),
+                    freeze_atom_model=freeze_atom_model,
+                )
+            elif model_type == "RackersTholeDampingNN":
+                self.model = RackersTholeDampingNN(
+                    atom_model=self.atom_model,
+                    n_message=config["n_message"],
+                    n_neuron=config["n_neuron"],
+                    n_embed=config["n_embed"],
+                    param_start_mean=config["param_start_mean"],
+                    param_start_std=config["param_start_std"],
+                    positivity_epsilon=config["positivity_epsilon"],
                     freeze_atom_model=freeze_atom_model,
                 )
             # elif model_type == "AtomTypeParamMPNN":
@@ -3643,6 +3711,17 @@ class AM_DimerParam_Model:
                     param_start_mean=param_start_mean,
                     param_start_std=param_start_std,
                     n_params=n_params,
+                    freeze_atom_model=freeze_atom_model,
+                )
+            elif model_type == "RackersTholeDampingNN":
+                self.model = RackersTholeDampingNN(
+                    atom_model=self.atom_model,
+                    n_message=n_message,
+                    n_neuron=n_neuron,
+                    n_embed=n_embed,
+                    param_start_mean=param_start_mean,
+                    param_start_std=param_start_std,
+                    positivity_epsilon=positivity_epsilon,
                     freeze_atom_model=freeze_atom_model,
                 )
             # elif model_type == "AtomTypeParamMPNN":
@@ -3678,35 +3757,43 @@ class AM_DimerParam_Model:
         else:
             self.dimer_model_elst = None
 
-        if n_message != self.model.n_message:
-            print(f"Changing n_mesage from {self.model.n_message} to {n_message}")
-            self.model.n_message = n_message
-        if n_neuron != self.model.n_neuron:
-            print(f"Changing n_neuron from {self.model.n_neuron} to {n_neuron}")
-            self.model.n_neuron = n_neuron
-        if n_embed != self.model.n_embed:
-            print(f"Changing n_embed from {self.model.n_embed} to {n_embed}")
-            self.model.n_embed = n_embed
-        # Handle param_start_mean/std as lists
-        if isinstance(param_start_mean, (list, tuple)):
-            if param_start_mean != self.model.param_start_mean:
+        if not pre_trained_model_path:
+            if n_message != self.model.n_message:
+                print(
+                    f"Changing n_mesage from {self.model.n_message} to {n_message}"
+                )
+                self.model.n_message = n_message
+            if n_neuron != self.model.n_neuron:
+                print(
+                    f"Changing n_neuron from {self.model.n_neuron} to {n_neuron}"
+                )
+                self.model.n_neuron = n_neuron
+            if n_embed != self.model.n_embed:
+                print(f"Changing n_embed from {self.model.n_embed} to {n_embed}")
+                self.model.n_embed = n_embed
+            if isinstance(param_start_mean, (list, tuple)):
+                if param_start_mean != self.model.param_start_mean:
+                    print(f"Changing param_start_mean to {param_start_mean}")
+                    self.model.param_start_mean = param_start_mean
+            elif not all(
+                p == param_start_mean for p in self.model.param_start_mean
+            ):
                 print(f"Changing param_start_mean to {param_start_mean}")
-                self.model.param_start_mean = param_start_mean
-        else:
-            # Scalar case, check if different from all current values
-            if not all(p == param_start_mean for p in self.model.param_start_mean):
-                print(f"Changing param_start_mean to {param_start_mean}")
-                self.model.param_start_mean = [param_start_mean] * self.model.n_params
+                self.model.param_start_mean = [
+                    param_start_mean
+                ] * self.model.n_params
 
-        if isinstance(param_start_std, (list, tuple)):
-            if param_start_std != self.model.param_start_std:
+            if isinstance(param_start_std, (list, tuple)):
+                if param_start_std != self.model.param_start_std:
+                    print(f"Changing param_start_std to {param_start_std}")
+                    self.model.param_start_std = param_start_std
+            elif not all(
+                p == param_start_std for p in self.model.param_start_std
+            ):
                 print(f"Changing param_start_std to {param_start_std}")
-                self.model.param_start_std = param_start_std
-        else:
-            # Scalar case
-            if not all(p == param_start_std for p in self.model.param_start_std):
-                print(f"Changing param_start_std to {param_start_std}")
-                self.model.param_start_std = [param_start_std] * self.model.n_params
+                self.model.param_start_std = [
+                    param_start_std
+                ] * self.model.n_params
 
         self.device = device
         self.atom_model.to(device)
@@ -3908,6 +3995,8 @@ class AM_DimerParam_Model:
             }
         model_config["elst_damping_type"] = self.elst_damping_type
         model_config["dimer_eval_type"] = self.dimer_eval_type
+        if type(model) is RackersTholeDampingNN:
+            model_config["dimer_eval"] = self.dimer_eval_type
 
         submodels = None
         if embed_atom_model and atom_model is not None:
@@ -4100,6 +4189,14 @@ class AM_DimerParam_Model:
             pair_energies_batch[i][atomA, atomB] += e_elst_lr
         return pair_energies_batch
 
+    def _dimer_index_for_output(self, batch):
+        if self.dimer_eval_type in {
+            "rackers_thole",
+            "rackers_thole_overlap",
+        }:
+            return batch.dimer_ind_full
+        return batch.dimer_ind
+
     @torch.inference_mode()
     def predict_qcel_mols_dimer(
         self,
@@ -4156,10 +4253,9 @@ class AM_DimerParam_Model:
             )
             dimer_batch.to(device=self.device)
             preds = self.dimer_model(dimer_batch)[0]
-            # Use dimer_ind_full for scatter_sum to include both sr and lr edges
             preds = scatter_sum_compile(
                 preds,
-                dimer_batch.dimer_ind_full,
+                self._dimer_index_for_output(dimer_batch),
                 dim_size=torch.tensor(
                     dimer_batch.total_charge_A.size(0), dtype=torch.long
                 ),
@@ -4308,7 +4404,7 @@ units angstrom
             # print(f"{preds = }")
             preds = scatter_sum_compile(
                 preds,
-                batch.dimer_ind,
+                self._dimer_index_for_output(batch),
                 dim_size=batch.total_charge_A.size(0),
             )
             comp_errors = preds - ref
@@ -4342,7 +4438,7 @@ units angstrom
                 ref = batch.y[:, y_ind]
                 preds = scatter_sum_compile(
                     preds,
-                    batch.dimer_ind,
+                    self._dimer_index_for_output(batch),
                     dim_size=torch.tensor(
                         batch.total_charge_A.size(0), dtype=torch.long
                     ),
@@ -4479,6 +4575,8 @@ units angstrom
         elif self.dimer_eval_type in [
             "elst_damping__induced_dipole",
             "ap3_elst_damping__induced_dipole",
+            "rackers_thole",
+            "rackers_thole_overlap",
         ]:
             assert isinstance(self.atom_model, AtomTypeParamNN), (
                 f"{self.dimer_eval_type} is only compatible with "
@@ -4696,6 +4794,58 @@ units angstrom
                 skip_compile=skip_compile,
             )
         return
+
+
+class _RackersTholeDampingModelBase(AM_DimerParam_Model):
+    DIMER_EVAL: str
+
+    def __init__(
+        self,
+        dataset=None,
+        atom_model: AtomTypeParamNN | None = None,
+        pre_trained_model_path=None,
+        n_message: int = 3,
+        n_neuron: int = 64,
+        n_embed: int = 8,
+        param_start_mean=RACKERS_INITIAL_VALUES,
+        param_start_std=RACKERS_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        freeze_atom_model: bool = True,
+        **dataset_kwargs,
+    ):
+        if not isinstance(param_start_mean, (list, tuple)) or len(
+            param_start_mean
+        ) != 4:
+            raise ValueError("param_start_mean must contain exactly four values")
+        if not isinstance(param_start_std, (list, tuple)) or len(
+            param_start_std
+        ) != 4:
+            raise ValueError("param_start_std must contain exactly four values")
+        super().__init__(
+            dataset=dataset,
+            atom_model=atom_model,
+            atom_model_type="AtomTypeParamNN",
+            model_type="RackersTholeDampingNN",
+            pre_trained_model_path=pre_trained_model_path,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            positivity_epsilon=positivity_epsilon,
+            n_params=4,
+            dimer_eval_type=self.DIMER_EVAL,
+            freeze_atom_model=freeze_atom_model,
+            **dataset_kwargs,
+        )
+
+
+class RackersTholeDampingModel(_RackersTholeDampingModelBase):
+    DIMER_EVAL = "rackers_thole"
+
+
+class RackersTholeDampingOverlapModel(_RackersTholeDampingModelBase):
+    DIMER_EVAL = "rackers_thole_overlap"
 
 
 ### Atom Type Model Wrapper ####
