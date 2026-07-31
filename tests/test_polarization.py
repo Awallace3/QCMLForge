@@ -243,6 +243,30 @@ water.key  water.xyz  w.xyz
 """
 
 
+def test_thole_direct_and_mutual_torch_are_finite_and_distinct():
+    r = torch.tensor([1.2, 2.5], dtype=torch.float64)
+    alpha_i = torch.tensor([0.8, 1.1], dtype=torch.float64)
+    alpha_j = torch.tensor([1.3, 0.7], dtype=torch.float64)
+
+    _, direct_l3, direct_l5 = (
+        apnet_pt.multipole.thole_damping_direct_torch(
+            r, alpha_i, alpha_j, 0.34
+        )
+    )
+    _, mutual_l3, mutual_l5 = (
+        apnet_pt.multipole.thole_damping_mutual_torch(
+            r, alpha_i, alpha_j, 0.39
+        )
+    )
+
+    assert torch.isfinite(direct_l3).all()
+    assert torch.isfinite(direct_l5).all()
+    assert torch.isfinite(mutual_l3).all()
+    assert torch.isfinite(mutual_l5).all()
+    assert not torch.allclose(direct_l3, mutual_l3)
+    assert not torch.allclose(direct_l5, mutual_l5)
+
+
 def build_local_frame_rotation_matrix(
     mol_coords, atom_idx, z_axis_atom, x_axis_atom, frame_type
 ):

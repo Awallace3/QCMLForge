@@ -1027,6 +1027,22 @@ def get_distances(RA, RB, e_source, e_target):
     return dR, dR_xyz
 
 
+def geometric_mean_edge_values(
+    source_values: torch.Tensor,
+    target_values: torch.Tensor,
+    e_source: torch.Tensor,
+    e_target: torch.Tensor,
+) -> torch.Tensor:
+    if not torch.isfinite(source_values).all():
+        raise ValueError("source per-atom values must be finite")
+    if not torch.isfinite(target_values).all():
+        raise ValueError("target per-atom values must be finite")
+
+    source_edge_values = source_values.index_select(0, e_source)
+    target_edge_values = target_values.index_select(0, e_target)
+    return torch.sqrt(source_edge_values * target_edge_values)
+
+
 # @torch.compile
 def elst_damping_mtp_mtp_torch(
     alpha_i: torch.tensor,

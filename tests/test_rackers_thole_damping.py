@@ -1,6 +1,8 @@
+import pytest
 import torch
 from torch_geometric.data import Data
 
+from apnet_pt.AtomPairwiseModels.mtp_mtp import geometric_mean_edge_values
 from apnet_pt.pt_datasets.ap2_fused_ds import ap2_fused_collate_update
 
 
@@ -55,3 +57,45 @@ def test_target_collate_emits_full_edge_domain():
     )
     assert batch.e_ABfull_source.numel() == batch.dimer_ind_full.numel()
     assert batch.dimer_ind_full.tolist() == [0, 0, 1, 1, 0, 0, 1, 1]
+
+
+def test_geometric_mean_edge_values_contract():
+    source = torch.tensor([1.0, 4.0, 9.0], dtype=torch.float64)
+    target = torch.tensor([16.0, 25.0], dtype=torch.float64)
+    e_source = torch.tensor([0, 1, 2], dtype=torch.long)
+    e_target = torch.tensor([1, 0, 1], dtype=torch.long)
+
+    actual = geometric_mean_edge_values(
+        source, target, e_source, e_target
+    )
+    expected = torch.tensor([5.0, 8.0, 15.0], dtype=torch.float64)
+
+    assert torch.equal(actual, expected)
+    assert actual.dtype == source.dtype
+    assert actual.device == source.device
+
+    exchanged = geometric_mean_edge_values(
+        target, source, e_target, e_source
+    )
+    assert torch.equal(exchanged, expected)
+
+
+@pytest.mark.parametrize(
+    "source,target",
+    [
+        (
+            torch.tensor([1.0, float("nan")]),
+            torch.tensor([4.0, 9.0]),
+        ),
+        (
+            torch.tensor([1.0, 4.0]),
+            torch.tensor([float("inf"), 9.0]),
+        ),
+    ],
+)
+def test_geometric_mean_edge_values_rejects_non_finite(
+    source, target
+):
+    edge = torch.tensor([0, 1], dtype=torch.long)
+    with pytest.raises(ValueError, match="finite"):
+        geometric_mean_edge_values(source, target, edge, edge)
