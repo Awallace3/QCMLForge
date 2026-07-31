@@ -3564,6 +3564,24 @@ class AM_DimerParam_Model:
             rackers_checkpoint = model_io.load_checkpoint(
                 pre_trained_model_path, map_location=device
             )
+            checkpoint_version = rackers_checkpoint.get(
+                "checkpoint_version"
+            )
+            if checkpoint_version != model_io.CHECKPOINT_VERSION:
+                raise ValueError(
+                    "Rackers checkpoint_version mismatch: expected "
+                    f"{model_io.CHECKPOINT_VERSION}, got "
+                    f"{checkpoint_version!r}"
+                )
+            if (
+                rackers_checkpoint.get("model_type")
+                != "RackersTholeDampingNN"
+            ):
+                raise ValueError(
+                    "Rackers checkpoint model_type mismatch: expected "
+                    "RackersTholeDampingNN, got "
+                    f"{rackers_checkpoint.get('model_type')!r}"
+                )
             model_io.validate_checkpoint(
                 rackers_checkpoint,
                 expected_type="RackersTholeDampingNN",
@@ -4695,8 +4713,17 @@ units angstrom
                 )
                 model_io.save_checkpoint(checkpoint, "nan_crash_model.pt")
                 break
-        self.model = best_model
-        self.model.to(rank_device)
+        underlying_model = model_io.unwrap_model(self.model)
+        underlying_model.load_state_dict(best_model.state_dict())
+        underlying_model.to(rank_device)
+        self.atom_model = underlying_model.atom_model
+        if self.dimer_model.AtomTypeParam is not underlying_model:
+            self.dimer_model.AtomTypeParam = underlying_model
+        if (
+            self.dimer_model_elst is not None
+            and self.dimer_model_elst.AtomTypeParam is not underlying_model
+        ):
+            self.dimer_model_elst.AtomTypeParam = underlying_model
         return
 
     def train(
