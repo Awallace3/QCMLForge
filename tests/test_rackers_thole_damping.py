@@ -1985,6 +1985,27 @@ class _FakeRackersTholeDampingOverlapModel(_FakeRackersHarnessBase):
     calls = []
 
 
+def _patch_rackers_dispatch_fakes(monkeypatch):
+    _FakeAtomTypeParamModel.calls.clear()
+    _FakeRackersTholeDampingModel.calls.clear()
+    _FakeRackersTholeDampingOverlapModel.calls.clear()
+    monkeypatch.setattr(
+        train_models.AtomPairwiseModels.mtp_mtp,
+        "AtomTypeParamModel",
+        _FakeAtomTypeParamModel,
+    )
+    monkeypatch.setattr(
+        train_models.AtomPairwiseModels.mtp_mtp,
+        "RackersTholeDampingModel",
+        _FakeRackersTholeDampingModel,
+    )
+    monkeypatch.setattr(
+        train_models.AtomPairwiseModels.mtp_mtp,
+        "RackersTholeDampingOverlapModel",
+        _FakeRackersTholeDampingOverlapModel,
+    )
+
+
 @pytest.mark.parametrize(
     "model_identifier,harness_type,other_harness_type",
     [
@@ -2009,24 +2030,7 @@ def test_rackers_dispatch_selects_harness_and_forwards_contract(
     other_harness_type,
     freeze_atom_model,
 ):
-    _FakeAtomTypeParamModel.calls.clear()
-    _FakeRackersTholeDampingModel.calls.clear()
-    _FakeRackersTholeDampingOverlapModel.calls.clear()
-    monkeypatch.setattr(
-        train_models.AtomPairwiseModels.mtp_mtp,
-        "AtomTypeParamModel",
-        _FakeAtomTypeParamModel,
-    )
-    monkeypatch.setattr(
-        train_models.AtomPairwiseModels.mtp_mtp,
-        "RackersTholeDampingModel",
-        _FakeRackersTholeDampingModel,
-    )
-    monkeypatch.setattr(
-        train_models.AtomPairwiseModels.mtp_mtp,
-        "RackersTholeDampingOverlapModel",
-        _FakeRackersTholeDampingOverlapModel,
-    )
+    _patch_rackers_dispatch_fakes(monkeypatch)
 
     model_out = tmp_path / "rackers-output.pt"
     train_models.train_pairwise_model(
@@ -2125,6 +2129,7 @@ class _FakeLegacyPairwiseHarness:
         self.kwargs = kwargs
         self.dataset = object()
         self.train_calls = 0
+        self.train_kwargs = None
         type(self).calls.append(self)
 
     def train(
@@ -2139,6 +2144,16 @@ class _FakeLegacyPairwiseHarness:
         lr_decay=None,
     ):
         self.train_calls += 1
+        self.train_kwargs = {
+            "model_path": model_path,
+            "n_epochs": n_epochs,
+            "world_size": world_size,
+            "omp_num_threads_per_process": omp_num_threads_per_process,
+            "lr": lr,
+            "dataloader_num_workers": dataloader_num_workers,
+            "random_seed": random_seed,
+            "lr_decay": lr_decay,
+        }
 
 
 @pytest.mark.parametrize(
@@ -2171,6 +2186,139 @@ def test_legacy_dispatch_still_broadcasts_scalar_defaults(
     assert harness.kwargs["param_start_mean"] == expected_mean
     assert harness.kwargs["param_start_std"] == expected_std
     assert harness.train_calls == 1
+
+
+@pytest.mark.parametrize(
+    "model_identifier,harness_type",
+    [
+        ("RackersTholeDampingModel", _FakeRackersTholeDampingModel),
+        (
+            "RackersTholeDampingOverlapModel",
+            _FakeRackersTholeDampingOverlapModel,
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "checkpoint_kwargs,expected_checkpoint",
+    [
+        pytest.param({}, None, id="omitted"),
+        pytest.param(
+            {"pre_trained_model_path": "explicit-rackers.pt"},
+            "explicit-rackers.pt",
+            id="explicit",
+        ),
+    ],
+)
+def test_rackers_dispatch_checkpoint_resolution(
+    tmp_path,
+    monkeypatch,
+    model_identifier,
+    harness_type,
+    checkpoint_kwargs,
+    expected_checkpoint,
+):
+    _patch_rackers_dispatch_fakes(monkeypatch)
+
+    train_models.train_pairwise_model(
+        apnet_model_type=model_identifier,
+        model_out=str(tmp_path / "rackers.pt"),
+        **checkpoint_kwargs,
+    )
+
+    assert harness_type.calls[0].kwargs["pre_trained_model_path"] == (
+        expected_checkpoint
+    )
+
+
+@pytest.mark.parametrize(
+    "model_identifier,harness_type",
+    [
+        ("RackersTholeDampingModel", _FakeRackersTholeDampingModel),
+        (
+            "RackersTholeDampingOverlapModel",
+            _FakeRackersTholeDampingOverlapModel,
+        ),
+    ],
+)
+def test_rackers_dispatch_build_dataset_only_skips_train(
+    tmp_path, monkeypatch, model_identifier, harness_type
+):
+    _patch_rackers_dispatch_fakes(monkeypatch)
+
+    train_models.train_pairwise_model(
+        apnet_model_type=model_identifier,
+        model_out=str(tmp_path / "rackers.pt"),
+        build_dataset_only=True,
+    )
+
+    rackers = harness_type.calls[0]
+    assert rackers.kwargs["pre_trained_model_path"] is None
+    assert rackers.train_calls == []
+
+
+def test_legacy_dispatch_preserves_omitted_checkpoint_default(
+    tmp_path, monkeypatch
+):
+    _FakeLegacyPairwiseHarness.calls.clear()
+    monkeypatch.setattr(
+        train_models.AtomPairwiseModels.mtp_mtp,
+        "AtomTypeParamModel",
+        _FakeLegacyPairwiseHarness,
+    )
+
+    train_models.train_pairwise_model(
+        apnet_model_type="AtomTypeParamModel",
+        model_out=str(tmp_path / "legacy.pt"),
+    )
+
+    legacy = _FakeLegacyPairwiseHarness.calls[0]
+    assert legacy.kwargs["pre_trained_model_path"] == (
+        "./models/dapnet2/ap2_0.pt"
+    )
+
+
+@pytest.mark.parametrize(
+    "model_identifier,harness_type",
+    [
+        ("RackersTholeDampingModel", _FakeRackersTholeDampingModel),
+        (
+            "RackersTholeDampingOverlapModel",
+            _FakeRackersTholeDampingOverlapModel,
+        ),
+    ],
+)
+def test_rackers_dispatch_forces_single_process_on_multi_gpu(
+    tmp_path, monkeypatch, model_identifier, harness_type
+):
+    _patch_rackers_dispatch_fakes(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    train_models.train_pairwise_model(
+        apnet_model_type=model_identifier,
+        model_out=str(tmp_path / "rackers.pt"),
+    )
+
+    assert harness_type.calls[0].train_calls[0]["world_size"] == 1
+
+
+def test_legacy_dispatch_retains_multi_gpu_world_size(tmp_path, monkeypatch):
+    _FakeLegacyPairwiseHarness.calls.clear()
+    monkeypatch.setattr(
+        train_models.AtomPairwiseModels.mtp_mtp,
+        "AtomTypeParamModel",
+        _FakeLegacyPairwiseHarness,
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    train_models.train_pairwise_model(
+        apnet_model_type="AtomTypeParamModel",
+        model_out=str(tmp_path / "legacy.pt"),
+        pre_trained_model_path=None,
+    )
+
+    assert _FakeLegacyPairwiseHarness.calls[0].train_kwargs["world_size"] == 2
 
 
 @pytest.mark.parametrize(

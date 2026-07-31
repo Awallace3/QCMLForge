@@ -16,6 +16,8 @@ RACKERS_MODEL_TYPES = {
 }
 RACKERS_PARAM_START_MEAN = [1.8, 0.34, 0.39, 1.8]
 RACKERS_PARAM_START_STD = [0.01, 0.01, 0.01, 0.01]
+LEGACY_PAIRWISE_PRETRAINED_MODEL_PATH = "./models/dapnet2/ap2_0.pt"
+_PAIRWISE_PRETRAINED_MODEL_PATH_UNSET = object()
 
 
 def maybe_skip_training_after_dataset_setup(model_name, dataset, build_dataset_only):
@@ -210,7 +212,7 @@ def train_pairwise_model(
     n_params=2,
     m1="",
     m2="",
-    pre_trained_model_path="./models/dapnet2/ap2_0.pt",
+    pre_trained_model_path=_PAIRWISE_PRETRAINED_MODEL_PATH_UNSET,
     param_start_mean=None,
     param_start_std=None,
     dimer_eval_type="elst_damping",
@@ -254,7 +256,7 @@ def train_pairwise_model(
         n_params (int): Number of per-dimer parameters when training parametric dimer models.
         m1 (str): Optional molecular identifier or filter passed into dataset creation (used by some variants).
         m2 (str): Optional second molecular identifier or filter passed into dataset creation.
-        pre_trained_model_path (str or None): External APNet pretrained checkpoint to initialize from.
+        pre_trained_model_path (str or None): External APNet pretrained checkpoint to initialize from. When omitted, Rackers routes start without an outer checkpoint while legacy routes retain the historical dAPNet checkpoint default.
         param_start_mean (float or list[float] or None): Initial parameter means. Rackers routes require exactly four values and use their physical defaults when unset; other routes use 1.5 when unset and broadcast scalars to n_params.
         param_start_std (float or list[float] or None): Initial parameter standard deviations. Rackers routes require exactly four values and use their physical defaults when unset; other routes use 0.1 when unset and broadcast scalars to n_params.
         dimer_eval_type (str): Evaluation mode for dimer models (e.g., "elst_damping", "elst_damping__induced_dipole").
@@ -270,6 +272,11 @@ def train_pairwise_model(
 
     """
     is_rackers_model = apnet_model_type in RACKERS_MODEL_TYPES
+    if pre_trained_model_path is _PAIRWISE_PRETRAINED_MODEL_PATH_UNSET:
+        if is_rackers_model:
+            pre_trained_model_path = None
+        else:
+            pre_trained_model_path = LEGACY_PAIRWISE_PRETRAINED_MODEL_PATH
     if is_rackers_model:
         if param_start_mean is None:
             param_start_mean = list(RACKERS_PARAM_START_MEAN)
@@ -366,7 +373,9 @@ def train_pairwise_model(
     if end_lr is not None and not supports_end_lr:
         raise ValueError("end_lr is currently only supported for APNetD3 training")
     print("Training {}...".format(apnet_model_type))
-    if torch.cuda.is_available():
+    if is_rackers_model:
+        world_size = 1
+    elif torch.cuda.is_available():
         world_size = torch.cuda.device_count()
     else:
         world_size = 1
