@@ -350,8 +350,10 @@ class _ControlledRackersAtomParam(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.atom_model = torch.nn.Identity()
+        self.batch_calls = []
 
     def forward(self, batch):
+        self.batch_calls.append(batch)
         atom_index = torch.arange(
             batch.x.numel(), dtype=batch.R.dtype, device=batch.x.device
         )
@@ -368,9 +370,16 @@ class _ControlledRackersAtomParam(torch.nn.Module):
             (-(0.8 + 0.1 * atom_index), 0.4 + 0.05 * atom_index),
             dim=1,
         )
+        parameter_columns = torch.arange(
+            1, 5, dtype=batch.R.dtype, device=batch.x.device
+        )
         parameters = torch.stack(
-            tuple(1.0 + column + 0.1 * atom_index for column in range(4)),
-            dim=1,
+            (
+                -parameter_columns,
+                RACKERS_POSITIVITY_EPSILON * parameter_columns / 10.0,
+                parameter_columns + 0.25,
+                parameter_columns + 1.25,
+            )
         )
         return charge, dipole, quadrupole, hfvr_vw, parameters
 
@@ -430,12 +439,29 @@ def test_rackers_dimer_forward_routes_columns_edges_and_preserves_charge(
         mtp_mtp, "rackers_thole_induction", induction_stub
     )
 
+    atom_parameters = _ControlledRackersAtomParam()
     dimer = DimerProp(
-        ATParam=_ControlledRackersAtomParam(),
+        ATParam=atom_parameters,
         dimer_eval=mode,
         elst_damping_type=elst_damping_type,
     )
     edge_energy, output_A, output_B = dimer(synthetic_dimer_batch)
+
+    assert len(atom_parameters.batch_calls) == 2
+    assert sum(
+        call is synthetic_dimer_batch.batch_atomic_A
+        for call in atom_parameters.batch_calls
+    ) == 1
+    assert sum(
+        call is synthetic_dimer_batch.batch_atomic_B
+        for call in atom_parameters.batch_calls
+    ) == 1
+    for output in (output_A, output_B):
+        assert torch.all(output[-1][0] < 0)
+        assert torch.all(output[-1][1] > 0)
+        assert torch.all(
+            output[-1][1] < RACKERS_POSITIVITY_EPSILON
+        )
 
     other_damping_type = (
         "AMOEBA" if elst_damping_type == "CLIFF" else "CLIFF"
