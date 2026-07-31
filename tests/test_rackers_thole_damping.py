@@ -289,6 +289,50 @@ def _rackers_kernel_inputs() -> dict[str, torch.Tensor]:
     }
 
 
+def _analytic_rackers_tensors(
+    Ri,
+    Rj,
+    e_source,
+    e_target,
+    alpha_i,
+    alpha_j,
+    damping,
+    damping_type,
+):
+    displacement = (
+        Rj.index_select(0, e_target) - Ri.index_select(0, e_source)
+    ) / constants.au2ang
+    distance = torch.linalg.vector_norm(displacement, dim=1)
+    alpha_source = alpha_i.index_select(0, e_source)
+    alpha_target = alpha_j.index_select(0, e_target)
+    u = distance / ((alpha_source * alpha_target) ** (1.0 / 6.0))
+    if damping_type == "direct":
+        au3 = damping * u ** (3.0 / 2.0)
+        lam_3 = 1.0 - torch.exp(-au3)
+        lam_5 = 1.0 - (1.0 + 0.5 * au3) * torch.exp(-au3)
+    else:
+        assert damping_type == "mutual"
+        au3 = damping * u**3
+        lam_3 = 1.0 - torch.exp(-au3)
+        lam_5 = 1.0 - (1.0 + au3) * torch.exp(-au3)
+
+    inverse_distance = 1.0 / distance
+    T1 = (
+        -(inverse_distance**3 * lam_3).unsqueeze(1) * displacement
+    )
+    displacement_outer = torch.einsum(
+        "ai,aj->aij", displacement, displacement
+    )
+    identity = torch.eye(3, dtype=distance.dtype, device=distance.device)
+    T2 = (
+        3.0 * displacement_outer * lam_5[:, None, None]
+        - distance.square()[:, None, None]
+        * identity[None, :, :]
+        * lam_3[:, None, None]
+    ) * inverse_distance.pow(5)[:, None, None]
+    return displacement, T1, T2
+
+
 def test_rackers_kernel_routes_distinct_parameters_and_overlap(monkeypatch):
     inputs = _rackers_kernel_inputs()
     direct_calls = []
@@ -409,6 +453,68 @@ def test_rackers_kernel_routes_distinct_parameters_and_overlap(monkeypatch):
     )
 
 
+def test_rackers_kernel_routes_top_level_direct_monomer_effects(
+    monkeypatch,
+):
+    inputs = _rackers_kernel_inputs()
+    original_builder = mtp_mtp._rackers_distance_tensors
+    original_initial_fields = mtp_mtp._rackers_initial_permanent_fields
+
+    def run_with_perturbation(direct_call_to_perturb):
+        direct_call_index = 0
+        captured_initial_fields = []
+
+        def perturb_builder(*args, **kwargs):
+            nonlocal direct_call_index
+            tensors = original_builder(*args, **kwargs)
+            damping_type = args[-1]
+            if damping_type != "direct":
+                return tensors
+
+            current_index = direct_call_index
+            direct_call_index += 1
+            if current_index != direct_call_to_perturb:
+                return tensors
+
+            perturbed = list(tensors)
+            perturbed[3] = tensors[3] * 1.7
+            perturbed[4] = tensors[4] * 1.7
+            return tuple(perturbed)
+
+        def capture_initial_fields(*args, **kwargs):
+            fields = original_initial_fields(*args, **kwargs)
+            captured_initial_fields.append(
+                tuple(field.detach().clone() for field in fields)
+            )
+            return fields
+
+        monkeypatch.setattr(
+            mtp_mtp, "_rackers_distance_tensors", perturb_builder
+        )
+        monkeypatch.setattr(
+            mtp_mtp,
+            "_rackers_initial_permanent_fields",
+            capture_initial_fields,
+        )
+        energy = mtp_mtp.rackers_thole_induction(
+            **inputs, include_overlap=False, max_iterations=4
+        )
+        assert len(captured_initial_fields) == 1
+        assert direct_call_index == 3
+        return energy.detach().clone(), captured_initial_fields[0]
+
+    baseline_energy, (baseline_A, baseline_B) = run_with_perturbation(None)
+    aa_energy, (aa_A, aa_B) = run_with_perturbation(1)
+    bb_energy, (bb_A, bb_B) = run_with_perturbation(2)
+
+    assert not torch.equal(aa_A, baseline_A)
+    assert torch.equal(aa_B, baseline_B)
+    assert not torch.allclose(aa_energy, baseline_energy)
+    assert torch.equal(bb_A, baseline_A)
+    assert not torch.equal(bb_B, baseline_B)
+    assert not torch.allclose(bb_energy, baseline_energy)
+
+
 def test_rackers_kernel_routes_direct_fields_and_mutual_scf_effect():
     dtype = torch.float64
     alpha_A = torch.tensor([1.0, 1.5], dtype=dtype)
@@ -502,6 +608,403 @@ def test_rackers_kernel_routes_direct_fields_and_mutual_scf_effect():
     assert torch.equal(base_B, initial_B_before_mutual_update)
     assert not torch.equal(zero_mutual_A, changed_mutual_A)
     assert not torch.equal(zero_mutual_B, changed_mutual_B)
+
+
+def test_rackers_kernel_routes_charge_oracle_orientation_and_symmetry():
+    dtype = torch.float64
+    RA = torch.tensor(
+        [[0.2, -0.4, 0.3], [1.4, 0.6, -0.2]], dtype=dtype
+    )
+    RB = torch.tensor(
+        [[3.7, -0.8, 1.1], [4.4, 1.3, -0.7]], dtype=dtype
+    )
+    alpha_A = torch.tensor([0.7, 1.3], dtype=dtype)
+    alpha_B = torch.tensor([1.1, 0.6], dtype=dtype)
+    qA = torch.tensor([0.35, 0.8], dtype=dtype)
+    qB = torch.tensor([0.55, 0.25], dtype=dtype)
+    e_AB_source = torch.tensor([0, 1], dtype=torch.long)
+    e_AB_target = torch.tensor([1, 0], dtype=torch.long)
+    e_AA_source = torch.tensor([0, 1], dtype=torch.long)
+    e_AA_target = torch.tensor([1, 0], dtype=torch.long)
+    e_BB_source = torch.tensor([1, 0], dtype=torch.long)
+    e_BB_target = torch.tensor([0, 1], dtype=torch.long)
+    direct_AB = torch.tensor([0.31, 0.47], dtype=dtype)
+    direct_AA = torch.tensor([0.4, 0.4], dtype=dtype)
+    direct_BB = torch.tensor([0.38, 0.38], dtype=dtype)
+    mutual_AB = torch.tensor([0.61, 0.79], dtype=dtype)
+    mutual_AA = torch.tensor([0.7, 0.7], dtype=dtype)
+    mutual_BB = torch.tensor([0.72, 0.72], dtype=dtype)
+
+    def evaluate_production(
+        R_first,
+        R_second,
+        alpha_first,
+        alpha_second,
+        q_first,
+        q_second,
+        cross_source,
+        cross_target,
+        first_source,
+        first_target,
+        second_source,
+        second_target,
+        direct_cross,
+        direct_first,
+        direct_second,
+        mutual_cross,
+        mutual_first,
+        mutual_second,
+    ):
+        direct_tensors = (
+            mtp_mtp._rackers_distance_tensors(
+                R_first,
+                R_second,
+                cross_source,
+                cross_target,
+                alpha_first,
+                alpha_second,
+                direct_cross,
+                "direct",
+            ),
+            mtp_mtp._rackers_distance_tensors(
+                R_first,
+                R_first,
+                first_source,
+                first_target,
+                alpha_first,
+                alpha_first,
+                direct_first,
+                "direct",
+            ),
+            mtp_mtp._rackers_distance_tensors(
+                R_second,
+                R_second,
+                second_source,
+                second_target,
+                alpha_second,
+                alpha_second,
+                direct_second,
+                "direct",
+            ),
+        )
+        initial_fields = mtp_mtp._rackers_initial_permanent_fields(
+            alpha_first,
+            alpha_second,
+            q_first,
+            torch.zeros_like(R_first),
+            q_second,
+            torch.zeros_like(R_second),
+            cross_source,
+            cross_target,
+            first_source,
+            first_target,
+            second_source,
+            second_target,
+            direct_tensors[0][3],
+            direct_tensors[0][4],
+            direct_tensors[1][3],
+            direct_tensors[1][4],
+            direct_tensors[2][3],
+            direct_tensors[2][4],
+        )
+        mutual_tensors = (
+            mtp_mtp._rackers_distance_tensors(
+                R_first,
+                R_second,
+                cross_source,
+                cross_target,
+                alpha_first,
+                alpha_second,
+                mutual_cross,
+                "mutual",
+            ),
+            mtp_mtp._rackers_distance_tensors(
+                R_first,
+                R_first,
+                first_source,
+                first_target,
+                alpha_first,
+                alpha_first,
+                mutual_first,
+                "mutual",
+            ),
+            mtp_mtp._rackers_distance_tensors(
+                R_second,
+                R_second,
+                second_source,
+                second_target,
+                alpha_second,
+                alpha_second,
+                mutual_second,
+                "mutual",
+            ),
+        )
+        update = mtp_mtp._rackers_scf_update(
+            alpha_first,
+            alpha_second,
+            cross_source,
+            cross_target,
+            first_source,
+            first_target,
+            second_source,
+            second_target,
+            mutual_tensors[0][4],
+            mutual_tensors[1][4],
+            mutual_tensors[2][4],
+            initial_fields[0],
+            initial_fields[1],
+            initial_fields[0],
+            initial_fields[1],
+        )
+        return direct_tensors, mutual_tensors, initial_fields, update
+
+    actual_direct, actual_mutual, actual_initial, actual_update = (
+        evaluate_production(
+            RA,
+            RB,
+            alpha_A,
+            alpha_B,
+            qA,
+            qB,
+            e_AB_source,
+            e_AB_target,
+            e_AA_source,
+            e_AA_target,
+            e_BB_source,
+            e_BB_target,
+            direct_AB,
+            direct_AA,
+            direct_BB,
+            mutual_AB,
+            mutual_AA,
+            mutual_BB,
+        )
+    )
+
+    displacement_AB, expected_T1_AB, expected_direct_T2_AB = (
+        _analytic_rackers_tensors(
+            RA,
+            RB,
+            e_AB_source,
+            e_AB_target,
+            alpha_A,
+            alpha_B,
+            direct_AB,
+            "direct",
+        )
+    )
+    _, expected_T1_AA, expected_direct_T2_AA = (
+        _analytic_rackers_tensors(
+            RA,
+            RA,
+            e_AA_source,
+            e_AA_target,
+            alpha_A,
+            alpha_A,
+            direct_AA,
+            "direct",
+        )
+    )
+    _, expected_T1_BB, expected_direct_T2_BB = (
+        _analytic_rackers_tensors(
+            RB,
+            RB,
+            e_BB_source,
+            e_BB_target,
+            alpha_B,
+            alpha_B,
+            direct_BB,
+            "direct",
+        )
+    )
+    _, _, expected_mutual_T2_AB = _analytic_rackers_tensors(
+        RA,
+        RB,
+        e_AB_source,
+        e_AB_target,
+        alpha_A,
+        alpha_B,
+        mutual_AB,
+        "mutual",
+    )
+    _, _, expected_mutual_T2_AA = _analytic_rackers_tensors(
+        RA,
+        RA,
+        e_AA_source,
+        e_AA_target,
+        alpha_A,
+        alpha_A,
+        mutual_AA,
+        "mutual",
+    )
+    _, _, expected_mutual_T2_BB = _analytic_rackers_tensors(
+        RB,
+        RB,
+        e_BB_source,
+        e_BB_target,
+        alpha_B,
+        alpha_B,
+        mutual_BB,
+        "mutual",
+    )
+    expected_direct = (
+        (expected_T1_AB, expected_direct_T2_AB),
+        (expected_T1_AA, expected_direct_T2_AA),
+        (expected_T1_BB, expected_direct_T2_BB),
+    )
+    expected_mutual_T2 = (
+        expected_mutual_T2_AB,
+        expected_mutual_T2_AA,
+        expected_mutual_T2_BB,
+    )
+    for actual, expected in zip(actual_direct, expected_direct):
+        assert torch.allclose(actual[3], expected[0], atol=1e-12)
+        assert torch.allclose(actual[4], expected[1], atol=1e-12)
+    for actual, expected in zip(actual_mutual, expected_mutual_T2):
+        assert torch.allclose(actual[4], expected, atol=1e-12)
+
+    alpha_A_cross = alpha_A.index_select(0, e_AB_source)
+    alpha_B_cross = alpha_B.index_select(0, e_AB_target)
+    qA_cross = qA.index_select(0, e_AB_source)
+    qB_cross = qB.index_select(0, e_AB_target)
+    cross_field_A = (
+        alpha_A_cross[:, None] * expected_T1_AB * qB_cross[:, None]
+    )
+    cross_field_B = (
+        alpha_B_cross[:, None] * -expected_T1_AB * qA_cross[:, None]
+    )
+    assert torch.all(
+        torch.einsum("ai,ai->a", cross_field_A, displacement_AB) < 0
+    )
+    assert torch.all(
+        torch.einsum("ai,ai->a", cross_field_B, displacement_AB) > 0
+    )
+
+    expected_initial_A = torch.zeros_like(RA)
+    expected_initial_A.index_add_(0, e_AB_source, cross_field_A)
+    expected_initial_A.index_add_(
+        0,
+        e_AA_target,
+        alpha_A.index_select(0, e_AA_target)[:, None]
+        * -expected_T1_AA
+        * qA.index_select(0, e_AA_source)[:, None],
+    )
+    expected_initial_B = torch.zeros_like(RB)
+    expected_initial_B.index_add_(0, e_AB_target, cross_field_B)
+    expected_initial_B.index_add_(
+        0,
+        e_BB_target,
+        alpha_B.index_select(0, e_BB_target)[:, None]
+        * -expected_T1_BB
+        * qB.index_select(0, e_BB_source)[:, None],
+    )
+    assert torch.allclose(
+        actual_initial[0], expected_initial_A, atol=1e-12
+    )
+    assert torch.allclose(
+        actual_initial[1], expected_initial_B, atol=1e-12
+    )
+
+    expected_update_A = expected_initial_A.clone()
+    expected_update_A.index_add_(
+        0,
+        e_AB_source,
+        alpha_A_cross[:, None]
+        * torch.einsum(
+            "aij,aj->ai",
+            expected_mutual_T2_AB,
+            expected_initial_B.index_select(0, e_AB_target),
+        ),
+    )
+    expected_update_A.index_add_(
+        0,
+        e_AA_target,
+        alpha_A.index_select(0, e_AA_target)[:, None]
+        * torch.einsum(
+            "aij,aj->ai",
+            expected_mutual_T2_AA,
+            expected_initial_A.index_select(0, e_AA_source),
+        ),
+    )
+    expected_update_B = expected_initial_B.clone()
+    expected_update_B.index_add_(
+        0,
+        e_AB_target,
+        alpha_B_cross[:, None]
+        * torch.einsum(
+            "aij,aj->ai",
+            expected_mutual_T2_AB,
+            expected_initial_A.index_select(0, e_AB_source),
+        ),
+    )
+    expected_update_B.index_add_(
+        0,
+        e_BB_target,
+        alpha_B.index_select(0, e_BB_target)[:, None]
+        * torch.einsum(
+            "aij,aj->ai",
+            expected_mutual_T2_BB,
+            expected_initial_B.index_select(0, e_BB_source),
+        ),
+    )
+    assert torch.allclose(actual_update[0], expected_update_A, atol=1e-12)
+    assert torch.allclose(actual_update[1], expected_update_B, atol=1e-12)
+
+    _, _, exchanged_initial, exchanged_update = evaluate_production(
+        RB,
+        RA,
+        alpha_B,
+        alpha_A,
+        qB,
+        qA,
+        e_AB_target,
+        e_AB_source,
+        e_BB_source,
+        e_BB_target,
+        e_AA_source,
+        e_AA_target,
+        direct_AB,
+        direct_BB,
+        direct_AA,
+        mutual_AB,
+        mutual_BB,
+        mutual_AA,
+    )
+    assert torch.allclose(exchanged_initial[0], actual_initial[1])
+    assert torch.allclose(exchanged_initial[1], actual_initial[0])
+    assert torch.allclose(exchanged_update[0], actual_update[1])
+    assert torch.allclose(exchanged_update[1], actual_update[0])
+
+    rotation = torch.tensor(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=dtype,
+    )
+    rotated_RA = RA @ rotation.T
+    rotated_RB = RB @ rotation.T
+    _, _, rotated_initial, rotated_update = evaluate_production(
+        rotated_RA,
+        rotated_RB,
+        alpha_A,
+        alpha_B,
+        qA,
+        qB,
+        e_AB_source,
+        e_AB_target,
+        e_AA_source,
+        e_AA_target,
+        e_BB_source,
+        e_BB_target,
+        direct_AB,
+        direct_AA,
+        direct_BB,
+        mutual_AB,
+        mutual_AA,
+        mutual_BB,
+    )
+    assert torch.allclose(rotated_initial[0], actual_initial[0] @ rotation.T)
+    assert torch.allclose(rotated_initial[1], actual_initial[1] @ rotation.T)
+    assert torch.allclose(rotated_update[0], actual_update[0] @ rotation.T)
+    assert torch.allclose(rotated_update[1], actual_update[1] @ rotation.T)
 
 
 def test_rackers_kernel_routes_tensor_builder_rejects_invalid_type():
