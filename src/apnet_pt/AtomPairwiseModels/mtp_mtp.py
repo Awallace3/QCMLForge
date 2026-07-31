@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.data import Data
 
@@ -46,6 +47,21 @@ from ..pt_datasets.ap2_fused_ds import (
 from ..util import scatter_sum_compile
 
 max_Z = 118
+
+RACKERS_PARAMETER_NAMES = (
+    "elst",
+    "thole_direct",
+    "thole_mutual",
+    "ind_overlap",
+)
+RACKERS_INITIAL_VALUES = (1.8, 0.34, 0.39, 1.8)
+RACKERS_INITIAL_STDS = (0.01, 0.01, 0.01, 0.01)
+RACKERS_POSITIVITY_EPSILON = 1e-8
+
+RACKERS_ELST_INDEX = 0
+RACKERS_THOLE_DIRECT_INDEX = 1
+RACKERS_THOLE_MUTUAL_INDEX = 2
+RACKERS_IND_OVERLAP_INDEX = 3
 
 
 def _polarizability_table_on_device(
@@ -1017,6 +1033,100 @@ class AtomTypeParamNN(nn.Module):
             *am_out[3:],
             K.squeeze(-1) if self.n_params == 1 else K,
         )
+
+
+def _serialize_nested_atom_model(model: nn.Module) -> dict:
+    if type(model) is AtomMPNN:
+        return {
+            "model_type": "AtomMPNN",
+            "config": model.get_config(),
+        }
+    if type(model) is AtomTypeParamNN:
+        return {
+            "model_type": "AtomTypeParamNN",
+            "config": model.get_config(),
+            "atom_model": _serialize_nested_atom_model(model.atom_model),
+        }
+    raise ValueError(
+        "Unsupported nested atom model type: "
+        f"{type(model).__name__}"
+    )
+
+
+def _inverse_softplus(value: float) -> float:
+    tensor = torch.tensor(value, dtype=torch.float64)
+    return torch.log(torch.expm1(tensor)).item()
+
+
+class RackersTholeDampingNN(AtomTypeParamNN):
+    def __init__(
+        self,
+        atom_model: AtomTypeParamNN,
+        n_message: int = 3,
+        n_neuron: int = 128,
+        n_embed: int = 8,
+        param_start_mean: tuple[
+            float, float, float, float
+        ] = RACKERS_INITIAL_VALUES,
+        param_start_std: tuple[
+            float, float, float, float
+        ] = RACKERS_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        freeze_atom_model: bool = True,
+    ):
+        if type(atom_model) is not AtomTypeParamNN:
+            raise ValueError("atom_model must be an AtomTypeParamNN")
+        if not isinstance(param_start_mean, (list, tuple)) or len(
+            param_start_mean
+        ) != 4:
+            raise ValueError("param_start_mean must contain exactly four values")
+        if not isinstance(param_start_std, (list, tuple)) or len(
+            param_start_std
+        ) != 4:
+            raise ValueError("param_start_std must contain exactly four values")
+
+        positive_means = list(param_start_mean)
+        raw_means = [
+            _inverse_softplus(value - positivity_epsilon)
+            for value in positive_means
+        ]
+        raw_stds = list(param_start_std)
+        super().__init__(
+            atom_model=atom_model,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=raw_means,
+            param_start_std=raw_stds,
+            n_params=4,
+            freeze_atom_model=freeze_atom_model,
+        )
+        self.raw_param_start_mean = raw_means
+        self.param_start_mean = positive_means
+        self.param_start_std = raw_stds
+        self.positivity_epsilon = positivity_epsilon
+        self.atom_model.requires_grad_(not freeze_atom_model)
+
+    def forward(self, batch):
+        output = super().forward(batch)
+        raw_parameters = output[-1]
+        parameters = F.softplus(raw_parameters) + self.positivity_epsilon
+        return (*output[:-1], parameters)
+
+    def get_config(self) -> dict:
+        return {
+            "model_type": "RackersTholeDampingNN",
+            "parameter_names": list(RACKERS_PARAMETER_NAMES),
+            "param_start_mean": list(self.param_start_mean),
+            "param_start_std": list(self.param_start_std),
+            "positivity_epsilon": self.positivity_epsilon,
+            "n_message": self.n_message,
+            "n_neuron": self.n_neuron,
+            "n_embed": self.n_embed,
+            "nested_atom_model": _serialize_nested_atom_model(
+                self.atom_model
+            ),
+        }
 
 
 def get_distances(RA, RB, e_source, e_target):
