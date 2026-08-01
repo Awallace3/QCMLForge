@@ -228,6 +228,7 @@ def train_pairwise_model(
     freeze_atom_model=True,
     build_dataset_only=False,
     include_total_mse=False,
+    omp_num_threads=8,
 ):
     # Ensure param_start_mean and param_start_std are lists
     """
@@ -269,6 +270,7 @@ def train_pairwise_model(
         no_disp_nn (bool): Skip the dispersion readout when training APNet3-fused-d3 and compute D3 at predict time instead.
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
         include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms.
+        omp_num_threads (int): Number of OpenMP threads assigned to each training process.
 
     """
     is_rackers_model = apnet_model_type in RACKERS_MODEL_TYPES
@@ -388,7 +390,7 @@ def train_pairwise_model(
         world_size = 1
     print("World Size", world_size)
 
-    omp_num_threads_per_process = 8
+    omp_num_threads_per_process = omp_num_threads
     if os.path.exists(model_out) and pre_trained_model_path is None:
         pretrained_model = model_out
         print(f"\nTraining from {model_out}\n")
@@ -1137,6 +1139,7 @@ def main():
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
+            omp_num_threads=args.omp_num_threads,
         )
     return
 

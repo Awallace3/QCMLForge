@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Create an executable `run.sh` that sequentially trains the pure and overlap Rackers Thole damping models with environment-overridable Splinter defaults.
+**Goal:** Create an executable `run.sh` that sequentially trains the pure and overlap Rackers Thole damping models with environment-overridable Splinter defaults, while validating the single-process Rackers constraint.
 
-**Architecture:** A root-level Bash script defines validated defaults and one shared argument array, then performs two explicit `train_models.py` invocations with distinct model identifiers and output checkpoints. A pytest test replaces Python with a recorder executable so command construction and ordering are verified without training.
+**Architecture:** A root-level Bash script defines validated defaults and one shared argument array, rejects `WORLD_SIZE_DDP` values other than `1`, then performs two explicit `train_models.py` invocations with distinct model identifiers and output checkpoints. The CLI forwards `OMP_NUM_THREADS` through `train_pairwise_model` to each Rackers harness training call. A pytest test replaces Python with a recorder executable so command construction and ordering are verified without training.
 
 **Tech Stack:** Bash, Python 3, pytest, `train_models.py` CLI.
 
@@ -14,7 +14,9 @@
 - Default configuration must match the Splinter `AM-DimerParam` example in `train_ap3d3_saptdft_local_1.sh`.
 - Do not pass `n_params`, `dimer_eval_type`, `param_start_mean`, or `param_start_std`.
 - Default outputs are `${MODEL_DIR}/rackers_thole_${ITER}.pt` and `${MODEL_DIR}/rackers_thole_overlap_${ITER}.pt`.
-- Every path and training setting is environment-overridable.
+- Every path and training setting except Rackers world size is environment-overridable.
+- `WORLD_SIZE_DDP` remains environment-visible but must be exactly `1` and is validated before directory creation or training.
+- `OMP_NUM_THREADS` must reach `apnet.train` as `omp_num_threads_per_process`; its launcher default is `16`, while omitted direct `train_pairwise_model` calls retain the legacy default of `8`.
 
 ---
 
@@ -34,7 +36,7 @@ Create `tests/test_run_script.py`. The test must create an executable temporary 
 
 Assert that exactly two JSON argument arrays were recorded; the first contains `--train_apnet RackersTholeDampingModel`; the second contains `--train_apnet RackersTholeDampingOverlapModel`; both contain identical overridden shared options; and their `--ap_model_path` values are the independently overridden pure and overlap outputs. Assert neither command contains `--n_params`, `--dimer_eval_type`, `--param_start_mean`, or `--param_start_std`.
 
-Also add a default-value test that runs through the same recorder with only `PYTHON` and `CALL_LOG` overridden and asserts the documented default atom model, HFVR/VW model, dataset, spec, architecture, optimization settings, and output names.
+Also add a default-value test that runs through the same recorder with only `PYTHON` and `CALL_LOG` overridden and asserts the documented default atom model, HFVR/VW model, dataset, spec, architecture, optimization settings, and output names. Add boundary tests proving OMP reaches the final Rackers `train` call and invalid world sizes fail before directory creation or invocation.
 
 - [ ] **Step 2: Run tests and verify RED**
 

@@ -163,7 +163,7 @@ def test_run_script_uses_overrides_for_two_sequential_commands(tmp_path):
         "N_EMBED": "11",
         "SPEC_TYPE_AP": "test-spec",
         "DS_IN_MEMORY": "False",
-        "WORLD_SIZE_DDP": "7",
+        "WORLD_SIZE_DDP": "1",
         "OMP_NUM_THREADS": "19",
         "RACKERS_MODEL_OUT": str(tmp_path / "pure model.pt"),
         "RACKERS_OVERLAP_MODEL_OUT": str(tmp_path / "overlap model.pt"),
@@ -204,7 +204,7 @@ def test_run_script_uses_overrides_for_two_sequential_commands(tmp_path):
 
 @pytest.mark.parametrize(
     ("setting", "expected_argument", "expected_parsed"),
-    [("False", None, False), ("True", "True", True)],
+    [("fAlSe", None, False), ("tRuE", "True", True)],
 )
 def test_ds_in_memory_shell_setting_reaches_parser_semantically(
     tmp_path, monkeypatch, setting, expected_argument, expected_parsed
@@ -234,6 +234,35 @@ def test_ds_in_memory_shell_setting_reaches_parser_semantically(
         expected_parsed,
         expected_parsed,
     ]
+
+
+def test_invalid_world_size_fails_before_invocation(tmp_path):
+    recorder, call_log = _make_recorder(tmp_path)
+    model_dir = tmp_path / "models"
+    env = os.environ.copy()
+    for variable in PUBLIC_VARIABLES:
+        env.pop(variable, None)
+    env.update(
+        {
+            "PYTHON": str(recorder),
+            "CALL_LOG": str(call_log),
+            "WORLD_SIZE_DDP": "2",
+            "MODEL_DIR": str(model_dir),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "run.sh"],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert "WORLD_SIZE_DDP must be exactly 1" in result.stderr
+    assert not call_log.exists()
+    assert not model_dir.exists()
 
 
 def test_invalid_ds_in_memory_fails_before_invocation(tmp_path):

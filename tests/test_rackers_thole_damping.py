@@ -2294,6 +2294,7 @@ def test_rackers_dispatch_selects_harness_and_forwards_contract(
         elst_damping_type="AMOEBA",
         ds_in_memory=True,
         freeze_atom_model=freeze_atom_model,
+        omp_num_threads=23,
     )
 
     assert len(_FakeAtomTypeParamModel.calls) == 1
@@ -2333,7 +2334,7 @@ def test_rackers_dispatch_selects_harness_and_forwards_contract(
             "model_path": str(model_out),
             "n_epochs": 7,
             "world_size": 1,
-            "omp_num_threads_per_process": 8,
+            "omp_num_threads_per_process": 23,
             "lr": 3e-4,
             "dataloader_num_workers": 4,
             "random_seed": 19,
@@ -2723,6 +2724,31 @@ def test_cli_resolves_unset_parameter_defaults_by_route(
 
     assert calls[0]["param_start_mean"] == expected_mean
     assert calls[0]["param_start_std"] == expected_std
+
+
+def test_cli_forwards_omp_threads_to_pairwise_training(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_models.py",
+            "--train_apnet",
+            "RackersTholeDampingModel",
+            "--omp_num_threads",
+            "23",
+        ],
+    )
+    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
+    monkeypatch.setattr(
+        train_models,
+        "train_pairwise_model",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    train_models.main()
+
+    assert calls[0]["omp_num_threads"] == 23
 
 
 def test_cli_help_names_both_rackers_routes(capsys, monkeypatch):

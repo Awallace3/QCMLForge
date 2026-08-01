@@ -32,8 +32,9 @@ The script will reproduce the relevant Splinter example settings:
 - learning rate: `5e-5`
 - architecture: `n_rbf=8`, `n_neuron=64`, `n_embed=8`
 - in-memory dataset: `True`
-- DDP world size: `1`
-- OMP threads: `16`
+- DDP world size: fixed at `1`; any other `WORLD_SIZE_DDP` value is rejected
+  before directory creation or training
+- OMP threads: `16`, forwarded to each Rackers harness training call
 
 The script will not pass `n_params`, `dimer_eval_type`, `param_start_mean`, or
 `param_start_std`. The fixed Rackers harnesses select their own dimer modes and
@@ -41,8 +42,11 @@ use their route-specific four-head initialization defaults.
 
 ## Environment Overrides
 
-Every path and training setting above will be configurable through an
-environment variable while retaining the listed local default. The Python
+Every path and training setting above except DDP world size will be
+configurable through an environment variable while retaining the listed local
+default. `WORLD_SIZE_DDP` remains environment-visible but accepts only `1`,
+because the Rackers harnesses support single-process training only.
+`OMP_NUM_THREADS` is effective at the final Rackers training call. The Python
 executable will also be configurable, defaulting to `python3`.
 
 The default output checkpoints will be distinct:
@@ -55,9 +59,10 @@ retain `train_models.py`'s current resume behavior.
 
 ## Error Handling
 
-The script will create `MODEL_DIR` before training. Shell strict mode ensures
-that undefined variables, command failures, and pipeline failures stop the
-script. No checkpoint deletion or automatic overwrite logic will be added.
+The script will validate `WORLD_SIZE_DDP` as exactly `1`, then create
+`MODEL_DIR` before training. Shell strict mode ensures that undefined variables,
+command failures, and pipeline failures stop the script. No checkpoint deletion
+or automatic overwrite logic will be added.
 
 ## Testing
 

@@ -20,11 +20,21 @@ OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 RACKERS_MODEL_OUT="${RACKERS_MODEL_OUT:-${MODEL_DIR}/rackers_thole_${ITER}.pt}"
 RACKERS_OVERLAP_MODEL_OUT="${RACKERS_OVERLAP_MODEL_OUT:-${MODEL_DIR}/rackers_thole_overlap_${ITER}.pt}"
 
-case "${DS_IN_MEMORY,,}" in
-    true)
+case "${WORLD_SIZE_DDP}" in
+    1)
+        ;;
+    *)
+        printf 'Error: WORLD_SIZE_DDP must be exactly 1 (got %q)\n' \
+            "${WORLD_SIZE_DDP}" >&2
+        exit 2
+        ;;
+esac
+
+case "${DS_IN_MEMORY}" in
+    [Tt][Rr][Uu][Ee])
         DS_IN_MEMORY=true
         ;;
-    false)
+    [Ff][Aa][Ll][Ss][Ee])
         DS_IN_MEMORY=false
         ;;
     *)
