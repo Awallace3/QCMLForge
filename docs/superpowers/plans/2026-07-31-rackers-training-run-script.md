@@ -16,7 +16,7 @@
 - Default outputs are `${MODEL_DIR}/rackers_thole_${ITER}.pt` and `${MODEL_DIR}/rackers_thole_overlap_${ITER}.pt`.
 - Every path and training setting except Rackers world size is environment-overridable.
 - `WORLD_SIZE_DDP` remains environment-visible but must be exactly `1` and is validated before directory creation or training.
-- `OMP_NUM_THREADS` must reach `apnet.train` as `omp_num_threads_per_process`; its launcher default is `16`, while omitted direct `train_pairwise_model` calls retain the legacy default of `8`.
+- `OMP_NUM_THREADS` must reach `apnet.train` as `omp_num_threads_per_process`; its launcher default is `16`, omitted pairwise CLI and direct `train_pairwise_model` calls default to `8`, omitted atom CLI calls default to `1`, and explicit values are preserved.
 
 ---
 
@@ -75,6 +75,30 @@ OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 RACKERS_MODEL_OUT="${RACKERS_MODEL_OUT:-${MODEL_DIR}/rackers_thole_${ITER}.pt}"
 RACKERS_OVERLAP_MODEL_OUT="${RACKERS_OVERLAP_MODEL_OUT:-${MODEL_DIR}/rackers_thole_overlap_${ITER}.pt}"
 
+case "${WORLD_SIZE_DDP}" in
+    1)
+        ;;
+    *)
+        printf 'Error: WORLD_SIZE_DDP must be exactly 1 (got %q)\n' \
+            "${WORLD_SIZE_DDP}" >&2
+        exit 2
+        ;;
+esac
+
+case "${DS_IN_MEMORY}" in
+    [Tt][Rr][Uu][Ee])
+        DS_IN_MEMORY=true
+        ;;
+    [Ff][Aa][Ll][Ss][Ee])
+        DS_IN_MEMORY=false
+        ;;
+    *)
+        printf 'Error: DS_IN_MEMORY must be true or false (got %q)\n' \
+            "${DS_IN_MEMORY}" >&2
+        exit 2
+        ;;
+esac
+
 mkdir -p "${MODEL_DIR}"
 
 COMMON_ARGS=(
@@ -88,7 +112,13 @@ COMMON_ARGS=(
     --data_dir "${DATA_DIR}"
     --spec_type_ap "${SPEC_TYPE_AP}"
     --lr "${LEARNING_RATE}"
-    --ds_in_memory "${DS_IN_MEMORY}"
+)
+
+if [[ "${DS_IN_MEMORY}" == true ]]; then
+    COMMON_ARGS+=(--ds_in_memory True)
+fi
+
+COMMON_ARGS+=(
     --world_size_ddp "${WORLD_SIZE_DDP}"
     --omp_num_threads "${OMP_NUM_THREADS}"
 )

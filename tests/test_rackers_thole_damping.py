@@ -2726,6 +2726,49 @@ def test_cli_resolves_unset_parameter_defaults_by_route(
     assert calls[0]["param_start_std"] == expected_std
 
 
+def test_pairwise_cli_omitted_omp_threads_uses_legacy_default(
+    tmp_path, monkeypatch
+):
+    _patch_rackers_dispatch_fakes(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_models.py",
+            "--train_apnet",
+            "RackersTholeDampingModel",
+            "--ap_model_path",
+            str(tmp_path / "rackers.pt"),
+        ],
+    )
+    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
+
+    train_models.main()
+
+    train_call = _FakeRackersTholeDampingModel.calls[0].train_calls[0]
+    assert train_call["world_size"] == 1
+    assert train_call["omp_num_threads_per_process"] == 8
+
+
+def test_atom_cli_omitted_omp_threads_uses_atom_default(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_models.py", "--train_am", "AtomModel"],
+    )
+    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
+    monkeypatch.setattr(
+        train_models,
+        "train_atom_model",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    train_models.main()
+
+    assert calls[0]["omp_num_threads"] == 1
+
+
 def test_cli_forwards_omp_threads_to_pairwise_training(monkeypatch):
     calls = []
     monkeypatch.setattr(

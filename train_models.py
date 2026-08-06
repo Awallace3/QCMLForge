@@ -988,8 +988,11 @@ def main():
     args.add_argument(
         "--omp_num_threads",
         type=int,
-        default=1,
-        help="specify omp_num_threads for DDP only for AtomModels currently (default: 1)",
+        default=None,
+        help=(
+            "OpenMP threads per training process "
+            "(default: 1 for atom models, 8 for pairwise models)"
+        ),
     )
     args.add_argument(
         "--ds_in_memory",
@@ -1082,7 +1085,11 @@ def main():
             random_seed=args.random_seed,
             ds_max_size=args.ds_max_size,
             world_size=args.world_size_ddp,
-            omp_num_threads=args.omp_num_threads,
+            omp_num_threads=(
+                args.omp_num_threads
+                if args.omp_num_threads is not None
+                else 1
+            ),
             lr=args.lr,
             n_message=args.n_message_atom,
             n_rbf=args.n_rbf_atom,
@@ -1139,7 +1146,11 @@ def main():
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
-            omp_num_threads=args.omp_num_threads,
+            omp_num_threads=(
+                args.omp_num_threads
+                if args.omp_num_threads is not None
+                else 8
+            ),
         )
     return
 

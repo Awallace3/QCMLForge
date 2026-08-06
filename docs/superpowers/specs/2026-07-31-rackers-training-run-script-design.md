@@ -46,8 +46,11 @@ Every path and training setting above except DDP world size will be
 configurable through an environment variable while retaining the listed local
 default. `WORLD_SIZE_DDP` remains environment-visible but accepts only `1`,
 because the Rackers harnesses support single-process training only.
-`OMP_NUM_THREADS` is effective at the final Rackers training call. The Python
-executable will also be configurable, defaulting to `python3`.
+`OMP_NUM_THREADS` is effective at the final Rackers training call. Its launcher
+default is `16`; a bare pairwise CLI and a direct `train_pairwise_model` call
+default to `8`, while a bare atom CLI retains its default of `1`. Explicit CLI
+values are unchanged. The Python executable will also be configurable,
+defaulting to `python3`.
 
 The default output checkpoints will be distinct:
 
@@ -73,6 +76,8 @@ script without starting model training, and assert:
 2. the pure model runs before the overlap model;
 3. both receive the shared Splinter configuration and pretrained paths;
 4. each receives its distinct output path; and
-5. environment overrides are honored.
+5. environment overrides are honored; and
+6. launcher/default/explicit OMP values reach the final route-specific training
+   call while Rackers world size remains `1`.
 
 The implementation will also be checked with `bash -n run.sh`.
