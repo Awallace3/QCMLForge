@@ -48,6 +48,8 @@ def qcel_dimer_to_fused_data(dimer, r_cut=5.0, r_cut_im=8.0, **kwargs):
         RB=dimer.get_fragment(1).geometry * constants.au2ang,
         ZB=dimer.get_fragment(1).atomic_numbers,
         TQB=dimer.get_fragment(1).molecular_charge,
+        total_spin_A=dimer.get_fragment(0).molecular_multiplicity,
+        total_spin_B=dimer.get_fragment(1).molecular_multiplicity,
         r_cut=r_cut,
         r_cut_im=r_cut_im,
         **kwargs,
@@ -89,6 +91,8 @@ def dimer_fused_data(
     r_cut=5.0,
     r_cut_im=8.0,
     check_validity=True,
+    total_spin_A=1,
+    total_spin_B=1,
     **kwargs,
 ):
     atomic_props_A = atomic_datasets.create_atomic_data(ZA, RA, TQA, r_cut=r_cut)
@@ -134,11 +138,39 @@ def dimer_fused_data(
         e_BB_source=e_BB_source,
         e_BB_target=e_BB_target,
         molecule_ind_B=atomic_props_B.molecule_ind,
-        # monomer charges
+        # monomer charge and MACE's input ``total_spin`` (multiplicity)
         total_charge_A=atomic_props_A.total_charge,
         total_charge_B=atomic_props_B.total_charge,
+        total_spin_A=torch.tensor(float(total_spin_A), dtype=torch.float32),
+        total_spin_B=torch.tensor(float(total_spin_B), dtype=torch.float32),
         **kwargs,  # allows for additional properties to be passed in
     )
+
+
+def _stack_monomer_metadata(batch, name, *, default, dtype):
+    """Stack one scalar per monomer without changing source data objects."""
+
+    values = []
+    for data in batch:
+        value = getattr(data, name, default)
+        if torch.is_tensor(value):
+            value = value.detach().reshape(-1)[0].item()
+        values.append(value)
+    return torch.tensor(values, dtype=dtype)
+
+
+def _attach_total_spin_metadata(batched_data, batch):
+    spin_a = _stack_monomer_metadata(
+        batch, "total_spin_A", default=1.0, dtype=torch.float32
+    )
+    spin_b = _stack_monomer_metadata(
+        batch, "total_spin_B", default=1.0, dtype=torch.float32
+    )
+    batched_data.total_spin_A = spin_a
+    batched_data.total_spin_B = spin_b
+    batched_data.batch_atomic_A.total_spin = spin_a
+    batched_data.batch_atomic_B.total_spin = spin_b
+    return batched_data
 
 
 def natural_key(text):
@@ -302,6 +334,12 @@ def ap3_fused_collate_update(batch):
     total_charge_B_tensor = torch.tensor(
         [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
     )
+    total_spin_A_tensor = _stack_monomer_metadata(
+        batch, "total_spin_A", default=1.0, dtype=torch.float32
+    )
+    total_spin_B_tensor = _stack_monomer_metadata(
+        batch, "total_spin_B", default=1.0, dtype=torch.float32
+    )
 
     batch_atomic_A = Data(
         x=ZA_cat,
@@ -309,6 +347,7 @@ def ap3_fused_collate_update(batch):
         R=RA_cat,
         molecule_ind=molecule_ind_A,
         total_charge=total_charge_A_tensor,
+        total_spin=total_spin_A_tensor,
         natom_per_mol=natom_per_mol_A,
     )
 
@@ -318,6 +357,7 @@ def ap3_fused_collate_update(batch):
         R=RB_cat,
         molecule_ind=molecule_ind_B,
         total_charge=total_charge_B_tensor,
+        total_spin=total_spin_B_tensor,
         natom_per_mol=natom_per_mol_B,
     )
 
@@ -364,6 +404,8 @@ def ap3_fused_collate_update(batch):
         dimer_ind_full=dimer_ind_full_cat,
         total_charge_A=total_charge_A_tensor,
         total_charge_B=total_charge_B_tensor,
+        total_spin_A=total_spin_A_tensor,
+        total_spin_B=total_spin_B_tensor,
         batch_atomic_A=batch_atomic_A,
         batch_atomic_B=batch_atomic_B,
         indA=indA_cat,
@@ -537,7 +579,7 @@ def ap3_fused_collate_update_no_target(batch):
         batch_atomic_A=batch_atomic_A,
         batch_atomic_B=batch_atomic_B,
     )
-    return batched_data
+    return _attach_total_spin_metadata(batched_data, batch)
 
 
 def ap3_fused_collate_update_no_target_monomer_indices(batch):
@@ -703,7 +745,7 @@ def ap3_fused_collate_update_no_target_monomer_indices(batch):
         batch_atomic_A=batch_atomic_A,
         batch_atomic_B=batch_atomic_B,
     )
-    return batched_data
+    return _attach_total_spin_metadata(batched_data, batch)
 
 
 class APNet2_fused_DataLoader(torch.utils.data.DataLoader):
@@ -785,6 +827,8 @@ def save_hdf5_data_objects(data_objects, filepath):
                 "molecule_ind_B",
                 "total_charge_A",
                 "total_charge_B",
+                "total_spin_A",
+                "total_spin_B",
                 "qA",
                 "muA",
                 "quadA",
@@ -1194,7 +1238,9 @@ class ap3_fused_module_dataset(Dataset):
         idx = 0
         data_objects = []
         # Handle direct qcel_mols input
-        RAs, RBs, ZAs, ZBs, TQAs, TQBs, targets = [], [], [], [], [], [], []
+        RAs, RBs, ZAs, ZBs, TQAs, TQBs, TMAs, TMBs, targets = (
+            [], [], [], [], [], [], [], [], []
+        )
         if self.qcel_molecules is not None and self.energy_labels is not None:
             print("Processing directly from provided QCElemental molecules...")
             split_name = self.split_name
@@ -1210,7 +1256,7 @@ class ap3_fused_module_dataset(Dataset):
                 ZA = torch.tensor(monA.atomic_numbers, dtype=torch.int64)
                 ZB = torch.tensor(monB.atomic_numbers, dtype=torch.int64)
 
-                # Calculate total charges
+                # Calculate total charges and preserve spin multiplicities.
                 TQA = torch.tensor(monA.molecular_charge, dtype=torch.float32)
                 TQB = torch.tensor(monB.molecular_charge, dtype=torch.float32)
 
@@ -1220,6 +1266,8 @@ class ap3_fused_module_dataset(Dataset):
                 ZBs.append(ZB)
                 TQAs.append(TQA)
                 TQBs.append(TQB)
+                TMAs.append(int(monA.molecular_multiplicity))
+                TMBs.append(int(monB.molecular_multiplicity))
             targets = self.energy_labels
 
             if self.MAX_SIZE is not None and len(RAs) > self.MAX_SIZE:
@@ -1229,6 +1277,8 @@ class ap3_fused_module_dataset(Dataset):
                 ZBs = ZBs[: self.MAX_SIZE]
                 TQAs = TQAs[: self.MAX_SIZE]
                 TQBs = TQBs[: self.MAX_SIZE]
+                TMAs = TMAs[: self.MAX_SIZE]
+                TMBs = TMBs[: self.MAX_SIZE]
                 targets = targets[: self.MAX_SIZE]
 
             print(
@@ -1259,6 +1309,10 @@ class ap3_fused_module_dataset(Dataset):
                 ZBs.extend(ZB)
                 TQAs.extend(TQA)
                 TQBs.extend(TQB)
+                # Legacy array datasets do not carry multiplicity; preserve the
+                # historical closed-shell assumption explicitly.
+                TMAs.extend([1] * len(RA))
+                TMBs.extend([1] * len(RB))
                 targets.extend(target)
         print("Creating data objects...")
         t1 = time()
@@ -1289,6 +1343,8 @@ class ap3_fused_module_dataset(Dataset):
                 r_cut=self.r_cut,
                 r_cut_im=self.r_cut_im,
                 check_validity=self.check_monomer_validity,
+                total_spin_A=TMAs[i],
+                total_spin_B=TMBs[i],
                 y=y,
             )
             if data is None:
@@ -1899,7 +1955,9 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         )
         data_objects = []
 
-        RAs, RBs, ZAs, ZBs, TQAs, TQBs, targets = [], [], [], [], [], [], []
+        RAs, RBs, ZAs, ZBs, TQAs, TQBs, TMAs, TMBs, targets = (
+            [], [], [], [], [], [], [], [], []
+        )
 
         if self.qcel_molecules is not None and self.energy_labels is not None:
             print("Processing directly from provided QCElemental molecules...")
@@ -1921,6 +1979,8 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 ZBs.append(ZB)
                 TQAs.append(TQA)
                 TQBs.append(TQB)
+                TMAs.append(int(monA.molecular_multiplicity))
+                TMBs.append(int(monB.molecular_multiplicity))
             targets = self.energy_labels
 
             if self.MAX_SIZE is not None and len(RAs) > self.MAX_SIZE:
@@ -1930,6 +1990,8 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 ZBs = ZBs[: self.MAX_SIZE]
                 TQAs = TQAs[: self.MAX_SIZE]
                 TQBs = TQBs[: self.MAX_SIZE]
+                TMAs = TMAs[: self.MAX_SIZE]
+                TMBs = TMBs[: self.MAX_SIZE]
                 targets = targets[: self.MAX_SIZE]
 
             print(
@@ -1960,6 +2022,8 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 ZBs.extend(ZB)
                 TQAs.extend(TQA)
                 TQBs.extend(TQB)
+                TMAs.extend([1] * len(RA))
+                TMBs.extend([1] * len(RB))
                 targets.extend(target)
 
         print("Creating data objects...")
@@ -1986,6 +2050,8 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 r_cut=self.r_cut,
                 r_cut_im=self.r_cut_im,
                 check_validity=self.check_monomer_validity,
+                total_spin_A=TMAs[i],
+                total_spin_B=TMBs[i],
                 y=y,
             )
 

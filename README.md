@@ -32,6 +32,27 @@ export TORCH=2.10.0
 pip install torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-${TORCH}+cpu.html
 ```
 
+## Optional MACE–AP3D3 workflows
+
+Install the pinned optional stack with `python -m pip install -e '.[mace]'`.
+The PolarMACE foundation model is an external ASL artifact: verify its trusted
+SHA-256 before loading, keep it outside QCMLForge checkpoints, and use only
+approved academic, non-commercial internal workflows. Ordinary package imports
+remain MACE-free.
+
+Before cluster work, run the deterministic smoke and script contracts:
+
+```bash
+python scripts/make_mace_ap3d3_smoke_data.py --check
+python -m pytest tests/test_mace_one_epoch.py tests/test_mace_slurm_scripts.py -q
+```
+
+See [the SLURM small-verification guide](docs/mace-apnet-slurm.md) for offline
+feature preparation, atomic-head training, the 5-model × 3-seed dry-run matrix,
+manifest review, and the mandatory small-`sbatch` gate. Full-scale submission
+and multi-GPU use remain prohibited pending that gate and an outstanding CUDA
+wheel/driver, memory, and CPU/GPU parity preflight.
+
 ## Usage Workshop Demo
 A QCArchive+QCMLForge+Cybershuttle workshop demo is available
 [here](https://github.com/Awallace3/psi4_interaction_energy_cybershuttle). This

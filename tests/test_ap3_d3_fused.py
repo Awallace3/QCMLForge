@@ -22,8 +22,69 @@ from apnet_pt.pt_datasets.ap3_fused_ds import (
 )
 from apnet_pt.util import scatter_sum_compile
 from qcml_dftd3.d3 import params_intermolecular_saptpbe0_d3i
+from torch_geometric.data import Data
 
 torch.manual_seed(42)
+
+
+class _PrecomputedBatch(Data):
+    def to(self, *args, **kwargs):
+        return self
+
+
+class _ResidualLoopStub(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(4))
+        self.no_disp_nn = False
+
+    def forward(self, batch):
+        predictions = self.weight.unsqueeze(0)
+        placeholder = predictions.new_zeros(1)
+        return (
+            predictions,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+        )
+
+
+def _precomputed_loop_harness():
+    harness = object.__new__(APNet3D3_AtomType_Model)
+    harness.model = _ResidualLoopStub()
+    harness.use_precomputed_classical = True
+    return harness
+
+
+def _precomputed_batch():
+    return _PrecomputedBatch(
+        y=torch.tensor([[10.0, 20.0, 30.0, 40.0]]),
+        E_classical_elst=torch.tensor([1.0]),
+        E_classical_ind=torch.tensor([2.0]),
+        E_classical_disp=torch.tensor([3.0]),
+    )
+
+
+@pytest.mark.parametrize("path", ["train", "evaluate"])
+def test_precomputed_residual_loops_do_not_mutate_full_labels(path):
+    harness = _precomputed_loop_harness()
+    batch = _precomputed_batch()
+    labels_before = batch.y.clone()
+    if path == "train":
+        optimizer = torch.optim.SGD(harness.model.parameters(), lr=1.0e-3)
+        harness._APNet3D3_AtomType_Model__train_batches_single_proc(
+            [batch], None, optimizer, torch.device("cpu"), None
+        )
+    else:
+        harness._APNet3D3_AtomType_Model__evaluate_batches_single_proc(
+            [batch], None, torch.device("cpu")
+        )
+    assert torch.equal(batch.y, labels_before)
+
+
 spec_type = 5
 current_file_path = os.path.dirname(os.path.realpath(__file__))
 data_path = f"{current_file_path}/test_data_path"

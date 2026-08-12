@@ -392,10 +392,9 @@ class APNet3D3_AtomType_MPNN(nn.Module):
     def get_messages(self, h0, h, rbf, e_source, e_target):
         nedge = e_source.numel()
         if nedge == 0:
-            # No intramolecular edges
-            return torch.zeros(
-                0, self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf
-            )
+            # Preserve the caller's dtype/device for single-atom monomers.
+            width = self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf
+            return h0.new_zeros((0, width))
 
         h0_source = h0.index_select(0, e_source)
         h0_target = h0.index_select(0, e_target)
@@ -466,6 +465,13 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         dR = torch.sqrt(torch.sum(dR_xyz * dR_xyz, dim=-1).clamp_min(1e-10))
         return dR, dR_xyz
 
+    def smooth_pair_energy_envelope(self, distances):
+        """Cosine envelope used only by injected MACE H1/H2 forwards."""
+
+        scaled = (distances / self.r_cut_im).clamp(min=0.0, max=1.0)
+        envelope = 0.5 * (torch.cos(torch.pi * scaled) + 1.0)
+        return torch.where(distances < self.r_cut_im, envelope, 0.0)
+
     # @torch.compile
     def readouts(self, H):
         parts = [
@@ -480,6 +486,12 @@ class APNet3D3_AtomType_MPNN(nn.Module):
     def forward(
         self,
         batch,
+        *,
+        initial_atom_states=None,
+        atomic_properties=None,
+        residual_only=False,
+        pair_energy_envelope=False,
+        bypass_intra_updates=False,
     ):
         ZA = batch.ZA
         RA = batch.RA
@@ -507,41 +519,50 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # interatomic distances
         dR_sr, dR_sr_xyz = self.get_distances(RA, RB, e_ABsr_source, e_ABsr_target)
         dR_lr, dR_lr_xyz = self.get_distances(RA, RB, e_ABlr_source, e_ABlr_target)
-        # TODO: need to handle single atoms correctly without self edge because
-        # this goes to zero causing nans later...
-        dRA, dRA_xyz = self.get_distances(RA, RA, e_AA_source, e_AA_target)
-        dRB, dRB_xyz = self.get_distances(RB, RB, e_BB_source, e_BB_target)
+        if not bypass_intra_updates:
+            dRA, dRA_xyz = self.get_distances(RA, RA, e_AA_source, e_AA_target)
+            dRB, dRB_xyz = self.get_distances(RB, RB, e_BB_source, e_BB_target)
 
         # interatomic unit vectors
         dR_sr_unit = dR_sr_xyz / dR_sr.unsqueeze(1)
-        dRA_unit = dRA_xyz / dRA.unsqueeze(1)
-        dRB_unit = dRB_xyz / dRB.unsqueeze(1)
+        if not bypass_intra_updates:
+            dRA_unit = dRA_xyz / dRA.unsqueeze(1)
+            dRB_unit = dRB_xyz / dRB.unsqueeze(1)
 
         # distance encodings
         rbf_sr = self.distance_layer_im(dR_sr)
-        rbfA = self.distance_layer(dRA)
-        rbfB = self.distance_layer(dRB)
+        if not bypass_intra_updates:
+            rbfA = self.distance_layer(dRA)
+            rbfB = self.distance_layer(dRB)
 
         ##########################################################
         ### predict monomer properties w/ pretrained AtomModel ###
         ##########################################################
 
-        if self.use_precomputed_classical:
-            mA, mB = self.dimer_prop_model(batch)
+        if atomic_properties is None:
+            if self.use_precomputed_classical:
+                mA, mB = self.dimer_prop_model(batch)
+            else:
+                E_classical, mA, mB = self.dimer_prop_model(batch)
+                E_elst = E_classical[:, 0]
+                E_ind = E_classical[:, 1]
+                if not self.no_disp_nn:
+                    E_disp = E_classical[:, 2]
+            qA = mA[0].view(-1, 1)
+            qB = mB[0].view(-1, 1)
+            hfvrA = mA[-2][:, 0].view(-1, 1)
+            hfvrB = mB[-2][:, 0].view(-1, 1)
+            vwA = mA[-2][:, 1].view(-1, 1)
+            vwB = mB[-2][:, 1].view(-1, 1)
         else:
-            E_classical, mA, mB = self.dimer_prop_model(batch)
-            E_elst = E_classical[:, 0]
-            E_ind = E_classical[:, 1]
-            if not self.no_disp_nn:
-                E_disp = E_classical[:, 2]
-        qA = mA[0]
-        qB = mB[0]
-        qA = qA.view(-1, 1)
-        qB = qB.view(-1, 1)
-        hfvrA = mA[-2][:, 0].view(-1, 1)
-        hfvrB = mB[-2][:, 0].view(-1, 1)
-        vwA = mA[-2][:, 1].view(-1, 1)
-        vwB = mB[-2][:, 1].view(-1, 1)
+            if not residual_only:
+                raise ValueError(
+                    "injected atomic properties require the residual-only AP3 seam"
+                )
+            propsA, propsB = atomic_properties
+            qA, qB = propsA.q, propsB.q
+            hfvrA, hfvrB = propsA.hfvr, propsB.hfvr
+            vwA, vwB = propsA.valence_width, propsB.valence_width
         # print(f"{hfvrA.shape = }, {hfvrB.shape = }, {vwA.shape = }, {vwB.shape = }")
         # print(f"{qB.shape = }")
         # print(f"{qA.shape = }, {muA.shape = }, {quadA.shape = }")
@@ -551,65 +572,68 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         ### predict SAPT components via intramonomer message passing ###
         ################################################################
 
-        # invariant hidden state lists
-        hA_list = [self.embed_layer(ZA).view(ZA.size(0), -1)]
-        hB_list = [self.embed_layer(ZB).view(ZB.size(0), -1)]
+        # invariant hidden state lists. Injected states replace, rather than
+        # supplement, the legacy element embedding for canonical MACE H1.
+        if initial_atom_states is None:
+            hA0 = self.embed_layer(ZA).view(ZA.size(0), -1)
+            hB0 = self.embed_layer(ZB).view(ZB.size(0), -1)
+        else:
+            hA0, hB0 = initial_atom_states
+            if hA0.shape != (natomA, self.n_embed) or hB0.shape != (
+                natomB,
+                self.n_embed,
+            ):
+                raise ValueError("initial atom states must match AP3 h0 dimensions")
 
-        # directional hidden state lists
-        hA_dir_list = []
-        hB_dir_list = []
+        if bypass_intra_updates:
+            if initial_atom_states is None:
+                raise ValueError(
+                    "bypassing AP3 intramonomer updates requires injected states"
+                )
+            # H2 uses the projected MACE state directly. Repeat it across the
+            # established AP3 state slots and reserve zero directional slots so
+            # H1 and H2 retain the exact same pair/readout input capacity.
+            hA = hA0.repeat(1, self.n_message + 1)
+            hB = hB0.repeat(1, self.n_message + 1)
+            directional_width = self.n_message * self.n_embed
+            hA_dir = hA0.new_zeros((natomA, 3, directional_width))
+            hB_dir = hB0.new_zeros((natomB, 3, directional_width))
+        else:
+            hA_list = [hA0]
+            hB_list = [hB0]
+            hA_dir_list = []
+            hB_dir_list = []
 
-        # TODO: need to determine how to handle all monA in batch having no
-        # monomer edges (single atoms)
-        for i in range(self.n_message):
-            mA_ij = self.get_messages(
-                hA_list[0], hA_list[-1], rbfA, e_AA_source, e_AA_target
-            )
-            mB_ij = self.get_messages(
-                hB_list[0], hB_list[-1], rbfB, e_BB_source, e_BB_target
-            )
-            if mA_ij is None or mB_ij is None:
-                # Single-atom corner case; skip
-                hA_list.append(hA_list[-1])
-                hB_list.append(hB_list[-1])
-                continue
+            for i in range(self.n_message):
+                mA_ij = self.get_messages(
+                    hA_list[0], hA_list[-1], rbfA, e_AA_source, e_AA_target
+                )
+                mB_ij = self.get_messages(
+                    hB_list[0], hB_list[-1], rbfB, e_BB_source, e_BB_target
+                )
 
-            #################
-            ### invariant ###
-            #################
+                mA_i = scatter_sum_compile(mA_ij, e_AA_source, int(natomA))
+                mB_i = scatter_sum_compile(mB_ij, e_BB_source, int(natomB))
+                hA_next = self.update_layers[i](mA_i)
+                hB_next = self.update_layers[i](mB_i)
+                hA_list.append(hA_next)
+                hB_list.append(hB_next)
 
-            # sum each atom's messages
-            mA_i = scatter_sum_compile(mA_ij, e_AA_source, int(natomA))
-            mB_i = scatter_sum_compile(mB_ij, e_BB_source, int(natomB))
+                mA_ij_dir = self.directional_layers[i](mA_ij)
+                mB_ij_dir = self.directional_layers[i](mB_ij)
+                mA_ij_dir = torch.einsum("ex,em->exm", dRA_unit, mA_ij_dir)
+                mB_ij_dir = torch.einsum("ex,em->exm", dRB_unit, mB_ij_dir)
+                hA_dir_list.append(
+                    scatter_sum_compile(mA_ij_dir, e_AA_source, int(natomA))
+                )
+                hB_dir_list.append(
+                    scatter_sum_compile(mB_ij_dir, e_BB_source, int(natomB))
+                )
 
-            # get the next hidden state of the atom
-            hA_next = self.update_layers[i](mA_i)
-            hB_next = self.update_layers[i](mB_i)
-
-            hA_list.append(hA_next)
-            hB_list.append(hB_next)
-
-            ###################
-            ### directional ###
-            ###################
-
-            mA_ij_dir = self.directional_layers[i](mA_ij)
-            mB_ij_dir = self.directional_layers[i](mB_ij)
-            mA_ij_dir = torch.einsum("ex,em->exm", dRA_unit, mA_ij_dir)
-            mB_ij_dir = torch.einsum("ex,em->exm", dRB_unit, mB_ij_dir)
-
-            # sum directional messages to get directional atomic hidden states
-            # NOTE: this summation must be linear to guarantee equivariance.
-            #       because of this constraint, we applied a dense net before
-            #       the summation, not after
-            hA_dir = scatter_sum_compile(mA_ij_dir, e_AA_source, int(natomA))
-            hB_dir = scatter_sum_compile(mB_ij_dir, e_BB_source, int(natomB))
-            hA_dir_list.append(hA_dir)
-            hB_dir_list.append(hB_dir)
-
-        # concatenate hidden states over MP iterations
-        hA = torch.cat(hA_list, dim=-1)
-        hB = torch.cat(hB_list, dim=-1)
+            hA = torch.cat(hA_list, dim=-1)
+            hB = torch.cat(hB_list, dim=-1)
+            hA_dir = torch.cat(hA_dir_list, dim=-1)
+            hB_dir = torch.cat(hB_dir_list, dim=-1)
 
         # atom-pair features are a combo of atomic hidden states and the interatomic distance
         hAB = self.get_pair_params(
@@ -622,9 +646,6 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # hBA = self.get_pair(hB, hA, qB, qA, rbf_sr, e_ABsr_target, e_ABsr_source)
 
         # project the directional atomic hidden states along the interatomic axis
-        hA_dir = torch.cat(hA_dir_list, dim=-1)
-        hB_dir = torch.cat(hB_dir_list, dim=-1)
-
         hA_dir_source = hA_dir.index_select(0, e_ABsr_source)
         hB_dir_target = hB_dir.index_select(0, e_ABsr_target)
 
@@ -640,9 +661,11 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         E_sr = EAB_sr + EBA_sr
 
         cutoff = (1.0 / (dR_sr**3)).unsqueeze(-1)
+        if pair_energy_envelope:
+            cutoff = cutoff * self.smooth_pair_energy_envelope(dR_sr).unsqueeze(-1)
         E_sr *= cutoff
         E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
-        if self.use_precomputed_classical:
+        if self.use_precomputed_classical or residual_only:
             E_output = E_sr_dimer
             if self.return_hidden_states:
                 return E_output, E_sr, 0, 0, 0, hAB, hBA, cutoff
@@ -2250,7 +2273,7 @@ units angstrom
                 batch
             )
             preds = E_sr_dimer.reshape(-1, n_comp)
-            labels = batch.y[:, :n_comp]
+            labels = batch.y[:, :n_comp].clone()
             if self.use_precomputed_classical:
                 labels[:, 0] -= batch.E_classical_elst
                 labels[:, 2] -= batch.E_classical_ind
@@ -2296,7 +2319,7 @@ units angstrom
                 batch = batch.to(rank_device, non_blocking=True)
                 E_sr_dimer, _, _, _, _, _, _ = self.model(batch)
                 preds = E_sr_dimer.reshape(-1, n_comp)
-                labels = batch.y[:, :n_comp]
+                labels = batch.y[:, :n_comp].clone()
                 if self.use_precomputed_classical:
                     labels[:, 0] -= batch.E_classical_elst
                     labels[:, 2] -= batch.E_classical_ind

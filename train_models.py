@@ -672,9 +672,8 @@ def parse_param_list(param_str):
         return float(param_str)
 
 
-def main():
-    """
-    Parse command-line arguments and run configured model training routines.
+def build_parser():
+    """Build the legacy-compatible parser plus the MACE/AP3D3 contract.
 
     Parses command-line options that configure atom and pairwise (APNet) training, converts the parameter-start mean/std strings to numeric lists, sets global random seeds, prints the parsed arguments, and invokes train_atom_model and/or train_pairwise_model when the corresponding flags are provided.
     """
@@ -961,7 +960,68 @@ def main():
         default=False,
         help="Build/process the requested dataset and exit without training.",
     )
-    args = args.parse_args()
+    args.add_argument("--mace_model", type=str, default="polar-1-s")
+    args.add_argument("--mace_model_path", type=str, default=None)
+    args.add_argument("--mace_model_sha256", type=str, default=None)
+    args.add_argument("--mace_feature_mode", type=str, default="auto")
+    args.add_argument("--mace_default_dtype", type=str, default="float32")
+    args.add_argument(
+        "--mace_device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Explicit eager MACE execution device policy.",
+    )
+    args.add_argument("--mace_cache_dir", type=str, default=None)
+    args.add_argument("--mace_offline", action="store_true", default=False)
+    args.add_argument("--mace_atom_model_path", type=str, default=None)
+    args.add_argument("--mace_property_mode", type=str, default="learned")
+    args.add_argument("--train_atomic_heads", action="store_true", default=False)
+    args.add_argument("--long_range_elst", type=str, default="damped-cliff")
+    args.add_argument("--d3_params", type=str, default="default")
+    args.add_argument("--smoke_data_path", type=str, default=None)
+    args.add_argument("--smoke_atom_data_path", type=str, default=None)
+    args.add_argument("--skip_compile", action="store_true", default=False)
+    args.add_argument("--dataloader_num_workers", type=int, default=None)
+    args.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="Pair smoke batch size; production dataset loaders retain their own defaults.",
+    )
+    args.add_argument("--overwrite", action="store_true", default=False)
+    args.add_argument("--resume", action="store_true", default=False)
+    return args
+
+
+def dispatch_args(args, *, mace_dispatch=None):
+    """Dispatch only after route-specific validation has completed."""
+
+    if args.train_apnet == "APNet3-fused-d3" and args.smoke_data_path:
+        from apnet_pt.training.smoke import run_matched_ap3d3_baseline_smoke
+
+        pprint(args)
+        set_all_seeds(args.random_seed)
+        report = run_matched_ap3d3_baseline_smoke(args)
+        print(f"baseline smoke loss={report.loss:.8g}")
+        print(f"baseline component_losses={dict(report.component_losses)}")
+        print(f"baseline classical_ledger={dict(report.classical_ledger)}")
+        print(f"baseline residual_ledger={dict(report.residual_ledger)}")
+        return report
+
+    from apnet_pt.training.mace_ap3d3_factory import looks_like_mace_option
+
+    is_mace_pair = bool(args.train_apnet) and looks_like_mace_option(
+        args.train_apnet
+    )
+    is_mace_atom = bool(args.train_am) and looks_like_mace_option(args.train_am)
+    if is_mace_pair or is_mace_atom:
+        if mace_dispatch is None:
+            from apnet_pt.training.mace_ap3d3_factory import dispatch_mace_cli
+
+            mace_dispatch = dispatch_mace_cli
+        pprint(args)
+        set_all_seeds(args.random_seed)
+        return mace_dispatch(args)
     # Parse param_start_mean and param_start_std
     args.param_start_mean = parse_param_list(args.param_start_mean)
     args.param_start_std = parse_param_list(args.param_start_std)
@@ -1031,6 +1091,13 @@ def main():
             include_total_mse=args.include_total_mse,
         )
     return
+
+
+def main(argv=None):
+    """Parse arguments and dispatch legacy or normalized MACE routes."""
+
+    args = build_parser().parse_args(argv)
+    return dispatch_args(args)
 
 
 if __name__ == "__main__":

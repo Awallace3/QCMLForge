@@ -29,6 +29,13 @@ dependencies = [
 ]
 license = {text = "MIT"}
 
+[project.optional-dependencies]
+mace = [
+    "mace-torch==0.3.16",
+    "e3nn==0.4.4",
+    "graph-longrange @ git+https://github.com/WillBaldwin0/graph_electrostatics.git@0e21d5546c482d08388a08eb4d948e833227ce47",
+]
+
 [project.urls]
 "Homepage" = "https://github.com/Awallace3/QCMLForge"
 "Bug Tracker" = "https://github.com/Awallace3/QCMLForge/issues"
@@ -39,6 +46,9 @@ dev_template = "{tag}.{ccount}+git.{sha}"
 dirty_template = "{tag}.{ccount}+git.{sha}.dirty"
 
 [tool.pytest.ini_options]
+markers = [
+    "mace_integration: requires a local digest-verified PolarMACE checkpoint",
+]
 filterwarnings = [
     'ignore:To copy construct from a tensor, it is recommended to use sourceTensor.detach\(\)\.clone\(\):UserWarning',
 ]

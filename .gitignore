@@ -170,6 +170,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 *.sbatch
+!scripts/slurm/*.sbatch
 data_dir
 tmp.py
 train.sh
