@@ -304,9 +304,9 @@ def test_real_checkpoint_directpolar_wiring_is_finite_not_accuracy_claim():
         load_verified_polar_mace,
     )
 
-    artifact = Path("/tmp/MACE-POLAR-1-S.model")
-    if not artifact.is_file():
-        pytest.skip("local PolarMACE artifact is not available")
+    from tests.mace_integration import polar_mace_artifact
+
+    artifact = polar_mace_artifact()
     backbone = load_verified_polar_mace(
         artifact, expected_sha256=POLAR_1S_SHA256, offline=True
     )

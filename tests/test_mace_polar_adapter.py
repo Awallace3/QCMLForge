@@ -111,9 +111,9 @@ def test_verified_loader_freezes_backbone_without_global_dtype_side_effect(tmp_p
 
 @pytest.mark.mace_integration
 def test_real_verified_polar_checkpoint_loads_as_frozen_module():
-    artifact = Path("/tmp/MACE-POLAR-1-S.model")
-    if not artifact.is_file():
-        pytest.skip("local PolarMACE artifact is not available")
+    from tests.mace_integration import polar_mace_artifact
+
+    artifact = polar_mace_artifact()
     model = load_verified_polar_mace(
         artifact,
         expected_sha256=POLAR_1S_SHA256,
@@ -427,9 +427,9 @@ def test_protocol_monomer_batch_order_and_atom_permutation():
 
 @pytest.mark.mace_integration
 def test_real_private_adapter_public_parity_and_direct_contract():
-    artifact = Path("/tmp/MACE-POLAR-1-S.model")
-    if not artifact.is_file():
-        pytest.skip("local PolarMACE artifact is not available")
+    from tests.mace_integration import polar_mace_artifact
+
+    artifact = polar_mace_artifact()
     backbone = load_verified_polar_mace(
         artifact, expected_sha256=POLAR_1S_SHA256, offline=True
     )

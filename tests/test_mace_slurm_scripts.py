@@ -352,13 +352,21 @@ def test_prepared_cache_consumer_requires_complete_identity_checked_entries(tmp_
     )
     manifest = {
         "status": "complete",
+        "cache_format": "qcmlforge-mace-monomer-cache-v1",
         "mace_sha256": mace_sha,
+        "mace_model_id": "polar-1-s",
         "physics_hash": physics_hash,
         "dtype": "float32",
+        "dataset_hash": "d" * 64,
+        "preprocessing_hash": "e" * 64,
+        "split_hash": "f" * 64,
+        "feature_schemas": {mode: f"stub:mode={mode}:cache"},
+        "entry_count": 1,
         "entries": [
             {
                 "path": str(entry.relative_to(cache)),
                 "sha256": _sha(entry),
+                "monomer_hash": "c" * 64,
                 "cache_key": key,
                 "feature_mode": mode,
             }
@@ -369,7 +377,12 @@ def test_prepared_cache_consumer_requires_complete_identity_checked_entries(tmp_
         cache,
         feature_mode=mode,
         mace_sha256=mace_sha,
+        mace_model_id="polar-1-s",
         physics_hash=physics_hash,
+        dataset_kind="pair",
+        dataset_hash="d" * 64,
+        preprocessing_hash="e" * 64,
+        split_hash="f" * 64,
         dtype=torch.float32,
     )
     assert set(loaded) == {key}
@@ -379,7 +392,12 @@ def test_prepared_cache_consumer_requires_complete_identity_checked_entries(tmp_
             cache,
             feature_mode=mode,
             mace_sha256=mace_sha,
+            mace_model_id="polar-1-s",
             physics_hash=physics_hash,
+            dataset_kind="pair",
+            dataset_hash="d" * 64,
+            preprocessing_hash="e" * 64,
+            split_hash="f" * 64,
             dtype=torch.float32,
         )
 

@@ -1,11 +1,10 @@
-import hashlib
 from pathlib import Path
 
 import pytest
 import torch
 
 import train_models
-from apnet_pt.mace.encoder import load_verified_polar_mace
+from apnet_pt.mace.encoder import POLAR_1S_SHA256, load_verified_polar_mace
 from apnet_pt.mace.model import MACEAP3D3
 from apnet_pt.training.mace_ap3d3_factory import (
     _default_factory_dependencies,
@@ -14,18 +13,17 @@ from apnet_pt.training.mace_ap3d3_factory import (
 )
 
 
-ARTIFACT = Path("/tmp/MACE-POLAR-1-S.model")
-ARTIFACT_SHA256 = "e4495612037b3b3312633182882a38a694ecac9ea0be2b9889ac0b2a84a99510"
+ARTIFACT = None
+ARTIFACT_SHA256 = POLAR_1S_SHA256
 DATA = Path(__file__).parent / "dataset_data"
 LEGACY = Path(__file__).parent / "test_models" / "ap3_ensemble_0"
 
 
 def _artifact_or_skip():
-    if not ARTIFACT.is_file():
-        pytest.skip("local PolarMACE checkpoint is unavailable")
-    actual = hashlib.sha256(ARTIFACT.read_bytes()).hexdigest()
-    if actual != ARTIFACT_SHA256:
-        pytest.skip("local PolarMACE checkpoint digest is not the pinned artifact")
+    global ARTIFACT
+    from tests.mace_integration import polar_mace_artifact
+
+    ARTIFACT = polar_mace_artifact()
 
 
 def _common():

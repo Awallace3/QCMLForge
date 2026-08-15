@@ -37,6 +37,10 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
+# Validation evidence is intentionally ignored so CI-0/JUnit output cannot
+# make a subsequent controlled CI-1 source-state check dirty.
+artifacts/
+junit-*.xml
 htmlcov/
 .tox/
 .nox/

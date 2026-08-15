@@ -126,9 +126,16 @@ def test_prepared_cache_rejects_neural_cutoff_physics_hash_mismatch(tmp_path):
     (tmp_path / "COMPLETE.json").write_text(
         __import__("json").dumps({
             "status": "complete",
+            "cache_format": "qcmlforge-mace-monomer-cache-v1",
             "mace_sha256": "a" * 64,
+            "mace_model_id": "polar-1-s",
             "physics_hash": old.physics_hash,
             "dtype": "float32",
+            "dataset_hash": "b" * 64,
+            "preprocessing_hash": "c" * 64,
+            "split_hash": "d" * 64,
+            "feature_schemas": {},
+            "entry_count": 0,
             "entries": [],
         })
     )
@@ -137,7 +144,12 @@ def test_prepared_cache_rejects_neural_cutoff_physics_hash_mismatch(tmp_path):
             tmp_path,
             feature_mode="final-layer-scalars",
             mace_sha256="a" * 64,
+            mace_model_id="polar-1-s",
             physics_hash=current.physics_hash,
+            dataset_kind="pair",
+            dataset_hash="b" * 64,
+            preprocessing_hash="c" * 64,
+            split_hash="d" * 64,
             dtype=torch.float32,
         )
 

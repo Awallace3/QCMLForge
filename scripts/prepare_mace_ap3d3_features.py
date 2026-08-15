@@ -28,7 +28,7 @@ from apnet_pt.training.smoke import (
 )
 
 
-CACHE_FORMAT = "qcmlforge-mace-monomer-cache-v1"
+CACHE_FORMAT = "qcmlforge-mace-monomer-cache-v2"
 MODES = ("final-layer-scalars", "all-scalars+norms")
 
 
@@ -58,7 +58,16 @@ def _load_fixture(path: Path, schema: str) -> Mapping[str, Any]:
 
 
 def _molecule_identity(molecule: qcel.models.Molecule) -> str:
-    return _canonical_hash(json.loads(molecule.json()))
+    """Hash only the physical inputs used to construct a cache key."""
+
+    return _canonical_hash(
+        {
+            "atomic_numbers": [int(value) for value in molecule.atomic_numbers],
+            "geometry_bohr": molecule.geometry.tolist(),
+            "molecular_charge": float(molecule.molecular_charge),
+            "molecular_multiplicity": int(molecule.molecular_multiplicity),
+        }
+    )
 
 
 def _primitive_molecule(record) -> qcel.models.Molecule:
@@ -73,15 +82,20 @@ def _primitive_molecule(record) -> qcel.models.Molecule:
 
 def _collect_monomers(pair_fixture, atom_fixture):
     monomers: dict[str, qcel.models.Molecule] = {}
+    membership = {"pair": set(), "atomic": set()}
     for record in pair_fixture["records"]:
         dimer = _primitive_molecule(record["dimer"])
         for fragment in (0, 1):
             molecule = dimer.get_fragment(fragment)
-            monomers.setdefault(_molecule_identity(molecule), molecule)
+            key = _molecule_identity(molecule)
+            monomers.setdefault(key, molecule)
+            membership["pair"].add(key)
     for record in atom_fixture["records"]:
         molecule = _primitive_molecule(record["monomer"])
-        monomers.setdefault(_molecule_identity(molecule), molecule)
-    return monomers
+        key = _molecule_identity(molecule)
+        monomers.setdefault(key, molecule)
+        membership["atomic"].add(key)
+    return monomers, {kind: sorted(values) for kind, values in membership.items()}
 
 
 def _entry_identity(key, cache_key, mode, args, physics_hash):
@@ -171,6 +185,27 @@ def _validate_complete_manifest(cache_dir: Path, expected: Mapping[str, Any]) ->
     actual = {path.resolve() for path in cache_dir.glob("*/*.pt")}
     if actual != listed:
         raise RuntimeError("complete cache contains unlisted or missing entries")
+
+    # Completed-cache reuse is held to the exact same record and membership
+    # contract as a training consumer, rather than trusting manifest digests.
+    from apnet_pt.training.smoke import load_prepared_feature_cache
+
+    dtype = torch.float32 if expected["dtype"] == "float32" else torch.float64
+    for kind in ("pair", "atomic"):
+        identity = expected["dataset_identity"][kind]
+        for mode in MODES:
+            load_prepared_feature_cache(
+                cache_dir,
+                feature_mode=mode,
+                mace_sha256=expected["mace_sha256"],
+                mace_model_id=expected["mace_model_id"],
+                physics_hash=expected["physics_hash"],
+                dataset_kind=kind,
+                dataset_hash=identity["dataset_hash"],
+                preprocessing_hash=identity["preprocessing_hash"],
+                split_hash=identity["split_hash"],
+                dtype=dtype,
+            )
     print(f"reusing {len(entries)} existing valid cache entries")
     return True
 
@@ -224,22 +259,31 @@ def prepare(args) -> Mapping[str, Any]:
     atom_path = Path(args.atom_data)
     pair_fixture = _load_fixture(pair_path, PAIR_SMOKE_SCHEMA)
     atom_fixture = _load_fixture(atom_path, ATOMIC_SMOKE_SCHEMA)
-    monomers = _collect_monomers(pair_fixture, atom_fixture)
+    monomers, membership = _collect_monomers(pair_fixture, atom_fixture)
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     physics = PhysicsConfig()
     dataset_identity = {
-        "pair_content_hash": pair_fixture["content_hash"],
-        "pair_split_hash": pair_fixture["split_hash"],
-        "pair_preprocessing_hash": pair_fixture["preprocessing_hash"],
-        "atomic_content_hash": atom_fixture["content_hash"],
-        "atomic_split_hash": atom_fixture["split_hash"],
-        "atomic_preprocessing_hash": atom_fixture["preprocessing_hash"],
+        "pair": {
+            "dataset_hash": pair_fixture["content_hash"],
+            "split_hash": pair_fixture["split_hash"],
+            "preprocessing_hash": pair_fixture["preprocessing_hash"],
+            "monomer_count": len(membership["pair"]),
+            "monomer_hashes": membership["pair"],
+        },
+        "atomic": {
+            "dataset_hash": atom_fixture["content_hash"],
+            "split_hash": atom_fixture["split_hash"],
+            "preprocessing_hash": atom_fixture["preprocessing_hash"],
+            "monomer_count": len(membership["atomic"]),
+            "monomer_hashes": membership["atomic"],
+        },
     }
     expected_manifest = {
         "status": "complete",
         "cache_format": CACHE_FORMAT,
         "mace_sha256": args.mace_sha256,
+        "mace_model_id": args.mace_model_id,
         "dataset_identity": dataset_identity,
         "physics_hash": physics.physics_hash,
         "dtype": args.dtype,
@@ -328,12 +372,18 @@ def prepare(args) -> Mapping[str, Any]:
         "cuda_version": torch.version.cuda,
         "device": str(device),
     }
+    listed_paths = {str(entry["path"]) for entry in entries}
+    actual_paths = {
+        str(path.relative_to(cache_dir)) for path in cache_dir.glob("*/*.pt")
+    }
+    if actual_paths != listed_paths:
+        raise RuntimeError("partial cache contains stale or unlisted entries")
+
     manifest = {
         **expected_manifest,
         "source_commit": _source_commit(),
         "environment": environment,
         "mace_version": importlib.metadata.version("mace-torch"),
-        "mace_model_id": args.mace_model_id,
         "mace_path": str(artifact.resolve()),
         "feature_schemas": feature_schemas,
         "dataset_counts": {

@@ -24,10 +24,24 @@ The canonical model ID is `polar-1-s`. The external artifact is:
 - SHA-256: `e4495612037b3b3312633182882a38a694ecac9ea0be2b9889ac0b2a84a99510`
 - checkpoint license: Academic Software License (ASL)
 
-Never deserialize a downloaded model before comparing its SHA-256 with the
-trusted manifest. Cluster jobs must use offline mode, a local path, and an
-explicit digest; compute nodes must not download models. The artifact remains
-external: do not commit, package, embed in QCMLForge checkpoints, or
+Never deserialize a downloaded model before comparing its exact size and
+SHA-256 with the trusted manifest. Protected tests resolve the administrator
+mounted path through `QCMLFORGE_POLARMACE_ARTIFACT`; missing protected
+prerequisites are `BLOCKED`, while wrong size/digest is `FAIL`. The Python
+preflight checks Unix permission bits only and does not prove mount immutability.
+CI-2 is currently **DISABLED/BLOCKED** by an unconditional workflow guard. The
+three confirmed external blockers are: no `polarmace-protected` GitHub
+Environment, unprotected `main`, and no isolated matching self-hosted runner.
+Before a reviewed future change enables it, administrators must verify protected
+Environment restrictions and required reviewers, branch protection, a
+read-only approved mount, and isolated runner cleanup. The future authority requires
+`QCMLFORGE_CI2_POLICY_ATTESTED=true` from that protected Environment; missing or
+false is `BLOCKED`. A local environment value or repository YAML is not proof of
+external policy. Trusted-ref YAML remains defense in depth, not the artifact
+security boundary. Cluster jobs must use offline mode, a local path, and an
+explicit digest; compute nodes must
+not download models. The artifact remains external: do not commit, package,
+embed in QCMLForge checkpoints, copy into caches/evidence, upload, or
 redistribute it. Checkpoints and run manifests record its canonical locator,
 digest, MACE version, schema, and license acknowledgment.
 
@@ -99,6 +113,9 @@ do not establish broader model accuracy.
 ## Small SLURM verification
 
 The offline preparation, atomic-head, pair-matrix, manifest, and dependency
-workflow is documented in [mace-apnet-slurm.md](mace-apnet-slurm.md). Run its
-local smoke and dry-run gates before any `sbatch`. Full-scale and multi-GPU runs
-remain blocked on successful small jobs and the outstanding CUDA preflight.
+workflow is documented in [mace-apnet-slurm.md](mace-apnet-slurm.md). Checked-in
+scripts, shell parsing, and fake-`sbatch` tests validate local wiring only; no
+real scheduler validation has been performed by those checks. Run the local
+smoke and dry-run gates before any separately authorized `sbatch`. Full-scale
+and multi-GPU runs remain blocked on successful real small jobs and the
+outstanding CUDA preflight.

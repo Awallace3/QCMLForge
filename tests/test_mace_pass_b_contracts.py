@@ -210,30 +210,79 @@ def test_all_remaining_trainable_pair_parameters_have_gradient_and_delta():
             )
 
 
-def test_prepared_cache_is_lazy_read_only_strict_and_dataset_bound(tmp_path):
+@pytest.mark.parametrize("identity_form", ["top-level", "scoped", "legacy-prefixed"])
+def test_prepared_cache_is_lazy_read_only_strict_and_dataset_bound(
+    tmp_path, identity_form
+):
     entry = tmp_path / "entry.pt"
-    torch.save({"identity": {}, "tensors": {}}, entry)
+    tensors = {
+        "invariant": torch.ones(1, 2),
+        "equivariant": torch.zeros(1, 0),
+        "batch": torch.zeros(1, dtype=torch.long),
+        "atomic_numbers": torch.ones(1, dtype=torch.long),
+        "total_charge": torch.zeros(1),
+        "total_spin": torch.ones(1),
+        "density_coefficients": torch.zeros(1, 4),
+        "charges": torch.zeros(1),
+        "molecular_dipole_eangstrom": torch.zeros(1, 3),
+        "positions_angstrom": torch.zeros(1, 3),
+    }
+    torch.save({
+        "identity": {
+            "format": "qcmlforge-mace-monomer-cache-v1",
+            "monomer_hash": "f" * 64,
+            "cache_key": "key",
+            "feature_mode": "final-layer-scalars",
+            "mace_sha256": "a" * 64,
+            "mace_model_id": "polar-1-s",
+            "physics_hash": "b" * 64,
+            "dtype": "float32",
+        },
+        "feature_schema": "stub:mode=final-layer-scalars",
+        "tensors": tensors,
+    }, entry)
     manifest = {
         "status": "complete",
+        "cache_format": "qcmlforge-mace-monomer-cache-v1",
         "mace_sha256": "a" * 64,
+        "mace_model_id": "polar-1-s",
         "physics_hash": "b" * 64,
         "dtype": "float32",
         "dataset_hash": "c" * 64,
         "preprocessing_hash": "d" * 64,
         "split_hash": "e" * 64,
+        "feature_schemas": {"final-layer-scalars": "stub:mode=final-layer-scalars"},
+        "entry_count": 1,
         "entries": [{
             "feature_mode": "final-layer-scalars",
+            "monomer_hash": "f" * 64,
             "cache_key": "key",
             "path": entry.name,
             "sha256": __import__("hashlib").sha256(entry.read_bytes()).hexdigest(),
         }],
     }
+    if identity_form != "top-level":
+        identity = {
+            "dataset_hash": manifest.pop("dataset_hash"),
+            "preprocessing_hash": manifest.pop("preprocessing_hash"),
+            "split_hash": manifest.pop("split_hash"),
+        }
+        if identity_form == "scoped":
+            manifest["dataset_identity"] = {"pair": identity}
+        else:
+            manifest["dataset_identity"] = {
+                "pair_content_hash": identity["dataset_hash"],
+                "pair_preprocessing_hash": identity["preprocessing_hash"],
+                "pair_split_hash": identity["split_hash"],
+            }
     (tmp_path / "COMPLETE.json").write_text(json.dumps(manifest))
     cache = PreparedFeatureCache(
         tmp_path,
         feature_mode="final-layer-scalars",
         mace_sha256="a" * 64,
+        mace_model_id="polar-1-s",
         physics_hash="b" * 64,
+        dataset_kind="pair",
         dataset_hash="c" * 64,
         preprocessing_hash="d" * 64,
         split_hash="e" * 64,
@@ -244,12 +293,28 @@ def test_prepared_cache_is_lazy_read_only_strict_and_dataset_bound(tmp_path):
         cache["missing"]
     with pytest.raises(TypeError, match="read-only"):
         cache["key"] = object()
+    if identity_form in {"scoped", "legacy-prefixed"}:
+        with pytest.raises(RuntimeError, match="v1 identity is not explicit"):
+            PreparedFeatureCache(
+                tmp_path,
+                feature_mode="final-layer-scalars",
+                mace_sha256="a" * 64,
+                mace_model_id="polar-1-s",
+                physics_hash="b" * 64,
+                dataset_kind="atomic",
+                dataset_hash="c" * 64,
+                preprocessing_hash="d" * 64,
+                split_hash="e" * 64,
+                dtype=torch.float32,
+            )
     with pytest.raises(RuntimeError, match="dataset_hash"):
         PreparedFeatureCache(
             tmp_path,
             feature_mode="final-layer-scalars",
             mace_sha256="a" * 64,
+            mace_model_id="polar-1-s",
             physics_hash="b" * 64,
+            dataset_kind="pair",
             dataset_hash="f" * 64,
             preprocessing_hash="d" * 64,
             split_hash="e" * 64,

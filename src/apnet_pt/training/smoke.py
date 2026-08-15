@@ -91,7 +91,17 @@ def _load_fixture(path: str | Path, schema: str) -> dict[str, Any]:
 
 
 class PreparedFeatureCache(MutableMapping):
-    """Lazy, read-only, identity-bound prepared feature cache."""
+    """Read-only prepared features with strict scoped identity validation."""
+
+    SUPPORTED_FORMATS = {
+        "qcmlforge-mace-monomer-cache-v1",
+        "qcmlforge-mace-monomer-cache-v2",
+    }
+    REQUIRED_TENSORS = {
+        "invariant", "equivariant", "batch", "atomic_numbers", "total_charge",
+        "total_spin", "density_coefficients", "charges",
+        "molecular_dipole_eangstrom", "positions_angstrom",
+    }
 
     def __init__(
         self,
@@ -99,7 +109,9 @@ class PreparedFeatureCache(MutableMapping):
         *,
         feature_mode: str,
         mace_sha256: str,
+        mace_model_id: str,
         physics_hash: str,
+        dataset_kind: str,
         dataset_hash: str,
         preprocessing_hash: str,
         split_hash: str,
@@ -109,74 +121,262 @@ class PreparedFeatureCache(MutableMapping):
         complete = self.cache_dir / "COMPLETE.json"
         if not complete.is_file():
             raise RuntimeError("partial feature cache: COMPLETE.json is missing")
-        self.manifest = json.loads(complete.read_text())
-        self.feature_mode = feature_mode
-        self.mace_sha256 = mace_sha256
-        self.physics_hash = physics_hash
-        self.dtype = dtype
-        expected = {
-            "status": "complete",
+        try:
+            self.manifest = json.loads(complete.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("partial feature cache: COMPLETE.json is invalid") from exc
+        if dataset_kind not in {"pair", "atomic"}:
+            raise ValueError("dataset_kind must be 'pair' or 'atomic'")
+        for name, value in {
             "mace_sha256": mace_sha256,
+            "mace_model_id": mace_model_id,
             "physics_hash": physics_hash,
-            "dtype": str(dtype).removeprefix("torch."),
             "dataset_hash": dataset_hash,
             "preprocessing_hash": preprocessing_hash,
             "split_hash": split_hash,
+        }.items():
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"prepared feature cache requires explicit {name}")
+
+        cache_format = self.manifest.get("cache_format")
+        if cache_format not in self.SUPPORTED_FORMATS:
+            raise RuntimeError("prepared feature cache mismatch for cache_format")
+        identity = self._dataset_identity(cache_format, dataset_kind)
+        scoped_monomers = None
+        if cache_format.endswith("v2"):
+            values = identity.get("monomer_hashes")
+            if (
+                not isinstance(values, list)
+                or not values
+                or any(not isinstance(value, str) or not value for value in values)
+                or len(values) != len(set(values))
+                or identity.get("monomer_count") != len(values)
+            ):
+                raise RuntimeError(
+                    f"prepared feature cache {dataset_kind} membership is invalid"
+                )
+            scoped_monomers = set(values)
+        expected = {
+            "status": "complete",
+            "mace_sha256": mace_sha256,
+            "mace_model_id": mace_model_id,
+            "physics_hash": physics_hash,
+            "dtype": str(dtype).removeprefix("torch."),
         }
         for name, value in expected.items():
             if self.manifest.get(name) != value:
                 raise RuntimeError(f"prepared feature cache mismatch for {name}")
-        self._entries = {
-            entry["cache_key"]: entry
-            for entry in self.manifest.get("entries", [])
-            if entry.get("feature_mode") == feature_mode
-        }
+        for name, value in {
+            "dataset_hash": dataset_hash,
+            "preprocessing_hash": preprocessing_hash,
+            "split_hash": split_hash,
+        }.items():
+            if identity.get(name) != value:
+                raise RuntimeError(f"prepared feature cache mismatch for {name}")
+
+        entries = self.manifest.get("entries")
+        if not isinstance(entries, list) or self.manifest.get("entry_count") != len(entries):
+            raise RuntimeError("prepared feature cache entry_count is inconsistent")
+        schemas = self.manifest.get("feature_schemas")
+        if not isinstance(schemas, Mapping) or feature_mode not in schemas:
+            raise RuntimeError("prepared feature cache feature schema is missing")
+        if cache_format.endswith("v2") and not set(("final-layer-scalars", "all-scalars+norms")).issubset(schemas):
+            raise RuntimeError("prepared feature cache is missing a required feature mode")
+
+        self.feature_mode = feature_mode
+        self.mace_sha256 = mace_sha256
+        self.mace_model_id = mace_model_id
+        self.physics_hash = physics_hash
+        self.dtype = dtype
+        self.cache_format = cache_format
+        self.feature_schema = schemas[feature_mode]
+        self._entries = {}
+        listed = set()
+        seen = set()
+        mode_monomers: dict[str, set[str]] = {mode: set() for mode in schemas}
+        all_v2_monomers: set[str] | None = None
+        if cache_format.endswith("v2"):
+            identities = self.manifest["dataset_identity"]
+            if set(identities) != {"pair", "atomic"}:
+                raise RuntimeError("prepared feature cache dataset scopes are invalid")
+            all_v2_monomers = set()
+            for kind in ("pair", "atomic"):
+                values = identities[kind].get("monomer_hashes")
+                if not isinstance(values, list):
+                    raise RuntimeError("prepared feature cache membership is missing")
+                all_v2_monomers.update(values)
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise RuntimeError("prepared feature cache entry is invalid")
+            required = {"path", "sha256", "cache_key", "feature_mode", "monomer_hash"}
+            if not required.issubset(entry):
+                raise RuntimeError("prepared feature cache entry metadata is incomplete")
+            pair = (entry["feature_mode"], entry["cache_key"])
+            if pair in seen:
+                raise RuntimeError("prepared feature cache contains duplicate cache key")
+            seen.add(pair)
+            relative = Path(entry["path"])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise RuntimeError("prepared feature cache entry path escapes cache root")
+            entry_path = (self.cache_dir / relative).resolve()
+            try:
+                entry_path.relative_to(self.cache_dir.resolve())
+            except ValueError as exc:
+                raise RuntimeError("prepared feature cache entry path escapes cache root") from exc
+            listed.add(entry_path)
+            if not entry_path.is_file() or _sha256_file(entry_path) != entry["sha256"]:
+                raise RuntimeError(f"prepared feature cache entry is corrupt: {entry_path}")
+            mode = entry["feature_mode"]
+            if mode not in schemas:
+                raise RuntimeError("prepared feature cache entry has no feature schema")
+            monomer_hash = entry["monomer_hash"]
+            if all_v2_monomers is not None and monomer_hash not in all_v2_monomers:
+                raise RuntimeError("prepared feature cache contains an out-of-scope monomer")
+            if monomer_hash in mode_monomers[mode]:
+                raise RuntimeError("prepared feature cache contains duplicate monomer")
+            mode_monomers[mode].add(monomer_hash)
+            self._validate_record(dict(entry), mode, schemas[mode])
+            if mode == feature_mode and (
+                scoped_monomers is None or monomer_hash in scoped_monomers
+            ):
+                self._entries[entry["cache_key"]] = dict(entry)
+        actual = {item.resolve() for item in self.cache_dir.rglob("*.pt")}
+        if actual != listed:
+            raise RuntimeError("prepared feature cache contains unlisted or missing entries")
+        if scoped_monomers is not None:
+            for mode in ("final-layer-scalars", "all-scalars+norms"):
+                missing = scoped_monomers - mode_monomers[mode]
+                if missing:
+                    raise RuntimeError(
+                        f"prepared feature cache {dataset_kind} membership is incomplete "
+                        f"for {mode}"
+                    )
+            selected = {
+                entry["monomer_hash"] for entry in self._entries.values()
+            }
+            if selected != scoped_monomers:
+                raise RuntimeError("prepared feature cache selected membership is inconsistent")
         if not self._entries:
             raise RuntimeError(f"prepared cache has no entries for {feature_mode}")
         self.loaded_entries = 0
         self.strict_read_only = True
 
+    def _dataset_identity(self, cache_format: str, dataset_kind: str) -> Mapping[str, Any]:
+        if cache_format.endswith("v2"):
+            identities = self.manifest.get("dataset_identity")
+            if not isinstance(identities, Mapping) or not isinstance(identities.get(dataset_kind), Mapping):
+                raise RuntimeError(f"prepared feature cache has no explicit {dataset_kind} identity")
+            return identities[dataset_kind]
+        # Compatibility is deliberately limited to explicit v1 identities.
+        nested = self.manifest.get("dataset_identity")
+        if isinstance(nested, Mapping):
+            scoped = nested.get(dataset_kind)
+            if isinstance(scoped, Mapping):
+                return scoped
+            prefix = "pair" if dataset_kind == "pair" else "atomic"
+            legacy = {
+                "dataset_hash": nested.get(f"{prefix}_content_hash"),
+                "preprocessing_hash": nested.get(f"{prefix}_preprocessing_hash"),
+                "split_hash": nested.get(f"{prefix}_split_hash"),
+            }
+            if all(isinstance(value, str) and value for value in legacy.values()):
+                return legacy
+        top = {name: self.manifest.get(name) for name in ("dataset_hash", "preprocessing_hash", "split_hash")}
+        if all(isinstance(value, str) and value for value in top.values()):
+            return top
+        raise RuntimeError("prepared feature cache v1 identity is not explicit")
+
+    def _validate_record(self, entry, mode, schema):
+        entry_path = self.cache_dir / entry["path"]
+        record = torch.load(entry_path, map_location="cpu", weights_only=True)
+        identity = record.get("identity")
+        expected = {
+            "format": self.cache_format,
+            "monomer_hash": entry["monomer_hash"],
+            "cache_key": entry["cache_key"],
+            "feature_mode": mode,
+            "mace_sha256": self.mace_sha256,
+            "mace_model_id": self.mace_model_id,
+            "physics_hash": self.physics_hash,
+            "dtype": str(self.dtype).removeprefix("torch."),
+        }
+        if not isinstance(identity, Mapping) or any(
+            identity.get(name) != value for name, value in expected.items()
+        ):
+            raise RuntimeError(f"prepared feature cache identity is stale: {entry_path}")
+        if record.get("feature_schema") != schema:
+            raise RuntimeError("prepared feature cache feature schema mismatch")
+        tensors = record.get("tensors")
+        if not isinstance(tensors, Mapping) or not self.REQUIRED_TENSORS.issubset(tensors):
+            raise RuntimeError("prepared feature cache tensors are incomplete")
+        if any(not torch.is_tensor(value) for value in tensors.values()):
+            raise RuntimeError("prepared feature cache tensors are invalid")
+        expected_dtype = self.dtype
+        floating_names = self.REQUIRED_TENSORS - {"batch", "atomic_numbers"}
+        if any(
+            not torch.is_floating_point(tensors[name])
+            or tensors[name].dtype != expected_dtype
+            or not torch.isfinite(tensors[name]).all()
+            for name in floating_names
+        ):
+            raise RuntimeError(
+                "prepared feature cache floating tensor dtype/value contract is invalid"
+            )
+        for name in ("batch", "atomic_numbers"):
+            if tensors[name].dtype not in {torch.int32, torch.int64}:
+                raise RuntimeError(
+                    "prepared feature cache integer tensor contract is invalid"
+                )
+        try:
+            features = MACEAtomicFeatures(
+                invariant=tensors["invariant"],
+                equivariant=tensors["equivariant"],
+                batch=tensors["batch"],
+                atomic_numbers=tensors["atomic_numbers"],
+                total_charge=tensors["total_charge"],
+                total_spin=tensors["total_spin"],
+                feature_schema=record["feature_schema"],
+            )
+            direct = PolarMACEDirectOutputs(
+                density_coefficients=tensors["density_coefficients"],
+                charges=tensors["charges"],
+                molecular_dipole_eangstrom=tensors["molecular_dipole_eangstrom"],
+                positions_angstrom=tensors["positions_angstrom"],
+                batch=tensors["batch"],
+                total_charge=tensors["total_charge"],
+            )
+            natom = features.natom
+            nmonomer = features.total_charge.numel()
+            if natom == 0 or features.batch.unique(sorted=True).tolist() != list(range(nmonomer)):
+                raise ValueError("feature batch must be zero-based and contiguous")
+            if not torch.equal(features.batch, direct.batch):
+                raise ValueError("feature and direct batches must agree")
+        except (TypeError, ValueError, KeyError) as exc:
+            raise RuntimeError(
+                f"prepared feature cache tensor schema is invalid: {exc}"
+            ) from exc
+        return record, tensors
+
     def __getitem__(self, key):
         if key not in self._entries:
             raise KeyError(f"prepared feature cache miss: {key}")
         entry = self._entries[key]
-        entry_path = self.cache_dir / entry["path"]
-        if not entry_path.is_file() or _sha256_file(entry_path) != entry["sha256"]:
-            raise RuntimeError(f"prepared feature cache entry is corrupt: {entry_path}")
-        record = torch.load(entry_path, map_location="cpu", weights_only=True)
-        identity = record.get("identity", {})
-        expected_dtype = str(self.dtype).removeprefix("torch.")
-        if identity and (
-            identity.get("cache_key") != key
-            or identity.get("mace_sha256") != self.mace_sha256
-            or identity.get("physics_hash") != self.physics_hash
-            or identity.get("dtype") != expected_dtype
-        ):
-            raise RuntimeError(f"prepared feature cache identity is stale: {entry_path}")
-        tensors = record["tensors"]
-        floating = {
-            name: value.to(dtype=self.dtype)
-            for name, value in tensors.items()
-            if torch.is_floating_point(value)
-        }
+        record, tensors = self._validate_record(
+            entry, self.feature_mode, self.feature_schema
+        )
         self.loaded_entries += 1
         return (
             MACEAtomicFeatures(
-                invariant=floating["invariant"],
-                equivariant=floating["equivariant"],
-                batch=tensors["batch"].to(torch.long),
-                atomic_numbers=tensors["atomic_numbers"].to(torch.long),
-                total_charge=floating["total_charge"],
-                total_spin=floating["total_spin"],
+                invariant=tensors["invariant"], equivariant=tensors["equivariant"],
+                batch=tensors["batch"], atomic_numbers=tensors["atomic_numbers"],
+                total_charge=tensors["total_charge"], total_spin=tensors["total_spin"],
                 feature_schema=record["feature_schema"],
             ),
             PolarMACEDirectOutputs(
-                density_coefficients=floating["density_coefficients"],
-                charges=floating["charges"],
-                molecular_dipole_eangstrom=floating["molecular_dipole_eangstrom"],
-                positions_angstrom=floating["positions_angstrom"],
-                batch=tensors["batch"].to(torch.long),
-                total_charge=floating["total_charge"],
+                density_coefficients=tensors["density_coefficients"], charges=tensors["charges"],
+                molecular_dipole_eangstrom=tensors["molecular_dipole_eangstrom"],
+                positions_angstrom=tensors["positions_angstrom"], batch=tensors["batch"],
+                total_charge=tensors["total_charge"],
             ),
         )
 
@@ -189,6 +389,9 @@ class PreparedFeatureCache(MutableMapping):
     def __iter__(self) -> Iterator[str]:
         return iter(self._entries)
 
+    def __contains__(self, key: object) -> bool:
+        return key in self._entries
+
     def __len__(self) -> int:
         return len(self._entries)
 
@@ -198,31 +401,21 @@ def load_prepared_feature_cache(
     *,
     feature_mode: str,
     mace_sha256: str,
+    mace_model_id: str,
     physics_hash: str,
+    dataset_kind: str,
+    dataset_hash: str,
+    preprocessing_hash: str,
+    split_hash: str,
     dtype: torch.dtype,
-    dataset_hash: str | None = None,
-    preprocessing_hash: str | None = None,
-    split_hash: str | None = None,
 ) -> PreparedFeatureCache:
-    """Open a complete prepared cache without eagerly loading tensor entries."""
+    """Open a complete prepared cache with an explicit dataset scope."""
 
-    manifest_path = Path(path) / "COMPLETE.json"
-    if not manifest_path.is_file():
-        raise RuntimeError("partial feature cache: COMPLETE.json is missing")
-    manifest = json.loads(manifest_path.read_text())
     return PreparedFeatureCache(
-        path,
-        feature_mode=feature_mode,
-        mace_sha256=mace_sha256,
-        physics_hash=physics_hash,
-        dataset_hash=(dataset_hash if dataset_hash is not None else manifest.get("dataset_hash")),
-        preprocessing_hash=(
-            preprocessing_hash
-            if preprocessing_hash is not None
-            else manifest.get("preprocessing_hash")
-        ),
-        split_hash=split_hash if split_hash is not None else manifest.get("split_hash"),
-        dtype=dtype,
+        path, feature_mode=feature_mode, mace_sha256=mace_sha256,
+        mace_model_id=mace_model_id, physics_hash=physics_hash,
+        dataset_kind=dataset_kind, dataset_hash=dataset_hash,
+        preprocessing_hash=preprocessing_hash, split_hash=split_hash, dtype=dtype,
     )
 
 
