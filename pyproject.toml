@@ -39,6 +39,9 @@ dev_template = "{tag}.{ccount}+git.{sha}"
 dirty_template = "{tag}.{ccount}+git.{sha}.dirty"
 
 [tool.pytest.ini_options]
+markers = [
+    "slow: long-running tests (e.g. Psi4-backed timing estimation)",
+]
 filterwarnings = [
     'ignore:To copy construct from a tensor, it is recommended to use sourceTensor.detach\(\)\.clone\(\):UserWarning',
 ]

@@ -1109,16 +1109,20 @@ class _ControlledRackersAtomParam(torch.nn.Module):
             (-(0.8 + 0.1 * atom_index), 0.4 + 0.05 * atom_index),
             dim=1,
         )
-        parameter_columns = torch.arange(
-            1, 5, dtype=batch.R.dtype, device=batch.x.device
-        )
+        # Stack along dim=1 so the sentinel matches the production
+        # [n_atoms, 4] parameter-head contract for any atom count. Column 0 is
+        # negative and column 1 is below the positivity epsilon so that the
+        # dimer forward pass is shown to pass raw head values through without
+        # re-clamping them.
+        atom_scale = 1.0 + 0.1 * atom_index
         parameters = torch.stack(
             (
-                -parameter_columns,
-                RACKERS_POSITIVITY_EPSILON * parameter_columns / 10.0,
-                parameter_columns + 0.25,
-                parameter_columns + 1.25,
-            )
+                -atom_scale,
+                RACKERS_POSITIVITY_EPSILON * atom_scale / 10.0,
+                atom_scale + 0.25,
+                atom_scale + 1.25,
+            ),
+            dim=1,
         )
         return charge, dipole, quadrupole, hfvr_vw, parameters
 
@@ -1196,10 +1200,11 @@ def test_rackers_dimer_forward_routes_columns_edges_and_preserves_charge(
         for call in atom_parameters.batch_calls
     ) == 1
     for output in (output_A, output_B):
-        assert torch.all(output[-1][0] < 0)
-        assert torch.all(output[-1][1] > 0)
+        assert output[-1].shape == (output[0].numel(), 4)
+        assert torch.all(output[-1][:, 0] < 0)
+        assert torch.all(output[-1][:, 1] > 0)
         assert torch.all(
-            output[-1][1] < RACKERS_POSITIVITY_EPSILON
+            output[-1][:, 1] < RACKERS_POSITIVITY_EPSILON
         )
 
     other_damping_type = (
@@ -2160,6 +2165,23 @@ def test_geometric_mean_edge_values_rejects_non_finite(
     edge = torch.tensor([0, 1], dtype=torch.long)
     with pytest.raises(ValueError, match="finite"):
         geometric_mean_edge_values(source, target, edge, edge)
+
+
+def test_geometric_mean_edge_values_is_compile_safe():
+    """The eager-only finite check must not break Dynamo tracing."""
+    source = torch.tensor([1.0, 4.0, 9.0], dtype=torch.float64)
+    target = torch.tensor([16.0, 25.0], dtype=torch.float64)
+    e_source = torch.tensor([0, 1, 2], dtype=torch.long)
+    e_target = torch.tensor([1, 0, 1], dtype=torch.long)
+
+    compiled = torch.compile(
+        geometric_mean_edge_values, backend="eager", fullgraph=True
+    )
+    actual = compiled(source, target, e_source, e_target)
+
+    assert torch.equal(
+        actual, torch.tensor([5.0, 8.0, 15.0], dtype=torch.float64)
+    )
 
 
 class _FakeHFVRModel(torch.nn.Module):

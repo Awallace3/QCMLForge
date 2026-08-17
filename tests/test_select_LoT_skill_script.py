@@ -2,7 +2,13 @@ import os
 import numpy as np
 import pytest
 import pandas as pd
-from qcml_mcp.ie_time_esimator_script import main
+
+# The timing estimator builds Psi4 wavefunctions/grids, so skip the whole
+# module when Psi4 is unavailable (e.g. the CI environment) instead of failing
+# collection.
+pytest.importorskip("psi4")
+
+from qcml_mcp.ie_time_esimator_script import main  # noqa: E402
 
 # Maybe it's a bit redundant to set up a folder of dimer geoms when there is data in .mols, but the inteded usage is to parse through a database of geometries
 
@@ -33,6 +39,15 @@ def _check_df_shape_and_cols(df, n_expected_rows, label):
     )
     assert df["ESTIMATED CPU TIMES (log10(s))"].dtype == np.float64, (
         f"dtype mismatch for {label}"
+    )
+    # dtype checks alone pass when every prediction is NaN, which happens when
+    # the dAPNet2 call or the timing fit lookup fails outright. Individual
+    # level-of-theory rows are still allowed to be NaN.
+    assert np.isfinite(df["ERROR ESTIMATES (kcal/mol)"]).any(), (
+        f"All error estimates are non-finite for {label}"
+    )
+    assert np.isfinite(df["ESTIMATED CPU TIMES (log10(s))"]).any(), (
+        f"All timing estimates are non-finite for {label}"
     )
     # mask = df["Level of Theory"] == "B3LYP-D3/aug-cc-pVTZ/unCP"
     # if mask.any():

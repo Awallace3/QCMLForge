@@ -1344,10 +1344,15 @@ def geometric_mean_edge_values(
     e_source: torch.Tensor,
     e_target: torch.Tensor,
 ) -> torch.Tensor:
-    if not torch.isfinite(source_values).all():
-        raise ValueError("source per-atom values must be finite")
-    if not torch.isfinite(target_values).all():
-        raise ValueError("target per-atom values must be finite")
+    # `torch.isfinite(...).all()` in a Python predicate forces a device sync and
+    # a graph break, and this helper runs six times per Rackers forward pass.
+    # `torch.compiler.is_compiling()` is folded to a constant while tracing, so
+    # the validation stays in eager execution and disappears under compilation.
+    if not torch.compiler.is_compiling():
+        if not torch.isfinite(source_values).all():
+            raise ValueError("source per-atom values must be finite")
+        if not torch.isfinite(target_values).all():
+            raise ValueError("target per-atom values must be finite")
 
     source_edge_values = source_values.index_select(0, e_source)
     target_edge_values = target_values.index_select(0, e_target)

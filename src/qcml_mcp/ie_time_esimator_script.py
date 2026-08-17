@@ -11,19 +11,22 @@ from importlib import resources
 from pprint import pprint as pp
 
 
-def load_coeffs(
-    restricted: bool
-    ) -> pd.DataFrame:
+def load_coeffs() -> pd.DataFrame:
+    """
+    Load the packaged restricted-reference timing-fit coefficients.
 
-    un = "" if restricted else "un"
+    UHF (unrestricted) references are not supported, so only the restricted
+    fit is shipped. The returned frame is indexed by method and carries a
+    ``fit_label`` column that splits fits into "Augmented", "Non-augmented",
+    and "All data" basis-set families.
+    """
     ref_path = resources.files("qcml_mcp.data").joinpath(
-        f"time_fit_inference_df_{un}restricted.pkl"
+        "time_fit_inference_df_restricted.pkl"
     )
     with ref_path.open("rb") as handle:
         return pd.read_pickle(handle).set_index("method")
 
 
-# _res_coeffs: pd.DataFrame = load_coeffs(1)
 print("Warning, I have removed UHF functionality for now")
 _coeffs: pd.DataFrame | None = None
 
@@ -92,13 +95,18 @@ def parse_geoms(
                     print(f"Error converting raw string to qcelemental.models.Molecule: \n {e}")
                     continue
 
-                id.append(file.strip().split(".")[0])
-                n_atoms.append(len(mol_qcel.atomic_numbers))
-
-
+                # Keep invalid entries isolated so one bad file does not abort
+                # the rest of the directory.
                 fragments = mol_qcel.fragments
                 if len(fragments) != 2:
-                    raise ValueError("input geometry must be a dimer")
+                    print(
+                        f"Error processing file at {filepath}: \n "
+                        f"input geometry must be a dimer (found {len(fragments)} fragments)"
+                    )
+                    continue
+
+                id.append(file.strip().split(".")[0])
+                n_atoms.append(len(mol_qcel.atomic_numbers))
 
                 qcel_dimer.append(mol_qcel)
                 qcel_monA.append(mol_qcel.get_fragment(0))
@@ -139,23 +147,33 @@ def compute_psi4_time_estimation_variables(
         "dft_pruning_scheme": "robust",
     })
 
-    wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
-    bs = wfn.basisset()
-    grid = psi4.core.DFTGrid.build(mol, bs)
-    print("compute vars: built wfn & grid")
+    try:
+        wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
+        bs = wfn.basisset()
+        grid = psi4.core.DFTGrid.build(mol, bs)
+        print("compute vars: built wfn & grid")
+
+    except Exception as e:
+        print(f"Error when building grid or wavefunction: \n {e}")
+        return np.array([np.nan] * 4)
 
     n_occupied = math.ceil((wfn.nalpha() + wfn.nbeta()) / 2)
     n_virtual = bs.nbf() - n_occupied
     np_total = grid.npoints()
 
-    aux_basis = psi4.core.BasisSet.build(
-        wfn.molecule(),
-        "DF_BASIS_SCF",
-        psi4.core.get_option("SCF", "DF_BASIS_SCF"),
-        "JKFIT",
-        psi4.core.get_global_option("BASIS"),
-    )
-    print("compute vars: built aux basis")
+    try:
+        aux_basis = psi4.core.BasisSet.build(
+            wfn.molecule(),
+            "DF_BASIS_SCF",
+            psi4.core.get_option("SCF", "DF_BASIS_SCF"),
+            "JKFIT",
+            psi4.core.get_global_option("BASIS"),
+        )
+        print("compute vars: built aux basis")
+
+    except Exception as e:
+        print(f"Error when building the auxillary basis: \n {e}")
+        return np.array([np.nan] * 4)
 
     nbf_aux = aux_basis.nbf()
     psi4.core.clean()
@@ -298,10 +316,8 @@ def predict_timing(
     polynomial_lambda_expr = polynomial_expressions[method]["poly"]
     
     global _coeffs
-    if _coeffs is None: 
-        _coeffs = load_coeffs(0)
-        # print(_coeffs.columns)
-        # print(_coeffs.index.name)
+    if _coeffs is None:
+        _coeffs = load_coeffs()
 
     fit_label = "Augmented" if "aug" in basis else "Non-augmented"
     mask = (_coeffs.index == method) & (_coeffs["fit_label"] == fit_label)
