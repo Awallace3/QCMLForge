@@ -31,11 +31,10 @@ from apnet_pt.AtomPairwiseModels.mtp_mtp import (
 from apnet_pt.pt_datasets.ap2_fused_ds import (
     ap2_fused_collate_update,
     ap2_fused_collate_update_no_target,
-    ap3_fused_collate_update,
 )
 from apnet_pt.pt_datasets.ap3_fused_ds import (
-    ap3_fused_collate_update as ap3_ds_fused_collate_update,
-    ap3_fused_collate_update_no_target as ap3_ds_fused_collate_update_no_target,
+    ap3_fused_collate_update,
+    ap3_fused_collate_update_no_target,
 )
 from apnet_pt.torch_util import set_weights_to_value
 from apnet_pt.util import scatter_sum_compile
@@ -100,8 +99,7 @@ def test_target_collate_emits_full_edge_domain():
         ap2_fused_collate_update,
         ap2_fused_collate_update_no_target,
         ap3_fused_collate_update,
-        ap3_ds_fused_collate_update,
-        ap3_ds_fused_collate_update_no_target,
+        ap3_fused_collate_update_no_target,
     ],
     ids=lambda fn: f"{fn.__module__.rsplit('.', 1)[-1]}.{fn.__name__}",
 )
