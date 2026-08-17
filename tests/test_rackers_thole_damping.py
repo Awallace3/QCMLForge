@@ -28,7 +28,15 @@ from apnet_pt.AtomPairwiseModels.mtp_mtp import (
     RackersTholeDampingOverlapModel,
     geometric_mean_edge_values,
 )
-from apnet_pt.pt_datasets.ap2_fused_ds import ap2_fused_collate_update
+from apnet_pt.pt_datasets.ap2_fused_ds import (
+    ap2_fused_collate_update,
+    ap2_fused_collate_update_no_target,
+    ap3_fused_collate_update,
+)
+from apnet_pt.pt_datasets.ap3_fused_ds import (
+    ap3_fused_collate_update as ap3_ds_fused_collate_update,
+    ap3_fused_collate_update_no_target as ap3_ds_fused_collate_update_no_target,
+)
 from apnet_pt.torch_util import set_weights_to_value
 from apnet_pt.util import scatter_sum_compile
 
@@ -84,6 +92,64 @@ def test_target_collate_emits_full_edge_domain():
     )
     assert batch.e_ABfull_source.numel() == batch.dimer_ind_full.numel()
     assert batch.dimer_ind_full.tolist() == [0, 0, 1, 1, 0, 0, 1, 1]
+
+
+@pytest.mark.parametrize(
+    "collate_fn",
+    [
+        ap2_fused_collate_update,
+        ap2_fused_collate_update_no_target,
+        ap3_fused_collate_update,
+        ap3_ds_fused_collate_update,
+        ap3_ds_fused_collate_update_no_target,
+    ],
+    ids=lambda fn: f"{fn.__module__.rsplit('.', 1)[-1]}.{fn.__name__}",
+)
+def test_full_edge_dimer_index_aligns_with_full_edge_lists(collate_fn):
+    """`dimer_ind_full[k]` must identify the dimer owning full edge `k`.
+
+    Both interleaved (per-item ``[sr_i, lr_i]``) and grouped (all short-range
+    then all long-range) layouts satisfy this; what must never happen is
+    ``e_ABfull_*`` using one layout while ``dimer_ind_full`` uses the other,
+    which silently attributes edges to the wrong dimer for batches > 1.
+    Monomer A and B are given different atom counts so a transposed or
+    mis-grouped index cannot coincidentally line up.
+    """
+    items = []
+    for scale in (1.0, 2.0, 3.0):
+        item = _make_collate_item(scale)
+        item.ZB = torch.tensor([8, 1, 1], dtype=torch.long)
+        item.RB = torch.tensor(
+            [[3.0, 0.0, 0.0], [7.0, 0.0, 0.0], [9.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        )
+        item.molecule_ind_B = torch.zeros(3, dtype=torch.long)
+        item.e_BB_source = torch.tensor([0, 1, 2], dtype=torch.long)
+        item.e_BB_target = torch.tensor([1, 2, 0], dtype=torch.long)
+        # Three short-range and one long-range AB edge, so the two layouts
+        # produce genuinely different orderings.
+        item.e_ABsr_source = torch.tensor([0, 1, 1], dtype=torch.long)
+        item.e_ABsr_target = torch.tensor([0, 0, 2], dtype=torch.long)
+        item.e_ABlr_source = torch.tensor([0], dtype=torch.long)
+        item.e_ABlr_target = torch.tensor([1], dtype=torch.long)
+        item.dimer_ind = torch.zeros(3, dtype=torch.long)
+        item.dimer_ind_lr = torch.zeros(1, dtype=torch.long)
+        items.append(item)
+
+    batch = collate_fn(items)
+
+    n_full = batch.e_ABfull_source.numel()
+    assert n_full == batch.e_ABfull_target.numel()
+    assert n_full == batch.dimer_ind_full.numel()
+    assert n_full == batch.dimer_ind.numel() + batch.dimer_ind_lr.numel()
+
+    # molecule_ind_A/B map each globally offset atom back to its batch item,
+    # giving a layout-independent ground truth for every full edge.
+    expected_from_source = batch.molecule_ind_A[batch.e_ABfull_source]
+    expected_from_target = batch.molecule_ind_B[batch.e_ABfull_target]
+    assert torch.equal(batch.dimer_ind_full, expected_from_source)
+    assert torch.equal(batch.dimer_ind_full, expected_from_target)
+    assert batch.dimer_ind_full.unique().tolist() == [0, 1, 2]
 
 
 @pytest.fixture

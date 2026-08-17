@@ -659,8 +659,11 @@ def ap3_fused_collate_update(batch):
             - concatenated atom features and coordinates for monomers A and B (ZA, RA, ZB, RB)
             - adjusted intra-monomer edge lists (e_AA_source/target, e_BB_source/target)
             - concatenated short- and long-range inter-monomer edge lists (e_ABsr_*, e_ABlr_*)
-            - full inter-monomer edge lists (e_ABfull_source, e_ABfull_target)
-            - per-edge dimer indices (dimer_ind, dimer_ind_lr, dimer_ind_full)
+            - full inter-monomer edge lists (e_ABfull_source, e_ABfull_target),
+              ordered per batch item as [short-range_i, long-range_i] to match
+              ap3_fused_ds.ap3_fused_collate_update
+            - per-edge dimer indices (dimer_ind, dimer_ind_lr, dimer_ind_full);
+              dimer_ind_full is aligned element-wise with e_ABfull_source/target
             - per-monomer molecule indices and counts (molecule_ind_A/B, natom_per_mol_A/B)
             - total charges per monomer (total_charge_A/B)
             - stacked targets `y`
@@ -675,6 +678,8 @@ def ap3_fused_collate_update(batch):
     local_e_AA_target = []
     local_e_BB_source = []
     local_e_BB_target = []
+    local_e_ABfull_source = []
+    local_e_ABfull_target = []
     for i, data in enumerate(batch):
         data.dimer_ind = (
             torch.ones(data.e_ABsr_source.size(0), dtype=data.dimer_ind.dtype) * i
@@ -693,6 +698,28 @@ def ap3_fused_collate_update(batch):
         local_e_ABsr_target.append(data.e_ABsr_target.clone() + monB_edge_offset)
         local_e_ABlr_source.append(data.e_ABlr_source.clone() + monA_edge_offset)
         local_e_ABlr_target.append(data.e_ABlr_target.clone() + monB_edge_offset)
+        # `dimer_ind_full` is built per item as [sr_i, lr_i], so the full edge
+        # lists must be accumulated in the same per-item order rather than as
+        # (all short-range, all long-range). This matches the canonical
+        # ap3_fused_ds.ap3_fused_collate_update layout.
+        local_e_ABfull_source.append(
+            torch.cat(
+                (
+                    data.e_ABsr_source.clone() + monA_edge_offset,
+                    data.e_ABlr_source.clone() + monA_edge_offset,
+                ),
+                dim=0,
+            )
+        )
+        local_e_ABfull_target.append(
+            torch.cat(
+                (
+                    data.e_ABsr_target.clone() + monB_edge_offset,
+                    data.e_ABlr_target.clone() + monB_edge_offset,
+                ),
+                dim=0,
+            )
+        )
         local_e_AA_source.append(data.e_AA_source.clone() + monA_edge_offset)
         local_e_AA_target.append(data.e_AA_target.clone() + monA_edge_offset)
         local_e_BB_source.append(data.e_BB_source.clone() + monB_edge_offset)
@@ -757,8 +784,8 @@ def ap3_fused_collate_update(batch):
     e_ABlr_source_cat = torch.cat(local_e_ABlr_source, dim=0)
     e_ABlr_target_cat = torch.cat(local_e_ABlr_target, dim=0)
 
-    e_ABfull_source = torch.cat([e_ABsr_source_cat, e_ABlr_source_cat], dim=0)
-    e_ABfull_target = torch.cat([e_ABsr_target_cat, e_ABlr_target_cat], dim=0)
+    e_ABfull_source = torch.cat(local_e_ABfull_source, dim=0)
+    e_ABfull_target = torch.cat(local_e_ABfull_target, dim=0)
 
     dimer_ind_cat = torch.cat([data.dimer_ind for data in batch], dim=0)
     dimer_ind_lr_cat = torch.cat([data.dimer_ind_lr for data in batch], dim=0)
