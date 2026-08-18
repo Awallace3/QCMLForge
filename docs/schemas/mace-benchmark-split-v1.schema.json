@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcmlforge.invalid/schemas/mace-benchmark-split-v1.schema.json",
+  "title": "QCMLForge MACE-AP3D3 frozen split manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pair_spec_type",
+    "index_basis",
+    "leakage_audit",
+    "pair",
+    "atomic"
+  ],
+  "$defs": {
+    "indices": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "uniqueItems": true
+    },
+    "pairMembership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "indices", "group_ids"],
+      "properties": {
+        "source": {"enum": ["train", "test"]},
+        "indices": {"$ref": "#/$defs/indices", "minItems": 1},
+        "group_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "atomicSourceMembership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["indices", "group_ids"],
+      "properties": {
+        "indices": {"$ref": "#/$defs/indices"},
+        "group_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "atomicMembership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spec_1", "spec_5"],
+      "properties": {
+        "spec_1": {"$ref": "#/$defs/atomicSourceMembership"},
+        "spec_5": {"$ref": "#/$defs/atomicSourceMembership"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "pair_spec_type": {"const": 2},
+    "index_basis": {
+      "const": {
+        "pair": "processed-ap3-fused-spec2-order-v1",
+        "atomic": "processed-pbe0-mbis-order-v1"
+      }
+    },
+    "leakage_audit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "status",
+        "group_key",
+        "audited_by",
+        "cross_dataset_policy",
+        "cross_dataset_overlap_count"
+      ],
+      "properties": {
+        "status": {"const": "passed"},
+        "group_key": {"type": "string", "minLength": 1},
+        "audited_by": {"type": "string", "minLength": 1},
+        "cross_dataset_policy": {
+          "const": "no-pair-test-monomer-in-atomic-train"
+        },
+        "cross_dataset_overlap_count": {"const": 0}
+      }
+    },
+    "pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["train", "validation", "test"],
+      "properties": {
+        "train": {"$ref": "#/$defs/pairMembership"},
+        "validation": {"$ref": "#/$defs/pairMembership"},
+        "test": {"$ref": "#/$defs/pairMembership"}
+      }
+    },
+    "atomic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["train", "validation", "test"],
+      "properties": {
+        "train": {"$ref": "#/$defs/atomicMembership"},
+        "validation": {"$ref": "#/$defs/atomicMembership"},
+        "test": {"$ref": "#/$defs/atomicMembership"}
+      }
+    }
+  }
+}

@@ -247,7 +247,9 @@ def test_protocol_dimer_calls_are_isolated_frozen_and_have_runtime_schema():
     assert not featurizer.backbone.training
     featurizer.train()
     assert not featurizer.backbone.training
-    assert all(not parameter.requires_grad for parameter in featurizer.backbone.parameters())
+    assert all(
+        not parameter.requires_grad for parameter in featurizer.backbone.parameters()
+    )
     assert not features_a.invariant.requires_grad
     assert not direct_b.charges.requires_grad
 
@@ -300,15 +302,16 @@ def test_protocol_local_dtype_unsupported_elements_and_schema_discovery():
     assert torch.get_default_dtype() == default_before
     with pytest.raises(ValueError, match="unsupported element.*9"):
         featurizer.forward_monomer(
-            torch.zeros(1, 3), torch.tensor([9]), torch.tensor([0.0]), torch.tensor([1.0])
+            torch.zeros(1, 3),
+            torch.tensor([9]),
+            torch.tensor([0.0]),
+            torch.tensor([1.0]),
         )
 
 
 def test_protocol_cache_online_parity_and_exact_invalidation():
     cache = {}
-    featurizer = _protocol_featurizer(
-        feature_mode="all-scalars+norms", cache=cache
-    )
+    featurizer = _protocol_featurizer(feature_mode="all-scalars+norms", cache=cache)
     positions = torch.tensor([[0.0, 0.0, 0.0], [0.7, 0.0, 0.0]])
     numbers = torch.tensor([1, 8])
     args = (positions, numbers, torch.tensor([0.0]), torch.tensor([1.0]))
@@ -330,9 +333,7 @@ def test_protocol_cache_online_parity_and_exact_invalidation():
         featurizer.forward_monomer(*variant)
     assert len(featurizer.backbone.calls) == calls + len(variants)
 
-    other_schema = _protocol_featurizer(
-        feature_mode="final-layer-scalars", cache=cache
-    )
+    other_schema = _protocol_featurizer(feature_mode="final-layer-scalars", cache=cache)
     other_schema.forward_monomer(*args)
     assert len(other_schema.backbone.calls) == 1
     other_dtype = _protocol_featurizer(
@@ -342,15 +343,51 @@ def test_protocol_cache_online_parity_and_exact_invalidation():
     assert len(other_dtype.backbone.calls) == 1
 
 
+def test_prepared_cache_values_follow_request_dtype_and_device():
+    source = _protocol_featurizer(feature_mode="all-scalars+norms")
+    positions = torch.tensor([[0.0, 0.0, 0.0], [0.7, 0.0, 0.0]])
+    numbers = torch.tensor([1, 8])
+    cached_value = source.forward_monomer(
+        positions,
+        numbers,
+        torch.tensor([0.0]),
+        torch.tensor([1.0]),
+    )
+
+    class PreparedCache:
+        strict_read_only = True
+
+        def __contains__(self, key):
+            return True
+
+        def __getitem__(self, key):
+            return cached_value
+
+    consumer = _protocol_featurizer(
+        feature_mode="all-scalars+norms",
+        dtype=torch.float64,
+        cache=PreparedCache(),
+    )
+    features, direct = consumer.forward_monomer(
+        positions.double(),
+        numbers,
+        torch.tensor([0.0], dtype=torch.float64),
+        torch.tensor([1.0], dtype=torch.float64),
+    )
+    assert not consumer.backbone.calls
+    assert features.invariant.dtype == torch.float64
+    assert direct.density_coefficients.dtype == torch.float64
+    assert features.invariant.device == positions.device
+    assert direct.density_coefficients.device == positions.device
+
+
 def test_protocol_translation_and_rotation_behavior():
     featurizer = _protocol_featurizer(feature_mode="final-layer-scalars")
     positions = torch.tensor([[0.2, -0.1, 0.3], [0.9, 0.4, -0.2]])
     numbers = torch.tensor([1, 8])
     charge = torch.tensor([0.0])
     spin = torch.tensor([1.0])
-    features, direct = featurizer.forward_monomer(
-        positions, numbers, charge, spin
-    )
+    features, direct = featurizer.forward_monomer(positions, numbers, charge, spin)
     shift = torch.tensor([1.5, -0.7, 0.2])
     shifted_features, shifted = featurizer.forward_monomer(
         positions + shift, numbers, charge, spin
@@ -452,27 +489,24 @@ def test_real_private_adapter_public_parity_and_direct_contract():
     assert features.invariant.shape == (3, 2560)
     assert features.equivariant.shape == (3, 8192)
     assert featurizer.last_private_parity_error <= 1.0e-6
-    assert torch.allclose(direct.density_coefficients[:, 0], direct.charges, atol=1.0e-7)
+    assert torch.allclose(
+        direct.density_coefficients[:, 0], direct.charges, atol=1.0e-7
+    )
     reconstructed = (
-        direct.charges[:, None] * positions
-        + direct.density_coefficients[:, [3, 1, 2]]
+        direct.charges[:, None] * positions + direct.density_coefficients[:, [3, 1, 2]]
     ).sum(0, keepdim=True)
     assert torch.allclose(reconstructed, direct.molecular_dipole_eangstrom, atol=1.0e-5)
 
     from e3nn import o3
 
-    rotation = torch.tensor(
-        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
-    )
+    rotation = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
     rotated_features, rotated_direct = featurizer.forward_monomer(
         positions @ rotation.T,
         torch.tensor([8, 1, 1]),
         torch.tensor([0.0]),
         torch.tensor([1.0]),
     )
-    physical_to_mace = torch.tensor(
-        [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]
-    )
+    physical_to_mace = torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
     mace_rotation = physical_to_mace @ rotation @ physical_to_mace.T
     irreps = o3.Irreps("512x0e+512x1o+512x2e+512x3o")
     d_matrix = irreps.D_from_matrix(mace_rotation)

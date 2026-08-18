@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcmlforge.invalid/schemas/mace-benchmark-v1.schema.json",
+  "title": "QCMLForge MACE-AP3D3 production benchmark config v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_id",
+    "output_root",
+    "dataset",
+    "artifacts",
+    "training",
+    "routes",
+    "slurm"
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "fileRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "benchmark_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    },
+    "output_root": {"type": "string", "minLength": 1},
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pair_spec_type",
+        "pair_files",
+        "atomic_files",
+        "split_manifest",
+        "provenance_manifest",
+        "target_method",
+        "atomic_target_method"
+      ],
+      "properties": {
+        "pair_spec_type": {"const": 2},
+        "pair_files": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["train", "test"],
+          "properties": {
+            "train": {"$ref": "#/$defs/fileRecord"},
+            "test": {"$ref": "#/$defs/fileRecord"}
+          }
+        },
+        "atomic_files": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["spec_1", "spec_5"],
+          "properties": {
+            "spec_1": {"$ref": "#/$defs/fileRecord"},
+            "spec_5": {"$ref": "#/$defs/fileRecord"}
+          }
+        },
+        "split_manifest": {"$ref": "#/$defs/fileRecord"},
+        "provenance_manifest": {"$ref": "#/$defs/fileRecord"},
+        "target_method": {"type": "string", "minLength": 1},
+        "atomic_target_method": {"const": "PBE0/MBIS"}
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mace",
+        "legacy_atom_model",
+        "legacy_parameter_model",
+        "legacy_parameter_model_2",
+        "physics_config"
+      ],
+      "properties": {
+        "mace": {"$ref": "#/$defs/fileRecord"},
+        "legacy_atom_model": {"$ref": "#/$defs/fileRecord"},
+        "legacy_parameter_model": {"$ref": "#/$defs/fileRecord"},
+        "legacy_parameter_model_2": {"$ref": "#/$defs/fileRecord"},
+        "physics_config": {"$ref": "#/$defs/fileRecord"}
+      }
+    },
+    "training": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seeds",
+        "epochs",
+        "atomic_epochs",
+        "batch_size",
+        "atomic_batch_size",
+        "learning_rate",
+        "end_learning_rate",
+        "include_total_mse",
+        "early_stopping_patience",
+        "num_workers"
+      ],
+      "properties": {
+        "seeds": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "epochs": {"type": "integer", "minimum": 1},
+        "atomic_epochs": {"type": "integer", "minimum": 1},
+        "batch_size": {"type": "integer", "minimum": 1},
+        "atomic_batch_size": {"type": "integer", "minimum": 1},
+        "learning_rate": {"type": "number", "exclusiveMinimum": 0},
+        "end_learning_rate": {"type": "number", "exclusiveMinimum": 0},
+        "include_total_mse": {"type": "boolean"},
+        "early_stopping_patience": {"type": "integer", "minimum": 1},
+        "num_workers": {"type": "integer", "minimum": 1}
+      }
+    },
+    "routes": {
+      "const": ["BASE", "H1", "H2", "DirectPolar", "AtomHead"]
+    },
+    "slurm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "account",
+        "partition",
+        "time",
+        "cpus_per_task",
+        "memory",
+        "gpus_per_task",
+        "python"
+      ],
+      "properties": {
+        "account": {"type": "string", "minLength": 1},
+        "partition": {"type": "string", "minLength": 1},
+        "time": {"type": "string", "minLength": 1},
+        "cpus_per_task": {"type": "integer", "minimum": 1},
+        "memory": {"type": "string", "minLength": 1},
+        "gpus_per_task": {"type": "integer", "minimum": 1},
+        "python": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

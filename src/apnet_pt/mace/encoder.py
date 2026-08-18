@@ -642,7 +642,49 @@ class MACEPolarFeaturizer(torch.nn.Module):
             key = self._cache_key(positions, numbers, charge, spin)
             if self.cache is not None and key in self.cache:
                 features, direct = self.cache[key]
-                result = (_clone_features(features), _clone_direct(direct))
+                features = _clone_features(features)
+                direct = _clone_direct(direct)
+                features = MACEAtomicFeatures(
+                    invariant=features.invariant.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    equivariant=features.equivariant.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    batch=features.batch.to(device=positions.device),
+                    atomic_numbers=features.atomic_numbers.to(
+                        device=positions.device
+                    ),
+                    total_charge=features.total_charge.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    total_spin=features.total_spin.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    feature_schema=features.feature_schema,
+                )
+                direct = PolarMACEDirectOutputs(
+                    density_coefficients=direct.density_coefficients.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    charges=direct.charges.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    molecular_dipole_eangstrom=(
+                        direct.molecular_dipole_eangstrom.to(
+                            device=positions.device, dtype=self.dtype
+                        )
+                    ),
+                    positions_angstrom=direct.positions_angstrom.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    batch=direct.batch.to(device=positions.device),
+                    total_charge=direct.total_charge.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    multipole_contract=direct.multipole_contract,
+                )
+                result = (features, direct)
             else:
                 if self.cache is not None and getattr(
                     self.cache, "strict_read_only", False

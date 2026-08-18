@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcmlforge.invalid/schemas/mace-benchmark-result-v1.schema.json",
+  "title": "QCMLForge MACE-AP3D3 pair benchmark result v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "benchmark_hash",
+    "route",
+    "seed",
+    "status",
+    "epochs_requested",
+    "epochs_completed",
+    "metrics",
+    "resources",
+    "history"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "benchmark_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "route": {"enum": ["BASE", "H1", "H2", "DirectPolar", "AtomHead"]},
+    "seed": {"type": "integer", "minimum": 0},
+    "status": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+    "epochs_requested": {"type": "integer", "minimum": 1},
+    "epochs_completed": {"type": "integer", "minimum": 0},
+    "termination_reason": {"enum": ["epoch_budget", "early_stopping", "exception"]},
+    "metrics": {"type": "object"},
+    "resources": {
+      "type": "object",
+      "required": ["elapsed_seconds", "peak_rss_mb"],
+      "properties": {
+        "elapsed_seconds": {"type": "number", "minimum": 0},
+        "peak_rss_mb": {"type": "number", "minimum": 0}
+      }
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["epoch", "train_loss", "validation_loss"],
+        "properties": {
+          "epoch": {"type": "integer", "minimum": 1},
+          "train_loss": {"type": "number", "minimum": 0},
+          "validation_loss": {"type": "number", "minimum": 0}
+        }
+      }
+    }
+  }
+}
