@@ -124,7 +124,8 @@ def atomic_collate_update(batch):
             - `edge_index` reindexed so atom indices are unique across molecules
             - optional `edge_index_full` reindexed and concatenated when present
             - `molecule_ind` indicating molecule membership per atom
-            - `total_charge` and `total_spin` per molecule
+            - `total_charge` per molecule
+            - optional `total_spin` molecular multiplicity per molecule
             - `natom_per_mol` giving the number of atoms in each molecule
     """
     current_count = 0
@@ -167,6 +168,10 @@ def atomic_collate_update(batch):
         natom_per_mol=natom_per_mol,
     )
 
+    if all(hasattr(data, "total_spin") for data in batch):
+        batched_data.total_spin = torch.stack(
+            [data.total_spin.float().reshape(()) for data in batch]
+        )
     if has_full_edges:
         batched_data.edge_index_full = torch.cat(edge_indices_full, dim=1)
 
@@ -496,7 +501,12 @@ def qcel_mon_to_pyg_data(mon, r_cut=5.0, custom=False, full_indices=False):
             - R: atomic coordinates in Angstroms (tensor, float)
             - molecule_ind: per-atom molecule index (tensor, long)
             - total_charge: molecular charge (tensor, long)
+<<<<<<< HEAD
             - total_spin: molecular multiplicity passed to MACE (tensor, float)
+||||||| aa3d9b8a
+=======
+            - total_spin: molecular multiplicity (tensor, float)
+>>>>>>> dc840fd91d06d06144362bbb53be097b0cb8d5f8
             - natom_per_mol: number of atoms in the monomer (tensor, long)
             - edge_index_full (optional): all atom-pair indices when `full_indices=True`
     """
@@ -504,7 +514,12 @@ def qcel_mon_to_pyg_data(mon, r_cut=5.0, custom=False, full_indices=False):
     node_features = torch.tensor(np.array(Z), dtype=torch.int64)
     R = torch.tensor(np.array(mon.geometry) * constants.au2ang, dtype=torch.float32)
     total_charge = torch.tensor(np.array(mon.molecular_charge), dtype=torch.int64)
+<<<<<<< HEAD
     total_spin = torch.tensor(float(mon.molecular_multiplicity), dtype=torch.float32)
+||||||| aa3d9b8a
+=======
+    total_spin = torch.tensor(np.array(mon.molecular_multiplicity), dtype=torch.float32)
+>>>>>>> dc840fd91d06d06144362bbb53be097b0cb8d5f8
 
     edge_index_full = None
     if custom:
@@ -524,7 +539,12 @@ def qcel_mon_to_pyg_data(mon, r_cut=5.0, custom=False, full_indices=False):
         "R": R.float(),
         "molecule_ind": torch.tensor(np.full(len(R), 0), dtype=torch.int64),
         "total_charge": total_charge.long(),
+<<<<<<< HEAD
         "total_spin": total_spin,
+||||||| aa3d9b8a
+=======
+        "total_spin": total_spin.float(),
+>>>>>>> dc840fd91d06d06144362bbb53be097b0cb8d5f8
         "natom_per_mol": torch.tensor([len(R)], dtype=torch.int64),
     }
 
