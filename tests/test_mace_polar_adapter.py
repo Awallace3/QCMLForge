@@ -342,6 +342,44 @@ def test_protocol_cache_online_parity_and_exact_invalidation():
     assert len(other_dtype.backbone.calls) == 1
 
 
+def test_prepared_cache_values_follow_request_dtype_and_device():
+    source = _protocol_featurizer(feature_mode="all-scalars+norms")
+    positions = torch.tensor([[0.0, 0.0, 0.0], [0.7, 0.0, 0.0]])
+    numbers = torch.tensor([1, 8])
+    cached_value = source.forward_monomer(
+        positions,
+        numbers,
+        torch.tensor([0.0]),
+        torch.tensor([1.0]),
+    )
+
+    class PreparedCache:
+        strict_read_only = True
+
+        def __contains__(self, key):
+            return True
+
+        def __getitem__(self, key):
+            return cached_value
+
+    consumer = _protocol_featurizer(
+        feature_mode="all-scalars+norms",
+        dtype=torch.float64,
+        cache=PreparedCache(),
+    )
+    features, direct = consumer.forward_monomer(
+        positions.double(),
+        numbers,
+        torch.tensor([0.0], dtype=torch.float64),
+        torch.tensor([1.0], dtype=torch.float64),
+    )
+    assert not consumer.backbone.calls
+    assert features.invariant.dtype == torch.float64
+    assert direct.density_coefficients.dtype == torch.float64
+    assert features.invariant.device == positions.device
+    assert direct.density_coefficients.device == positions.device
+
+
 def test_protocol_translation_and_rotation_behavior():
     featurizer = _protocol_featurizer(feature_mode="final-layer-scalars")
     positions = torch.tensor([[0.2, -0.1, 0.3], [0.9, 0.4, -0.2]])
