@@ -1,12 +1,12 @@
 # MACE–AP3D3 small SLURM verification workflow
 
 These scripts implement only a reproducible **one-epoch smoke verification
-gate**. They are not a production training path: these verification scripts
-continue to prohibit multi-epoch/full-dataset work. The separate locked
-production benchmark controller is documented in
-[`mace-apnet-benchmark.md`](mace-apnet-benchmark.md). Its presence does not
-satisfy the CUDA or real-`sbatch` validation gates. MACE execution remains eager
-and requires `--skip_compile`.
+gate**. They are not a production training path: multi-epoch/full-dataset
+lifecycles and full-scale submission are not implemented. MACE execution is
+currently eager and requires `--skip_compile`; CUDA and real `sbatch` parity
+remain external gates. Production benchmark definitions, scheduler generation,
+result retention, and analysis live in
+[`qcmlforge-exp`](https://github.com/awallace3/qcmlforge-exp).
 
 ## Installation and local gate
 
