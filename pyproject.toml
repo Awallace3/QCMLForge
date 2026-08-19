@@ -29,6 +29,9 @@ dependencies = [
 ]
 license = {text = "MIT"}
 
+[project.optional-dependencies]
+tracking = ["wandb>=0.19.9,<1"]
+
 [project.urls]
 "Homepage" = "https://github.com/Awallace3/QCMLForge"
 "Bug Tracker" = "https://github.com/Awallace3/QCMLForge/issues"

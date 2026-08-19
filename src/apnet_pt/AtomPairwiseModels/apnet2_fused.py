@@ -15,6 +15,13 @@ from ..pt_datasets.ap2_fused_ds import (
     qcel_dimer_to_fused_data,
 )
 from .. import constants
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    tracked_ddp_worker,
+)
 import os
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -694,6 +701,7 @@ class APNet2_AM_Model:
     pre-computed and passed as input to the model.
 """
             )
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(
                 f"Loading pre-trained APNet2_MPNN model from {pre_trained_model_path}"
@@ -1359,7 +1367,7 @@ units angstrom
             exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
             indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
             disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-            count += preds.numel()
+            count += preds.shape[0]
         if scheduler is not None:
             scheduler.step()
 
@@ -1368,6 +1376,7 @@ units angstrom
         elst_error = torch.tensor(elst_error, dtype=torch.float32, device=rank_device)
         exch_error = torch.tensor(exch_error, dtype=torch.float32, device=rank_device)
         indu_error = torch.tensor(indu_error, dtype=torch.float32, device=rank_device)
+        disp_error = torch.tensor(disp_error, dtype=torch.float32, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -1375,6 +1384,7 @@ units angstrom
         dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
+        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
 
         total_MAE_t = (total_error / count).cpu()
@@ -1413,13 +1423,14 @@ units angstrom
                 exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
                 indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
                 disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-                count += preds.numel()
+                count += preds.shape[0]
 
         total_loss = torch.tensor(total_loss, device=rank_device)
         total_error = torch.tensor(total_error, device=rank_device)
         elst_error = torch.tensor(elst_error, device=rank_device)
         exch_error = torch.tensor(exch_error, device=rank_device)
         indu_error = torch.tensor(indu_error, device=rank_device)
+        disp_error = torch.tensor(disp_error, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -1427,6 +1438,7 @@ units angstrom
         dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
+        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
 
         total_MAE_t = (total_error / count).cpu()
@@ -1840,6 +1852,9 @@ units angstrom
         skip_compile=False,
         transfer_learning=False,
         pretrain_test_loss=True,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         """
         Train the APNet2_AM_Model on the provided dataset using the configured device and training settings.
@@ -1931,9 +1946,18 @@ units angstrom
         if world_size > 1:
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="pairwise",
+                initial_config={"training/epochs": n_epochs},
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -1950,18 +1974,38 @@ units angstrom
         else:
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    lr_decay=lr_decay,
+                    skip_compile=skip_compile,
+                    transfer_learning=transfer_learning,
+                    pretrain_test_loss=pretrain_test_loss,
+                ),
+                wandb_config,
+                model_family="pairwise",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                lr_decay=lr_decay,
-                skip_compile=skip_compile,
-                transfer_learning=transfer_learning,
-                pretrain_test_loss=pretrain_test_loss,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config={
+                    "training/epochs": n_epochs,
+                    "training/learning_rate_initial": lr,
+                    "training/learning_rate_decay": lr_decay,
+                    "training/random_seed": random_seed,
+                    "training/skip_compile": skip_compile,
+                    "training/transfer_learning": transfer_learning,
+                    "training/pretrain_test_loss": pretrain_test_loss,
+                },
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
         return
 

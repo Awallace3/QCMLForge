@@ -9,6 +9,14 @@ from .. import atomic_datasets
 from ..hf_pretrained import resolve_pretrained_paths
 from .. import pairwise_datasets
 from .. import model_io
+from ..distributed_metrics import globally_reduced_mae
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    tracked_ddp_worker,
+)
 from ..pairwise_datasets import (
     apnet2_module_dataset,
     APNet2_DataLoader,
@@ -735,6 +743,7 @@ class APNet2Model:
         # Track whether we loaded the atom_model from an embedded submodel
         atom_model_loaded_from_embed = False
 
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(
                 f"Loading pre-trained APNet2_MPNN model from {pre_trained_model_path}"
@@ -1999,29 +2008,23 @@ units angstrom
             exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
             indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
             disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-            count += preds.numel()
+            count += preds.shape[0]
         if scheduler is not None:
             scheduler.step()
 
         total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
-        total_error = torch.tensor(total_error, dtype=torch.float32, device=rank_device)
-        elst_error = torch.tensor(elst_error, dtype=torch.float32, device=rank_device)
-        exch_error = torch.tensor(exch_error, dtype=torch.float32, device=rank_device)
-        indu_error = torch.tensor(indu_error, dtype=torch.float32, device=rank_device)
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
-        total_MAE_t = (total_error / count).cpu()
-        elst_MAE_t = (elst_error / count).cpu()
-        exch_MAE_t = (exch_error / count).cpu()
-        indu_MAE_t = (indu_error / count).cpu()
-        disp_MAE_t = (disp_error / count).cpu()
+        (
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+        ) = globally_reduced_mae(
+            (total_error, elst_error, exch_error, indu_error, disp_error),
+            count,
+            device=rank_device,
+        )
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     # @torch.inference_mode()
@@ -2056,27 +2059,21 @@ units angstrom
                 exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
                 indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
                 disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-                count += preds.numel()
+                count += preds.shape[0]
 
         total_loss = torch.tensor(total_loss, device=rank_device)
-        total_error = torch.tensor(total_error, device=rank_device)
-        elst_error = torch.tensor(elst_error, device=rank_device)
-        exch_error = torch.tensor(exch_error, device=rank_device)
-        indu_error = torch.tensor(indu_error, device=rank_device)
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
-        total_MAE_t = (total_error / count).cpu()
-        elst_MAE_t = (elst_error / count).cpu()
-        exch_MAE_t = (exch_error / count).cpu()
-        indu_MAE_t = (indu_error / count).cpu()
-        disp_MAE_t = (disp_error / count).cpu()
+        (
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+        ) = globally_reduced_mae(
+            (total_error, elst_error, exch_error, indu_error, disp_error),
+            count,
+            device=rank_device,
+        )
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     def ddp_train(
@@ -2470,6 +2467,9 @@ units angstrom
         skip_compile=False,
         transfer_learning=False,
         include_total_mse=False,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         """
         Train the APNet2Model on a dataset using single-process or multi-process (DDP) execution.
@@ -2560,9 +2560,18 @@ units angstrom
         if world_size > 1:
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="pairwise",
+                initial_config={"training/epochs": n_epochs},
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -2580,17 +2589,37 @@ units angstrom
         else:
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    lr_decay=lr_decay,
+                    skip_compile=skip_compile,
+                    transfer_learning=transfer_learning,
+                    include_total_mse=include_total_mse,
+                ),
+                wandb_config,
+                model_family="pairwise",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                lr_decay=lr_decay,
-                skip_compile=skip_compile,
-                transfer_learning=transfer_learning,
-                include_total_mse=include_total_mse,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config={
+                    "training/epochs": n_epochs,
+                    "training/learning_rate_initial": lr,
+                    "training/learning_rate_decay": lr_decay,
+                    "training/random_seed": random_seed,
+                    "training/skip_compile": skip_compile,
+                    "training/transfer_learning": transfer_learning,
+                    "training/include_total_mse": include_total_mse,
+                },
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
         return

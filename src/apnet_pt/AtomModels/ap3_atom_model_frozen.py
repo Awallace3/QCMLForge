@@ -4,6 +4,13 @@ from apnet_pt.util import scatter_sum_compile
 import numpy as np
 import warnings
 from .. import multipole
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    tracked_ddp_worker,
+)
 from ..hf_pretrained import resolve_pretrained_path
 import time
 from apnet_pt.atomic_datasets import (
@@ -1323,6 +1330,7 @@ class InducedDipoleModel:
         # Load pretrained AtomMPNN model if provided
         # Note: If pre_trained_model_path is provided, it takes priority and
         # atom_mpnn_pre_trained_path will be ignored (model is loaded from saved state)
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             # When loading a pretrained InducedDipoleModel, the AtomMPNN weights
             # are already stored in the model state_dict, so we don't load separately
@@ -1851,6 +1859,9 @@ units angstrom
                 f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f}",
                 flush=True,
             )
+        from ..training_tracking import track_pretraining_from_locals
+
+        track_pretraining_from_locals(self, locals())
         return test_loss
 
     def pretrain_statistics_ddp(
@@ -2026,9 +2037,11 @@ units angstrom
         total_qpole_error = torch.tensor(
             total_qpole_error, dtype=torch.float32, device=rank_device
         )
+        total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         # All-reduce across processes
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_charge_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_dipole_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_qpole_error, op=dist.ReduceOp.SUM)
@@ -2499,6 +2512,9 @@ units angstrom
         world_size=1,  # Default to 1 for single-core operation
         omp_num_threads_per_process=None,
         random_seed=42,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         """
         Train the model on a dataset with optional splitting, single- or multi-process execution, and configurable hyperparameters.
@@ -2585,9 +2601,18 @@ units angstrom
             # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="atomic",
+                initial_config={"training/epochs": n_epochs},
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -2604,17 +2629,34 @@ units angstrom
             # Run single-process training directly
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
-                rank=0,
-                world_size=world_size,
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    rank=0,
+                    world_size=world_size,
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    skip_compile=skip_compile,
+                ),
+                wandb_config,
+                model_family="atomic",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                skip_compile=skip_compile,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config={
+                    "training/epochs": n_epochs,
+                    "training/learning_rate_initial": lr,
+                    "training/random_seed": random_seed,
+                    "training/skip_compile": skip_compile,
+                },
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
 
         return

@@ -1,10 +1,13 @@
 from apnet_pt import AtomModels
 from apnet_pt import AtomPairwiseModels
+from apnet_pt.training_tracking import WandbConfig
 import argparse
 import inspect
 import os
 import random
+from dataclasses import replace
 from pprint import pprint
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -25,6 +28,40 @@ def maybe_skip_training_after_dataset_setup(model_name, dataset, build_dataset_o
         )
         return True
     return False
+
+
+def build_wandb_run_configs(args):
+    """Build atom/pairwise W&B configs, grouping sequential runs together."""
+
+    base_config = WandbConfig(
+        mode=args.wandb_mode,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_name,
+        group=args.wandb_group,
+        tags=tuple(args.wandb_tags),
+        job_type=args.wandb_job_type,
+        notes=args.wandb_notes,
+        directory=args.wandb_dir,
+    )
+    dual_run = args.train_am != "" and args.train_apnet != ""
+    resolved_group = base_config.group or os.getenv("WANDB_RUN_GROUP")
+    if dual_run and resolved_group is None:
+        resolved_group = f"train-models-{uuid4().hex[:12]}"
+    resolved_name = base_config.name or os.getenv("WANDB_NAME")
+    atom_config = replace(
+        base_config,
+        group=resolved_group,
+        name=f"{resolved_name}-atom" if dual_run and resolved_name else resolved_name,
+    )
+    pairwise_config = replace(
+        base_config,
+        group=resolved_group,
+        name=(
+            f"{resolved_name}-pairwise" if dual_run and resolved_name else resolved_name
+        ),
+    )
+    return atom_config, pairwise_config
 
 
 def train_atom_model(
@@ -50,6 +87,7 @@ def train_atom_model(
     precompute_hfvr=False,
     ds_use_lmdb=False,
     build_dataset_only=False,
+    wandb_config=None,
 ):
     """
     Train a single-atom model of the specified type using data in data_dir.
@@ -177,6 +215,7 @@ def train_atom_model(
         omp_num_threads_per_process=omp_num_threads,
         random_seed=random_seed,
         skip_compile=skip_compile,
+        wandb_config=wandb_config,
     )
     return
 
@@ -218,6 +257,7 @@ def train_pairwise_model(
     freeze_atom_model=True,
     build_dataset_only=False,
     include_total_mse=False,
+    wandb_config=None,
 ):
     # Ensure param_start_mean and param_start_std are lists
     """
@@ -623,6 +663,7 @@ def train_pairwise_model(
         dataloader_num_workers=4,
         random_seed=random_seed,
         include_total_mse=include_total_mse,
+        wandb_config=wandb_config,
     )
     if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
         train_kwargs["end_lr"] = end_lr
@@ -961,12 +1002,29 @@ def main():
         default=False,
         help="Build/process the requested dataset and exit without training.",
     )
+    wandb_mode_default = os.getenv("WANDB_MODE", "disabled")
+    if wandb_mode_default not in {"disabled", "online", "offline"}:
+        wandb_mode_default = "disabled"
+    args.add_argument(
+        "--wandb-mode",
+        choices=("disabled", "online", "offline"),
+        default=wandb_mode_default,
+    )
+    args.add_argument("--wandb-project", default=None)
+    args.add_argument("--wandb-entity", default=None)
+    args.add_argument("--wandb-name", default=None)
+    args.add_argument("--wandb-group", default=None)
+    args.add_argument("--wandb-tags", nargs="*", default=())
+    args.add_argument("--wandb-job-type", default=None)
+    args.add_argument("--wandb-notes", default=None)
+    args.add_argument("--wandb-dir", default=None)
     args = args.parse_args()
     # Parse param_start_mean and param_start_std
     args.param_start_mean = parse_param_list(args.param_start_mean)
     args.param_start_std = parse_param_list(args.param_start_std)
     pprint(args)
     set_all_seeds(args.random_seed)
+    atom_wandb_config, pairwise_wandb_config = build_wandb_run_configs(args)
     if args.train_am != "":
         train_atom_model(
             atom_model_type=args.train_am,
@@ -990,6 +1048,7 @@ def main():
             precompute_hfvr=args.precompute_hfvr,
             ds_use_lmdb=args.ds_use_lmdb,
             build_dataset_only=args.build_dataset_only,
+            wandb_config=atom_wandb_config,
         )
     if args.train_apnet != "":
         train_pairwise_model(
@@ -1029,6 +1088,7 @@ def main():
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
+            wandb_config=pairwise_wandb_config,
         )
     return
 
