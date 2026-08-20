@@ -1,8 +1,18 @@
 import os
+
 import numpy as np
-import pytest
 import pandas as pd
+import pytest
+
+pytest.importorskip(
+    "mcp.server.fastmcp",
+    reason="requires the optional MCP server dependency",
+)
+
 from qcml_mcp.ie_time_esimator_script import main
+
+
+pytestmark = [pytest.mark.mcp, pytest.mark.slow]
 
 # Maybe it's a bit redundant to set up a folder of dimer geoms when there is data in .mols, but the inteded usage is to parse through a database of geometries
 
@@ -41,7 +51,6 @@ def _check_df_shape_and_cols(df, n_expected_rows, label):
     #     )
 
 
-@pytest.mark.slow
 def test_one_geom():
     df = main(
         geom_path=one_geom_path,
@@ -54,7 +63,6 @@ def test_one_geom():
     _check_df_shape_and_cols(df, 10, "1 geom, 1 basis, 10 methods")
 
 
-@pytest.mark.slow
 def test_two_geom():
     df = main(
         geom_path=two_geom_path,
@@ -67,7 +75,6 @@ def test_two_geom():
     _check_df_shape_and_cols(df, 40, "2 geoms, 2 bases, 10 methods")
 
 
-@pytest.mark.slow
 def test_many_geom():
     df = main(
         geom_path=many_geom_path,

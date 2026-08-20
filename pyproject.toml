@@ -30,6 +30,7 @@ dependencies = [
 license = {text = "MIT"}
 
 [project.optional-dependencies]
+mcp = ["mcp>=1,<2"]
 tracking = ["wandb>=0.19.9,<1"]
 
 [project.urls]
@@ -42,6 +43,10 @@ dev_template = "{tag}.{ccount}+git.{sha}"
 dirty_template = "{tag}.{ccount}+git.{sha}.dirty"
 
 [tool.pytest.ini_options]
+markers = [
+    "mcp: tests requiring the optional MCP server dependency",
+    "slow: tests with long-running model or integration workloads",
+]
 filterwarnings = [
     'ignore:To copy construct from a tensor, it is recommended to use sourceTensor.detach\(\)\.clone\(\):UserWarning',
 ]
