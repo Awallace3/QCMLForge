@@ -510,9 +510,10 @@ warm_start_source_name
 The local `model_path` remains the best-validation checkpoint. Do not upload a version on every improvement. At training completion:
 
 - only when `tracker.artifacts_enabled` is true, snapshot the epoch-0 candidate before optimization into the tracker staging directory, even when `model_path` is `None`;
-- when a baseline validation value exists, treat epoch 0 as the initial best candidate and log `checkpoint/is_best=true`; when it does not, keep the snapshot only as the `n_epochs=0` fallback and replace it at the first evaluated epoch;
-- replace the staged best snapshot whenever the same strict comparison used by the harness finds an improvement;
-- verify that the final best snapshot is readable and upload it once with alias `best`;
+- treat the pre-training evaluation as the initial best candidate and log `checkpoint/is_best=true` at epoch 0, since it is the only candidate that exists yet; harnesses that seed their own `lowest_test_loss` with infinity replace it at the first evaluated epoch, and harnesses that seed it from the pre-training loss keep it until a real improvement;
+- replace the staged best snapshot whenever the harness' own improvement flag is set, reusing that decision rather than recomputing it;
+- validate each staged checkpoint in memory before writing it, without reading it back, because staging runs on the epoch hot path;
+- upload the final best snapshot once with alias `best`;
 - support `n_epochs=0` and no-improvement runs with and without `model_path`;
 - preserve the existing user-visible `model_path` semantics and do not delete or rename it.
 
@@ -520,13 +521,14 @@ The local `model_path` remains the best-validation checkpoint. Do not upload a v
 
 The final checkpoint represents model state immediately after the final epoch, before any harness-specific restoration of an in-memory best model. Each harness must use its existing checkpoint construction logic so embedded atom/dimer submodels and configuration remain loadable.
 
-When `tracker.artifacts_enabled` is true, write the final checkpoint into the tracker staging directory, upload with aliases `final` and `latest`, and allow W&B/offline storage to retain it. Disabled and nonprimary processes must not perform staging serialization. Do not create an extra sibling checkpoint beside the user's `model_path` unless a future CLI option explicitly requests one.
+When `tracker.artifacts_enabled` is true, write the final checkpoint into the tracker staging directory once at the end of the run, upload with aliases `final` and `latest`, and allow W&B/offline storage to retain it. Do not serialize a final checkpoint on every epoch. When the last completed epoch was also the best one the staged best checkpoint already holds the final weights, so no second file is written and the single version carries all three aliases. Disabled and nonprimary processes must not perform staging serialization. Do not create an extra sibling checkpoint beside the user's `model_path` unless a future CLI option explicitly requests one.
 
 For harnesses that restore `best_model` at the end, capture the final-epoch checkpoint before that restoration. The local/in-memory post-training behavior remains unchanged.
 
 ### 10.4 Artifact failure policy
 
 - Failure to serialize a checkpoint is a training failure because the artifact contract is explicit when W&B is enabled.
+- Metric values are never a training failure. A NaN or infinite loss is logged as-is; tracking must not terminate a run that would otherwise continue.
 - A missing `model_path` does not disable artifacts; best and final checkpoints are serialized into the run directory.
 - Disabled tracking does not create W&B artifact files or alter checkpoint behavior.
 
@@ -534,22 +536,33 @@ For harnesses that restore `best_model` at the end, capture the final-epoch chec
 
 ### 11.1 Shared event helpers
 
-Add small helpers for payload construction rather than embedding metric strings throughout loops:
+Every training loop reports itself through two explicit calls rather than having
+its methods wrapped from outside:
 
 ```python
-atomic_metric_payload(...)
-hirshfeld_metric_payload(...)
-pairwise_metric_payload(...)
-parameter_metric_payload(labels, ...)
+track_pretraining_from_locals(self, locals(), metric_labels=..., exclude=...)
+track_epoch_from_locals(self, locals(), metric_labels=..., exclude=...)
 ```
 
-Helpers:
+Both read the conventional `train_loss`, `test_loss`, `epoch`, `dt`,
+`optimizer`, `star_marker`/`test_lowered`, and `<name>_MAE_t`/`<name>_MAE_v`
+locals the loops already define, so the loops keep their existing shape.
+`metric_labels` names the components of an MAE local that holds one value per
+predicted term; `exclude` drops a conventional metric a model does not predict
+(dispersion under `no_disp_nn`).
+
+The helpers:
 
 - accept Python numbers or scalar tensors;
-- detach tensors and convert them to finite Python scalars;
-- reject non-scalar or non-finite values with a clear model/metric name;
-- omit unsupported optional metrics;
-- never perform distributed collectives.
+- detach tensors and convert them to Python scalars, passing NaN/infinity
+  through so a diverged epoch is visible in the run instead of raising into
+  training;
+- reject non-scalar or non-numeric values with a clear metric name;
+- omit optional metrics the loop did not compute;
+- never perform distributed collectives;
+- no-op when tracking is disabled or the caller is not the tracking owner.
+
+No harness method is monkeypatched, in production or in tests.
 
 ### 11.2 Per-loop changes
 
@@ -560,7 +573,7 @@ For every `single_proc_train()` and `ddp_train()` listed in Section 5:
 3. when `tracker.artifacts_enabled` is true, snapshot the epoch-0 model as the initial best candidate; disabled and nonprimary ranks skip all tracker-driven serialization;
 4. log pre-training metrics at epoch 0 only when already available or computed through a nonshuffled evaluation loader with dedicated generator and preserved CPU/CUDA/dataloader RNG state;
 5. after each globally reduced evaluation, log the full epoch payload;
-6. mark `checkpoint/is_best` from the same comparison that drives checkpoint saving;
+6. mark `checkpoint/is_best` from the harness' own `star_marker`/`test_lowered` flag, which is the same comparison that drives checkpoint saving;
 7. capture best checkpoint metadata at the successful save boundary;
 8. capture the final-epoch checkpoint before restoring any best model;
 9. upload best/final artifacts and finish the run;

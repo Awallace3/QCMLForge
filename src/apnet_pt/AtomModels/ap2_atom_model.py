@@ -13,6 +13,8 @@ from ..training_tracking import (
     WandbConfig,
     configure_distributed_tracking,
     run_tracked_single_process,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
     tracked_ddp_worker,
 )
 from ..hf_pretrained import resolve_pretrained_path
@@ -893,8 +895,6 @@ units angstrom
                 f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f}",
                 flush=True,
             )
-        from ..training_tracking import track_pretraining_from_locals
-
         track_pretraining_from_locals(self, locals())
         return test_loss
 
@@ -1151,6 +1151,7 @@ units angstrom
                 f"{qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f}",
                 flush=True,
             )
+        track_pretraining_from_locals(self, locals())
 
         lowest_test_loss = test_loss
 
@@ -1181,6 +1182,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 # if (world_size==1 or rank == 0):
                 print(
@@ -1270,6 +1272,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f} {test_lowered}",
@@ -1360,6 +1363,12 @@ units angstrom
             torch.jit.enable_onednn_fusion(True)
             torch.autograd.set_detect_anomaly(False)
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+        }
         if world_size > 1:
             # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)
             print("Running multi-process training", flush=True)
@@ -1368,7 +1377,7 @@ units angstrom
                 self,
                 wandb_config,
                 model_family="atomic",
-                initial_config={"training/epochs": n_epochs},
+                initial_config=tracking_config,
                 backend=_tracker_backend,
                 event_directory=_tracker_event_directory,
             )
@@ -1413,13 +1422,7 @@ units angstrom
                 validation_dataset=test_dataset,
                 effective_batch_size=batch_size,
                 world_size=world_size,
-                initial_config={
-                    "training/epochs": n_epochs,
-                    "training/learning_rate_initial": lr,
-                    "training/random_seed": random_seed,
-                    "training/skip_compile": skip_compile,
-                    "training/pretrain_test_loss": False,
-                },
+                initial_config=tracking_config,
                 backend=_tracker_backend,
                 event_directory=_tracker_event_directory,
             )

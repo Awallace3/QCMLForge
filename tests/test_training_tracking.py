@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import math
 import pickle
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,16 +27,15 @@ from apnet_pt.training_tracking import (
     TrackerBackend,
     WandbConfig,
     WandbTrainingTracker,
-    atomic_metric_payload,
     create_training_tracker,
     epoch_metric_payload,
-    hirshfeld_metric_payload,
-    pairwise_metric_payload,
-    parameter_metric_payload,
     run_tracked_distributed,
     run_tracked_single_process,
     scalar_value,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
 )
+from apnet_pt.training_tracking import _metrics_from_locals
 
 
 def _context(**overrides):
@@ -126,15 +127,26 @@ class _ExternalTrackedHarness:
     def evaluate_batches(self):
         return 2.0, 0.5, 1.0, 1.5
 
+    def ddp_train(self, n_epochs=1):
+        train_loss, charge_MAE_t, dipole_MAE_t, qpole_MAE_t = self.train_batches()
+        test_loss, charge_MAE_v, dipole_MAE_v, qpole_MAE_v = self.evaluate_batches()
+        track_pretraining_from_locals(self, locals())
+        lowest_test_loss = test_loss
+        for epoch in range(n_epochs):
+            train_loss, charge_MAE_t, dipole_MAE_t, qpole_MAE_t = self.train_batches()
+            test_loss, charge_MAE_v, dipole_MAE_v, qpole_MAE_v = self.evaluate_batches()
+            test_lowered = " "
+            if test_loss < lowest_test_loss:
+                lowest_test_loss = test_loss
+                test_lowered = "*"
+            track_epoch_from_locals(self, locals())
+
 
 def _spawn_external_tracker(rank: int, world_size: int, event_directory: str) -> None:
     harness = _ExternalTrackedHarness()
 
     def train_loop():
-        harness.evaluate_batches()
-        harness.evaluate_batches()
-        harness.train_batches()
-        harness.evaluate_batches()
+        harness.ddp_train()
 
     run_tracked_distributed(
         harness,
@@ -578,42 +590,66 @@ def test_safe_wrappers_raise_base_exception_without_primary(tmp_path, operation)
         invoke()
 
 
-def test_metric_payload_helpers_and_scalar_validation():
-    metrics = {}
-    metrics.update(epoch_metric_payload(epoch=1, learning_rate=5e-4, is_best=True))
-    metrics.update(
-        atomic_metric_payload(
-            "train",
-            loss_sum=torch.tensor(3.0),
-            charge_mae=1,
-            dipole_mae=2,
-            quadrupole_mae=3,
-        )
-    )
-    metrics.update(
-        hirshfeld_metric_payload("val", hfvr_mae=0.2, valence_width_mae=0.3)
-    )
-    metrics.update(
-        pairwise_metric_payload(
-            "val",
-            total_mae=1,
-            electrostatics_mae=2,
-            exchange_mae=3,
-            induction_mae=4,
-            dispersion_mae=None,
-        )
+def test_epoch_payload_and_scalar_conversion():
+    metrics = epoch_metric_payload(
+        epoch=1, learning_rate=5e-4, epoch_seconds=torch.tensor(1.5), is_best=True
     )
 
-    assert metrics["train/loss_sum"] == 3.0
-    assert metrics["checkpoint/is_best"] is True
-    assert metrics["val/mae/valence_width"] == 0.3
-    assert metrics["val/mae/total"] == 1.0
-    assert "val/mae/dispersion" not in metrics
+    assert metrics == {
+        "epoch": 1,
+        "optimizer/learning_rate": 5e-4,
+        "timing/epoch_seconds": 1.5,
+        "checkpoint/is_best": True,
+    }
     assert scalar_value(torch.tensor(2.0), metric_name="x") == 2.0
+    assert scalar_value(np.float32(0.5), metric_name="x") == 0.5
     with pytest.raises(ValueError, match="scalar"):
         scalar_value(torch.tensor([1.0, 2.0]), metric_name="x")
-    with pytest.raises(ValueError, match="finite"):
-        scalar_value(float("nan"), metric_name="x")
+    with pytest.raises(TypeError, match="not numeric"):
+        scalar_value("nope", metric_name="x")
+
+
+def test_scalar_conversion_passes_through_non_finite_values():
+    """A diverged epoch must reach the run instead of raising into training."""
+
+    assert math.isnan(scalar_value(float("nan"), metric_name="x"))
+    assert math.isinf(scalar_value(torch.tensor(float("inf")), metric_name="x"))
+
+
+def test_metrics_from_locals_names_expands_and_excludes():
+    values = {
+        "total_MAE_t": 1.0,
+        "total_MAE_v": 2.0,
+        "disp_MAE_t": 3.0,
+        "disp_MAE_v": 4.0,
+    }
+
+    assert _metrics_from_locals(values) == (
+        ["total", "dispersion"],
+        [1.0, 3.0],
+        [2.0, 4.0],
+    )
+    assert _metrics_from_locals(values, exclude=("dispersion",)) == (
+        ["total"],
+        [1.0],
+        [2.0],
+    )
+
+    vector = {
+        "total_MAE_t": torch.tensor([0.1, 0.2]),
+        "total_MAE_v": torch.tensor([0.3, 0.4]),
+    }
+    names, train_values, validation_values = _metrics_from_locals(
+        vector, metric_labels=("electrostatics", "induction")
+    )
+    assert names == ["electrostatics", "induction"]
+    assert [float(value) for value in train_values] == pytest.approx([0.1, 0.2])
+    assert [float(value) for value in validation_values] == pytest.approx([0.3, 0.4])
+
+    with pytest.raises(ValueError, match="pass metric_labels"):
+        _metrics_from_locals(vector)
+    with pytest.raises(ValueError, match="1 names for the 2 components"):
+        _metrics_from_locals(vector, metric_labels=("only-one",))
 
 
 _PUBLIC_TRAIN_HARNESSES = (
@@ -651,6 +687,13 @@ def test_every_public_train_harness_has_universal_tracking_api(
     assert parameters["_tracker_event_directory"].default is None
     assert "run_tracked_single_process" in inspect.getsource(harness_class.train)
 
+    # Every epoch loop must report itself; nothing wraps the harness on its behalf.
+    for loop_name in ("single_proc_train", "ddp_train"):
+        loop = getattr(harness_class, loop_name, None)
+        if loop is None:
+            continue
+        assert "track_epoch_from_locals(" in inspect.getsource(loop), loop_name
+
 
 class _ToyTrackedModel(torch.nn.Module):
     def __init__(self):
@@ -662,12 +705,22 @@ class _ToyTrackedModel(torch.nn.Module):
 
 
 class _ToyTrackedHarness:
+    """Minimal harness shaped like the real ones: it drives tracking itself."""
+
+    _MAE_NAMES = {
+        "atomic": ("charge", "dipole", "qpole"),
+        "pairwise": ("total", "elst", "exch", "indu", "disp"),
+        "parameter": ("total",),
+    }
+
     def __init__(self, family):
         self.family = family
         self.model = _ToyTrackedModel()
         self.device = torch.device("cpu")
         self.model_save_path = None
-        self.dimer_eval_type = "elst_damping__induced_dipole"
+        self.metric_labels = (
+            ("electrostatics", "induction") if family == "parameter" else None
+        )
 
     def _create_checkpoint(self, metadata=None):
         return {
@@ -677,14 +730,6 @@ class _ToyTrackedHarness:
             "model_type": "ToyTrackedModel",
             "metadata": metadata or {},
         }
-
-    def train_batches_single_proc(self):
-        with torch.no_grad():
-            self.model.weight.add_(1.0)
-        return self._result(train=True)
-
-    def evaluate_batches_single_proc(self):
-        return self._result(train=False)
 
     def _result(self, train):
         offset = 0.0 if train else 0.5
@@ -701,12 +746,49 @@ class _ToyTrackedHarness:
             )
         return (2.0 + offset, torch.tensor([0.1 + offset, 0.2 + offset]))
 
+    def _mae_locals(self, train_maes, validation_maes):
+        names = self._MAE_NAMES[self.family]
+        return {
+            **{f"{name}_MAE_t": value for name, value in zip(names, train_maes)},
+            **{f"{name}_MAE_v": value for name, value in zip(names, validation_maes)},
+        }
 
-def _run_toy_training(harness):
-    harness.evaluate_batches_single_proc()
-    harness.evaluate_batches_single_proc()
-    harness.train_batches_single_proc()
-    harness.evaluate_batches_single_proc()
+    def _tracking_kwargs(self):
+        return {
+            "metric_labels": self.metric_labels,
+            "exclude": (
+                ("dispersion",) if getattr(self.model, "no_disp_nn", False) else ()
+            ),
+        }
+
+    def single_proc_train(self, n_epochs=1, nan_epoch=None):
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.1)
+        train_loss, *train_maes = self._result(train=True)
+        test_loss, *validation_maes = self._result(train=False)
+        track_pretraining_from_locals(
+            self,
+            {**locals(), **self._mae_locals(train_maes, validation_maes)},
+            **self._tracking_kwargs(),
+        )
+        lowest_test_loss = test_loss
+        for epoch in range(n_epochs):
+            t1 = time.time()
+            with torch.no_grad():
+                self.model.weight.add_(1.0)
+            train_loss, *train_maes = self._result(train=True)
+            test_loss, *validation_maes = self._result(train=False)
+            if epoch == nan_epoch:
+                test_loss = float("nan")
+            star_marker = " "
+            if test_loss < lowest_test_loss:
+                lowest_test_loss = test_loss
+                star_marker = "*"
+            dt = time.time() - t1
+            track_epoch_from_locals(
+                self,
+                {**locals(), **self._mae_locals(train_maes, validation_maes)},
+                **self._tracking_kwargs(),
+            )
 
 
 @pytest.mark.parametrize(
@@ -728,7 +810,7 @@ def test_file_event_integration_covers_metric_and_checkpoint_families(
 
     run_tracked_single_process(
         harness,
-        lambda: _run_toy_training(harness),
+        lambda: harness.single_proc_train(),
         WandbConfig(mode="offline"),
         model_family=family,
         train_dataset=dataset,
@@ -867,7 +949,7 @@ def test_real_atom_harness_training_emits_file_events_and_loadable_artifact(tmp_
     events = _read_events(event_directory)
     logs = [event["metrics"] for event in events if event["event"] == "log"]
     assert [log["epoch"] for log in logs] == [0, 1]
-    assert logs[0]["checkpoint/is_best"] is False
+    assert logs[0]["checkpoint/is_best"] is True
     assert set(logs[-1]) >= {
         "train/mae/charge",
         "val/mae/dipole",
@@ -1092,7 +1174,7 @@ def test_no_dispersion_model_omits_dispersion_metric(tmp_path):
 
     run_tracked_single_process(
         harness,
-        lambda: _run_toy_training(harness),
+        lambda: harness.single_proc_train(),
         WandbConfig(mode="offline"),
         model_family="pairwise",
         train_dataset=dataset,
@@ -1148,17 +1230,36 @@ def test_harness_failure_records_failed_status_and_cleans_up(tmp_path):
     assert not hasattr(harness, "_training_tracking_state")
 
 
-def test_parameter_metrics_validate_labels_and_lengths():
-    payload = parameter_metric_payload(
-        "train", labels=("HFVR", "Valence Width"), mae_values=(0.1, 0.2)
+def test_nan_validation_loss_is_logged_without_ending_training(tmp_path):
+    """Tracking must never turn a diverged epoch into a training failure."""
+
+    harness = _ToyTrackedHarness("pairwise")
+
+    run_tracked_single_process(
+        harness,
+        lambda: harness.single_proc_train(n_epochs=3, nan_epoch=1),
+        WandbConfig(mode="offline"),
+        model_family="pairwise",
+        train_dataset=[0, 1],
+        validation_dataset=[2, 3],
+        effective_batch_size=2,
+        world_size=1,
+        initial_config={"training/epochs": 3},
+        backend=TrackerBackend.FILE_EVENT,
+        event_directory=str(tmp_path),
     )
-    assert payload == {
-        "train/mae/hfvr": 0.1,
-        "train/mae/valence_width": 0.2,
+
+    events = _read_events(tmp_path)
+    logs = [event["metrics"] for event in events if event["event"] == "log"]
+    assert [log["epoch"] for log in logs] == [0, 1, 2, 3]
+    assert math.isnan(logs[2]["val/loss_sum"])
+    assert logs[2]["checkpoint/is_best"] is False
+    summaries = [
+        event["values"] for event in events if event["event"] == "summary"
+    ]
+    assert any(values.get("run/status") == "completed" for values in summaries)
+    assert events[-1] == {
+        "event": "finish",
+        "exit_code": 0,
+        "pid": events[-1]["pid"],
     }
-    with pytest.raises(ValueError, match="equal lengths"):
-        parameter_metric_payload("train", labels=("a",), mae_values=(1, 2))
-    with pytest.raises(ValueError, match="Duplicate"):
-        parameter_metric_payload(
-            "train", labels=("Valence Width", "valence-width"), mae_values=(1, 2)
-        )

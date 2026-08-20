@@ -20,6 +20,8 @@ from ..training_tracking import (
     WandbConfig,
     configure_distributed_tracking,
     run_tracked_single_process,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
     tracked_ddp_worker,
 )
 import os
@@ -1584,6 +1586,7 @@ units angstrom
                     f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                     flush=True,
                 )
+        track_pretraining_from_locals(self, locals())
         for epoch in range(n_epochs):
             t1 = time.time()
             test_lowered = False
@@ -1626,6 +1629,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch: 4d}({dt: < 7.2f} sec)  MAE: {total_MAE_t: > 7.3f}/{total_MAE_v: < 7.3f} {elst_MAE_t: > 7.3f}/{elst_MAE_v: < 7.3f} {exch_MAE_t: > 7.3f}/{exch_MAE_v: < 7.3f} {indu_MAE_t: > 7.3f}/{indu_MAE_v: < 7.3f} {disp_MAE_t: > 7.3f}/{disp_MAE_v: < 7.3f} {test_lowered}",
@@ -1757,6 +1761,7 @@ units angstrom
                     total_MAE_t: > 7.3f}/{total_MAE_v: < 7.3f}",
                 flush=True,
             )
+        track_pretraining_from_locals(self, locals())
 
         # (6) Main training loop
         if pretrain_test_loss:
@@ -1816,6 +1821,8 @@ units angstrom
                     )
                 self.model.to(rank_device)
 
+            dt = time.time() - t1
+            track_epoch_from_locals(self, locals())
             if not transfer_learning:
                 print(
                     f"  EPOCH: {epoch:4d} ({time.time() - t1:<7.2f}s)  MAE: "
@@ -1943,6 +1950,15 @@ units angstrom
 
         self.shuffle = shuffle
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/learning_rate_decay": lr_decay,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+            "training/transfer_learning": transfer_learning,
+            "training/pretrain_test_loss": pretrain_test_loss,
+        }
         if world_size > 1:
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
@@ -1950,7 +1966,7 @@ units angstrom
                 self,
                 wandb_config,
                 model_family="pairwise",
-                initial_config={"training/epochs": n_epochs},
+                initial_config=tracking_config,
                 backend=_tracker_backend,
                 event_directory=_tracker_event_directory,
             )
@@ -1995,15 +2011,7 @@ units angstrom
                 validation_dataset=test_dataset,
                 effective_batch_size=batch_size,
                 world_size=world_size,
-                initial_config={
-                    "training/epochs": n_epochs,
-                    "training/learning_rate_initial": lr,
-                    "training/learning_rate_decay": lr_decay,
-                    "training/random_seed": random_seed,
-                    "training/skip_compile": skip_compile,
-                    "training/transfer_learning": transfer_learning,
-                    "training/pretrain_test_loss": pretrain_test_loss,
-                },
+                initial_config=tracking_config,
                 backend=_tracker_backend,
                 event_directory=_tracker_event_directory,
             )

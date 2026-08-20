@@ -11,6 +11,8 @@ from ..training_tracking import (
     configure_distributed_tracking,
     run_tracked_distributed,
     run_tracked_single_process,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
     tracked_ddp_worker,
 )
 from ..hf_pretrained import resolve_pretrained_path
@@ -1646,8 +1648,6 @@ units angstrom
                 f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f}",
                 flush=True,
             )
-        from ..training_tracking import track_pretraining_from_locals
-
         track_pretraining_from_locals(self, locals())
         return test_loss
 
@@ -1701,6 +1701,7 @@ units angstrom
                     flush=True,
                 )
 
+        track_pretraining_from_locals(self, locals())
         return test_loss
 
     def train_batches_single_proc(
@@ -2055,6 +2056,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 # if (world_size==1 or rank == 0):
                 print(
@@ -2168,6 +2170,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f} {test_lowered}",
@@ -2352,7 +2355,6 @@ units angstrom
                     "training/learning_rate_initial": lr,
                     "training/random_seed": random_seed,
                     "training/skip_compile": skip_compile,
-                    "training/pretrain_test_loss": False,
                 },
                 backend=_tracker_backend,
                 event_directory=_tracker_event_directory,

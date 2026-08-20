@@ -8,10 +8,9 @@ W&B SDK is an optional training dependency and is loaded only when an enabled
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
-import math
 import os
-import re
 import sys
 import time
 import uuid
@@ -19,7 +18,6 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
-from functools import wraps
 from numbers import Real
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
@@ -575,7 +573,6 @@ def harness_tracking(
     global_rank: int = 0,
     local_rank: int | None = 0,
     variant: str = "single-process",
-    distributed: bool = False,
 ) -> Generator[TrainingTracker, None, None]:
     """Own a complete rank-aware tracker lifecycle for a model harness."""
 
@@ -626,27 +623,25 @@ def harness_tracking(
             "best_epoch": 0,
             "best_validation_loss": None,
             "last_validation_loss": None,
-            "final_path": None,
             "epochs_completed": 0,
             "defined_metrics": None,
-            "pretraining_is_best": initial_config.get(
-                "training/pretrain_test_loss", True
-            ),
             "config_refreshed": False,
         }
-        restore_hooks = _install_training_tracking_hooks(
-            harness, tracker, distributed=distributed
-        )
         yield tracker
-        restore_hooks()
         state = harness._training_tracking_state
-        final_path = state["final_path"] or stage_harness_checkpoint(
-            tracker,
-            harness,
-            role="final",
-            epoch=state["epochs_completed"],
-            validation_loss=state["last_validation_loss"],
-        )
+        # The staged best checkpoint already holds the final weights whenever the
+        # last completed epoch was also the best one, so only serialize a second
+        # checkpoint when training ended on weights worse than the best.
+        if state["best_epoch"] == state["epochs_completed"]:
+            final_path = state["best_path"]
+        else:
+            final_path = stage_harness_checkpoint(
+                tracker,
+                harness,
+                role="final",
+                epoch=state["epochs_completed"],
+                validation_loss=state["last_validation_loss"],
+            )
         publish_harness_artifacts(
             tracker,
             best_path=state["best_path"],
@@ -673,9 +668,6 @@ def harness_tracking(
             )
         raise
     finally:
-        restore = locals().get("restore_hooks")
-        if restore is not None:
-            restore()
         try:
             del harness._training_tracking_state
         except AttributeError:
@@ -758,7 +750,11 @@ def tracked_ddp_worker(rank: int, ddp_callable: Callable[..., Any], *args: Any) 
     descriptor = getattr(harness, "_distributed_tracking_descriptor", None)
     if descriptor is None:
         return ddp_callable(rank, *args)
-    world_size, train_dataset, validation_dataset, _, batch_size = args[:5]
+    bound = inspect.signature(ddp_callable).bind(rank, *args)
+    world_size = bound.arguments["world_size"]
+    train_dataset = bound.arguments["train_dataset"]
+    validation_dataset = bound.arguments["test_dataset"]
+    batch_size = bound.arguments["batch_size"]
     local_rank = descriptor["local_rank"]
     if local_rank is None:
         local_rank = rank
@@ -815,7 +811,6 @@ def run_tracked_distributed(
             global_rank=rank,
             local_rank=local_rank,
             variant=variant,
-            distributed=True,
         ):
             return training_callable()
     finally:
@@ -843,245 +838,6 @@ def current_harness_tracker(harness: Any) -> TrainingTracker:
     return getattr(harness, "_training_tracker", NullTrainingTracker())
 
 
-def _install_training_tracking_hooks(
-    harness: Any,
-    tracker: TrainingTracker,
-    *,
-    distributed: bool = False,
-) -> Callable[[], None]:
-    """Wrap existing epoch batch methods without changing their math."""
-
-    originals: dict[str, tuple[bool, Any]] = {}
-    pending: dict[str, Any] = {
-        "train": None,
-        "pretrain": [],
-        "learning_rate": None,
-        "started_at": None,
-    }
-
-    for attribute_name in dir(harness):
-        if "batches" not in attribute_name:
-            continue
-        is_single_process = "single_proc" in attribute_name
-        if distributed == is_single_process:
-            continue
-        if "train_batches" not in attribute_name and "evaluate_batches" not in attribute_name:
-            continue
-        original = getattr(harness, attribute_name)
-        if not callable(original):
-            continue
-        originals[attribute_name] = (
-            attribute_name in getattr(harness, "__dict__", {}),
-            getattr(harness, "__dict__", {}).get(attribute_name),
-        )
-        if "train_batches" in attribute_name:
-
-            @wraps(original)
-            def train_wrapper(*args: Any, __original: Any = original, **kwargs: Any) -> Any:
-                pending["started_at"] = time.perf_counter()
-                optimizer = next(
-                    (
-                        value
-                        for value in (*args, *kwargs.values())
-                        if hasattr(value, "param_groups")
-                    ),
-                    None,
-                )
-                pending["learning_rate"] = (
-                    optimizer.param_groups[0]["lr"] if optimizer is not None else None
-                )
-                result = __original(*args, **kwargs)
-                pending["train"] = result
-                return result
-
-            setattr(harness, attribute_name, train_wrapper)
-        else:
-
-            @wraps(original)
-            def evaluate_wrapper(
-                *args: Any, __original: Any = original, **kwargs: Any
-            ) -> Any:
-                result = __original(*args, **kwargs)
-                train_result = pending.pop("train", None)
-                pending["train"] = None
-                if train_result is not None:
-                    epoch_seconds = None
-                    if pending["started_at"] is not None:
-                        epoch_seconds = time.perf_counter() - pending["started_at"]
-                    _track_batch_results(
-                        harness,
-                        tracker,
-                        train_result,
-                        result,
-                        learning_rate=pending["learning_rate"],
-                        epoch_seconds=epoch_seconds,
-                    )
-                else:
-                    pending["pretrain"].append(result)
-                    if len(pending["pretrain"]) == 2:
-                        _track_batch_results(
-                            harness,
-                            tracker,
-                            pending["pretrain"][0],
-                            pending["pretrain"][1],
-                            pretraining=True,
-                        )
-                        pending["pretrain"].clear()
-                return result
-
-            setattr(harness, attribute_name, evaluate_wrapper)
-
-    restored = False
-
-    def restore() -> None:
-        nonlocal restored
-        if restored:
-            return
-        for attribute_name, (had_instance_value, instance_value) in originals.items():
-            if had_instance_value:
-                setattr(harness, attribute_name, instance_value)
-            else:
-                try:
-                    delattr(harness, attribute_name)
-                except AttributeError:
-                    pass
-        restored = True
-
-    return restore
-
-
-def _track_batch_results(
-    harness: Any,
-    tracker: TrainingTracker,
-    train_result: Any,
-    validation_result: Any,
-    *,
-    pretraining: bool = False,
-    learning_rate: Any | None = None,
-    epoch_seconds: Any | None = None,
-) -> None:
-    if not isinstance(train_result, (tuple, list)) or not isinstance(
-        validation_result, (tuple, list)
-    ):
-        return
-    train_loss, train_metrics = train_result[0], list(train_result[1:])
-    validation_loss, validation_metrics = (
-        validation_result[0],
-        list(validation_result[1:]),
-    )
-    names, train_metrics, validation_metrics = _result_metric_names(
-        harness, train_metrics, validation_metrics
-    )
-    if not names:
-        return
-    state = harness._training_tracking_state
-    if not state["config_refreshed"]:
-        tracker.update_config(_resolved_training_config(harness, {}))
-        state["config_refreshed"] = True
-    if state["defined_metrics"] is None:
-        define_epoch_metrics(tracker, names)
-        state["defined_metrics"] = tuple(names)
-    if pretraining:
-        epoch = 0
-        is_best = bool(state["pretraining_is_best"])
-        if is_best:
-            state["best_validation_loss"] = validation_loss
-    else:
-        epoch = state["epochs_completed"] + 1
-        previous_best = state["best_validation_loss"]
-        is_best = previous_best is None or scalar_value(
-            validation_loss, metric_name="val/loss_sum"
-        ) < scalar_value(previous_best, metric_name="best/val_loss_sum")
-        state["epochs_completed"] = epoch
-    if is_best:
-        state["best_epoch"] = epoch
-        state["best_validation_loss"] = validation_loss
-        state["best_path"] = stage_harness_checkpoint(
-            tracker,
-            harness,
-            role="best",
-            epoch=epoch,
-            validation_loss=validation_loss,
-        )
-    state["last_validation_loss"] = validation_loss
-    if not pretraining:
-        state["final_path"] = stage_harness_checkpoint(
-            tracker,
-            harness,
-            role="final",
-            epoch=epoch,
-            validation_loss=validation_loss,
-        )
-    log_epoch_metrics(
-        tracker,
-        epoch=epoch,
-        metric_names=names,
-        train_values=train_metrics,
-        validation_values=validation_metrics,
-        train_loss=train_loss,
-        validation_loss=validation_loss,
-        learning_rate=learning_rate,
-        epoch_seconds=epoch_seconds,
-        is_best=is_best,
-    )
-
-
-def _result_metric_names(
-    harness: Any,
-    train_metrics: list[Any],
-    validation_metrics: list[Any],
-) -> tuple[list[str], list[Any], list[Any]]:
-    if len(train_metrics) != len(validation_metrics):
-        raise ValueError("Train and validation metric result lengths differ")
-    if len(train_metrics) == 1 and _value_length(train_metrics[0]) > 1:
-        train_metrics = _flatten_values(train_metrics[0])
-        validation_metrics = _flatten_values(validation_metrics[0])
-        eval_type = getattr(harness, "dimer_eval_type", "")
-        if "elst" in eval_type and "induced" in eval_type:
-            names = ["electrostatics", "induction"]
-        elif "induced" in eval_type:
-            names = ["induction"]
-        else:
-            names = ["electrostatics"]
-        return names[: len(train_metrics)], train_metrics, validation_metrics
-    count = len(train_metrics)
-    family = harness.__class__.__name__
-    if count == 5 and "Hirshfeld" in family:
-        names = ["charge", "dipole", "quadrupole", "hfvr", "valence_width"]
-    elif count == 5:
-        names = ["total", "electrostatics", "exchange", "induction", "dispersion"]
-        metric_model = getattr(harness, "model", None)
-        metric_model = getattr(metric_model, "module", metric_model)
-        if getattr(metric_model, "no_disp_nn", False):
-            names = names[:-1]
-            train_metrics = train_metrics[:-1]
-            validation_metrics = validation_metrics[:-1]
-    elif count == 3:
-        names = ["charge", "dipole", "quadrupole"]
-    elif count == 2:
-        names = ["hfvr", "valence_width"]
-    elif count == 1:
-        names = ["total"]
-    else:
-        names = [f"metric_{index}" for index in range(count)]
-    return names, train_metrics, validation_metrics
-
-
-def _value_length(value: Any) -> int:
-    if hasattr(value, "numel"):
-        return int(value.numel())
-    try:
-        return len(value)
-    except TypeError:
-        return 1
-
-
-def _flatten_values(value: Any) -> list[Any]:
-    if hasattr(value, "reshape"):
-        return list(value.reshape(-1))
-    return list(value)
-
-
 _LOCAL_METRIC_VARIABLES = (
     ("total", "total_MAE_t", "total_MAE_v"),
     ("electrostatics", "elst_MAE_t", "elst_MAE_v"),
@@ -1096,15 +852,78 @@ _LOCAL_METRIC_VARIABLES = (
 )
 
 
-def track_pretraining_from_locals(harness: Any, values: Mapping[str, Any]) -> None:
-    """Log existing pre-training metrics without performing another evaluation."""
+def track_pretraining_from_locals(
+    harness: Any,
+    values: Mapping[str, Any],
+    *,
+    metric_labels: Sequence[str] | None = None,
+    exclude: Sequence[str] = (),
+) -> None:
+    """Log an existing pre-training evaluation as epoch 0.
 
-    tracker = current_harness_tracker(harness)
-    names, train_values, validation_values = _metrics_from_locals(values)
-    if not names:
-        return
+    ``values`` is the calling loop's ``locals()``; the conventional ``*_MAE_t`` /
+    ``*_MAE_v`` names in :data:`_LOCAL_METRIC_VARIABLES` are picked up from it.
+    The pre-training model is staged as the provisional best checkpoint because
+    it is the only candidate that exists yet; the first epoch that the harness
+    marks as an improvement replaces it.
+    """
+
+    _track_evaluation_boundary(
+        harness,
+        values,
+        epoch=0,
+        is_best=True,
+        metric_labels=metric_labels,
+        exclude=exclude,
+    )
+
+
+def track_epoch_from_locals(
+    harness: Any,
+    values: Mapping[str, Any],
+    *,
+    metric_labels: Sequence[str] | None = None,
+    exclude: Sequence[str] = (),
+) -> None:
+    """Log one completed epoch from the calling loop's ``locals()``.
+
+    ``epoch`` is read as the loop's zero-based counter and reported as
+    ``epoch + 1``.  Whether the epoch is a new best is taken from the harness'
+    own ``star_marker``/``test_lowered`` decision rather than recomputed, so the
+    staged artifact always matches the checkpoint the harness itself kept.
+    """
+
+    marker = values.get("star_marker", values.get("test_lowered", False))
+    _track_evaluation_boundary(
+        harness,
+        values,
+        epoch=int(values.get("epoch", 0)) + 1,
+        is_best=marker is True or marker == "*",
+        metric_labels=metric_labels,
+        exclude=exclude,
+    )
+
+
+def _track_evaluation_boundary(
+    harness: Any,
+    values: Mapping[str, Any],
+    *,
+    epoch: int,
+    is_best: bool,
+    metric_labels: Sequence[str] | None,
+    exclude: Sequence[str],
+) -> None:
+    """Record one train/validation evaluation boundary for an active run."""
+
     state = getattr(harness, "_training_tracking_state", None)
     if state is None:
+        # Tracking is disabled, or the loop was called outside ``harness_tracking``.
+        return
+    tracker = current_harness_tracker(harness)
+    names, train_values, validation_values = _metrics_from_locals(
+        values, metric_labels=metric_labels, exclude=exclude
+    )
+    if not names:
         return
     if not state["config_refreshed"]:
         tracker.update_config(_resolved_training_config(harness, {}))
@@ -1112,54 +931,10 @@ def track_pretraining_from_locals(harness: Any, values: Mapping[str, Any]) -> No
     if state["defined_metrics"] is None:
         define_epoch_metrics(tracker, names)
         state["defined_metrics"] = tuple(names)
-    validation_loss = values.get("test_loss")
-    is_best = bool(state["pretraining_is_best"])
-    state["last_validation_loss"] = validation_loss
-    if is_best:
-        state["best_validation_loss"] = validation_loss
-        state["best_path"] = stage_harness_checkpoint(
-            tracker,
-            harness,
-            role="best",
-            epoch=0,
-            validation_loss=validation_loss,
-        )
-    log_epoch_metrics(
-        tracker,
-        epoch=0,
-        metric_names=names,
-        train_values=train_values,
-        validation_values=validation_values,
-        train_loss=values.get("train_loss"),
-        validation_loss=validation_loss,
-        is_best=is_best,
-    )
-
-
-def track_epoch_from_locals(harness: Any, values: Mapping[str, Any]) -> None:
-    """Map conventional harness local variables to one stable epoch payload."""
-
-    tracker = current_harness_tracker(harness)
-    state = getattr(harness, "_training_tracking_state", None)
-    if state is None:
-        return
-    names, train_values, validation_values = _metrics_from_locals(values)
-    if not names:
-        return
-    if state["defined_metrics"] is None:
-        define_epoch_metrics(tracker, names)
-        state["defined_metrics"] = tuple(names)
     elif tuple(names) != state["defined_metrics"]:
         raise ValueError("Training metric shape changed during a tracked run")
-    epoch = int(values.get("epoch", state["epochs_completed"])) + 1
-    marker = values.get("star_marker", values.get("test_lowered", False))
-    is_best = marker is True or marker == "*"
     validation_loss = values.get("test_loss")
     optimizer = values.get("optimizer")
-    learning_rate = None
-    if optimizer is not None:
-        learning_rate = optimizer.param_groups[0]["lr"]
-    epoch_seconds = values.get("dt")
     if is_best:
         state["best_epoch"] = epoch
         state["best_validation_loss"] = validation_loss
@@ -1180,24 +955,70 @@ def track_epoch_from_locals(harness: Any, values: Mapping[str, Any]) -> None:
         validation_values=validation_values,
         train_loss=values.get("train_loss"),
         validation_loss=validation_loss,
-        learning_rate=learning_rate,
-        epoch_seconds=epoch_seconds,
+        learning_rate=(
+            optimizer.param_groups[0]["lr"] if optimizer is not None else None
+        ),
+        epoch_seconds=values.get("dt"),
         is_best=is_best,
     )
 
 
 def _metrics_from_locals(
     values: Mapping[str, Any],
+    *,
+    metric_labels: Sequence[str] | None = None,
+    exclude: Sequence[str] = (),
 ) -> tuple[list[str], list[Any], list[Any]]:
+    """Collect conventional ``*_MAE_t``/``*_MAE_v`` locals into aligned lists.
+
+    ``metric_labels`` renames the collected components, and is required when a
+    harness' MAE local holds one value per predicted component rather than a
+    single scalar.  ``exclude`` drops conventional names a model does not
+    actually predict (for example dispersion under ``no_disp_nn``).
+    """
+
     names: list[str] = []
     train_values: list[Any] = []
     validation_values: list[Any] = []
     for name, train_name, validation_name in _LOCAL_METRIC_VARIABLES:
-        if train_name in values and validation_name in values:
-            names.append(name)
-            train_values.append(values[train_name])
-            validation_values.append(values[validation_name])
+        if name in exclude:
+            continue
+        if train_name not in values or validation_name not in values:
+            continue
+        train_value = values[train_name]
+        validation_value = values[validation_name]
+        width = _value_width(train_value)
+        if metric_labels is None:
+            if width != 1:
+                raise ValueError(
+                    f"Local {train_name!r} holds {width} components; pass "
+                    "metric_labels naming each one"
+                )
+            labels = [name]
+        else:
+            labels = list(metric_labels)
+            if len(labels) != width:
+                raise ValueError(
+                    f"metric_labels has {len(labels)} names for the {width} "
+                    f"components in {train_name!r}"
+                )
+        if width == 1:
+            names.append(labels[0])
+            train_values.append(train_value)
+            validation_values.append(validation_value)
+        else:
+            names.extend(labels)
+            train_values.extend(train_value)
+            validation_values.extend(validation_value)
     return names, train_values, validation_values
+
+
+def _value_width(value: Any) -> int:
+    if hasattr(value, "numel"):
+        return int(value.numel())
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return 1
 
 
 def log_epoch_metrics(
@@ -1393,25 +1214,6 @@ def _create_fallback_harness_checkpoint(
     )
 
 
-def _checkpoints_have_same_weights(best_path: Path, final_path: Path) -> bool:
-    """Compare staged weights while ignoring timestamps and role metadata."""
-
-    from . import model_io
-
-    best = model_io.load_state_dict_from_checkpoint(
-        model_io.load_checkpoint(str(best_path), map_location="cpu")
-    )
-    final = model_io.load_state_dict_from_checkpoint(
-        model_io.load_checkpoint(str(final_path), map_location="cpu")
-    )
-    if best.keys() != final.keys():
-        return False
-    return all(
-        bool(left.shape == right.shape and left.equal(right))
-        for left, right in zip(best.values(), final.values())
-    )
-
-
 def stage_harness_checkpoint(
     tracker: TrainingTracker,
     harness: Any,
@@ -1458,10 +1260,11 @@ def stage_harness_checkpoint(
         # Restore each rank's device before the next DDP collective/epoch.
         for module, device in module_devices:
             module.to(device)
+    # Validate in memory: staging runs on the training hot path, so the extra
+    # read-back of a freshly written checkpoint is not worth its cost per epoch.
+    model_io.validate_checkpoint(checkpoint)
     path = tracker.staging_directory / f"{role}.pt"
     model_io.save_checkpoint(checkpoint, str(path))
-    loaded = model_io.load_checkpoint(str(path), map_location="cpu")
-    model_io.validate_checkpoint(loaded)
     return path
 
 
@@ -1487,7 +1290,7 @@ def publish_harness_artifacts(
             else None
         ),
     }
-    if _checkpoints_have_same_weights(best_path, final_path):
+    if best_path == final_path:
         reference = tracker.log_checkpoint(
             final_path,
             aliases=("best", "final", "latest"),
@@ -1518,7 +1321,13 @@ def publish_harness_artifacts(
 
 
 def scalar_value(value: Any, *, metric_name: str) -> Scalar:
-    """Convert a Python/numpy/torch scalar to a finite built-in scalar."""
+    """Convert a Python/numpy/torch scalar to a built-in scalar.
+
+    NaN and infinity are passed through rather than rejected.  W&B stores them
+    natively, and a diverged epoch must show up in the run instead of raising
+    out of a tracking call and terminating training that would otherwise carry
+    on (several harnesses handle NaN losses themselves).
+    """
 
     if isinstance(value, bool):
         return value
@@ -1537,8 +1346,6 @@ def scalar_value(value: Any, *, metric_name: str) -> Scalar:
         if not isinstance(candidate, Real):
             raise TypeError(f"Metric {metric_name!r} is not numeric")
         result = float(candidate)
-    if not math.isfinite(float(result)):
-        raise ValueError(f"Metric {metric_name!r} must be finite")
     return result
 
 
@@ -1561,128 +1368,6 @@ def epoch_metric_payload(
         if value is not None:
             payload[name] = scalar_value(value, metric_name=name)
     return payload
-
-
-def atomic_metric_payload(
-    split: Literal["train", "val"],
-    *,
-    loss_sum: Any | None = None,
-    charge_mae: Any | None = None,
-    dipole_mae: Any | None = None,
-    quadrupole_mae: Any | None = None,
-) -> dict[str, Scalar]:
-    """Build atomic charge/dipole/quadrupole metrics for one split."""
-
-    return _split_metric_payload(
-        split,
-        loss_sum=loss_sum,
-        metrics={
-            "charge": charge_mae,
-            "dipole": dipole_mae,
-            "quadrupole": quadrupole_mae,
-        },
-    )
-
-
-def hirshfeld_metric_payload(
-    split: Literal["train", "val"],
-    *,
-    loss_sum: Any | None = None,
-    charge_mae: Any | None = None,
-    dipole_mae: Any | None = None,
-    quadrupole_mae: Any | None = None,
-    hfvr_mae: Any | None = None,
-    valence_width_mae: Any | None = None,
-) -> dict[str, Scalar]:
-    """Build atomic multipole and Hirshfeld parameter metrics."""
-
-    return _split_metric_payload(
-        split,
-        loss_sum=loss_sum,
-        metrics={
-            "charge": charge_mae,
-            "dipole": dipole_mae,
-            "quadrupole": quadrupole_mae,
-            "hfvr": hfvr_mae,
-            "valence_width": valence_width_mae,
-        },
-    )
-
-
-def pairwise_metric_payload(
-    split: Literal["train", "val"],
-    *,
-    loss_sum: Any | None = None,
-    total_mae: Any | None = None,
-    electrostatics_mae: Any | None = None,
-    exchange_mae: Any | None = None,
-    induction_mae: Any | None = None,
-    dispersion_mae: Any | None = None,
-) -> dict[str, Scalar]:
-    """Build total and SAPT-component metrics for one split."""
-
-    return _split_metric_payload(
-        split,
-        loss_sum=loss_sum,
-        metrics={
-            "total": total_mae,
-            "electrostatics": electrostatics_mae,
-            "exchange": exchange_mae,
-            "induction": induction_mae,
-            "dispersion": dispersion_mae,
-        },
-    )
-
-
-def parameter_metric_payload(
-    split: Literal["train", "val"],
-    *,
-    labels: Sequence[str],
-    mae_values: Sequence[Any],
-    loss_sum: Any | None = None,
-) -> dict[str, Scalar]:
-    """Build dynamically labelled parameter MAEs with collision detection."""
-
-    if len(labels) != len(mae_values):
-        raise ValueError("Parameter metric labels and values must have equal lengths")
-    metrics: dict[str, Any] = {}
-    for label, value in zip(labels, mae_values):
-        key = _metric_label(label)
-        if key in metrics:
-            raise ValueError(
-                f"Duplicate parameter metric label after normalization: {key}"
-            )
-        metrics[key] = value
-    return _split_metric_payload(split, loss_sum=loss_sum, metrics=metrics)
-
-
-def _split_metric_payload(
-    split: str,
-    *,
-    loss_sum: Any | None,
-    metrics: Mapping[str, Any | None],
-) -> dict[str, Scalar]:
-    if split not in {"train", "val"}:
-        raise ValueError("Metric split must be 'train' or 'val'")
-    payload: dict[str, Scalar] = {}
-    if loss_sum is not None:
-        name = f"{split}/loss_sum"
-        payload[name] = scalar_value(loss_sum, metric_name=name)
-    for key, value in metrics.items():
-        if value is None:
-            continue
-        name = f"{split}/mae/{key}"
-        payload[name] = scalar_value(value, metric_name=name)
-    return payload
-
-
-def _metric_label(label: str) -> str:
-    if not isinstance(label, str) or not label.strip():
-        raise ValueError("Parameter metric labels must be non-empty strings")
-    normalized = re.sub(r"[^a-z0-9]+", "_", label.strip().lower()).strip("_")
-    if not normalized:
-        raise ValueError(f"Parameter metric label has no usable characters: {label!r}")
-    return normalized
 
 
 def _validated_metrics(metrics: Mapping[str, Any]) -> dict[str, Scalar]:

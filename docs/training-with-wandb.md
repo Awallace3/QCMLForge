@@ -74,9 +74,16 @@ use the `train/mae/*`, `val/mae/*`, `train/loss_sum`, and `val/loss_sum`
 namespaces. `loss_sum` is intentionally not described as a sample-normalized
 loss.
 
+Tracking never changes how training ends. A NaN or infinite loss is recorded as
+such and the loop keeps running; only the harness' own divergence handling stops
+a run.
+
 Each successful tracked run publishes the best-validation checkpoint with the
 `best` alias and the final-epoch checkpoint with `final` and `latest`. When the
-states are identical, one artifact version receives all three aliases. The
+last epoch was also the best one, a single artifact version receives all three
+aliases. Checkpoints are serialized only when the best model changes and once at
+the end of the run, so tracking adds no per-epoch checkpoint I/O to epochs that
+did not improve. The
 user-provided local `model_path` keeps its existing best-checkpoint semantics.
 For example:
 
