@@ -16,8 +16,56 @@ RACKERS_MODEL_TYPES = {
 }
 RACKERS_PARAM_START_MEAN = [1.8, 0.34, 0.39, 1.8]
 RACKERS_PARAM_START_STD = [0.01, 0.01, 0.01, 0.01]
+
+# CLIFF classical routes.  Each identifier is deliberately spelled exactly like
+# its `mtp_mtp` harness class, so the dispatch below resolves it by name.
+CLIFF_MODEL_TYPES = {
+    "CliffExchangeModel",
+    "CliffClassicalModel",
+    "CliffClassicalOverlapModel",
+}
+# The CLIFF routes predicting more than one SAPT component.  Only these have a
+# meaningful total-versus-component loss split, so `--component_gamma` and
+# `--total_includes_d3` are accepted here and rejected everywhere else --
+# including on `CliffExchangeModel`, which fits `Exch` alone.
+COMBINED_CLIFF_MODEL_TYPES = {
+    "CliffClassicalModel",
+    "CliffClassicalOverlapModel",
+}
+# `--include_total_mse` predates `--component_gamma` and is filtered out of
+# `AM_DimerParam_Model.train`, which never accepted it.  On a CLIFF route it is
+# reinterpreted as this gamma rather than silently dropped.
+CLIFF_INCLUDE_TOTAL_MSE_GAMMA = 0.5
+# Every route whose parameter head follows an `AtomTypeParamNN` positive-
+# parameter contract.  The two-stage HFVR/valence-width construction,
+# `world_size = 1`, the absent legacy checkpoint default, and list-only
+# parameter initialization are shared by all of them.
+POSITIVE_PARAM_MODEL_TYPES = RACKERS_MODEL_TYPES | CLIFF_MODEL_TYPES
+
 LEGACY_PAIRWISE_PRETRAINED_MODEL_PATH = "./models/dapnet2/ap2_0.pt"
 _PAIRWISE_PRETRAINED_MODEL_PATH_UNSET = object()
+
+
+def _cliff_parameter_contract(apnet_model_type):
+    """Return ``(parameter_names, default_means, default_stds)`` for a CLIFF route.
+
+    Read out of `mtp_mtp` rather than restated here, so the CLI's expected
+    override length and its default initialization cannot drift from the harness
+    contract they are validated against.  Resolved per call so a test that
+    monkeypatches the module still sees its own constants.
+    """
+    mtp = AtomPairwiseModels.mtp_mtp
+    if apnet_model_type == "CliffExchangeModel":
+        return (
+            mtp.CLIFF_EXCH_PARAMETER_NAMES,
+            mtp.CLIFF_EXCH_INITIAL_VALUES,
+            mtp.CLIFF_EXCH_INITIAL_STDS,
+        )
+    return (
+        mtp.CLIFF_CLASSICAL_PARAMETER_NAMES,
+        mtp.CLIFF_CLASSICAL_INITIAL_VALUES,
+        mtp.CLIFF_CLASSICAL_INITIAL_STDS,
+    )
 
 
 def maybe_skip_training_after_dataset_setup(model_name, dataset, build_dataset_only):
@@ -228,6 +276,8 @@ def train_pairwise_model(
     freeze_atom_model=True,
     build_dataset_only=False,
     include_total_mse=False,
+    component_gamma=None,
+    total_includes_d3=False,
     omp_num_threads=8,
 ):
     # Ensure param_start_mean and param_start_std are lists
@@ -257,9 +307,9 @@ def train_pairwise_model(
         n_params (int): Number of per-dimer parameters when training parametric dimer models.
         m1 (str): Optional molecular identifier or filter passed into dataset creation (used by some variants).
         m2 (str): Optional second molecular identifier or filter passed into dataset creation.
-        pre_trained_model_path (str or None): External APNet pretrained checkpoint to initialize from. When omitted, Rackers routes start without an outer checkpoint while legacy routes retain the historical dAPNet checkpoint default.
-        param_start_mean (float or list[float] or None): Initial parameter means. Rackers routes require exactly four values and use their physical defaults when unset; other routes use 1.5 when unset and broadcast scalars to n_params.
-        param_start_std (float or list[float] or None): Initial parameter standard deviations. Rackers routes require exactly four values and use their physical defaults when unset; other routes use 0.1 when unset and broadcast scalars to n_params.
+        pre_trained_model_path (str or None): External APNet pretrained checkpoint to initialize from. When omitted, Rackers and CLIFF routes start without an outer checkpoint while legacy routes retain the historical dAPNet checkpoint default.
+        param_start_mean (float or list[float] or None): Initial parameter means. Rackers routes require exactly four values, CliffExchangeModel exactly one, and the CliffClassical routes exactly five; each uses its physical defaults when unset. Other routes use 1.5 when unset and broadcast scalars to n_params.
+        param_start_std (float or list[float] or None): Initial parameter standard deviations. Rackers routes require exactly four values, CliffExchangeModel exactly one, and the CliffClassical routes exactly five; each uses its physical defaults when unset. Other routes use 0.1 when unset and broadcast scalars to n_params.
         dimer_eval_type (str): Evaluation mode for dimer models (e.g., "elst_damping", "elst_damping__induced_dipole").
         elst_damping_type (str): Electrostatic damping variant for dimer prop models (e.g., "CLIFF", "AMOEBA").
         ds_in_memory (bool): Whether datasets should be loaded entirely into memory for applicable model types.
@@ -269,17 +319,70 @@ def train_pairwise_model(
         ds_type (str): Dataset energy-type selector (e.g., "total_component_energies", "fsapt_energies").
         no_disp_nn (bool): Skip the dispersion readout when training APNet3-fused-d3 and compute D3 at predict time instead.
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
-        include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms.
+        include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms. On a CLIFF route it is instead shorthand for component_gamma=0.5 and cannot be combined with an explicit component_gamma.
+        component_gamma (float or None): CLIFF Eq. (23) component/total loss weight for the combined CLIFF routes. None (the default) keeps the legacy plain multi-column MSE; any float in [0.0, 1.0] selects the Eq. (23) functional. Rejected on CliffExchangeModel and on every pre-existing route.
+        total_includes_d3 (bool): If true, the CLIFF Eq. (23) total term includes D3 dispersion and is compared against all four SAPT columns. Requires an explicit component_gamma and one of the combined CLIFF routes.
         omp_num_threads (int): Number of OpenMP threads assigned to each training process.
 
     """
     is_rackers_model = apnet_model_type in RACKERS_MODEL_TYPES
+    is_cliff_model = apnet_model_type in CLIFF_MODEL_TYPES
+    is_positive_param_model = apnet_model_type in POSITIVE_PARAM_MODEL_TYPES
+    if is_cliff_model and include_total_mse:
+        # `--include_total_mse` is the pre-CLIFF spelling of "also fit the
+        # total".  Reinterpreting it keeps the flag meaningful on the new
+        # routes; accepting both spellings at once would leave which one wins
+        # ambiguous, so that is an error rather than a precedence rule.
+        if component_gamma is not None:
+            raise ValueError(
+                "include_total_mse and component_gamma cannot both be "
+                "supplied on a CLIFF route; include_total_mse is shorthand "
+                f"for component_gamma={CLIFF_INCLUDE_TOTAL_MSE_GAMMA}"
+            )
+        component_gamma = CLIFF_INCLUDE_TOTAL_MSE_GAMMA
+    if apnet_model_type not in COMBINED_CLIFF_MODEL_TYPES:
+        # Rejected rather than silently dropped: the shared pairwise tail
+        # filters train_kwargs by signature, so a route whose train() lacks
+        # these would otherwise discard them without a word.
+        if component_gamma is not None:
+            raise ValueError(
+                "component_gamma is only supported for the combined CLIFF "
+                f"routes {sorted(COMBINED_CLIFF_MODEL_TYPES)}, not "
+                f"{apnet_model_type!r}"
+            )
+        if total_includes_d3:
+            raise ValueError(
+                "total_includes_d3 is only supported for the combined CLIFF "
+                f"routes {sorted(COMBINED_CLIFF_MODEL_TYPES)}, not "
+                f"{apnet_model_type!r}"
+            )
     if pre_trained_model_path is _PAIRWISE_PRETRAINED_MODEL_PATH_UNSET:
-        if is_rackers_model:
+        if is_positive_param_model:
             pre_trained_model_path = None
         else:
             pre_trained_model_path = LEGACY_PAIRWISE_PRETRAINED_MODEL_PATH
-    if is_rackers_model:
+    if is_cliff_model:
+        parameter_names, default_mean, default_std = _cliff_parameter_contract(
+            apnet_model_type
+        )
+        if param_start_mean is None:
+            param_start_mean = list(default_mean)
+        if param_start_std is None:
+            param_start_std = list(default_std)
+        # Scalars are deliberately *not* broadcast here.  A CLIFF classical
+        # contract mixes electrostatic, Thole, overlap, and exchange scales, so
+        # one number cannot express the intent unambiguously; the shared
+        # validator rejects any non-sequence and any wrong length, reporting the
+        # expected count derived from `parameter_names`.
+        param_start_mean, param_start_std, _, _ = (
+            AtomPairwiseModels.mtp_mtp._validate_positive_initialization(
+                parameter_names,
+                param_start_mean,
+                param_start_std,
+                AtomPairwiseModels.mtp_mtp.RACKERS_POSITIVITY_EPSILON,
+            )
+        )
+    elif is_rackers_model:
         if param_start_mean is None:
             param_start_mean = list(RACKERS_PARAM_START_MEAN)
         elif not isinstance(param_start_mean, (list, tuple)) or len(
@@ -370,6 +473,11 @@ def train_pairwise_model(
         APNet = AtomPairwiseModels.mtp_mtp.RackersTholeDampingModel
     elif apnet_model_type == "RackersTholeDampingOverlapModel":
         APNet = AtomPairwiseModels.mtp_mtp.RackersTholeDampingOverlapModel
+    elif is_cliff_model:
+        # Each CLIFF identifier is its harness class name, and the class fixes
+        # its own dimer mode, model type, and parameter count -- so there is
+        # nothing per-route to branch on here.
+        APNet = getattr(AtomPairwiseModels.mtp_mtp, apnet_model_type)
     else:
         raise ValueError("Invalid Atom Model Type")
     normalized_type = apnet_model_type.lower()
@@ -382,7 +490,9 @@ def train_pairwise_model(
     if end_lr is not None and not supports_end_lr:
         raise ValueError("end_lr is currently only supported for APNetD3 training")
     print("Training {}...".format(apnet_model_type))
-    if is_rackers_model:
+    if is_positive_param_model:
+        # No DDP path exists for the positive-parameter heads;
+        # `AM_DimerParam_Model.train` raises NotImplementedError above 1.
         world_size = 1
     elif torch.cuda.is_available():
         world_size = torch.cuda.device_count()
@@ -400,7 +510,12 @@ def train_pairwise_model(
     else:
         pretrained_model = None
         print("\nTraining from scratch...\n")
-    if is_rackers_model:
+    if is_positive_param_model:
+        # Two-stage construction shared by the Rackers and CLIFF routes: build
+        # the HFVR/valence-width AtomTypeParamModel from --am_model_path plus
+        # --atom_type_param_model_path, then wrap its `.model` in the selected
+        # harness.  `n_params` is intentionally not forwarded -- every one of
+        # these harnesses fixes its own parameter count.
         atom_type_hf_vw_model = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
             ds_root=None,
             use_GPU=False,
@@ -708,6 +823,14 @@ def train_pairwise_model(
         random_seed=random_seed,
         include_total_mse=include_total_mse,
     )
+    if is_cliff_model:
+        # Added only for the CLIFF routes so every other route's train_kwargs
+        # stay exactly as they were.  `component_gamma` is forwarded as-is,
+        # including its `None` default: `None` is the harness's sentinel for the
+        # legacy plain multi-column MSE, and coercing it to a float here would
+        # silently switch the run onto the Eq. (23) functional.
+        train_kwargs["component_gamma"] = component_gamma
+        train_kwargs["total_includes_d3"] = total_includes_d3
     if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
         train_kwargs["end_lr"] = end_lr
     else:
@@ -816,9 +939,10 @@ def main():
         type=str,
         default="",
         help=(
-            "Train APNet model, including RackersTholeDampingModel or "
-            "RackersTholeDampingOverlapModel (plus legacy APNet2, "
-            "APNet3-fused variants, dAPNet2, APNet2-fused, and "
+            "Train APNet model, including RackersTholeDampingModel, "
+            "RackersTholeDampingOverlapModel, CliffExchangeModel, "
+            "CliffClassicalModel, or CliffClassicalOverlapModel (plus legacy "
+            "APNet2, APNet3-fused variants, dAPNet2, APNet2-fused, and "
             "AM-DimerParam routes)."
         ),
     )
@@ -965,8 +1089,12 @@ def main():
         default=None,
         help=(
             "Parameter initialization mean. Unset uses 2.0 for legacy CLI "
-            "routes or [1.8, 0.34, 0.39, 1.8] for Rackers routes; custom "
-            "Rackers values must contain exactly four comma-separated values."
+            "routes, [1.8, 0.34, 0.39, 1.8] for Rackers routes, [2.5] for "
+            "CliffExchangeModel, and [1.8, 0.34, 0.39, 1.8, 2.5] for the "
+            "CliffClassical routes. Custom comma-separated values must "
+            "contain exactly four values for Rackers routes, exactly one "
+            "value for CliffExchangeModel, and exactly five values for the "
+            "CliffClassical routes; a bare scalar is rejected on all of them."
         ),
     )
     args.add_argument(
@@ -975,8 +1103,12 @@ def main():
         default=None,
         help=(
             "Parameter initialization std. Unset uses 0.1 for legacy CLI "
-            "routes or [0.01, 0.01, 0.01, 0.01] for Rackers routes; custom "
-            "Rackers values must contain exactly four comma-separated values."
+            "routes, [0.01, 0.01, 0.01, 0.01] for Rackers routes, [0.01] for "
+            "CliffExchangeModel, and five 0.01 values for the CliffClassical "
+            "routes. Custom comma-separated values must contain exactly four "
+            "values for Rackers routes, exactly one value for "
+            "CliffExchangeModel, and exactly five values for the "
+            "CliffClassical routes; a bare scalar is rejected on all of them."
         ),
     )
     args.add_argument(
@@ -1034,7 +1166,63 @@ def main():
         default=False,
         help=(
             "AP2/AP3-D3 training: add a fifth MSE term on the total energy "
-            "in addition to the four component losses."
+            "in addition to the four component losses. On a CLIFF route this "
+            "is shorthand for --component_gamma 0.5 and cannot be combined "
+            "with an explicit --component_gamma."
+        ),
+    )
+    args.add_argument(
+        "--component_gamma",
+        type=float,
+        default=None,
+        help=(
+            "CliffClassicalModel/CliffClassicalOverlapModel only: CLIFF "
+            "Eq. (23) weight, L = (1-gamma) MSE(total) + gamma sum_C MSE(E_C). "
+            "Unset (the default) keeps the legacy plain multi-column MSE "
+            "bitwise unchanged; any value in [0.0, 1.0] selects the Eq. (23) "
+            "functional (CLIFF's fitted value is 0.4). Rejected on "
+            "CliffExchangeModel and on every pre-existing route."
+        ),
+    )
+    args.add_argument(
+        "--total_includes_d3",
+        action="store_true",
+        default=False,
+        help=(
+            "CliffClassicalModel/CliffClassicalOverlapModel only: include D3 "
+            "dispersion in the Eq. (23) total term and compare it against all "
+            "four SAPT columns. Requires an explicit --component_gamma."
+        ),
+    )
+    args.add_argument(
+        "--merge_rackers_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Stage-two warm start: RackersTholeDampingNN checkpoint whose "
+            "elst/thole_direct/thole_mutual/ind_overlap columns are copied "
+            "into a CliffClassicalNN checkpoint by parameter name. Requires "
+            "--merge_output_path."
+        ),
+    )
+    args.add_argument(
+        "--merge_exchange_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Stage-two warm start: CliffExchangeNN checkpoint whose exch "
+            "column is copied into a CliffClassicalNN checkpoint by parameter "
+            "name. Requires --merge_output_path."
+        ),
+    )
+    args.add_argument(
+        "--merge_output_path",
+        type=str,
+        default=None,
+        help=(
+            "Destination CliffClassicalNN checkpoint for "
+            "--merge_rackers_checkpoint / --merge_exchange_checkpoint. "
+            "Merging runs on its own and exits without training."
         ),
     )
     args.add_argument(
@@ -1055,8 +1243,9 @@ def main():
         default=False,
         help=(
             "Unfreeze the nested atom-type model for APNet3-fused variants, "
-            "RackersTholeDampingModel, or "
-            "RackersTholeDampingOverlapModel (default: frozen)."
+            "RackersTholeDampingModel, RackersTholeDampingOverlapModel, "
+            "CliffExchangeModel, CliffClassicalModel, or "
+            "CliffClassicalOverlapModel (default: frozen)."
         ),
     )
     args.add_argument(
@@ -1073,6 +1262,43 @@ def main():
         args.param_start_std = parse_param_list(args.param_start_std)
     pprint(args)
     set_all_seeds(args.random_seed)
+    merge_requested = (
+        args.merge_rackers_checkpoint is not None
+        or args.merge_exchange_checkpoint is not None
+        or args.merge_output_path is not None
+    )
+    if merge_requested:
+        # Stage-two warm start is a standalone operation: it rewrites
+        # checkpoints and exits rather than falling through into training.
+        if args.merge_output_path is None:
+            raise ValueError(
+                "--merge_output_path is required when "
+                "--merge_rackers_checkpoint or "
+                "--merge_exchange_checkpoint is supplied"
+            )
+        if (
+            args.merge_rackers_checkpoint is None
+            and args.merge_exchange_checkpoint is None
+        ):
+            raise ValueError(
+                "--merge_output_path requires at least one of "
+                "--merge_rackers_checkpoint or "
+                "--merge_exchange_checkpoint"
+            )
+        from apnet_pt.AtomPairwiseModels.cliff_2 import (
+            merge_classical_parameter_checkpoints,
+        )
+
+        merge_classical_parameter_checkpoints(
+            args.merge_rackers_checkpoint,
+            args.merge_exchange_checkpoint,
+            args.merge_output_path,
+        )
+        print(
+            f"Merged classical parameter checkpoint written to "
+            f"{args.merge_output_path}"
+        )
+        return
     if args.train_am != "":
         train_atom_model(
             atom_model_type=args.train_am,
@@ -1104,7 +1330,10 @@ def main():
     if args.train_apnet != "":
         param_start_mean = args.param_start_mean
         param_start_std = args.param_start_std
-        if args.train_apnet not in RACKERS_MODEL_TYPES:
+        if args.train_apnet not in POSITIVE_PARAM_MODEL_TYPES:
+            # The unset sentinel only survives for the positive-parameter
+            # routes, which resolve it to their own physical defaults; every
+            # other route keeps its historical scalar default.
             if param_start_mean is None:
                 param_start_mean = 2.0
             if param_start_std is None:
@@ -1146,6 +1375,8 @@ def main():
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
+            component_gamma=args.component_gamma,
+            total_includes_d3=args.total_includes_d3,
             omp_num_threads=(
                 args.omp_num_threads
                 if args.omp_num_threads is not None

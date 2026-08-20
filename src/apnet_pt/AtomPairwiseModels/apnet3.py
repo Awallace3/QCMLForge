@@ -274,10 +274,23 @@ class APNet3_MPNN(nn.Module):
         return E_elst
 
     def valence_width_exch(self, e_source, e_target, vwA, vwB, r_ij):
-        # TODO: Implement valence width exchange;
-        # vwA and vwB are the valence widths of monomer A and B,
-        # respectively. r_ij is the interatomic distance between atoms i
-        # and j. Use distance matrix to compute r_ij.
+        # NOT a physical overlap integral -- do not "fix" this.
+        #
+        # This is a learned short-range shape factor.  Its B_ij is
+        # 1 / (sigma_i * sigma_j), which is CLIFF Eq. (11) *missing its square
+        # root*; the physically correct form is
+        # mtp_mtp.atomic_overlap_S_ij, which uses
+        # B_ij = 1 / sqrt(sigma_i * sigma_j).  The literal form used here
+        # underpredicts a water-dimer hydrogen-bond overlap by roughly six
+        # orders of magnitude.
+        #
+        # That discrepancy is harmless *here* only because the returned S_ij is
+        # multiplied by the learned readout_layer_exch_quotient, which has
+        # absorbed the missing square root into its fitted weights.  Correcting
+        # B_ij in place would silently invalidate every trained AP3 checkpoint,
+        # so the numerics are pinned by a regression test
+        # (tests/test_cliff_classical_exchange.py) instead.  New physics must
+        # call mtp_mtp.atomic_overlap_S_ij, never this method.
         vwA = torch.where(vwA > 0.1, vwA, 0.1)
         vwB = torch.where(vwB > 0.1, vwB, 0.1)
         sigma_A_source = vwA.index_select(0, e_source)

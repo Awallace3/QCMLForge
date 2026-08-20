@@ -64,6 +64,120 @@ RACKERS_THOLE_DIRECT_INDEX = 1
 RACKERS_THOLE_MUTUAL_INDEX = 2
 RACKERS_IND_OVERLAP_INDEX = 3
 
+# CLIFF classical-exchange parameter contract.  ``K_exch`` is a single positive
+# per-atom parameter combined *multiplicatively* (``K_i K_j``), unlike the
+# Thole parameters which use a geometric mean.  ``2.5`` sits near the centre of
+# the CLIFF Table I ``K_exch`` range (0.60-7.60, mean ~3.2) and reproduces
+# water-dimer-scale exchange at initialization.
+CLIFF_EXCH_PARAMETER_NAMES = ("exch",)
+CLIFF_EXCH_INITIAL_VALUES = (2.5,)
+CLIFF_EXCH_INITIAL_STDS = (0.01,)
+
+# Combined classical contract.  Columns 0-3 intentionally mirror
+# ``RACKERS_PARAMETER_NAMES`` so the electrostatics and induction physics paths
+# are reused unchanged and a Rackers checkpoint's learned columns remain
+# interpretable; column 4 adds exchange.
+CLIFF_CLASSICAL_PARAMETER_NAMES = (
+    "elst",
+    "thole_direct",
+    "thole_mutual",
+    "ind_overlap",
+    "exch",
+)
+CLIFF_CLASSICAL_INITIAL_VALUES = (1.8, 0.34, 0.39, 1.8, 2.5)
+CLIFF_CLASSICAL_INITIAL_STDS = (0.01, 0.01, 0.01, 0.01, 0.01)
+
+# Column indices into the 2-D parameter tensors returned by ``CliffExchangeNN``
+# and ``CliffClassicalNN``.  Both classes present a uniform ``[n_atoms, k]``
+# contract, so these indices are the only sanctioned way to read a column.
+CLIFF_EXCH_INDEX = 0
+CLIFF_CLASSICAL_ELST_INDEX = 0
+CLIFF_CLASSICAL_THOLE_DIRECT_INDEX = 1
+CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX = 2
+CLIFF_CLASSICAL_IND_OVERLAP_INDEX = 3
+CLIFF_CLASSICAL_EXCH_INDEX = 4
+
+# Lower bound applied to predicted valence widths before they enter the
+# ``rsqrt`` in :func:`atomic_overlap_S_ij`.  ``AtomHirshfeldMPNN`` emits
+# ``relu(...) + 1e-4`` (ap2_hirshfeld_atom_model.py:403), so a predicted width
+# can legitimately approach zero and blow ``B_ij`` up.  ``0.1`` matches the
+# floor that ``apnet3.valence_width_exch`` has always applied.
+OVERLAP_WIDTH_FLOOR = 0.1
+
+# Dimer evaluation modes whose per-edge energies live on the *full*
+# intermolecular edge domain (``e_ABfull_source`` / ``e_ABfull_target``).  Those
+# energies must be scatter-aggregated with ``batch.dimer_ind_full``; the
+# short-range ``batch.dimer_ind`` covers only ``e_ABsr_*`` and would silently
+# attribute long-range edges to the wrong dimer (and drop the tail entirely) if
+# used here.  ``_dimer_index_for_output`` is the sole consumer, so keeping the
+# membership in one named place is what stops the edge domain and the
+# aggregation index from drifting apart.  Every mode listed here evaluates its
+# kernels over ``e_ABfull_*``; conversely, any forward that switches to
+# ``e_ABfull_*`` must be added here in the same change.
+FULL_EDGE_DIMER_EVAL_MODES = frozenset(
+    {
+        "rackers_thole",
+        "rackers_thole_overlap",
+        "cliff_exch",
+        "cliff_classical",
+        "cliff_classical_overlap",
+        "cliff_classical_d3",
+    }
+)
+
+# Trainable multi-component CLIFF routes.  These are the only ``dimer_eval``
+# values for which a total/component loss split (``component_gamma``) is
+# meaningful: ``cliff_exch`` predicts a single component, and
+# ``cliff_classical_d3`` is inference-only.
+COMBINED_CLIFF_DIMER_EVAL_MODES = frozenset(
+    {
+        "cliff_classical",
+        "cliff_classical_overlap",
+    }
+)
+
+# Checkpoint contract for every positive per-atom parameter head:
+# ``{model_type: parameter_names}``.  ``AM_DimerParam_Model.__init__`` looks the
+# expected ``parameter_names`` up here instead of hard-coding one contract, so a
+# checkpoint can never silently reassign the physical meaning of a column.  The
+# ordering is load-bearing -- a reordered list is rejected, not remapped.
+POSITIVE_PARAMETER_CONTRACTS: dict[str, tuple[str, ...]] = {
+    "RackersTholeDampingNN": RACKERS_PARAMETER_NAMES,
+    "CliffExchangeNN": CLIFF_EXCH_PARAMETER_NAMES,
+    "CliffClassicalNN": CLIFF_CLASSICAL_PARAMETER_NAMES,
+}
+
+# Human-readable prefix used in the checkpoint-contract error messages.  The
+# Rackers strings predate the generalization and are asserted on verbatim by
+# ``tests/test_rackers_thole_damping.py``, so "Rackers" must stay mapped here;
+# every other contract falls back to its own ``model_type``.
+_POSITIVE_PARAMETER_ERROR_LABELS: dict[str, str] = {
+    "RackersTholeDampingNN": "Rackers",
+}
+
+
+def _positive_parameter_error_label(model_type: str) -> str:
+    return _POSITIVE_PARAMETER_ERROR_LABELS.get(model_type, model_type)
+
+
+# Per-column width of the MAE progress report.  The header and the numeric rows
+# are both generated from the column *labels*, so widening the target selection
+# from one to two to three columns adds a label and nothing else -- no format
+# string anywhere assumes a particular number of columns.
+_MAE_REPORT_COLUMN_WIDTH = 10
+
+
+def _mae_report_header(labels) -> str:
+    """Left-justified per-column MAE header for any number of columns.
+
+    Byte-identical to the literals it replaces for the pre-existing selections
+    (``("Elst",)`` -> ``"Elst"``, ``("Elst", "Ind")`` -> ``"Elst      Ind"``);
+    ``tests/test_cliff_classical_exchange.py`` pins that equivalence.
+    """
+    return "".join(
+        f"{label:<{_MAE_REPORT_COLUMN_WIDTH}}" for label in labels
+    ).rstrip()
+
 
 def _polarizability_table_on_device(
     polarizability_table: torch.Tensor,
@@ -149,6 +263,18 @@ class DimerProp(nn.Module):
                   induced-point-dipole induction (_rackers_thole_forward)
                 - "rackers_thole_overlap": combined Rackers electrostatics and
                   overlap-augmented induction (_rackers_thole_overlap_forward)
+                - "cliff_exch": CLIFF classical exchange repulsion alone
+                  (_cliff_exch_forward), returning [n_edges]
+                - "cliff_classical": combined CLIFF electrostatics, exchange,
+                  and pure induced-point-dipole induction
+                  (_cliff_classical_forward), returning [n_edges, 3] with
+                  columns (Elst, Exch, Indu)
+                - "cliff_classical_overlap": the same three terms with the
+                  short-range induction overlap correction enabled
+                  (_cliff_classical_overlap_forward), returning [n_edges, 3]
+                - "cliff_classical_d3": the three classical terms plus DFT-D3
+                  dispersion (_cliff_classical_d3_forward), returning
+                  [n_edges, 4] with columns (Elst, Exch, Indu, Disp)
                 - "ap3_elst_damping__induced_dipole": AP3-specific damped electrostatics plus induction (_ap3_elst_damping_indu_induced_dipole_forward)
                 - "ap3_atomMPNN": return AP3 atom multipole parameters only (_ap3_atomMPNN)
 
@@ -159,6 +285,16 @@ class DimerProp(nn.Module):
               polarizabilities with Hirshfeld volume ratios; only
               "rackers_thole_overlap" uses valence widths in its energy
               expression.
+            - "cliff_exch" is exchange-only: it runs no induction and therefore
+              deliberately does *not* clone a polarizability table. The three
+              "cliff_classical*" modes do induction and clone it exactly as the
+              Rackers modes do.
+            - The combined CLIFF column order is fixed at (Elst, Exch, Indu)
+              and, for "cliff_classical_d3", (Elst, Exch, Indu, Disp). That
+              matches the pairwise dataset's y = [Elst, Exch, Ind, Disp]
+              layout, so target slicing is a plain column select.
+            - Every "cliff_*" mode evaluates over the full intermolecular edge
+              domain and is a member of FULL_EDGE_DIMER_EVAL_MODES.
             - Raises ValueError if dimer_eval is not one of the accepted mode strings.
         """
         if dimer_eval == "elst_damping":
@@ -181,6 +317,18 @@ class DimerProp(nn.Module):
             self.polarizability_table = constants.polarizability_table.clone()
         elif dimer_eval == "rackers_thole_overlap":
             self.forward = self._rackers_thole_overlap_forward
+            self.polarizability_table = constants.polarizability_table.clone()
+        elif dimer_eval == "cliff_exch":
+            # Exchange-only: no induction, so no polarizability table.
+            self.forward = self._cliff_exch_forward
+        elif dimer_eval == "cliff_classical":
+            self.forward = self._cliff_classical_forward
+            self.polarizability_table = constants.polarizability_table.clone()
+        elif dimer_eval == "cliff_classical_overlap":
+            self.forward = self._cliff_classical_overlap_forward
+            self.polarizability_table = constants.polarizability_table.clone()
+        elif dimer_eval == "cliff_classical_d3":
+            self.forward = self._cliff_classical_d3_forward
             self.polarizability_table = constants.polarizability_table.clone()
         elif dimer_eval == "ap3_elst_damping__induced_dipole":
             self.forward = self._ap3_elst_damping_indu_induced_dipole_forward
@@ -272,6 +420,192 @@ class DimerProp(nn.Module):
             polarizability_table=self.polarizability_table,
         )
         return torch.vstack((Elst, Indu)).T, output_A, output_B
+
+    def _overlap_width_floor(self) -> float:
+        """Valence-width floor for the exchange overlap.
+
+        ``CliffExchangeNN`` / ``CliffClassicalNN`` record ``width_floor`` in
+        their config, so the value used at inference follows the checkpoint
+        rather than the module default.  Parameter heads that do not declare
+        one (the Rackers head, or a test stub) fall back to
+        :data:`OVERLAP_WIDTH_FLOOR`.
+        """
+        return getattr(
+            self.AtomTypeParam, "width_floor", OVERLAP_WIDTH_FLOOR
+        )
+
+    def _cliff_exch_forward(self, batch):
+        """CLIFF classical exchange repulsion alone, ``[n_edges]`` kcal/mol.
+
+        Touches neither electrostatics nor induction, so no polarizability
+        table is required (``set_forward`` deliberately does not clone one for
+        this mode).  ``cliff_exchange`` is called without ``dR_AB``, so it
+        performs the single intermolecular distance reduction of this forward
+        pass itself.
+        """
+        output_A = self.AtomTypeParam(batch.batch_atomic_A)
+        output_B = self.AtomTypeParam(batch.batch_atomic_B)
+        Exch = cliff_exchange(
+            RA=batch.RA,
+            RB=batch.RB,
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
+            valence_widths_A=output_A[-2][:, 1],
+            valence_widths_B=output_B[-2][:, 1],
+            K_exch_A=output_A[-1][:, CLIFF_EXCH_INDEX],
+            K_exch_B=output_B[-1][:, CLIFF_EXCH_INDEX],
+            width_floor=self._overlap_width_floor(),
+        )
+        return Exch, output_A, output_B
+
+    def _cliff_classical_forward(self, batch):
+        return self._cliff_classical_common_forward(
+            batch, include_overlap=False, include_d3=False
+        )
+
+    def _cliff_classical_overlap_forward(self, batch):
+        return self._cliff_classical_common_forward(
+            batch, include_overlap=True, include_d3=False
+        )
+
+    def _cliff_classical_d3_forward(self, batch):
+        return self._cliff_classical_common_forward(
+            batch, include_overlap=True, include_d3=True
+        )
+
+    def _cliff_classical_common_forward(
+        self, batch, include_overlap, include_d3
+    ):
+        """Combined CLIFF electrostatics, exchange, and induction.
+
+        Mirrors :meth:`_rackers_thole_common_forward` and adds exchange.
+        Returns ``(edge_energy, output_A, output_B)`` with ``edge_energy`` of
+        shape ``[n_edges, 3]`` in column order ``(Elst, Exch, Indu)``, or
+        ``[n_edges, 4]`` appending ``Disp`` when ``include_d3`` is set.  All
+        columns live on the full intermolecular edge domain, so the caller must
+        aggregate with ``batch.dimer_ind_full``
+        (see :data:`FULL_EDGE_DIMER_EVAL_MODES`).
+
+        Parameter columns are read through the ``CLIFF_CLASSICAL_*_INDEX``
+        constants: column 0 damps electrostatics, columns 1-3 feed Thole direct
+        / Thole mutual / induction overlap, and column 4 is the exchange
+        amplitude.
+        """
+        output_A = self.AtomTypeParam(batch.batch_atomic_A)
+        output_B = self.AtomTypeParam(batch.batch_atomic_B)
+        parameters_A = output_A[-1]
+        parameters_B = output_B[-1]
+        hfvr_A = torch.abs(output_A[-2][:, 0])
+        hfvr_B = torch.abs(output_B[-2][:, 0])
+        valence_widths_A = output_A[-2][:, 1]
+        valence_widths_B = output_B[-2][:, 1]
+
+        if self.elst_damping_type == "AMOEBA":
+            damping_fn = mtp_elst_damping_AMOEBA
+        elif self.elst_damping_type == "CLIFF":
+            damping_fn = mtp_elst_damping
+        else:
+            raise ValueError(
+                "Unsupported elst_damping_type: "
+                f"{self.elst_damping_type}"
+            )
+
+        # One intermolecular distance reduction per forward pass, shared with
+        # exchange below.
+        #
+        # UNITS: `get_distances` returns ANGSTROM, while `atomic_overlap_S_ij`
+        # (reached through `cliff_exchange`) needs BOHR because `B_ij` is built
+        # from bohr valence widths.  Convert here exactly as `cliff_exchange`'s
+        # own `dR_AB=None` path does; skipping this yields a wrong-but-plausible
+        # exchange energy rather than an error.
+        dR_AB_ang, _ = get_distances(
+            batch.RA,
+            batch.RB,
+            batch.e_ABfull_source,
+            batch.e_ABfull_target,
+        )
+        dR_AB = dR_AB_ang / constants.au2ang
+
+        # `mtp_elst_damping` mutates its `qA_0` / `qB_0` in place, so pass a
+        # clone and leave `output_*[0]` intact for the induction call below.
+        Elst = damping_fn(
+            ZA=batch.ZA,
+            RA=batch.RA,
+            qA_0=output_A[0].clone(),
+            muA=output_A[1],
+            quadA=output_A[2],
+            Ka=parameters_A[:, CLIFF_CLASSICAL_ELST_INDEX],
+            ZB=batch.ZB,
+            RB=batch.RB,
+            qB_0=output_B[0].clone(),
+            muB=output_B[1],
+            quadB=output_B[2],
+            Kb=parameters_B[:, CLIFF_CLASSICAL_ELST_INDEX],
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
+        )
+        Exch = cliff_exchange(
+            RA=batch.RA,
+            RB=batch.RB,
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
+            valence_widths_A=valence_widths_A,
+            valence_widths_B=valence_widths_B,
+            K_exch_A=parameters_A[:, CLIFF_CLASSICAL_EXCH_INDEX],
+            K_exch_B=parameters_B[:, CLIFF_CLASSICAL_EXCH_INDEX],
+            dR_AB=dR_AB,
+            width_floor=self._overlap_width_floor(),
+        )
+        Indu = rackers_thole_induction(
+            ZA=batch.ZA,
+            RA=batch.RA,
+            qA=output_A[0],
+            muA=output_A[1],
+            quadA=output_A[2],
+            ZB=batch.ZB,
+            RB=batch.RB,
+            qB=output_B[0],
+            muB=output_B[1],
+            quadB=output_B[2],
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
+            e_AA_source=batch.e_AA_source,
+            e_BB_source=batch.e_BB_source,
+            e_AA_target=batch.e_AA_target,
+            e_BB_target=batch.e_BB_target,
+            hirshfeld_volume_ratio_A=hfvr_A,
+            hirshfeld_volume_ratio_B=hfvr_B,
+            valence_widths_A=valence_widths_A,
+            valence_widths_B=valence_widths_B,
+            thole_direct_A=parameters_A[
+                :, CLIFF_CLASSICAL_THOLE_DIRECT_INDEX
+            ],
+            thole_direct_B=parameters_B[
+                :, CLIFF_CLASSICAL_THOLE_DIRECT_INDEX
+            ],
+            thole_mutual_A=parameters_A[
+                :, CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX
+            ],
+            thole_mutual_B=parameters_B[
+                :, CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX
+            ],
+            ind_overlap_A=parameters_A[
+                :, CLIFF_CLASSICAL_IND_OVERLAP_INDEX
+            ],
+            ind_overlap_B=parameters_B[
+                :, CLIFF_CLASSICAL_IND_OVERLAP_INDEX
+            ],
+            include_overlap=include_overlap,
+            polarizability_table=self.polarizability_table,
+        )
+        if include_d3:
+            Disp = d3(batch, params=self.d3_damping_parameters)
+            return (
+                torch.vstack((Elst, Exch, Indu, Disp)).T,
+                output_A,
+                output_B,
+            )
+        return torch.vstack((Elst, Exch, Indu)).T, output_A, output_B
 
     def get_config(self) -> dict:
         """
@@ -1183,20 +1517,65 @@ def _inverse_softplus(value: float) -> float:
     return math.log(math.expm1(value))
 
 
-def _validate_rackers_initialization(
+_COUNT_WORDS = (
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+)
+
+
+def _expected_count_phrase(n_params: int) -> str:
+    """Render ``"exactly four values"``-style text for a required list length.
+
+    The Rackers case (``n_params == 4``) must render byte-for-byte as it
+    always has: ``tests/test_rackers_thole_damping.py`` matches on
+    ``"exactly four"`` in several places and ``train_models.py`` surfaces the
+    message verbatim.
+    """
+    word = (
+        _COUNT_WORDS[n_params]
+        if 0 <= n_params < len(_COUNT_WORDS)
+        else str(n_params)
+    )
+    noun = "value" if n_params == 1 else "values"
+    return f"exactly {word} {noun}"
+
+
+def _validate_positive_initialization(
+    parameter_names,
     param_start_mean,
     param_start_std,
     positivity_epsilon,
 ) -> tuple[list[float], list[float], float, list[float]]:
-    """Validate and normalize the Rackers positive-parameter initialization."""
+    """Validate and normalize a positive per-atom parameter initialization.
+
+    Shared by every ``AtomTypeParamNN`` subclass that exposes its parameters
+    through ``softplus(raw) + positivity_epsilon``: the Rackers Thole route and
+    the CLIFF exchange / classical routes.  ``parameter_names`` fixes both the
+    expected list length and the error text's reported count.
+
+    Returns ``(positive_means, raw_stds, epsilon, raw_means)`` where
+    ``raw_means`` are the inverse-softplus pre-images that make a zeroed
+    correction head reproduce ``positive_means`` exactly.
+    """
+    n_params = len(parameter_names)
+    count_phrase = _expected_count_phrase(n_params)
     if not isinstance(param_start_mean, (list, tuple)) or len(
         param_start_mean
-    ) != 4:
-        raise ValueError("param_start_mean must contain exactly four values")
+    ) != n_params:
+        raise ValueError(f"param_start_mean must contain {count_phrase}")
     if not isinstance(param_start_std, (list, tuple)) or len(
         param_start_std
-    ) != 4:
-        raise ValueError("param_start_std must contain exactly four values")
+    ) != n_params:
+        raise ValueError(f"param_start_std must contain {count_phrase}")
 
     try:
         epsilon = float(positivity_epsilon)
@@ -1258,6 +1637,53 @@ def _validate_rackers_initialization(
         )
 
     return positive_means, raw_stds, epsilon, raw_means
+
+
+def _validate_rackers_initialization(
+    param_start_mean,
+    param_start_std,
+    positivity_epsilon,
+) -> tuple[list[float], list[float], float, list[float]]:
+    """Validate and normalize the Rackers positive-parameter initialization.
+
+    Thin wrapper binding :data:`RACKERS_PARAMETER_NAMES`.  Retained as its own
+    name because ``train_models.py`` calls it directly to validate CLI
+    overrides before any model is constructed, and its error strings are
+    asserted on verbatim by ``tests/test_rackers_thole_damping.py``.
+    """
+    return _validate_positive_initialization(
+        RACKERS_PARAMETER_NAMES,
+        param_start_mean,
+        param_start_std,
+        positivity_epsilon,
+    )
+
+
+def _validate_model_width_floor(width_floor) -> float:
+    """Validate a model-configuration ``width_floor``.
+
+    A *model config* width floor must be strictly positive and finite: it is
+    the guard that keeps a degenerate predicted valence width from blowing up
+    the ``rsqrt`` in :func:`atomic_overlap_S_ij`, so disabling it via config
+    would silently remove that guard.
+
+    This is deliberately stricter than the :func:`atomic_overlap_S_ij`
+    *argument*, which accepts ``0.0`` as a documented legacy-parity bypass for
+    the three pre-existing induction-overlap call sites (flooring those is not
+    behavior-preserving).  Those call sites pass ``0.0`` positionally and never
+    route through this validator.
+    """
+    try:
+        value = float(width_floor)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "width_floor must be finite and strictly greater than zero"
+        ) from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            "width_floor must be finite and strictly greater than zero"
+        )
+    return value
 
 
 class RackersTholeDampingNN(AtomTypeParamNN):
@@ -1330,6 +1756,199 @@ class RackersTholeDampingNN(AtomTypeParamNN):
         }
 
 
+class _CliffPositiveParamNN(AtomTypeParamNN):
+    """Shared base for the CLIFF positive per-atom parameter heads.
+
+    Follows :class:`RackersTholeDampingNN` exactly -- reject a nested model
+    that is not an ``AtomTypeParamNN``, validate initialization through
+    :func:`_validate_positive_initialization`, seed the per-element embeddings
+    with inverse-softplus pre-images so a zeroed correction head reproduces the
+    requested positive values, and expose
+    ``K = softplus(K_raw) + positivity_epsilon`` from ``forward`` -- and adds
+    two things the Rackers head does not need:
+
+    * a ``width_floor`` config entry, since these heads feed
+      :func:`atomic_overlap_S_ij`, and
+    * normalization of the parameter tensor to two dimensions, so
+      ``CLIFF_EXCH_INDEX`` / ``CLIFF_CLASSICAL_*_INDEX`` column indexing works
+      identically for a one-column and a five-column head.
+
+    Subclasses fix ``MODEL_TYPE`` and ``PARAMETER_NAMES``; the parameter count
+    is derived from ``PARAMETER_NAMES`` and ``n_params`` is deliberately absent
+    from every constructor signature.
+    """
+
+    MODEL_TYPE: str = ""
+    PARAMETER_NAMES: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        atom_model: AtomTypeParamNN,
+        n_message: int,
+        n_neuron: int,
+        n_embed: int,
+        param_start_mean,
+        param_start_std,
+        positivity_epsilon: float,
+        width_floor: float,
+        freeze_atom_model: bool,
+    ):
+        if type(atom_model) is not AtomTypeParamNN:
+            raise ValueError("atom_model must be an AtomTypeParamNN")
+        positive_means, raw_stds, positivity_epsilon, raw_means = (
+            _validate_positive_initialization(
+                self.PARAMETER_NAMES,
+                param_start_mean,
+                param_start_std,
+                positivity_epsilon,
+            )
+        )
+        width_floor = _validate_model_width_floor(width_floor)
+        super().__init__(
+            atom_model=atom_model,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=raw_means,
+            param_start_std=raw_stds,
+            n_params=len(self.PARAMETER_NAMES),
+            freeze_atom_model=freeze_atom_model,
+        )
+        if any(
+            not torch.isfinite(layer.weight).all().item()
+            for layer in self.guess_layer
+        ):
+            raise ValueError(
+                f"{self.MODEL_TYPE} embedding initialization produced "
+                "non-finite parameters"
+            )
+        self.raw_param_start_mean = raw_means
+        self.param_start_mean = positive_means
+        self.param_start_std = raw_stds
+        self.positivity_epsilon = positivity_epsilon
+        self.width_floor = width_floor
+        self.atom_model.requires_grad_(not freeze_atom_model)
+
+    def forward(self, batch):
+        output = super().forward(batch)
+        raw_parameters = output[-1]
+        # `AtomTypeParamNN.forward` returns `K.squeeze(-1)` when
+        # `n_params == 1`, so a single-parameter head arrives here as
+        # `[n_atoms]`.  Restore the column axis *before* softplus so both CLIFF
+        # heads return `[n_atoms, len(PARAMETER_NAMES)]` and callers can always
+        # index a column.  `Tensor.dim()` is a static rank, not data, so this
+        # branch is folded away under `torch.compile`.
+        if raw_parameters.dim() == 1:
+            raw_parameters = raw_parameters.unsqueeze(-1)
+        parameters = F.softplus(raw_parameters) + self.positivity_epsilon
+        return (*output[:-1], parameters)
+
+    def get_config(self) -> dict:
+        return {
+            "model_type": self.MODEL_TYPE,
+            "parameter_names": list(self.PARAMETER_NAMES),
+            "param_start_mean": list(self.param_start_mean),
+            "param_start_std": list(self.param_start_std),
+            "positivity_epsilon": self.positivity_epsilon,
+            "width_floor": self.width_floor,
+            "n_message": self.n_message,
+            "n_neuron": self.n_neuron,
+            "n_embed": self.n_embed,
+            "nested_atom_model": _serialize_nested_atom_model(
+                self.atom_model
+            ),
+        }
+
+
+class CliffExchangeNN(_CliffPositiveParamNN):
+    """Predict the single positive per-atom ``K_exch`` of CLIFF Eq. (8).
+
+    ``forward`` returns ``(*nested_output, parameters)`` with ``parameters`` of
+    shape ``[n_atoms, 1]``; read the column with
+    :data:`CLIFF_EXCH_INDEX`.  Valence widths remain available from the nested
+    output as ``output[-2][:, 1]`` and Hirshfeld volume ratios as
+    ``abs(output[-2][:, 0])``.
+    """
+
+    MODEL_TYPE = "CliffExchangeNN"
+    PARAMETER_NAMES = CLIFF_EXCH_PARAMETER_NAMES
+
+    def __init__(
+        self,
+        atom_model: AtomTypeParamNN,
+        n_message: int = 3,
+        n_neuron: int = 128,
+        n_embed: int = 8,
+        param_start_mean: tuple[float] = CLIFF_EXCH_INITIAL_VALUES,
+        param_start_std: tuple[float] = CLIFF_EXCH_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        width_floor: float = OVERLAP_WIDTH_FLOOR,
+        freeze_atom_model: bool = True,
+    ):
+        super().__init__(
+            atom_model=atom_model,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            positivity_epsilon=positivity_epsilon,
+            width_floor=width_floor,
+            freeze_atom_model=freeze_atom_model,
+        )
+
+
+class CliffClassicalNN(_CliffPositiveParamNN):
+    """Predict the five positive per-atom parameters of the classical route.
+
+    ``forward`` returns ``(*nested_output, parameters)`` with ``parameters`` of
+    shape ``[n_atoms, 5]``.  Columns 0-3 carry the same physical meaning as the
+    Rackers head (``elst``, ``thole_direct``, ``thole_mutual``,
+    ``ind_overlap``) and column 4 carries ``exch``; read them with the
+    ``CLIFF_CLASSICAL_*_INDEX`` constants rather than literals.
+    """
+
+    MODEL_TYPE = "CliffClassicalNN"
+    PARAMETER_NAMES = CLIFF_CLASSICAL_PARAMETER_NAMES
+
+    def __init__(
+        self,
+        atom_model: AtomTypeParamNN,
+        n_message: int = 3,
+        n_neuron: int = 128,
+        n_embed: int = 8,
+        param_start_mean: tuple[
+            float, float, float, float, float
+        ] = CLIFF_CLASSICAL_INITIAL_VALUES,
+        param_start_std: tuple[
+            float, float, float, float, float
+        ] = CLIFF_CLASSICAL_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        width_floor: float = OVERLAP_WIDTH_FLOOR,
+        freeze_atom_model: bool = True,
+    ):
+        super().__init__(
+            atom_model=atom_model,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            positivity_epsilon=positivity_epsilon,
+            width_floor=width_floor,
+            freeze_atom_model=freeze_atom_model,
+        )
+
+
+# Constructor for each CLIFF parameter head, keyed by the ``model_type`` its
+# ``get_config`` records.  ``AM_DimerParam_Model.__init__`` builds through this
+# mapping so adding a head is one entry rather than two more ``elif`` blocks.
+_CLIFF_PARAMETER_HEADS: dict[str, type[_CliffPositiveParamNN]] = {
+    CliffExchangeNN.MODEL_TYPE: CliffExchangeNN,
+    CliffClassicalNN.MODEL_TYPE: CliffClassicalNN,
+}
+
+
 def get_distances(RA, RB, e_source, e_target):
     RA_source = RA.index_select(0, e_source)
     RB_target = RB.index_select(0, e_target)
@@ -1357,6 +1976,163 @@ def geometric_mean_edge_values(
     source_edge_values = source_values.index_select(0, e_source)
     target_edge_values = target_values.index_select(0, e_target)
     return torch.sqrt(source_edge_values * target_edge_values)
+
+
+def atomic_overlap_S_ij(
+    valence_widths_A: torch.Tensor,
+    valence_widths_B: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    dR_AB: torch.Tensor,
+    width_floor: float = OVERLAP_WIDTH_FLOOR,
+) -> torch.Tensor:
+    """Dimensionless per-edge atomic overlap ``S_ij``.
+
+    Implements the Van Vleet effective-width overlap used by CLIFF Eq. (11)::
+
+        B_ij = 1 / sqrt(sigma_i * sigma_j)
+        S_ij = (1/3 (B_ij r_ij)^2 + B_ij r_ij + 1) exp(-B_ij r_ij)
+
+    ``B_ij`` uses the *square root* of the width product.  CLIFF Eq. (10) is
+    typeset as ``1 / (sigma_i sigma_j)``, which is neither dimensionally nor
+    numerically viable: for a water-dimer hydrogen bond the literal form
+    underpredicts exchange by six orders of magnitude.  See
+    ``apnet3.AtomPairwiseMPNN3.valence_width_exch`` for the one place the
+    literal form is deliberately retained as a *learned* shape factor.
+
+    Units
+    -----
+    ``valence_widths_*`` are Slater valence widths in bohr, so ``B_ij`` is in
+    bohr^-1 and ``dR_AB`` **must already be in bohr** (atomic units).  Every
+    in-repo caller obtains ``dR_AB`` from ``_rackers_distance_tensors`` or
+    ``distance_tensors``, both of which divide by ``constants.au2ang`` before
+    returning.  ``get_distances`` returns Angstrom and must be converted by the
+    caller (``cliff_exchange`` does this).  No unit conversion happens here and
+    no ``h2kcalmol`` factor is applied: the return value is dimensionless and
+    callers own the conversion to kcal/mol.
+
+    Parameters
+    ----------
+    valence_widths_A, valence_widths_B
+        Per-atom valence widths for monomer A / B, shape ``[n_A]`` / ``[n_B]``
+        (a trailing singleton dimension is tolerated and reduced).
+    e_AB_source, e_AB_target
+        Edge index into A and B respectively, shape ``[n_edges]``.
+    dR_AB
+        Per-edge interatomic distance in bohr, shape ``[n_edges]``.
+    width_floor
+        Widths are ``clamp_min``-ed to this value before the ``rsqrt``, which
+        guards against a degenerate predicted width.  ``0.0`` disables the
+        floor (``clamp_min(0.0)`` is an exact no-op for the strictly positive
+        widths every atom model emits).
+
+        .. note::
+           The three induction-overlap call sites in this module pass
+           ``width_floor=0.0`` to preserve their historical numerics.  They
+           have never applied a floor, and ``AtomHirshfeldMPNN`` emits
+           ``relu(...) + 1e-4`` (``ap2_hirshfeld_atom_model.py:403``), so
+           sub-``0.1`` widths really do occur in trained models; introducing
+           the floor there would change existing predictions and invalidate
+           trained Rackers checkpoints.  New physics (``cliff_exchange``) uses
+           the ``OVERLAP_WIDTH_FLOOR`` default.
+
+    Returns
+    -------
+    torch.Tensor
+        Dimensionless ``S_ij`` of shape ``[n_edges]``, in the dtype and on the
+        device of the inputs.
+
+    Notes
+    -----
+    Exactly one ``index_select`` per monomer is performed, so no ``[n_A, n_B]``
+    outer product is ever materialized.  There is no data-dependent control
+    flow, keeping the helper ``torch.compile``-safe.
+    """
+    sigma_i = valence_widths_A.reshape(-1).index_select(0, e_AB_source)
+    sigma_j = valence_widths_B.reshape(-1).index_select(0, e_AB_target)
+    if width_floor:
+        sigma_i = sigma_i.clamp_min(width_floor)
+        sigma_j = sigma_j.clamp_min(width_floor)
+    # rsqrt fuses the reciprocal and the square root into one op.
+    B_ij = torch.rsqrt(sigma_i * sigma_j)
+    x = B_ij * dR_AB
+    # Horner form of (x^2 / 3 + x + 1); one fewer multiply than the literal.
+    return (x * (x / 3.0 + 1.0) + 1.0) * torch.exp(-x)
+
+
+def cliff_exchange(
+    RA: torch.Tensor,
+    RB: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    valence_widths_A: torch.Tensor,
+    valence_widths_B: torch.Tensor,
+    K_exch_A: torch.Tensor,
+    K_exch_B: torch.Tensor,
+    dR_AB: torch.Tensor | None = None,
+    width_floor: float = OVERLAP_WIDTH_FLOOR,
+) -> torch.Tensor:
+    """CLIFF classical exchange repulsion, per intermolecular edge, kcal/mol.
+
+    Implements CLIFF Eq. (8) with the Eq. (11) overlap::
+
+        E_ij^exch = K_i^exch K_j^exch S_ij * h2kcalmol
+
+    The pair rule is the **product** ``K_i * K_j``, matching CLIFF's
+    ``K^exch`` / ``K^indu`` / ``K^disp`` parameters.  It is *not* the geometric
+    mean that :func:`geometric_mean_edge_values` applies to the Thole damping
+    widths; the two must never be interchanged.  Positivity of ``K`` is a
+    softplus contract owned by the parameter model, so no ``abs`` or clamp is
+    applied here and the result is strictly positive, matching the SAPT
+    ``Exch`` sign convention.
+
+    Parameters
+    ----------
+    RA, RB
+        Monomer coordinates in **Angstrom**, shape ``[n_A, 3]`` / ``[n_B, 3]``.
+        Used only when ``dR_AB`` is ``None``.
+    e_AB_source, e_AB_target
+        Full intermolecular edge index (``e_ABfull_source`` / ``_target``),
+        consistent with the Rackers routes.
+    valence_widths_A, valence_widths_B
+        Per-atom valence widths in bohr.
+    K_exch_A, K_exch_B
+        Per-atom exchange amplitudes.
+    dR_AB
+        Optional precomputed per-edge distance in **bohr** (atomic units).
+        Combined-mode forwards pass the distances already computed for
+        electrostatics so the intermolecular distance reduction happens once
+        per batch.  When ``None``, distances are computed with
+        :func:`get_distances` (which returns Angstrom) and converted to bohr
+        here.
+    width_floor
+        Forwarded to :func:`atomic_overlap_S_ij`.
+
+    Returns
+    -------
+    torch.Tensor
+        Strictly positive per-edge exchange energy in kcal/mol, shape
+        ``[n_edges]``.
+    """
+    if dR_AB is None:
+        dR_ang, _ = get_distances(RA, RB, e_AB_source, e_AB_target)
+        dR_AB = dR_ang / constants.au2ang
+    elif dR_AB.shape[0] != e_AB_source.shape[0]:
+        raise ValueError(
+            "cliff_exchange received dR_AB of length "
+            f"{dR_AB.shape[0]} for {e_AB_source.shape[0]} edges"
+        )
+    S_ij = atomic_overlap_S_ij(
+        valence_widths_A,
+        valence_widths_B,
+        e_AB_source,
+        e_AB_target,
+        dR_AB,
+        width_floor=width_floor,
+    )
+    K_i = K_exch_A.reshape(-1).index_select(0, e_AB_source)
+    K_j = K_exch_B.reshape(-1).index_select(0, e_AB_target)
+    return K_i * K_j * S_ij * constants.h2kcalmol
 
 
 # @torch.compile
@@ -2467,13 +3243,18 @@ def rackers_thole_induction(
     E_ind = (E_qu + E_uu) / 2.0
 
     if include_overlap:
-        sigma_A = valence_widths_A.index_select(0, e_AB_source)
-        sigma_B = valence_widths_B.index_select(0, e_AB_target)
-        B_ij = torch.sqrt(1.0 / (sigma_A * sigma_B))
-        dR_AB = direct_tensors_AB[0]
-        S_ij = (
-            (B_ij * dR_AB) ** 2 / 3.0 + B_ij * dR_AB + 1.0
-        ) * torch.exp(-B_ij * dR_AB)
+        # width_floor=0.0 preserves the historical numerics of this route: it
+        # has never floored predicted widths, and flooring them now would
+        # change every trained Rackers-overlap checkpoint's predictions.  See
+        # atomic_overlap_S_ij for the full rationale.
+        S_ij = atomic_overlap_S_ij(
+            valence_widths_A,
+            valence_widths_B,
+            e_AB_source,
+            e_AB_target,
+            direct_tensors_AB[0],  # bohr
+            width_floor=0.0,
+        )
         K_A = ind_overlap_A.index_select(0, e_AB_source)
         K_B = ind_overlap_B.index_select(0, e_AB_target)
         E_ind -= K_A * S_ij * K_B * constants.h2kcalmol
@@ -2588,12 +3369,15 @@ def induced_dipole_induction(
 
     K_A_source = Ka.index_select(0, e_AB_source)
     K_B_target = Kb.index_select(0, e_AB_target)
-    # Must have sigma be > 0 to avoid NaNs
-    sigma_A_source = valence_widths_A.index_select(0, e_AB_source)
-    sigma_B_target = valence_widths_B.index_select(0, e_AB_target)
-    B_ij = torch.sqrt(1.0 / (sigma_A_source * sigma_B_target))
-    S_ij = (1.0 / 3.0 * (B_ij * dR_AB) ** 2 + B_ij * dR_AB + 1.0) * torch.exp(
-        -B_ij * dR_AB
+    # width_floor=0.0 preserves this route's historical numerics; see
+    # atomic_overlap_S_ij for why the floor is not applied here.
+    S_ij = atomic_overlap_S_ij(
+        valence_widths_A,
+        valence_widths_B,
+        e_AB_source,
+        e_AB_target,
+        dR_AB,  # bohr
+        width_floor=0.0,
     )
     E_ind_overlap = K_A_source * S_ij * K_B_target * h2kcalmol
 
@@ -3048,11 +3832,15 @@ def induced_dipole_induction_optimized(
 
     K_A_source = Ka.index_select(0, e_AB_source)
     K_B_target = Kb.index_select(0, e_AB_target)
-    sigma_A_source = valence_widths_A.index_select(0, e_AB_source)
-    sigma_B_target = valence_widths_B.index_select(0, e_AB_target)
-    B_ij = torch.sqrt(1.0 / (sigma_A_source * sigma_B_target))
-    S_ij = (1.0 / 3.0 * (B_ij * dR_AB) ** 2 + B_ij * dR_AB + 1.0) * torch.exp(
-        -B_ij * dR_AB
+    # width_floor=0.0 preserves this route's historical numerics; see
+    # atomic_overlap_S_ij for why the floor is not applied here.
+    S_ij = atomic_overlap_S_ij(
+        valence_widths_A,
+        valence_widths_B,
+        e_AB_source,
+        e_AB_target,
+        dR_AB,  # bohr
+        width_floor=0.0,
     )
     E_ind_overlap = K_A_source * S_ij * K_B_target * h2kcalmol
 
@@ -3594,6 +4382,7 @@ class AM_DimerParam_Model:
         elst_damping_type="CLIFF",
         freeze_atom_model=True,
         positivity_epsilon=RACKERS_POSITIVITY_EPSILON,
+        width_floor=OVERLAP_WIDTH_FLOOR,
     ):
         """
         Construct an AtomTypeParamModel wrapper that builds or loads an atom-level model, a parameter-predicting model, and optional dimer evaluators and dataset.
@@ -3638,6 +4427,7 @@ class AM_DimerParam_Model:
             ds_energy_labels (optional): Energy label specifications for dataset builder.
             dimer_eval_type (str): Dimer evaluation mode used by created DimerProp (e.g., "elst_damping", "elst").
             elst_damping_type (str): Electrostatic damping variant to use ("CLIFF" or "AMOEBA"); can be overridden by loaded checkpoint config.
+            width_floor (float): Valence-width floor recorded on `CliffExchangeNN` / `CliffClassicalNN` and applied inside `atomic_overlap_S_ij`; ignored by every other `model_type`, and overridden by a loaded checkpoint's own value.
 
         Notes:
             - When loading checkpoints, model constructor parameters (n_message, n_neuron, n_embed, param_start_*) are read from the checkpoint config to reinstantiate compatible model instances.
@@ -3650,54 +4440,57 @@ class AM_DimerParam_Model:
             device = torch.device("cpu")
             print("running on the CPU")
         self.ds_spec_type = ds_spec_type
-        rackers_checkpoint = None
-        rackers_config = None
-        if pre_trained_model_path and model_type == "RackersTholeDampingNN":
-            rackers_checkpoint = model_io.load_checkpoint(
+        param_checkpoint = None
+        param_config = None
+        if pre_trained_model_path and model_type in POSITIVE_PARAMETER_CONTRACTS:
+            # One contract-driven validation path for every positive per-atom
+            # parameter head.  `label` reproduces the pre-existing Rackers
+            # message prefix byte-for-byte and names the model type otherwise;
+            # every check below is the original Rackers check with the
+            # hard-coded model type and parameter list replaced by the looked-up
+            # contract.
+            label = _positive_parameter_error_label(model_type)
+            expected_parameter_names = list(
+                POSITIVE_PARAMETER_CONTRACTS[model_type]
+            )
+            param_checkpoint = model_io.load_checkpoint(
                 pre_trained_model_path, map_location=device
             )
-            checkpoint_version = rackers_checkpoint.get(
-                "checkpoint_version"
-            )
+            checkpoint_version = param_checkpoint.get("checkpoint_version")
             if checkpoint_version != model_io.CHECKPOINT_VERSION:
                 raise ValueError(
-                    "Rackers checkpoint_version mismatch: expected "
+                    f"{label} checkpoint_version mismatch: expected "
                     f"{model_io.CHECKPOINT_VERSION}, got "
                     f"{checkpoint_version!r}"
                 )
-            if (
-                rackers_checkpoint.get("model_type")
-                != "RackersTholeDampingNN"
-            ):
+            if param_checkpoint.get("model_type") != model_type:
                 raise ValueError(
-                    "Rackers checkpoint model_type mismatch: expected "
-                    "RackersTholeDampingNN, got "
-                    f"{rackers_checkpoint.get('model_type')!r}"
+                    f"{label} checkpoint model_type mismatch: expected "
+                    f"{model_type}, got "
+                    f"{param_checkpoint.get('model_type')!r}"
                 )
             model_io.validate_checkpoint(
-                rackers_checkpoint,
-                expected_type="RackersTholeDampingNN",
+                param_checkpoint,
+                expected_type=model_type,
             )
-            rackers_config = rackers_checkpoint["config"]
-            if rackers_config.get("parameter_names") != list(
-                RACKERS_PARAMETER_NAMES
-            ):
+            param_config = param_checkpoint["config"]
+            if param_config.get("parameter_names") != expected_parameter_names:
                 raise ValueError(
-                    "Rackers checkpoint parameter_names must exactly match "
-                    f"{list(RACKERS_PARAMETER_NAMES)}"
+                    f"{label} checkpoint parameter_names must exactly match "
+                    f"{expected_parameter_names}"
                 )
-            if rackers_config.get("dimer_eval") != dimer_eval_type:
+            if param_config.get("dimer_eval") != dimer_eval_type:
                 raise ValueError(
-                    "Rackers checkpoint dimer_eval mismatch: expected "
+                    f"{label} checkpoint dimer_eval mismatch: expected "
                     f"{dimer_eval_type}, got "
-                    f"{rackers_config.get('dimer_eval')!r}"
+                    f"{param_config.get('dimer_eval')!r}"
                 )
-            if "nested_atom_model" not in rackers_config:
+            if "nested_atom_model" not in param_config:
                 raise ValueError(
-                    "Rackers checkpoint missing nested_atom_model metadata"
+                    f"{label} checkpoint missing nested_atom_model metadata"
                 )
             self.atom_model = _rebuild_nested_atom_model(
-                rackers_config["nested_atom_model"], freeze_atom_model
+                param_config["nested_atom_model"], freeze_atom_model
             )
             am_type = AtomTypeParamNN
         elif atom_model_type == "AtomMPNN":
@@ -3717,7 +4510,7 @@ class AM_DimerParam_Model:
         else:
             raise ValueError(f"Unknown atom_model_type: {atom_model_type}")
 
-        if rackers_checkpoint is not None:
+        if param_checkpoint is not None:
             pass
         elif atom_model_pre_trained_path:
             print(
@@ -3763,10 +4556,10 @@ class AM_DimerParam_Model:
             print(
                 f"Loading pre-trained MTP-MTP {model_type} from {pre_trained_model_path}"
             )
-            checkpoint = rackers_checkpoint or model_io.load_checkpoint(
+            checkpoint = param_checkpoint or model_io.load_checkpoint(
                 pre_trained_model_path
             )
-            config = rackers_config or model_io.load_config_from_checkpoint(
+            config = param_config or model_io.load_config_from_checkpoint(
                 checkpoint
             )
             if config is None:
@@ -3793,6 +4586,21 @@ class AM_DimerParam_Model:
                     param_start_mean=config["param_start_mean"],
                     param_start_std=config["param_start_std"],
                     positivity_epsilon=config["positivity_epsilon"],
+                    freeze_atom_model=freeze_atom_model,
+                )
+            elif model_type in _CLIFF_PARAMETER_HEADS:
+                # `width_floor` follows the checkpoint rather than the caller,
+                # so a reloaded model reproduces the overlap it was trained
+                # with.
+                self.model = _CLIFF_PARAMETER_HEADS[model_type](
+                    atom_model=self.atom_model,
+                    n_message=config["n_message"],
+                    n_neuron=config["n_neuron"],
+                    n_embed=config["n_embed"],
+                    param_start_mean=config["param_start_mean"],
+                    param_start_std=config["param_start_std"],
+                    positivity_epsilon=config["positivity_epsilon"],
+                    width_floor=config.get("width_floor", width_floor),
                     freeze_atom_model=freeze_atom_model,
                 )
             # elif model_type == "AtomTypeParamMPNN":
@@ -3834,6 +4642,18 @@ class AM_DimerParam_Model:
                     positivity_epsilon=positivity_epsilon,
                     freeze_atom_model=freeze_atom_model,
                 )
+            elif model_type in _CLIFF_PARAMETER_HEADS:
+                self.model = _CLIFF_PARAMETER_HEADS[model_type](
+                    atom_model=self.atom_model,
+                    n_message=n_message,
+                    n_neuron=n_neuron,
+                    n_embed=n_embed,
+                    param_start_mean=param_start_mean,
+                    param_start_std=param_start_std,
+                    positivity_epsilon=positivity_epsilon,
+                    width_floor=width_floor,
+                    freeze_atom_model=freeze_atom_model,
+                )
             # elif model_type == "AtomTypeParamMPNN":
             #     self.model = AtomTypeParamMPNN(
             #         atom_model=self.atom_model,
@@ -3851,6 +4671,21 @@ class AM_DimerParam_Model:
         self.n_params = n_params
         self.dimer_eval_type = dimer_eval_type
         self.elst_damping_type = elst_damping_type
+        self.width_floor = getattr(self.model, "width_floor", width_floor)
+        # CLIFF Eq. (23) component/total loss weighting.  `None` selects the
+        # historical plain MSE over the selected columns and is the default for
+        # every route; any float in [0, 1] selects the Eq. (23) functional.
+        # `train()` overrides both, and a combined-route checkpoint carries
+        # whatever was last used so a resumed run reproduces it -- including a
+        # recorded `None`, which must not silently become a float.
+        loaded_config = param_config if pre_trained_model_path else None
+        loaded_gamma = (loaded_config or {}).get("component_gamma")
+        self.component_gamma = (
+            None if loaded_gamma is None else float(loaded_gamma)
+        )
+        self.total_includes_d3 = bool(
+            (loaded_config or {}).get("total_includes_d3", False)
+        )
         self.dimer_model = DimerProp(
             self.model,
             dimer_eval=dimer_eval_type,
@@ -4105,8 +4940,23 @@ class AM_DimerParam_Model:
             }
         model_config["elst_damping_type"] = self.elst_damping_type
         model_config["dimer_eval_type"] = self.dimer_eval_type
-        if type(model) is RackersTholeDampingNN:
+        if type(model).__name__ in POSITIVE_PARAMETER_CONTRACTS:
+            # `dimer_eval` is the key the contract validation in `__init__`
+            # cross-checks, so every positive-parameter head records it.
             model_config["dimer_eval"] = self.dimer_eval_type
+        if type(model).__name__ in _CLIFF_PARAMETER_HEADS:
+            model_config["d3_damping_parameters"] = deepcopy(
+                self.dimer_model.d3_damping_parameters
+            )
+            if self.dimer_eval_type in COMBINED_CLIFF_DIMER_EVAL_MODES:
+                # `component_gamma` is recorded as-is, including `None` (the
+                # legacy plain-MSE sentinel).  Coercing it to a float here
+                # would silently switch a resumed run onto the Eq. (23)
+                # functional, whose `gamma == 1.0` endpoint is `k` times the
+                # legacy loss.
+                gamma, includes_d3 = self._component_loss_weighting()
+                model_config["component_gamma"] = gamma
+                model_config["total_includes_d3"] = includes_d3
 
         submodels = None
         if embed_atom_model and atom_model is not None:
@@ -4300,10 +5150,10 @@ class AM_DimerParam_Model:
         return pair_energies_batch
 
     def _dimer_index_for_output(self, batch):
-        if self.dimer_eval_type in {
-            "rackers_thole",
-            "rackers_thole_overlap",
-        }:
+        # Membership is defined once in FULL_EDGE_DIMER_EVAL_MODES so a new
+        # full-edge mode cannot be added to `DimerProp.set_forward` while this
+        # aggregation index silently keeps using the short-range `dimer_ind`.
+        if self.dimer_eval_type in FULL_EDGE_DIMER_EVAL_MODES:
             return batch.dimer_ind_full
         return batch.dimer_ind
 
@@ -4497,6 +5347,79 @@ units angstrom
     def __cleanup(self):
         dist.destroy_process_group()
 
+    def _component_loss_weighting(self) -> tuple[float | None, bool]:
+        """Resolved ``(component_gamma, total_includes_d3)`` for this harness.
+
+        ``component_gamma is None`` means the legacy plain MSE.  Read through
+        ``getattr`` so a bare ``AM_DimerParam_Model.__new__`` instance (the
+        pattern the training-loop unit tests use) keeps the historical defaults
+        without having to know about this feature.
+        """
+        gamma = getattr(self, "component_gamma", None)
+        return (
+            None if gamma is None else float(gamma),
+            bool(getattr(self, "total_includes_d3", False)),
+        )
+
+    def _batch_loss(self, preds, ref, comp_errors, batch, loss_fn):
+        """Per-batch loss: legacy plain MSE, or CLIFF Eq. (23) weighted.
+
+        ``component_gamma is None`` -- the default for every route -- takes the
+        *original* expression verbatim, so the historical plain (multi-column)
+        MSE is reproduced bitwise, not merely to within floating-point
+        tolerance.
+
+        Any float in ``[0.0, 1.0]`` selects the CLIFF Eq. (23) functional:
+
+            L = (1 - gamma) * MSE(E_total) + gamma * sum_C MSE(E_C)
+
+        ``sum_C`` is deliberately *unnormalized*, so ``component_gamma`` keeps
+        the paper's meaning and ``0.4`` is CLIFF's fitted value.  Because the
+        legacy default is a separate sentinel rather than an overloaded
+        ``gamma == 1.0``, the Eq. (23) family is continuous over the whole
+        ``[0, 1]`` sweep of CLIFF Fig. 3; ``gamma == 1.0`` is the honest
+        endpoint "fit the components only, zero weight on the total"
+        (``sum_C MSE(E_C)``), which is ``k`` times the plain mean MSE and
+        therefore *not* the legacy loss.
+
+        ``E_total`` is the *partial* total ``Elst + Exch + Indu`` compared
+        against the summed reference columns, which keeps the total term
+        differentiable with respect to trained parameters only.  With
+        ``total_includes_d3`` the detached dispersion is added to the predicted
+        total and the reference becomes all four SAPT columns; D3 has no
+        trainable parameters and is detached so it can contribute no gradient
+        by either route.
+        """
+        gamma, includes_d3 = self._component_loss_weighting()
+        if gamma is None:
+            return (
+                torch.mean(torch.square(comp_errors))
+                if (loss_fn is None)
+                else loss_fn(preds, ref)
+            )
+        if preds.dim() < 2:
+            raise ValueError(
+                "component_gamma is only defined for multi-component "
+                f"dimer_eval_type values, not {self.dimer_eval_type!r}"
+            )
+        component_mse = torch.square(comp_errors).mean(dim=0).sum()
+        pred_total = preds.sum(dim=-1)
+        if includes_d3:
+            disp_edges = d3(
+                batch, params=self.dimer_model.d3_damping_parameters
+            ).detach()
+            disp = scatter_sum_compile(
+                disp_edges,
+                self._dimer_index_for_output(batch),
+                dim_size=batch.total_charge_A.size(0),
+            )
+            pred_total = pred_total + disp
+            ref_total = batch.y.sum(dim=-1)
+        else:
+            ref_total = ref.sum(dim=-1)
+        total_mse = torch.mean(torch.square(pred_total - ref_total))
+        return (1.0 - gamma) * total_mse + gamma * component_mse
+
     def __train_batches_single_proc(
         self, dataloader, loss_fn, optimizer, rank_device, scheduler, y_ind=0
     ):
@@ -4520,10 +5443,8 @@ units angstrom
             comp_errors = preds - ref
             # print(f"{preds = }")
             # print(f"{ref = }")
-            batch_loss = (
-                torch.mean(torch.square(comp_errors))
-                if (loss_fn is None)
-                else loss_fn(preds, ref)
+            batch_loss = self._batch_loss(
+                preds, ref, comp_errors, batch, loss_fn
             )
             batch_loss.backward()
             # torch.nn.utils.clip_grad_norm_(self.dimer_model.parameters(), max_norm=0.2)
@@ -4554,10 +5475,8 @@ units angstrom
                     ),
                 )
                 comp_errors = preds - ref
-                batch_loss = (
-                    torch.mean(torch.square(comp_errors))
-                    if (loss_fn is None)
-                    else loss_fn(preds, ref)
+                batch_loss = self._batch_loss(
+                    preds, ref, comp_errors, batch, loss_fn
                 )
                 total_loss += batch_loss.item()
                 comp_errors_t.append(comp_errors.detach().cpu())
@@ -4675,18 +5594,31 @@ units angstrom
         # (4) Set eval functions
         if self.dimer_eval_type == "elst_damping":
             y_ind = 0
-            term = "Elst"
+            term = _mae_report_header(("Elst",))
         elif self.dimer_eval_type in ["induced_dipole", "induced_dipole_param"]:
             y_ind = 2
-            term = "Indu"
+            term = _mae_report_header(("Indu",))
             self.dimer_model.polarizability_table = (
                 self.dimer_model.polarizability_table.to(self.device)
             )
+        elif self.dimer_eval_type == "cliff_exch":
+            # Standalone exchange fits SAPT `Exch` (column 1) alone.  It runs
+            # neither electrostatics nor induction, so there is no
+            # polarizability table to place and none of the induction device
+            # moves below apply; `__init__` has already moved the hierarchy.
+            assert isinstance(self.atom_model, AtomTypeParamNN), (
+                f"{self.dimer_eval_type} is only compatible with "
+                "AtomTypeParamNN atom models presently."
+            )
+            y_ind = 1
+            term = _mae_report_header(("Exch",))
         elif self.dimer_eval_type in [
             "elst_damping__induced_dipole",
             "ap3_elst_damping__induced_dipole",
             "rackers_thole",
             "rackers_thole_overlap",
+            "cliff_classical",
+            "cliff_classical_overlap",
         ]:
             assert isinstance(self.atom_model, AtomTypeParamNN), (
                 f"{self.dimer_eval_type} is only compatible with "
@@ -4696,8 +5628,19 @@ units angstrom
             self.model.atom_model.to(self.device)
             self.model.atom_model.atom_model.to(self.device)
             print(self.device)
-            y_ind = torch.tensor([0, 2])
-            term = "Elst      Ind"
+            # The combined CLIFF routes add an exchange column between elst and
+            # induction, matching the dataset's [Elst, Exch, Ind, Disp] layout
+            # so target slicing stays a plain column select.  Both the target
+            # index and the report header come from one labelled selection, so
+            # nothing downstream is specialized to a column count.
+            if self.dimer_eval_type in COMBINED_CLIFF_DIMER_EVAL_MODES:
+                target_columns = (0, 1, 2)
+                target_labels = ("Elst", "Exch", "Ind")
+            else:
+                target_columns = (0, 2)
+                target_labels = ("Elst", "Ind")
+            y_ind = torch.tensor(target_columns)
+            term = _mae_report_header(target_labels)
             self.dimer_model.polarizability_table = (
                 self.dimer_model.polarizability_table.to(self.device)
             )
@@ -4818,6 +5761,52 @@ units angstrom
             self.dimer_model_elst.AtomTypeParam = underlying_model
         return
 
+    def _validate_component_loss_weighting(
+        self,
+        component_gamma,
+        total_includes_d3,
+    ) -> tuple[float | None, bool]:
+        """Validate the CLIFF Eq. (23) weighting for this route.
+
+        ``None`` (the default) selects the legacy plain MSE and is accepted on
+        every route.  A float must lie in ``[0.0, 1.0]`` and selects the
+        Eq. (23) functional, which is only meaningful on the combined CLIFF
+        routes: a single-component route such as ``cliff_exch`` has no
+        total-versus-component split, and neither do the pre-existing
+        two-column routes, whose loss must stay unchanged.
+        """
+        includes_d3 = bool(total_includes_d3)
+        if (
+            component_gamma is not None or includes_d3
+        ) and self.dimer_eval_type not in COMBINED_CLIFF_DIMER_EVAL_MODES:
+            raise ValueError(
+                "component_gamma/total_includes_d3 are only supported for the "
+                "combined CLIFF routes "
+                f"{sorted(COMBINED_CLIFF_DIMER_EVAL_MODES)}, not "
+                f"{self.dimer_eval_type!r}"
+            )
+        if component_gamma is None:
+            if includes_d3:
+                # Without an explicit gamma there is no total term at all, so
+                # a D3 evaluation per batch would buy nothing.  Rejecting is
+                # clearer than silently ignoring the flag.
+                raise ValueError(
+                    "total_includes_d3 requires an explicit component_gamma; "
+                    "the default (None) loss has no total term"
+                )
+            return None, False
+        try:
+            gamma = float(component_gamma)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "component_gamma must be None or a float in [0.0, 1.0]"
+            ) from exc
+        if not math.isfinite(gamma) or gamma < 0.0 or gamma > 1.0:
+            raise ValueError(
+                f"component_gamma must be in [0.0, 1.0], got {component_gamma!r}"
+            )
+        return gamma, includes_d3
+
     def train(
         self,
         dataset=None,
@@ -4832,7 +5821,26 @@ units angstrom
         random_seed=42,
         skip_compile=False,
         lr_decay=None,
+        component_gamma=None,
+        total_includes_d3=False,
     ):
+        """Fit the parameter head.
+
+        ``component_gamma=None`` (the default) keeps the legacy plain MSE; a
+        float in ``[0.0, 1.0]`` selects CLIFF Eq. (23).  Both it and
+        ``total_includes_d3`` are declared here as named parameters
+        *deliberately*: ``train_models.py`` filters ``train_kwargs`` through
+        ``inspect.signature(apnet.train).parameters`` before calling, so
+        anything absent from this signature is silently dropped rather than
+        raising.  See :meth:`_batch_loss` for the weighting itself.
+        """
+        # Validated before any dataset work so a misconfigured route fails
+        # immediately rather than after a dataset build.
+        self.component_gamma, self.total_includes_d3 = (
+            self._validate_component_loss_weighting(
+                component_gamma, total_includes_d3
+            )
+        )
         print("NOTE: lr_decay is not implemented.")
         if dataset is not None:
             self.dataset = dataset
@@ -4964,6 +5972,165 @@ class RackersTholeDampingModel(_RackersTholeDampingModelBase):
 
 class RackersTholeDampingOverlapModel(_RackersTholeDampingModelBase):
     DIMER_EVAL = "rackers_thole_overlap"
+
+
+class _CliffParamModelBase(AM_DimerParam_Model):
+    """Shared plumbing for the CLIFF training harnesses.
+
+    Mirrors :class:`_RackersTholeDampingModelBase`: each concrete harness fixes
+    its ``MODEL_TYPE``, ``DIMER_EVAL``, and ``PARAMETER_NAMES`` (hence its
+    parameter count *and* column ordering) as class attributes and exposes none
+    of ``n_params`` / ``model_type`` / ``dimer_eval_type`` in its public
+    constructor.  Initialization always routes through
+    :func:`_validate_positive_initialization`, which reports the expected count
+    from ``PARAMETER_NAMES``.
+
+    The concrete subclasses keep explicit signatures (rather than inheriting one
+    with sentinel defaults) so the CLIFF defaults are visible where a reader
+    looks for them, and share only the ``AM_DimerParam_Model`` call below.
+    """
+
+    DIMER_EVAL: str
+    MODEL_TYPE: str
+    PARAMETER_NAMES: tuple[str, ...]
+
+    def _init_cliff_harness(
+        self,
+        *,
+        dataset,
+        atom_model,
+        pre_trained_model_path,
+        n_message,
+        n_neuron,
+        n_embed,
+        param_start_mean,
+        param_start_std,
+        positivity_epsilon,
+        width_floor,
+        freeze_atom_model,
+        dataset_kwargs,
+    ):
+        param_start_mean, param_start_std, positivity_epsilon, _ = (
+            _validate_positive_initialization(
+                self.PARAMETER_NAMES,
+                param_start_mean,
+                param_start_std,
+                positivity_epsilon,
+            )
+        )
+        AM_DimerParam_Model.__init__(
+            self,
+            dataset=dataset,
+            atom_model=atom_model,
+            atom_model_type="AtomTypeParamNN",
+            model_type=self.MODEL_TYPE,
+            pre_trained_model_path=pre_trained_model_path,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            positivity_epsilon=positivity_epsilon,
+            width_floor=width_floor,
+            n_params=len(self.PARAMETER_NAMES),
+            dimer_eval_type=self.DIMER_EVAL,
+            freeze_atom_model=freeze_atom_model,
+            **dataset_kwargs,
+        )
+
+
+class CliffExchangeModel(_CliffParamModelBase):
+    """Fit CLIFF classical exchange repulsion alone against SAPT ``Exch``.
+
+    One positive per-atom parameter (``K_exch``).  Being a single-component
+    route it has no total/component split, so ``train`` rejects any
+    ``component_gamma`` other than the default ``None``.
+    """
+
+    DIMER_EVAL = "cliff_exch"
+    MODEL_TYPE = "CliffExchangeNN"
+    PARAMETER_NAMES = CLIFF_EXCH_PARAMETER_NAMES
+
+    def __init__(
+        self,
+        dataset=None,
+        atom_model: AtomTypeParamNN | None = None,
+        pre_trained_model_path=None,
+        n_message: int = 3,
+        n_neuron: int = 64,
+        n_embed: int = 8,
+        param_start_mean=CLIFF_EXCH_INITIAL_VALUES,
+        param_start_std=CLIFF_EXCH_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        width_floor: float = OVERLAP_WIDTH_FLOOR,
+        freeze_atom_model: bool = True,
+        **dataset_kwargs,
+    ):
+        self._init_cliff_harness(
+            dataset=dataset,
+            atom_model=atom_model,
+            pre_trained_model_path=pre_trained_model_path,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            positivity_epsilon=positivity_epsilon,
+            width_floor=width_floor,
+            freeze_atom_model=freeze_atom_model,
+            dataset_kwargs=dataset_kwargs,
+        )
+
+
+class _CliffClassicalModelBase(_CliffParamModelBase):
+    """Fit electrostatics, exchange, and induction jointly.
+
+    Five positive per-atom parameters in the fixed order
+    :data:`CLIFF_CLASSICAL_PARAMETER_NAMES`, whose first four columns
+    intentionally match the Rackers ordering.  Subclasses select whether the
+    short-range induction overlap correction is enabled via ``DIMER_EVAL``.
+    """
+
+    MODEL_TYPE = "CliffClassicalNN"
+    PARAMETER_NAMES = CLIFF_CLASSICAL_PARAMETER_NAMES
+
+    def __init__(
+        self,
+        dataset=None,
+        atom_model: AtomTypeParamNN | None = None,
+        pre_trained_model_path=None,
+        n_message: int = 3,
+        n_neuron: int = 64,
+        n_embed: int = 8,
+        param_start_mean=CLIFF_CLASSICAL_INITIAL_VALUES,
+        param_start_std=CLIFF_CLASSICAL_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        width_floor: float = OVERLAP_WIDTH_FLOOR,
+        freeze_atom_model: bool = True,
+        **dataset_kwargs,
+    ):
+        self._init_cliff_harness(
+            dataset=dataset,
+            atom_model=atom_model,
+            pre_trained_model_path=pre_trained_model_path,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            positivity_epsilon=positivity_epsilon,
+            width_floor=width_floor,
+            freeze_atom_model=freeze_atom_model,
+            dataset_kwargs=dataset_kwargs,
+        )
+
+
+class CliffClassicalModel(_CliffClassicalModelBase):
+    DIMER_EVAL = "cliff_classical"
+
+
+class CliffClassicalOverlapModel(_CliffClassicalModelBase):
+    DIMER_EVAL = "cliff_classical_overlap"
 
 
 ### Atom Type Model Wrapper ####

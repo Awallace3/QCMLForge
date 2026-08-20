@@ -3,9 +3,7 @@ import sys
 
 import numpy as np
 import pytest
-import qcelemental as qcel
 import torch
-from torch_geometric.data import Data
 
 import train_models
 from apnet_pt import constants, model_io
@@ -21,7 +19,6 @@ from apnet_pt.AtomPairwiseModels.mtp_mtp import (
     RACKERS_THOLE_DIRECT_INDEX,
     RACKERS_THOLE_MUTUAL_INDEX,
     AM_DimerParam_Model,
-    AtomTypeParamNN,
     DimerProp,
     RackersTholeDampingModel,
     RackersTholeDampingNN,
@@ -36,40 +33,14 @@ from apnet_pt.pt_datasets.ap3_fused_ds import (
     ap3_fused_collate_update,
     ap3_fused_collate_update_no_target,
 )
-from apnet_pt.torch_util import set_weights_to_value
 from apnet_pt.util import scatter_sum_compile
 
+from .conftest import _make_collate_item
 
-def _make_collate_item(y_scale: float) -> Data:
-    return Data(
-        y=torch.tensor(
-            [-1.0, 2.0, -3.0, 4.0], dtype=torch.float32
-        ) * y_scale,
-        ZA=torch.tensor([8, 1], dtype=torch.long),
-        RA=torch.tensor(
-            [[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]],
-            dtype=torch.float32,
-        ),
-        ZB=torch.tensor([8, 1], dtype=torch.long),
-        RB=torch.tensor(
-            [[3.0, 0.0, 0.0], [7.0, 0.0, 0.0]],
-            dtype=torch.float32,
-        ),
-        e_ABsr_source=torch.tensor([0, 1], dtype=torch.long),
-        e_ABsr_target=torch.tensor([0, 0], dtype=torch.long),
-        e_ABlr_source=torch.tensor([0, 1], dtype=torch.long),
-        e_ABlr_target=torch.tensor([1, 1], dtype=torch.long),
-        e_AA_source=torch.tensor([0, 1], dtype=torch.long),
-        e_AA_target=torch.tensor([1, 0], dtype=torch.long),
-        e_BB_source=torch.tensor([0, 1], dtype=torch.long),
-        e_BB_target=torch.tensor([1, 0], dtype=torch.long),
-        dimer_ind=torch.zeros(2, dtype=torch.long),
-        dimer_ind_lr=torch.zeros(2, dtype=torch.long),
-        molecule_ind_A=torch.zeros(2, dtype=torch.long),
-        molecule_ind_B=torch.zeros(2, dtype=torch.long),
-        total_charge_A=torch.tensor(0.0),
-        total_charge_B=torch.tensor(0.0),
-    )
+# The `atomic_batch`, `nested_hfvr_vw_model`, and `synthetic_dimer_batch`
+# fixtures, plus the `_make_collate_item` builder imported above, live in
+# tests/conftest.py because tests/test_cliff_classical_exchange.py needs the
+# same nested HFVR / valence-width contract and the same dimer batch.
 
 
 def test_target_collate_emits_full_edge_domain():
@@ -148,91 +119,6 @@ def test_full_edge_dimer_index_aligns_with_full_edge_lists(collate_fn):
     assert torch.equal(batch.dimer_ind_full, expected_from_source)
     assert torch.equal(batch.dimer_ind_full, expected_from_target)
     assert batch.dimer_ind_full.unique().tolist() == [0, 1, 2]
-
-
-@pytest.fixture
-def synthetic_dimer_batch() -> Data:
-    items = [_make_collate_item(1.0), _make_collate_item(2.0)]
-    for item in items:
-        item.RB = torch.tensor(
-            [[1.8, 0.3, 0.0], [2.7, -0.2, 0.0]],
-            dtype=torch.float32,
-        )
-    return ap2_fused_collate_update(items)
-
-
-@pytest.fixture
-def atomic_batch() -> Data:
-    return Data(
-        x=torch.tensor([8, 1, 1], dtype=torch.long),
-        R=torch.tensor(
-            [
-                [0.0, 0.0, 0.0],
-                [0.9, 0.0, 0.0],
-                [-0.3, 0.8, 0.0],
-            ],
-            dtype=torch.float32,
-        ),
-        edge_index=torch.tensor(
-            [[0, 1, 0, 2, 1, 2], [1, 0, 2, 0, 2, 1]],
-            dtype=torch.long,
-        ),
-        molecule_ind=torch.zeros(3, dtype=torch.long),
-        total_charge=torch.tensor([0.0], dtype=torch.float32),
-        natom_per_mol=torch.tensor([3], dtype=torch.long),
-    )
-
-
-@pytest.fixture
-def synthetic_qcel_dimers():
-    first = qcel.models.Molecule.from_data("""
-0 1
-O  0.000000  0.000000  0.000000
-H  0.758602  0.000000  0.504284
-H -0.260455  0.000000 -0.872893
---
-0 1
-O  3.000000  0.500000  0.000000
-H  3.758602  0.500000  0.504284
-H  2.739545  0.500000 -0.872893
-units angstrom
-""")
-    second = qcel.models.Molecule.from_data("""
-0 1
-O  0.000000  0.000000  0.000000
-H  0.758602  0.000000  0.504284
-H -0.260455  0.000000 -0.872893
---
-0 1
-O  3.500000 -0.250000  0.100000
-H  4.258602 -0.250000  0.604284
-H  3.239545 -0.250000 -0.772893
-units angstrom
-""")
-    return [first, second]
-
-
-@pytest.fixture
-def nested_hfvr_vw_model() -> AtomTypeParamNN:
-    atom_model = AtomMPNN(
-        n_message=1,
-        n_rbf=2,
-        n_neuron=8,
-        n_embed=4,
-        r_cut=5.0,
-    )
-    nested = AtomTypeParamNN(
-        atom_model=atom_model,
-        n_message=1,
-        n_neuron=8,
-        n_embed=4,
-        param_start_mean=[1.0, 0.4],
-        param_start_std=[0.0, 0.0],
-        n_params=2,
-        freeze_atom_model=False,
-    )
-    set_weights_to_value(nested, 0.01)
-    return nested
 
 
 @pytest.mark.parametrize(
