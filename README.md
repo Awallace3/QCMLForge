@@ -1,3 +1,5 @@
+
+
 # QCMLForge
 
 [![Tests](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml/badge.svg)](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml)
@@ -23,7 +25,7 @@ to install a specific version through the following example:
 # If you want the CUDA version
 pip uninstall torch-geometric
 export TORCH=2.10.0
-export CUDA=cu126 # for cuda version 12.8
+export CUDA=cu126 # for cuda version 12.6
 pip install torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
 
 # If you want the CPU version
@@ -103,6 +105,11 @@ python3 ./train_models.py \
     --ap_model_path ./models/example/ap2_example.pt \
     --n_epochs 5 
 ```
+
+## Experiment tracking
+
+Optional experiment tracking is documented in
+[Training with Weights & Biases](docs/training-with-wandb.md).
 
 # PyTorch AtomicModule 
 Code re-implemented from TensorFlow version located [here](https://github.com/zachglick/apnet)

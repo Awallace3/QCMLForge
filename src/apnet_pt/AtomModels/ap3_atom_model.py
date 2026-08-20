@@ -5,6 +5,16 @@ import numpy as np
 import warnings
 from .. import multipole
 from .. import model_io
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_distributed,
+    run_tracked_single_process,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
+    tracked_ddp_worker,
+)
 from ..hf_pretrained import resolve_pretrained_path
 import time
 from apnet_pt.atomic_datasets import (
@@ -1197,6 +1207,7 @@ class AtomInducedDipoleModel:
             }
             self.atomtype_hfvr_model.load_state_dict(model_state_dict)
 
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             checkpoint = torch.load(pre_trained_model_path, weights_only=False)
             # Prioritize user-provided precompute_hfvr over checkpoint value
@@ -1637,6 +1648,7 @@ units angstrom
                 f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f}",
                 flush=True,
             )
+        track_pretraining_from_locals(self, locals())
         return test_loss
 
     def pretrain_statistics_ddp(
@@ -1689,6 +1701,7 @@ units angstrom
                     flush=True,
                 )
 
+        track_pretraining_from_locals(self, locals())
         return test_loss
 
     def train_batches_single_proc(
@@ -1794,9 +1807,11 @@ units angstrom
         total_qpole_error = torch.tensor(
             total_qpole_error, dtype=torch.float32, device=rank_device
         )
+        total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         # All-reduce across processes
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_charge_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_dipole_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_qpole_error, op=dist.ReduceOp.SUM)
@@ -1941,7 +1956,11 @@ units angstrom
             rank_device = "cpu"
         else:
             rank_device = rank
-        if world_size > 1:
+        # ddp_train is only reached from distributed entry points, including
+        # external launchers that run a single task (world_size == 1). The
+        # metric reductions below need an initialized process group either way.
+        owns_process_group = not dist.is_initialized()
+        if owns_process_group:
             self.setup(rank, world_size)
 
         self.model.to(rank_device)
@@ -2041,13 +2060,14 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 # if (world_size==1 or rank == 0):
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f} {test_lowered}",
                     flush=True,
                 )
-        if world_size > 1:
+        if owns_process_group:
             self.cleanup()
         return
 
@@ -2154,6 +2174,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f} {test_lowered}",
@@ -2177,6 +2198,11 @@ units angstrom
         world_size=1,  # Default to 1 for single-core operation
         omp_num_threads_per_process=None,
         random_seed=42,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
+        _external_rank: int | None = None,
+        _external_local_rank: int | None = None,
     ):
         self.model_save_path = model_path
         if self.model_save_path is not None:
@@ -2241,40 +2267,101 @@ units angstrom
             torch.jit.enable_onednn_fusion(True)
             torch.autograd.set_detect_anomaly(False)
 
-        if world_size > 1:
-            # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)
-            print("Running multi-process training", flush=True)
+        if world_size > 1 or _external_rank is not None:
+            # External launchers enter this worker path even for a one-task job.
+            print("Running distributed training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            mp.spawn(
-                self.ddp_train,
-                args=(
-                    world_size,
-                    train_dataset,
-                    test_dataset,
-                    n_epochs,
-                    batch_size,
-                    lr,
-                    pin_memory,
-                    dataloader_num_workers,
-                ),
-                nprocs=world_size,
-                join=True,
-            )
+            ddp_config = {
+                "training/epochs": n_epochs,
+                "training/learning_rate_initial": lr,
+                "training/random_seed": random_seed,
+                "training/skip_compile": skip_compile,
+                "training/external_ddp": _external_rank is not None,
+            }
+            if _external_rank is None:
+                configure_distributed_tracking(
+                    self,
+                    wandb_config,
+                    model_family="atomic",
+                    initial_config=ddp_config,
+                    backend=_tracker_backend,
+                    event_directory=_tracker_event_directory,
+                )
+                mp.spawn(
+                    tracked_ddp_worker,
+                    args=(
+                        self.ddp_train,
+                        world_size,
+                        train_dataset,
+                        test_dataset,
+                        n_epochs,
+                        batch_size,
+                        lr,
+                        pin_memory,
+                        dataloader_num_workers,
+                    ),
+                    nprocs=world_size,
+                    join=True,
+                )
+            else:
+                run_tracked_distributed(
+                    self,
+                    lambda: self.ddp_train(
+                        _external_rank,
+                        world_size,
+                        train_dataset,
+                        test_dataset,
+                        n_epochs,
+                        batch_size,
+                        lr,
+                        pin_memory,
+                        dataloader_num_workers,
+                    ),
+                    wandb_config,
+                    rank=_external_rank,
+                    local_rank=_external_local_rank,
+                    model_family="atomic",
+                    train_dataset=train_dataset,
+                    validation_dataset=test_dataset,
+                    effective_batch_size=batch_size,
+                    world_size=world_size,
+                    initial_config=ddp_config,
+                    backend=_tracker_backend,
+                    event_directory=_tracker_event_directory,
+                    variant="external-ddp",
+                )
         else:
             # Run single-process training directly
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
-                rank=0,
-                world_size=world_size,
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    rank=0,
+                    world_size=world_size,
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    skip_compile=skip_compile,
+                ),
+                wandb_config,
+                model_family="atomic",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                skip_compile=skip_compile,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config={
+                    "training/epochs": n_epochs,
+                    "training/learning_rate_initial": lr,
+                    "training/random_seed": random_seed,
+                    "training/skip_compile": skip_compile,
+                },
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
 
         return

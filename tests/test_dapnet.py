@@ -104,18 +104,22 @@ def test_dapnet2_architecture():
     print(output)
     assert np.allclose(output[0], target_energies, atol=1e-6)
 
-@pytest.mark.skip("Models no longer available vi PyPI")
-def test_dapnet2_pretrained_hfadz():
+@pytest.mark.parametrize(
+    ("m1", "ref"),
+    [
+        ("B3LYP-D3/aug-cc-pVTZ/CP", np.array([4.76954738e-05, 4.76958230e-05])),
+    ],
+)
+def test_dapnet2_pretrained_error_estimators(m1, ref):
     qcel_mols = [mol3, mol3]
     v = apnet_pt.pretrained_models.dapnet2_model_predict(
         qcel_mols,
-        m1="HF/aug-cc-pVDZ/CP",
+        m1=m1,
         m2="CCSD(T)/CBS/CP",
         compile=False,
         use_GPU=False,
     )
     print(v)
-    ref = np.array([0.03997326, 0.03997326])
     assert np.allclose(v, ref, atol=1e-6), f"Expected {ref}, but got {v}"
 
 def main():

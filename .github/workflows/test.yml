@@ -32,16 +32,46 @@ jobs:
       run: |
         pip install -e . --no-deps
 
+    - name: Cache Hugging Face pretrained models
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/huggingface/hub
+        key: hf-pretrained-${{ runner.os }}-${{ hashFiles('.github/workflows/test.yml') }}
+        restore-keys: |
+          hf-pretrained-${{ runner.os }}-
+
     - name: Download pretrained models from Hugging Face
       shell: bash -l {0}
       run: |
         python - <<'PY'
+        import time
+
         from huggingface_hub import snapshot_download
 
-        snapshot_download(
-            repo_id="awallace3/qcmlforge",
-            allow_patterns=["am_ensemble/*", "ap2_ensemble/*"],
-        )
+        patterns = [
+            "am_ensemble/*",
+            "ap2_ensemble/*",
+            "dapnet2/B3LYP-D3aug-cc-pVTZCP_CCSD_LP_T_RP_CBSCP.pt",
+        ]
+
+        last_error = None
+        for attempt in range(1, 7):
+            try:
+                snapshot_download(
+                    repo_id="awallace3/qcmlforge",
+                    allow_patterns=patterns,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt == 6:
+                    raise
+                sleep_s = 30 * attempt
+                print(
+                    "Hugging Face model download failed "
+                    f"(attempt {attempt}/6): {exc!r}. Retrying in {sleep_s}s."
+                )
+                time.sleep(sleep_s)
         PY
     
     - name: Run tests

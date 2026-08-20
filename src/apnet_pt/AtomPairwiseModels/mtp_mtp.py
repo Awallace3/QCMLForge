@@ -20,6 +20,16 @@ from qcml_dftd3.d3 import d3, resolve_d3_damping_parameters
 
 from .. import constants
 from .. import model_io
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    stage_final_weights,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
+    tracked_ddp_worker,
+)
 from ..atomic_datasets import (
     AtomicDataLoader,
     atomic_collate_update,
@@ -129,6 +139,17 @@ FULL_EDGE_DIMER_EVAL_MODES = frozenset(
 # values for which a total/component loss split (``component_gamma``) is
 # meaningful: ``cliff_exch`` predicts a single component, and
 # ``cliff_classical_d3`` is inference-only.
+# Maps the short MAE-report term labels onto the tracker's metric names, so a
+# route's target columns, report header, and logged metric names are all derived
+# from one labelled selection instead of three parallel literals.
+TRACKER_METRIC_LABELS_BY_TERM = {
+    "Elst": "electrostatics",
+    "Exch": "exchange",
+    "Ind": "induction",
+    "Indu": "induction",
+    "Disp": "dispersion",
+}
+
 COMBINED_CLIFF_DIMER_EVAL_MODES = frozenset(
     {
         "cliff_classical",
@@ -4552,6 +4573,7 @@ class AM_DimerParam_Model:
     pre-computed and passed as input to the model.
 """
             )
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(
                 f"Loading pre-trained MTP-MTP {model_type} from {pre_trained_model_path}"
@@ -5595,9 +5617,11 @@ units angstrom
         if self.dimer_eval_type == "elst_damping":
             y_ind = 0
             term = _mae_report_header(("Elst",))
+            metric_labels = ("electrostatics",)
         elif self.dimer_eval_type in ["induced_dipole", "induced_dipole_param"]:
             y_ind = 2
             term = _mae_report_header(("Indu",))
+            metric_labels = ("induction",)
             self.dimer_model.polarizability_table = (
                 self.dimer_model.polarizability_table.to(self.device)
             )
@@ -5612,6 +5636,7 @@ units angstrom
             )
             y_ind = 1
             term = _mae_report_header(("Exch",))
+            metric_labels = ("exchange",)
         elif self.dimer_eval_type in [
             "elst_damping__induced_dipole",
             "ap3_elst_damping__induced_dipole",
@@ -5630,9 +5655,10 @@ units angstrom
             print(self.device)
             # The combined CLIFF routes add an exchange column between elst and
             # induction, matching the dataset's [Elst, Exch, Ind, Disp] layout
-            # so target slicing stays a plain column select.  Both the target
-            # index and the report header come from one labelled selection, so
-            # nothing downstream is specialized to a column count.
+            # so target slicing stays a plain column select.  The target index,
+            # the report header, and the tracker metric labels all come from one
+            # labelled selection, so nothing downstream is specialized to a
+            # column count and the three cannot drift apart.
             if self.dimer_eval_type in COMBINED_CLIFF_DIMER_EVAL_MODES:
                 target_columns = (0, 1, 2)
                 target_labels = ("Elst", "Exch", "Ind")
@@ -5641,6 +5667,9 @@ units angstrom
                 target_labels = ("Elst", "Ind")
             y_ind = torch.tensor(target_columns)
             term = _mae_report_header(target_labels)
+            metric_labels = tuple(
+                TRACKER_METRIC_LABELS_BY_TERM[label] for label in target_labels
+            )
             self.dimer_model.polarizability_table = (
                 self.dimer_model.polarizability_table.to(self.device)
             )
@@ -5720,6 +5749,8 @@ units angstrom
                     model_io.save_checkpoint(checkpoint, self.model_save_path)
                 self.model.to(rank_device)
 
+            dt = time.time() - t1
+            track_epoch_from_locals(self, locals(), metric_labels=metric_labels)
             if isinstance(y_ind, torch.Tensor):
                 mae_string = " ".join(
                     [
@@ -5748,6 +5779,11 @@ units angstrom
                 )
                 model_io.save_checkpoint(checkpoint, "nan_crash_model.pt")
                 break
+        # Publish the real final-epoch weights before restoring the best ones.
+        stage_final_weights(self)
+        # Restore into the existing module rather than rebinding self.model, so
+        # compiled wrappers and the DimerProp references below keep pointing at
+        # the live object.
         underlying_model = model_io.unwrap_model(self.model)
         underlying_model.load_state_dict(best_model.state_dict())
         underlying_model.to(rank_device)
@@ -5823,6 +5859,9 @@ units angstrom
         lr_decay=None,
         component_gamma=None,
         total_includes_d3=False,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         """Fit the parameter head.
 
@@ -5902,6 +5941,12 @@ units angstrom
 
         self.shuffle = shuffle
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+        }
         if world_size > 1:
             print("Running multi-process training", flush=True)
             raise NotImplementedError(
@@ -5910,15 +5955,27 @@ units angstrom
         else:
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    skip_compile=skip_compile,
+                ),
+                wandb_config,
+                model_family="parameter",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                skip_compile=skip_compile,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
         return
 
@@ -6218,6 +6275,7 @@ class AtomTypeParamModel:
     pre-computed and passed as input to the model.
 """
             )
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(f"Loading pre-trained MTP-MTP model from {pre_trained_model_path}")
             checkpoint = model_io.load_checkpoint(pre_trained_model_path)
@@ -6482,6 +6540,7 @@ class AtomTypeParamModel:
                 f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f}",
                 flush=True,
             )
+        track_pretraining_from_locals(self, locals())
         return test_loss
 
     def train_batches_single_proc(
@@ -6559,9 +6618,11 @@ class AtomTypeParamModel:
         total_vw_error = torch.tensor(
             total_vw_error, dtype=torch.float32, device=rank_device
         )
+        total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         # All-reduce across processes
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_hfvr_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_vw_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
@@ -6731,20 +6792,32 @@ class AtomTypeParamModel:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         criterion = torch.nn.MSELoss()
 
-        test_loss = self.pretrain_statistics(train_loader, test_loader, criterion)
+        with torch.no_grad():
+            train_loss, hfvr_MAE_t, vw_MAE_t = self.evaluate_batches(
+                rank, train_loader, criterion, rank_device
+            )
+            test_loss, hfvr_MAE_v, vw_MAE_v = self.evaluate_batches(
+                rank, test_loader, criterion, rank_device
+            )
+        if rank == 0:
+            print(
+                "  (Pre-training)  MAE: "
+                f"{hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} "
+                f"{vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f}",
+                flush=True,
+            )
+        track_pretraining_from_locals(self, locals())
 
         lowest_test_loss = test_loss
 
         for epoch in range(n_epochs):
             t1 = time.time()
             test_lowered = False
-            train_loss, charge_MAE_t, dipole_MAE_t, qpole_MAE_t, hfvr_MAE_t = (
-                self.train_batches(
-                    rank, train_loader, criterion, optimizer, rank_device
-                )
+            train_loss, hfvr_MAE_t, vw_MAE_t = self.train_batches(
+                rank, train_loader, criterion, optimizer, rank_device
             )
-            test_loss, charge_MAE_v, dipole_MAE_v, qpole_MAE_v, hfvr_MAE_v = (
-                self.evaluate_batches(rank, test_loader, criterion, rank_device)
+            test_loss, hfvr_MAE_v, vw_MAE_v = self.evaluate_batches(
+                rank, test_loader, criterion, rank_device
             )
 
             if rank == 0:
@@ -6766,10 +6839,11 @@ class AtomTypeParamModel:
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 # if (world_size==1 or rank == 0):
                 print(
-                    f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {test_lowered}",
+                    f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f} {test_lowered}",
                     flush=True,
                 )
         if world_size > 1:
@@ -6835,6 +6909,7 @@ class AtomTypeParamModel:
             f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f}",
             flush=True,
         )
+        track_pretraining_from_locals(self, locals())
         for epoch in range(n_epochs):
             t1 = time.time()
             test_lowered = False
@@ -6869,6 +6944,7 @@ class AtomTypeParamModel:
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f} {test_lowered}",
@@ -6897,6 +6973,9 @@ class AtomTypeParamModel:
         world_size=1,  # Default to 1 for single-core operation
         omp_num_threads_per_process=None,
         random_seed=42,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         self.model_save_path = model_path
         if self.model_save_path is not None:
@@ -6944,13 +7023,28 @@ class AtomTypeParamModel:
             torch.jit.enable_onednn_fusion(True)
             torch.autograd.set_detect_anomaly(False)
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+        }
         if world_size > 1:
             # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="parameter",
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -6967,17 +7061,34 @@ class AtomTypeParamModel:
             # Run single-process training directly
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
-                rank=0,
-                world_size=world_size,
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    rank=0,
+                    world_size=world_size,
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    skip_compile=skip_compile,
+                ),
+                wandb_config,
+                model_family="parameter",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                skip_compile=skip_compile,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config={
+                    "training/epochs": n_epochs,
+                    "training/learning_rate_initial": lr,
+                    "training/random_seed": random_seed,
+                    "training/skip_compile": skip_compile,
+                },
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
 
         return

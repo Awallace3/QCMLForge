@@ -24,6 +24,17 @@ from ..pt_datasets.ap3_fused_fsapt_ds import (
 from .. import constants
 from ..hf_pretrained import resolve_pretrained_path
 from .. import model_io
+from ..distributed_metrics import globally_reduced_mae
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    stage_final_weights,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
+    tracked_ddp_worker,
+)
 from ..util import scatter_sum_compile
 import os
 import torch.distributed as dist
@@ -32,6 +43,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import qcelemental as qcel
 from importlib import resources
 from copy import deepcopy
+
 from apnet_pt.torch_util import set_weights_to_value
 from qcml_dftd3.d3 import resolve_d3_damping_parameters
 from .mtp_mtp import (
@@ -41,6 +53,13 @@ from .mtp_mtp import (
     isolate_atom_parameter_predictions_ap3,
     load_dimer_prop_from_checkpoint,
 )
+
+
+def _omitted_metrics(harness) -> tuple[str, ...]:
+    """Names in the standard metric set that this model does not predict."""
+
+    model = model_io.unwrap_model(harness.model)
+    return ("dispersion",) if getattr(model, "no_disp_nn", False) else ()
 
 
 def inverse_time_decay(step, initial_lr, decay_steps, decay_rate, staircase=True):
@@ -835,6 +854,7 @@ class APNet3D3_AtomType_Model:
 """
             )
         self.use_precomputed_classical = use_precomputed_classical
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(
                 f"Loading pre-trained APNet3D3_AtomType_MPNN model from {pre_trained_model_path}"
@@ -2621,33 +2641,25 @@ units angstrom
             indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
             if not self.model.no_disp_nn:
                 disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-            count += preds.numel()
+            count += preds.shape[0]
         if scheduler is not None:
             scheduler.step()
 
         total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
-        total_error = torch.tensor(total_error, dtype=torch.float32, device=rank_device)
-        elst_error = torch.tensor(elst_error, dtype=torch.float32, device=rank_device)
-        exch_error = torch.tensor(exch_error, dtype=torch.float32, device=rank_device)
-        indu_error = torch.tensor(indu_error, dtype=torch.float32, device=rank_device)
-        disp_error = torch.tensor(disp_error, dtype=torch.float32, device=rank_device)
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
-        total_MAE_t = (total_error / count).cpu()
-        elst_MAE_t = (elst_error / count).cpu()
-        exch_MAE_t = (exch_error / count).cpu()
-        indu_MAE_t = (indu_error / count).cpu()
-        disp_MAE_t = (
-            torch.tensor(0.0) if self.model.no_disp_nn else (disp_error / count).cpu()
+        (
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+        ) = globally_reduced_mae(
+            (total_error, elst_error, exch_error, indu_error, disp_error),
+            count,
+            device=rank_device,
         )
+        if self.model.no_disp_nn:
+            disp_MAE_t = 0.0
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     # @torch.inference_mode()
@@ -2690,31 +2702,23 @@ units angstrom
                 indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
                 if not self.model.no_disp_nn:
                     disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-                count += preds.numel()
+                count += preds.shape[0]
 
         total_loss = torch.tensor(total_loss, device=rank_device)
-        total_error = torch.tensor(total_error, device=rank_device)
-        elst_error = torch.tensor(elst_error, device=rank_device)
-        exch_error = torch.tensor(exch_error, device=rank_device)
-        indu_error = torch.tensor(indu_error, device=rank_device)
-        disp_error = torch.tensor(disp_error, device=rank_device)
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
-        total_MAE_t = (total_error / count).cpu()
-        elst_MAE_t = (elst_error / count).cpu()
-        exch_MAE_t = (exch_error / count).cpu()
-        indu_MAE_t = (indu_error / count).cpu()
-        disp_MAE_t = (
-            torch.tensor(0.0) if self.model.no_disp_nn else (disp_error / count).cpu()
+        (
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+        ) = globally_reduced_mae(
+            (total_error, elst_error, exch_error, indu_error, disp_error),
+            count,
+            device=rank_device,
         )
+        if self.model.no_disp_nn:
+            disp_MAE_t = 0.0
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     def ddp_train(
@@ -2866,6 +2870,9 @@ units angstrom
                         f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                         flush=True,
                     )
+        track_pretraining_from_locals(
+            self, locals(), exclude=_omitted_metrics(self)
+        )
         model_saved = False
         for epoch in range(n_epochs):
             t1 = time.time()
@@ -2905,6 +2912,9 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(
+                    self, locals(), exclude=_omitted_metrics(self)
+                )
                 test_loss = 0.0
                 if self.model.no_disp_nn:
                     print(
@@ -3115,6 +3125,9 @@ units angstrom
                     total_MAE_t: > 7.3f}/{total_MAE_v: < 7.3f}",
                 flush=True,
             )
+        track_pretraining_from_locals(
+            self, locals(), exclude=_omitted_metrics(self)
+        )
 
         # (6) Main training loop
         lowest_test_loss = test_loss
@@ -3174,6 +3187,8 @@ units angstrom
                     model_saved = True
                 self.model.to(rank_device)
 
+            dt = time.time() - t1
+            track_epoch_from_locals(self, locals(), exclude=_omitted_metrics(self))
             if is_fsapt or not transfer_learning:
                 if self.model.no_disp_nn:
                     print(
@@ -3214,6 +3229,8 @@ units angstrom
             cpu_model = model_io.unwrap_model(self.model).to("cpu")
             best_model = deepcopy(cpu_model)
             self.model.to(rank_device)
+        # Publish the real final-epoch weights before restoring the best ones.
+        stage_final_weights(self)
         self.model = best_model
         self.model.to(rank_device)
         return
@@ -3235,6 +3252,9 @@ units angstrom
         skip_compile=True,
         transfer_learning=False,
         include_total_mse=False,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         """
         hyperparameters match the defaults in the original code:
@@ -3311,12 +3331,31 @@ units angstrom
             self.dimer_prop_model.set_forward("ap3_atomMPNN")
             self.dimer_prop_model.to(self.device)
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/learning_rate_decay": lr_decay,
+            "training/learning_rate_final": end_lr,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+            "training/transfer_learning": transfer_learning,
+            "training/include_total_mse": include_total_mse,
+        }
         if world_size > 1:
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="pairwise",
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -3335,19 +3374,31 @@ units angstrom
         else:
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    lr_decay=lr_decay,
+                    end_lr=end_lr,
+                    skip_compile=skip_compile,
+                    transfer_learning=transfer_learning,
+                    include_total_mse=include_total_mse,
+                ),
+                wandb_config,
+                model_family="pairwise",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                lr_decay=lr_decay,
-                end_lr=end_lr,
-                skip_compile=skip_compile,
-                transfer_learning=transfer_learning,
-                include_total_mse=include_total_mse,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
         return
 

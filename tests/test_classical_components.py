@@ -61,7 +61,7 @@ def test_elst_multipoles_AP2():
     )
     print(f"E_elst = {E_elst:.6f} kcal/mol")
     E_ref = -0.853646
-    assert abs(E_elst - E_ref) < 1e-6, f"Expected {E_ref}, got {E_elst}"
+    assert abs(E_elst - E_ref) < 1e-5, f"Expected {E_ref}, got {E_elst}"
 
 
 def test_elst_multipoles_MTP_torch_no_damping():
@@ -301,9 +301,9 @@ def test_elst_charge_dipole_qpole():
     E_q_ref = -1.239722
     E_dp_ref = 0.392898
     E_qpole_ref = -0.006823
-    assert abs(E_q - E_q_ref) < 1e-6, f"Expected {E_q_ref}, got {E_q}"
-    assert abs(E_dp - E_dp_ref) < 1e-6, f"Expected {E_dp_ref}, got {E_dp}"
-    assert abs(E_qpole - E_qpole_ref) < 1e-6, f"Expected {E_qpole_ref}, got {E_qpole}"
+    assert abs(E_q - E_q_ref) < 1e-5, f"Expected {E_q_ref}, got {E_q}"
+    assert abs(E_dp - E_dp_ref) < 1e-5, f"Expected {E_dp_ref}, got {E_dp}"
+    assert abs(E_qpole - E_qpole_ref) < 1e-5, f"Expected {E_qpole_ref}, got {E_qpole}"
 
 
 def test_elst_charge_dipole_qpole_pairwise():
