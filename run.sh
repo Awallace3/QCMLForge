@@ -16,7 +16,10 @@ N_EMBED="${N_EMBED:-8}"
 SPEC_TYPE_AP="${SPEC_TYPE_AP:-2}"
 DS_IN_MEMORY="${DS_IN_MEMORY:-True}"
 WORLD_SIZE_DDP="${WORLD_SIZE_DDP:-1}"
-OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
+# Deliberately not named OMP_NUM_THREADS: batch schedulers routinely export
+# that standard OpenMP variable (e.g. SLURM sets it from --cpus-per-task),
+# which would silently override the default below.
+TRAIN_OMP_NUM_THREADS="${TRAIN_OMP_NUM_THREADS:-16}"
 RACKERS_MODEL_OUT="${RACKERS_MODEL_OUT:-${MODEL_DIR}/rackers_thole_${ITER}.pt}"
 RACKERS_OVERLAP_MODEL_OUT="${RACKERS_OVERLAP_MODEL_OUT:-${MODEL_DIR}/rackers_thole_overlap_${ITER}.pt}"
 
@@ -65,7 +68,7 @@ fi
 
 COMMON_ARGS+=(
     --world_size_ddp "${WORLD_SIZE_DDP}"
-    --omp_num_threads "${OMP_NUM_THREADS}"
+    --omp_num_threads "${TRAIN_OMP_NUM_THREADS}"
 )
 
 "${PYTHON}" -u ./train_models.py \

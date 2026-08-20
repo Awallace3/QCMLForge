@@ -11,6 +11,7 @@ import train_models
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+RUN_SCRIPT = REPO_ROOT / "run.sh"
 PUBLIC_VARIABLES = (
     "PYTHON",
     "ITER",
@@ -27,7 +28,7 @@ PUBLIC_VARIABLES = (
     "SPEC_TYPE_AP",
     "DS_IN_MEMORY",
     "WORLD_SIZE_DDP",
-    "OMP_NUM_THREADS",
+    "TRAIN_OMP_NUM_THREADS",
     "RACKERS_MODEL_OUT",
     "RACKERS_OVERLAP_MODEL_OUT",
 )
@@ -63,9 +64,14 @@ def _run_script(tmp_path: Path, overrides: dict[str, str]) -> list[list[str]]:
     env.update({"PYTHON": str(recorder), "CALL_LOG": str(call_log)})
     env.update(overrides)
 
+    # Run from a scratch directory so that the script's relative default
+    # MODEL_DIR (and its `mkdir -p`) never touches the repository tree, while
+    # the recorded argv still contains the literal default path strings.
+    workdir = tmp_path / "workdir"
+    workdir.mkdir(exist_ok=True)
     subprocess.run(
-        ["bash", "run.sh"],
-        cwd=REPO_ROOT,
+        ["bash", str(RUN_SCRIPT)],
+        cwd=workdir,
         env=env,
         check=True,
     )
@@ -164,7 +170,7 @@ def test_run_script_uses_overrides_for_two_sequential_commands(tmp_path):
         "SPEC_TYPE_AP": "test-spec",
         "DS_IN_MEMORY": "False",
         "WORLD_SIZE_DDP": "1",
-        "OMP_NUM_THREADS": "19",
+        "TRAIN_OMP_NUM_THREADS": "19",
         "RACKERS_MODEL_OUT": str(tmp_path / "pure model.pt"),
         "RACKERS_OVERLAP_MODEL_OUT": str(tmp_path / "overlap model.pt"),
     }
@@ -183,7 +189,7 @@ def test_run_script_uses_overrides_for_two_sequential_commands(tmp_path):
         "learning_rate": values["LEARNING_RATE"],
         "ds_in_memory": None,
         "world_size_ddp": values["WORLD_SIZE_DDP"],
-        "omp_num_threads": values["OMP_NUM_THREADS"],
+        "omp_num_threads": values["TRAIN_OMP_NUM_THREADS"],
     }
     assert calls == [
         _expected_command(
@@ -251,9 +257,11 @@ def test_invalid_world_size_fails_before_invocation(tmp_path):
         }
     )
 
+    workdir = tmp_path / "workdir"
+    workdir.mkdir(exist_ok=True)
     result = subprocess.run(
-        ["bash", "run.sh"],
-        cwd=REPO_ROOT,
+        ["bash", str(RUN_SCRIPT)],
+        cwd=workdir,
         env=env,
         text=True,
         capture_output=True,
@@ -280,9 +288,11 @@ def test_invalid_ds_in_memory_fails_before_invocation(tmp_path):
         }
     )
 
+    workdir = tmp_path / "workdir"
+    workdir.mkdir(exist_ok=True)
     result = subprocess.run(
-        ["bash", "run.sh"],
-        cwd=REPO_ROOT,
+        ["bash", str(RUN_SCRIPT)],
+        cwd=workdir,
         env=env,
         text=True,
         capture_output=True,
@@ -329,3 +339,6 @@ def test_run_script_defaults(tmp_path):
         for call in calls
         for forbidden in FORBIDDEN_ARGUMENTS
     )
+    # The default MODEL_DIR is relative, so it must be created under the
+    # scratch working directory rather than inside the repository.
+    assert (tmp_path / "workdir" / "models" / "ap3_saptpbe0" / "1").is_dir()

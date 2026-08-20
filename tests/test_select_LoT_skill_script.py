@@ -48,6 +48,15 @@ def _check_df_shape_and_cols(df, n_expected_rows, label):
     assert df["ESTIMATED CPU TIMES (log10(s))"].dtype == np.float64, (
         f"dtype mismatch for {label}"
     )
+    # dtype checks alone pass when every prediction is NaN, which happens when
+    # the dAPNet2 call or the timing fit lookup fails outright. Individual
+    # level-of-theory rows are still allowed to be NaN.
+    assert np.isfinite(df["ERROR ESTIMATES (kcal/mol)"]).any(), (
+        f"All error estimates are non-finite for {label}"
+    )
+    assert np.isfinite(df["ESTIMATED CPU TIMES (log10(s))"]).any(), (
+        f"All timing estimates are non-finite for {label}"
+    )
     # mask = df["Level of Theory"] == "B3LYP-D3/aug-cc-pVTZ/unCP"
     # if mask.any():
     #     assert df.loc[mask, "ERROR ESTIMATES (kcal/mol)"].notna().all(), (
