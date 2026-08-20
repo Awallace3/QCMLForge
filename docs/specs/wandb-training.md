@@ -597,7 +597,7 @@ Each `.train()` method:
 
 - `src/apnet_pt/training_tracking.py`
 - `tests/test_training_tracking.py`
-- `docs/training-with-wandb.md`
+- `docs/wandb.md`
 
 ### Modified files
 
