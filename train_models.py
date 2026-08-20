@@ -71,6 +71,26 @@ def _cliff_parameter_contract(apnet_model_type):
     )
 
 
+def str2bool(value):
+    """Parse a boolean CLI value.
+
+    ``type=bool`` is a trap for argparse: it applies ``bool()`` to the raw
+    string, so ``--flag False`` evaluates to ``True`` and the only way to get
+    ``False`` is to omit the flag entirely.  This accepts the spellings a shell
+    launcher is likely to pass and rejects anything ambiguous.
+    """
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in ("true", "t", "yes", "y", "1"):
+        return True
+    if normalized in ("false", "f", "no", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected a boolean value, got {value!r}"
+    )
+
+
 def maybe_skip_training_after_dataset_setup(model_name, dataset, build_dataset_only):
     """Print dataset info and optionally stop after dataset construction."""
     print(dataset)
@@ -311,6 +331,7 @@ def train_pairwise_model(
     dimer_eval_type="elst_damping",
     elst_damping_type="CLIFF",
     ds_in_memory=False,
+    ds_max_size=None,
     ds_class_type="pt",
     DimerProp_model_type="AtomTypeParamNN",
     ap2_pretrained_model_only=None,
@@ -359,6 +380,7 @@ def train_pairwise_model(
         dimer_eval_type (str): Evaluation mode for dimer models (e.g., "elst_damping", "elst_damping__induced_dipole").
         elst_damping_type (str): Electrostatic damping variant for dimer prop models (e.g., "CLIFF", "AMOEBA").
         ds_in_memory (bool): Whether datasets should be loaded entirely into memory for applicable model types.
+        ds_max_size (int or None): Truncate the pairwise dataset to N datapoints. Useful for small smoke-test runs; None uses the full dataset.
         ds_class_type (str): Dataset class/storage type identifier (e.g., "pt").
         DimerProp_model_type (str): Dimer property model type name used when constructing AM-DimerParam models.
         ap2_pretrained_model_only (str or None): If provided for APNet3-fused variants, load AP2 weights from this path into the APNet.
@@ -587,6 +609,7 @@ def train_pairwise_model(
             ds_prebatched=False,
             ds_random_seed=random_seed,
             ds_in_memory=ds_in_memory,
+            ds_max_size=ds_max_size,
             param_start_mean=param_start_mean,
             param_start_std=param_start_std,
             elst_damping_type=elst_damping_type,
@@ -1175,9 +1198,12 @@ def main():
     )
     args.add_argument(
         "--ds_in_memory",
-        type=bool,
+        type=str2bool,
         default=False,
-        help="Load dataset in memory (default: False).",
+        help=(
+            "Load dataset in memory (default: False). Accepts "
+            "true/false/yes/no/1/0."
+        ),
     )
     args.add_argument(
         "--use_precomputed_classical",
@@ -1440,6 +1466,7 @@ def main():
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
+            ds_max_size=args.ds_max_size,
             component_gamma=args.component_gamma,
             total_includes_d3=args.total_includes_d3,
             omp_num_threads=(
