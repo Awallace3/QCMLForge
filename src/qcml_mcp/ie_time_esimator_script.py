@@ -185,7 +185,7 @@ def build_inference_table(
     cp_str = "/unCP"
 
     if cp:
-        # print("Warning: using un-counterpoise corrected models for counterpoise corrected timing predictions")
+        print("Warning: using un-counterpoise corrected models for counterpoise corrected timing predictions")
         cp_str = "/CP"
 
     lotr_strings = [m + "/" + b + cp_str for b in bases for m in methods] # pretty sure everything I ran was not CP-corrected
@@ -400,11 +400,13 @@ def main(
 
     df2 = build_inference_table(df1, methods, bases, using_cp)
 
+
     predict_ie_errors_batch(df2)
     predict_timings_batch(df2)
     pd.set_option("display.max_rows", None)
     pd.set_option("display.max_columns", None)
     pp(df2)
+    # pp(df2.iloc[80:99])
 
     return df2
 

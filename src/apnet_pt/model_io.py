@@ -55,9 +55,18 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     nn.Module
         The unwrapped model
     """
-    if hasattr(model, "module"):
-        return model.module
-    return model
+    seen = set()
+    while True:
+        model_id = id(model)
+        if model_id in seen:
+            raise ValueError("Cycle detected while unwrapping model")
+        seen.add(model_id)
+        if hasattr(model, "module"):
+            model = model.module
+        elif hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        else:
+            return model
 
 
 def strip_prefix_from_state_dict(

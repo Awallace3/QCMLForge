@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import time
@@ -10,6 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.data import Data
 
@@ -56,6 +58,21 @@ from ..pt_datasets.ap2_fused_ds import (
 from ..util import scatter_sum_compile
 
 max_Z = 118
+
+RACKERS_PARAMETER_NAMES = (
+    "elst",
+    "thole_direct",
+    "thole_mutual",
+    "ind_overlap",
+)
+RACKERS_INITIAL_VALUES = (1.8, 0.34, 0.39, 1.8)
+RACKERS_INITIAL_STDS = (0.01, 0.01, 0.01, 0.01)
+RACKERS_POSITIVITY_EPSILON = 1e-8
+
+RACKERS_ELST_INDEX = 0
+RACKERS_THOLE_DIRECT_INDEX = 1
+RACKERS_THOLE_MUTUAL_INDEX = 2
+RACKERS_IND_OVERLAP_INDEX = 3
 
 
 def _polarizability_table_on_device(
@@ -138,12 +155,20 @@ class DimerProp(nn.Module):
                 - "induced_dipole": compute induction via induced dipoles (_indu_induced_dipole_forward)
                 - "induced_dipole_param": induction using parameterized polarizabilities (_indu_induced_dipole_param_forward)
                 - "elst_damping__induced_dipole": combined damped electrostatics and induction (_elst_damping_indu_induced_dipole_forward)
+                - "rackers_thole": combined Rackers electrostatics and pure
+                  induced-point-dipole induction (_rackers_thole_forward)
+                - "rackers_thole_overlap": combined Rackers electrostatics and
+                  overlap-augmented induction (_rackers_thole_overlap_forward)
                 - "ap3_elst_damping__induced_dipole": AP3-specific damped electrostatics plus induction (_ap3_elst_damping_indu_induced_dipole_forward)
                 - "ap3_atomMPNN": return AP3 atom multipole parameters only (_ap3_atomMPNN)
 
         Notes:
             - This method sets self.forward to the corresponding internal forward implementation.
-            - For modes that compute induction ("induced_dipole", "induced_dipole_param", and the combined induction modes), this method also clones the global polarizability table into self.polarizability_table.
+            - Induction modes clone the global polarizability table into
+              self.polarizability_table. Both Rackers modes scale
+              polarizabilities with Hirshfeld volume ratios; only
+              "rackers_thole_overlap" uses valence widths in its energy
+              expression.
             - Raises ValueError if dimer_eval is not one of the accepted mode strings.
         """
         if dimer_eval == "elst_damping":
@@ -161,6 +186,12 @@ class DimerProp(nn.Module):
         elif dimer_eval == "elst_damping__induced_dipole":
             self.forward = self._elst_damping_indu_induced_dipole_forward
             self.polarizability_table = constants.polarizability_table.clone()
+        elif dimer_eval == "rackers_thole":
+            self.forward = self._rackers_thole_forward
+            self.polarizability_table = constants.polarizability_table.clone()
+        elif dimer_eval == "rackers_thole_overlap":
+            self.forward = self._rackers_thole_overlap_forward
+            self.polarizability_table = constants.polarizability_table.clone()
         elif dimer_eval == "ap3_elst_damping__induced_dipole":
             self.forward = self._ap3_elst_damping_indu_induced_dipole_forward
             self.polarizability_table = constants.polarizability_table.clone()
@@ -173,6 +204,84 @@ class DimerProp(nn.Module):
             self.forward = self._ap3_atomMPNN
         else:
             raise ValueError(f"Unknown dimer_eval: {dimer_eval}")
+
+    def _rackers_thole_forward(self, batch):
+        return self._rackers_thole_common_forward(
+            batch, include_overlap=False
+        )
+
+    def _rackers_thole_overlap_forward(self, batch):
+        return self._rackers_thole_common_forward(
+            batch, include_overlap=True
+        )
+
+    def _rackers_thole_common_forward(self, batch, include_overlap):
+        output_A = self.AtomTypeParam(batch.batch_atomic_A)
+        output_B = self.AtomTypeParam(batch.batch_atomic_B)
+        parameters_A = output_A[-1]
+        parameters_B = output_B[-1]
+        hfvr_A = torch.abs(output_A[-2][:, 0])
+        hfvr_B = torch.abs(output_B[-2][:, 0])
+        valence_widths_A = output_A[-2][:, 1]
+        valence_widths_B = output_B[-2][:, 1]
+
+        if self.elst_damping_type == "AMOEBA":
+            damping_fn = mtp_elst_damping_AMOEBA
+        elif self.elst_damping_type == "CLIFF":
+            damping_fn = mtp_elst_damping
+        else:
+            raise ValueError(
+                "Unsupported elst_damping_type: "
+                f"{self.elst_damping_type}"
+            )
+
+        Elst = damping_fn(
+            ZA=batch.ZA,
+            RA=batch.RA,
+            qA_0=output_A[0].clone(),
+            muA=output_A[1],
+            quadA=output_A[2],
+            Ka=parameters_A[:, RACKERS_ELST_INDEX],
+            ZB=batch.ZB,
+            RB=batch.RB,
+            qB_0=output_B[0].clone(),
+            muB=output_B[1],
+            quadB=output_B[2],
+            Kb=parameters_B[:, RACKERS_ELST_INDEX],
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
+        )
+        Indu = rackers_thole_induction(
+            ZA=batch.ZA,
+            RA=batch.RA,
+            qA=output_A[0],
+            muA=output_A[1],
+            quadA=output_A[2],
+            ZB=batch.ZB,
+            RB=batch.RB,
+            qB=output_B[0],
+            muB=output_B[1],
+            quadB=output_B[2],
+            e_AB_source=batch.e_ABfull_source,
+            e_AB_target=batch.e_ABfull_target,
+            e_AA_source=batch.e_AA_source,
+            e_BB_source=batch.e_BB_source,
+            e_AA_target=batch.e_AA_target,
+            e_BB_target=batch.e_BB_target,
+            hirshfeld_volume_ratio_A=hfvr_A,
+            hirshfeld_volume_ratio_B=hfvr_B,
+            valence_widths_A=valence_widths_A,
+            valence_widths_B=valence_widths_B,
+            thole_direct_A=parameters_A[:, RACKERS_THOLE_DIRECT_INDEX],
+            thole_direct_B=parameters_B[:, RACKERS_THOLE_DIRECT_INDEX],
+            thole_mutual_A=parameters_A[:, RACKERS_THOLE_MUTUAL_INDEX],
+            thole_mutual_B=parameters_B[:, RACKERS_THOLE_MUTUAL_INDEX],
+            ind_overlap_A=parameters_A[:, RACKERS_IND_OVERLAP_INDEX],
+            ind_overlap_B=parameters_B[:, RACKERS_IND_OVERLAP_INDEX],
+            include_overlap=include_overlap,
+            polarizability_table=self.polarizability_table,
+        )
+        return torch.vstack((Elst, Indu)).T, output_A, output_B
 
     def get_config(self) -> dict:
         """
@@ -1029,12 +1138,230 @@ class AtomTypeParamNN(nn.Module):
         )
 
 
+def _serialize_nested_atom_model(model: nn.Module) -> dict:
+    if type(model) is AtomMPNN:
+        return {
+            "model_type": "AtomMPNN",
+            "config": model.get_config(),
+        }
+    if type(model) is AtomTypeParamNN:
+        return {
+            "model_type": "AtomTypeParamNN",
+            "config": model.get_config(),
+            "atom_model": _serialize_nested_atom_model(model.atom_model),
+        }
+    raise ValueError(
+        "Unsupported nested atom model type: "
+        f"{type(model).__name__}"
+    )
+
+
+def _rebuild_nested_atom_model(
+    metadata: dict,
+    freeze_atom_model: bool,
+) -> nn.Module:
+    if not isinstance(metadata, dict):
+        raise ValueError("nested_atom_model metadata must be a dictionary")
+    model_type = metadata.get("model_type")
+    config = metadata.get("config")
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"Nested {model_type!r} metadata must contain a config dictionary"
+        )
+    if model_type == "AtomMPNN":
+        return AtomMPNN(**config)
+    if model_type == "AtomTypeParamNN":
+        if "atom_model" not in metadata:
+            raise ValueError(
+                "Nested AtomTypeParamNN metadata must contain atom_model"
+            )
+        atom_model = _rebuild_nested_atom_model(
+            metadata["atom_model"], freeze_atom_model
+        )
+        return AtomTypeParamNN(
+            atom_model=atom_model,
+            freeze_atom_model=freeze_atom_model,
+            **config,
+        )
+    raise ValueError(f"Unsupported nested atom model type: {model_type!r}")
+
+
+def _inverse_softplus(value: float) -> float:
+    """Return inverse softplus without overflowing for large finite inputs."""
+    if value > 20.0:
+        return value + math.log1p(-math.exp(-value))
+    return math.log(math.expm1(value))
+
+
+def _validate_rackers_initialization(
+    param_start_mean,
+    param_start_std,
+    positivity_epsilon,
+) -> tuple[list[float], list[float], float, list[float]]:
+    """Validate and normalize the Rackers positive-parameter initialization."""
+    if not isinstance(param_start_mean, (list, tuple)) or len(
+        param_start_mean
+    ) != 4:
+        raise ValueError("param_start_mean must contain exactly four values")
+    if not isinstance(param_start_std, (list, tuple)) or len(
+        param_start_std
+    ) != 4:
+        raise ValueError("param_start_std must contain exactly four values")
+
+    try:
+        epsilon = float(positivity_epsilon)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "positivity_epsilon must be finite and strictly greater than zero"
+        ) from exc
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError(
+            "positivity_epsilon must be finite and strictly greater than zero"
+        )
+
+    try:
+        positive_means = [float(value) for value in param_start_mean]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "param_start_mean values must be finite and strictly greater than "
+            "positivity_epsilon"
+        ) from exc
+    if any(
+        not math.isfinite(value) or value <= epsilon
+        for value in positive_means
+    ):
+        raise ValueError(
+            "param_start_mean values must be finite and strictly greater than "
+            "positivity_epsilon"
+        )
+
+    try:
+        raw_stds = [float(value) for value in param_start_std]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "param_start_std values must be finite and greater than or equal "
+            "to zero"
+        ) from exc
+    if any(not math.isfinite(value) or value < 0.0 for value in raw_stds):
+        raise ValueError(
+            "param_start_std values must be finite and greater than or equal "
+            "to zero"
+        )
+
+    raw_means = [
+        _inverse_softplus(value - epsilon) for value in positive_means
+    ]
+    embedding_dtype = torch.get_default_dtype()
+    embedding_limit = torch.finfo(embedding_dtype).max
+    if any(
+        not math.isfinite(value) or abs(value) > embedding_limit
+        for value in raw_means
+    ):
+        raise ValueError(
+            "transformed param_start_mean values must be finite and "
+            f"representable in the {embedding_dtype} embedding dtype"
+        )
+    if any(value > embedding_limit for value in raw_stds):
+        raise ValueError(
+            "param_start_std values must be representable in the "
+            f"{embedding_dtype} embedding dtype"
+        )
+
+    return positive_means, raw_stds, epsilon, raw_means
+
+
+class RackersTholeDampingNN(AtomTypeParamNN):
+    def __init__(
+        self,
+        atom_model: AtomTypeParamNN,
+        n_message: int = 3,
+        n_neuron: int = 128,
+        n_embed: int = 8,
+        param_start_mean: tuple[
+            float, float, float, float
+        ] = RACKERS_INITIAL_VALUES,
+        param_start_std: tuple[
+            float, float, float, float
+        ] = RACKERS_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        freeze_atom_model: bool = True,
+    ):
+        if type(atom_model) is not AtomTypeParamNN:
+            raise ValueError("atom_model must be an AtomTypeParamNN")
+        positive_means, raw_stds, positivity_epsilon, raw_means = (
+            _validate_rackers_initialization(
+                param_start_mean,
+                param_start_std,
+                positivity_epsilon,
+            )
+        )
+        super().__init__(
+            atom_model=atom_model,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=raw_means,
+            param_start_std=raw_stds,
+            n_params=4,
+            freeze_atom_model=freeze_atom_model,
+        )
+        if any(
+            not torch.isfinite(layer.weight).all().item()
+            for layer in self.guess_layer
+        ):
+            raise ValueError(
+                "Rackers embedding initialization produced non-finite parameters"
+            )
+        self.raw_param_start_mean = raw_means
+        self.param_start_mean = positive_means
+        self.param_start_std = raw_stds
+        self.positivity_epsilon = positivity_epsilon
+        self.atom_model.requires_grad_(not freeze_atom_model)
+
+    def forward(self, batch):
+        output = super().forward(batch)
+        raw_parameters = output[-1]
+        parameters = F.softplus(raw_parameters) + self.positivity_epsilon
+        return (*output[:-1], parameters)
+
+    def get_config(self) -> dict:
+        return {
+            "model_type": "RackersTholeDampingNN",
+            "parameter_names": list(RACKERS_PARAMETER_NAMES),
+            "param_start_mean": list(self.param_start_mean),
+            "param_start_std": list(self.param_start_std),
+            "positivity_epsilon": self.positivity_epsilon,
+            "n_message": self.n_message,
+            "n_neuron": self.n_neuron,
+            "n_embed": self.n_embed,
+            "nested_atom_model": _serialize_nested_atom_model(
+                self.atom_model
+            ),
+        }
+
+
 def get_distances(RA, RB, e_source, e_target):
     RA_source = RA.index_select(0, e_source)
     RB_target = RB.index_select(0, e_target)
     dR_xyz = RB_target - RA_source
     dR = torch.sqrt(torch.sum(dR_xyz * dR_xyz, dim=-1).clamp_min(1e-10))
     return dR, dR_xyz
+
+
+def geometric_mean_edge_values(
+    source_values: torch.Tensor,
+    target_values: torch.Tensor,
+    e_source: torch.Tensor,
+    e_target: torch.Tensor,
+) -> torch.Tensor:
+    if not torch.isfinite(source_values).all():
+        raise ValueError("source per-atom values must be finite")
+    if not torch.isfinite(target_values).all():
+        raise ValueError("target per-atom values must be finite")
+
+    source_edge_values = source_values.index_select(0, e_source)
+    target_edge_values = target_values.index_select(0, e_target)
+    return torch.sqrt(source_edge_values * target_edge_values)
 
 
 # @torch.compile
@@ -1703,6 +2030,459 @@ def distance_tensors(
     )
     T2 = torch.einsum("x,xyz->xyz", oodR**5, T2)
     return dR, dR_xyz, oodR, T1, T2
+
+
+def _rackers_distance_tensors(
+    Ri: torch.Tensor,
+    Rj: torch.Tensor,
+    e_source: torch.Tensor,
+    e_target: torch.Tensor,
+    alpha_i: torch.Tensor,
+    alpha_j: torch.Tensor,
+    thole_edge_values: torch.Tensor,
+    damping_type: str,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Build direct or mutual Thole tensors from edge damping values."""
+    dR_ang, dR_xyz_ang = get_distances(Ri, Rj, e_source, e_target)
+    dR_xyz = dR_xyz_ang / constants.au2ang
+    dR = dR_ang / constants.au2ang
+    alpha_source = alpha_i.index_select(0, e_source)
+    alpha_target = alpha_j.index_select(0, e_target)
+
+    if damping_type == "direct":
+        _, lam_3, lam_5 = thole_damping_direct_torch(
+            dR,
+            alpha_source,
+            alpha_target,
+            thole_edge_values,
+        )
+    elif damping_type == "mutual":
+        _, lam_3, lam_5 = thole_damping_mutual_torch(
+            dR,
+            alpha_source,
+            alpha_target,
+            thole_edge_values,
+        )
+    else:
+        raise ValueError(
+            f"Invalid Rackers damping type: {damping_type!r}"
+        )
+
+    delta = torch.eye(3, device=dR.device, dtype=dR.dtype)
+    oodR = 1.0 / dR
+    T1 = torch.einsum(
+        "x,xy,x->xy", oodR**3, -1.0 * dR_xyz, lam_3
+    )
+    T2 = 3 * torch.einsum(
+        "xy,xz,x->xyz", dR_xyz, dR_xyz, lam_5
+    ) - torch.einsum("x,x,yz,x->xyz", dR, dR, delta, lam_3)
+    T2 = torch.einsum("x,xyz->xyz", oodR**5, T2)
+    return dR, dR_xyz, oodR, T1, T2
+
+
+def _rackers_initial_permanent_fields(
+    alpha_A: torch.Tensor,
+    alpha_B: torch.Tensor,
+    qA: torch.Tensor,
+    muA: torch.Tensor,
+    qB: torch.Tensor,
+    muB: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_source: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_source: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    T1_AB: torch.Tensor,
+    T2_AB: torch.Tensor,
+    T1_AA: torch.Tensor,
+    T2_AA: torch.Tensor,
+    T1_BB: torch.Tensor,
+    T2_BB: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build permanent-multipole fields using only direct tensors."""
+    n_atoms_A = alpha_A.shape[0]
+    n_atoms_B = alpha_B.shape[0]
+    qA = qA.reshape(-1)
+    qB = qB.reshape(-1)
+
+    alpha_A_source = alpha_A.index_select(0, e_AB_source)
+    alpha_B_target = alpha_B.index_select(0, e_AB_target)
+    qA_source = qA.index_select(0, e_AB_source)
+    qB_target = qB.index_select(0, e_AB_target)
+    muA_source = muA.index_select(0, e_AB_source)
+    muB_target = muB.index_select(0, e_AB_target)
+
+    mu_charge_A = torch.einsum(
+        "a,ai,a->ai", alpha_A_source, T1_AB, qB_target
+    )
+    mu_induced_0_A = scatter_sum_compile(
+        mu_charge_A, e_AB_source, dim_size=n_atoms_A
+    )
+    mu_dipole_A = torch.einsum(
+        "a,aij,aj->ai", alpha_A_source, T2_AB, muB_target
+    )
+    mu_induced_0_A += scatter_sum_compile(
+        mu_dipole_A, e_AB_source, dim_size=n_atoms_A
+    )
+
+    mu_charge_B = torch.einsum(
+        "a,ai,a->ai", alpha_B_target, -T1_AB, qA_source
+    )
+    mu_induced_0_B = scatter_sum_compile(
+        mu_charge_B, e_AB_target, dim_size=n_atoms_B
+    )
+    mu_dipole_B = torch.einsum(
+        "a,aij,aj->ai", alpha_B_target, T2_AB, muA_source
+    )
+    mu_induced_0_B += scatter_sum_compile(
+        mu_dipole_B, e_AB_target, dim_size=n_atoms_B
+    )
+
+    alpha_AA_target = alpha_A.index_select(0, e_AA_target)
+    qA_AA_source = qA.index_select(0, e_AA_source)
+    muA_AA_source = muA.index_select(0, e_AA_source)
+    mu_charge_AA = torch.einsum(
+        "a,ai,a->ai", alpha_AA_target, -T1_AA, qA_AA_source
+    )
+    mu_dipole_AA = torch.einsum(
+        "a,aij,aj->ai", alpha_AA_target, T2_AA, muA_AA_source
+    )
+    mu_induced_0_A += scatter_sum_compile(
+        mu_charge_AA + mu_dipole_AA,
+        e_AA_target,
+        dim_size=n_atoms_A,
+    )
+
+    alpha_BB_target = alpha_B.index_select(0, e_BB_target)
+    qB_BB_source = qB.index_select(0, e_BB_source)
+    muB_BB_source = muB.index_select(0, e_BB_source)
+    mu_charge_BB = torch.einsum(
+        "a,ai,a->ai", alpha_BB_target, -T1_BB, qB_BB_source
+    )
+    mu_dipole_BB = torch.einsum(
+        "a,aij,aj->ai", alpha_BB_target, T2_BB, muB_BB_source
+    )
+    mu_induced_0_B += scatter_sum_compile(
+        mu_charge_BB + mu_dipole_BB,
+        e_BB_target,
+        dim_size=n_atoms_B,
+    )
+    return mu_induced_0_A, mu_induced_0_B
+
+
+def _rackers_scf_update(
+    alpha_A: torch.Tensor,
+    alpha_B: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_source: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_source: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    T2_AB: torch.Tensor,
+    T2_AA: torch.Tensor,
+    T2_BB: torch.Tensor,
+    mu_induced_A: torch.Tensor,
+    mu_induced_B: torch.Tensor,
+    mu_induced_0_A: torch.Tensor,
+    mu_induced_0_B: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply one unmixed induced-dipole update using mutual tensors."""
+    n_atoms_A = alpha_A.shape[0]
+    n_atoms_B = alpha_B.shape[0]
+    alpha_A_source = alpha_A.index_select(0, e_AB_source)
+    alpha_B_target = alpha_B.index_select(0, e_AB_target)
+    alpha_AA_target = alpha_A.index_select(0, e_AA_target)
+    alpha_BB_target = alpha_B.index_select(0, e_BB_target)
+
+    mu_induced_A_due_B = torch.einsum(
+        "a,aij,aj->ai",
+        alpha_A_source,
+        T2_AB,
+        mu_induced_B.index_select(0, e_AB_target),
+    )
+    mu_induced_A_new = scatter_sum_compile(
+        mu_induced_A_due_B, e_AB_source, dim_size=n_atoms_A
+    )
+    mu_induced_A_due_A = torch.einsum(
+        "a,aij,aj->ai",
+        alpha_AA_target,
+        T2_AA,
+        mu_induced_A.index_select(0, e_AA_source),
+    )
+    mu_induced_A_new += scatter_sum_compile(
+        mu_induced_A_due_A, e_AA_target, dim_size=n_atoms_A
+    )
+    mu_induced_A_new += mu_induced_0_A
+
+    mu_induced_B_due_A = torch.einsum(
+        "a,aij,aj->ai",
+        alpha_B_target,
+        T2_AB,
+        mu_induced_A.index_select(0, e_AB_source),
+    )
+    mu_induced_B_new = scatter_sum_compile(
+        mu_induced_B_due_A, e_AB_target, dim_size=n_atoms_B
+    )
+    mu_induced_B_due_B = torch.einsum(
+        "a,aij,aj->ai",
+        alpha_BB_target,
+        T2_BB,
+        mu_induced_B.index_select(0, e_BB_source),
+    )
+    mu_induced_B_new += scatter_sum_compile(
+        mu_induced_B_due_B, e_BB_target, dim_size=n_atoms_B
+    )
+    mu_induced_B_new += mu_induced_0_B
+    return mu_induced_A_new, mu_induced_B_new
+
+
+def rackers_thole_induction(
+    ZA: torch.Tensor,
+    RA: torch.Tensor,
+    qA: torch.Tensor,
+    muA: torch.Tensor,
+    quadA: torch.Tensor,
+    ZB: torch.Tensor,
+    RB: torch.Tensor,
+    qB: torch.Tensor,
+    muB: torch.Tensor,
+    quadB: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_source: torch.Tensor,
+    e_BB_source: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    hirshfeld_volume_ratio_A: torch.Tensor,
+    hirshfeld_volume_ratio_B: torch.Tensor,
+    valence_widths_A: torch.Tensor,
+    valence_widths_B: torch.Tensor,
+    thole_direct_A: torch.Tensor,
+    thole_direct_B: torch.Tensor,
+    thole_mutual_A: torch.Tensor,
+    thole_mutual_B: torch.Tensor,
+    ind_overlap_A: torch.Tensor,
+    ind_overlap_B: torch.Tensor,
+    include_overlap: bool = False,
+    max_iterations: int = 200,
+    convergence_threshold: float = 1e-8,
+    omega: float = 0.7,
+    polarizability_table: torch.Tensor = constants.polarizability_table,
+) -> torch.Tensor:
+    """Compute Rackers induction with distinct direct and mutual damping."""
+    del quadA, quadB
+    polarizability_table = _polarizability_table_on_device(
+        polarizability_table,
+        ZA.device,
+    )
+    alpha_0_A = torch.index_select(polarizability_table, 0, ZA.long())
+    alpha_0_B = torch.index_select(polarizability_table, 0, ZB.long())
+    alpha_A = alpha_0_A * hirshfeld_volume_ratio_A ** (4 / 3.0)
+    alpha_B = alpha_0_B * hirshfeld_volume_ratio_B ** (4 / 3.0)
+
+    direct_AB = geometric_mean_edge_values(
+        thole_direct_A,
+        thole_direct_B,
+        e_AB_source,
+        e_AB_target,
+    )
+    direct_AA = geometric_mean_edge_values(
+        thole_direct_A,
+        thole_direct_A,
+        e_AA_source,
+        e_AA_target,
+    )
+    direct_BB = geometric_mean_edge_values(
+        thole_direct_B,
+        thole_direct_B,
+        e_BB_source,
+        e_BB_target,
+    )
+    direct_tensors_AB = _rackers_distance_tensors(
+        RA,
+        RB,
+        e_AB_source,
+        e_AB_target,
+        alpha_A,
+        alpha_B,
+        direct_AB,
+        "direct",
+    )
+    direct_tensors_AA = _rackers_distance_tensors(
+        RA,
+        RA,
+        e_AA_source,
+        e_AA_target,
+        alpha_A,
+        alpha_A,
+        direct_AA,
+        "direct",
+    )
+    direct_tensors_BB = _rackers_distance_tensors(
+        RB,
+        RB,
+        e_BB_source,
+        e_BB_target,
+        alpha_B,
+        alpha_B,
+        direct_BB,
+        "direct",
+    )
+
+    mutual_AB = geometric_mean_edge_values(
+        thole_mutual_A,
+        thole_mutual_B,
+        e_AB_source,
+        e_AB_target,
+    )
+    mutual_AA = geometric_mean_edge_values(
+        thole_mutual_A,
+        thole_mutual_A,
+        e_AA_source,
+        e_AA_target,
+    )
+    mutual_BB = geometric_mean_edge_values(
+        thole_mutual_B,
+        thole_mutual_B,
+        e_BB_source,
+        e_BB_target,
+    )
+    mutual_tensors_AB = _rackers_distance_tensors(
+        RA,
+        RB,
+        e_AB_source,
+        e_AB_target,
+        alpha_A,
+        alpha_B,
+        mutual_AB,
+        "mutual",
+    )
+    mutual_tensors_AA = _rackers_distance_tensors(
+        RA,
+        RA,
+        e_AA_source,
+        e_AA_target,
+        alpha_A,
+        alpha_A,
+        mutual_AA,
+        "mutual",
+    )
+    mutual_tensors_BB = _rackers_distance_tensors(
+        RB,
+        RB,
+        e_BB_source,
+        e_BB_target,
+        alpha_B,
+        alpha_B,
+        mutual_BB,
+        "mutual",
+    )
+
+    mu_induced_0_A, mu_induced_0_B = (
+        _rackers_initial_permanent_fields(
+            alpha_A,
+            alpha_B,
+            qA,
+            muA,
+            qB,
+            muB,
+            e_AB_source,
+            e_AB_target,
+            e_AA_source,
+            e_AA_target,
+            e_BB_source,
+            e_BB_target,
+            direct_tensors_AB[3],
+            direct_tensors_AB[4],
+            direct_tensors_AA[3],
+            direct_tensors_AA[4],
+            direct_tensors_BB[3],
+            direct_tensors_BB[4],
+        )
+    )
+    mu_induced_A = mu_induced_0_A.clone()
+    mu_induced_B = mu_induced_0_B.clone()
+
+    for _ in range(max_iterations):
+        mu_induced_A_old = mu_induced_A.clone()
+        mu_induced_B_old = mu_induced_B.clone()
+        mu_induced_A_new, mu_induced_B_new = _rackers_scf_update(
+            alpha_A,
+            alpha_B,
+            e_AB_source,
+            e_AB_target,
+            e_AA_source,
+            e_AA_target,
+            e_BB_source,
+            e_BB_target,
+            mutual_tensors_AB[4],
+            mutual_tensors_AA[4],
+            mutual_tensors_BB[4],
+            mu_induced_A,
+            mu_induced_B,
+            mu_induced_0_A,
+            mu_induced_0_B,
+        )
+        mu_induced_A = (
+            (1 - omega) * mu_induced_A_old + omega * mu_induced_A_new
+        )
+        mu_induced_B = (
+            (1 - omega) * mu_induced_B_old + omega * mu_induced_B_new
+        )
+        delta_A = torch.norm(mu_induced_A - mu_induced_A_old)
+        delta_B = torch.norm(mu_induced_B - mu_induced_B_old)
+        if max(delta_A, delta_B) < convergence_threshold:
+            break
+
+    qA_source = qA.reshape(-1).index_select(0, e_AB_source)
+    qB_target = qB.reshape(-1).index_select(0, e_AB_target)
+    muA_source = muA.index_select(0, e_AB_source)
+    muB_target = muB.index_select(0, e_AB_target)
+    muA_induced_source = mu_induced_A.index_select(0, e_AB_source)
+    muB_induced_target = mu_induced_B.index_select(0, e_AB_target)
+    qu = torch.einsum(
+        "x,xy->xy", qA_source, muB_induced_target
+    ) - torch.einsum("x,xy->xy", qB_target, muA_induced_source)
+    E_qu = (
+        torch.einsum("xy,xy->x", direct_tensors_AB[3], qu)
+        * constants.h2kcalmol
+    )
+    E_uu = -1.0 * (
+        torch.einsum(
+            "xy,xz,xyz->x",
+            muA_induced_source,
+            muB_target,
+            direct_tensors_AB[4],
+        )
+        + torch.einsum(
+            "xy,xz,xyz->x",
+            muA_source,
+            muB_induced_target,
+            direct_tensors_AB[4],
+        )
+    ) * constants.h2kcalmol
+    E_ind = (E_qu + E_uu) / 2.0
+
+    if include_overlap:
+        sigma_A = valence_widths_A.index_select(0, e_AB_source)
+        sigma_B = valence_widths_B.index_select(0, e_AB_target)
+        B_ij = torch.sqrt(1.0 / (sigma_A * sigma_B))
+        dR_AB = direct_tensors_AB[0]
+        S_ij = (
+            (B_ij * dR_AB) ** 2 / 3.0 + B_ij * dR_AB + 1.0
+        ) * torch.exp(-B_ij * dR_AB)
+        K_A = ind_overlap_A.index_select(0, e_AB_source)
+        K_B = ind_overlap_B.index_select(0, e_AB_target)
+        E_ind -= K_A * S_ij * K_B * constants.h2kcalmol
+    return E_ind
 
 
 # @torch.compile
@@ -2818,6 +3598,7 @@ class AM_DimerParam_Model:
         dimer_eval_type="elst_damping",
         elst_damping_type="CLIFF",
         freeze_atom_model=True,
+        positivity_epsilon=RACKERS_POSITIVITY_EPSILON,
     ):
         """
         Construct an AtomTypeParamModel wrapper that builds or loads an atom-level model, a parameter-predicting model, and optional dimer evaluators and dataset.
@@ -2874,7 +3655,57 @@ class AM_DimerParam_Model:
             device = torch.device("cpu")
             print("running on the CPU")
         self.ds_spec_type = ds_spec_type
-        if atom_model_type == "AtomMPNN":
+        rackers_checkpoint = None
+        rackers_config = None
+        if pre_trained_model_path and model_type == "RackersTholeDampingNN":
+            rackers_checkpoint = model_io.load_checkpoint(
+                pre_trained_model_path, map_location=device
+            )
+            checkpoint_version = rackers_checkpoint.get(
+                "checkpoint_version"
+            )
+            if checkpoint_version != model_io.CHECKPOINT_VERSION:
+                raise ValueError(
+                    "Rackers checkpoint_version mismatch: expected "
+                    f"{model_io.CHECKPOINT_VERSION}, got "
+                    f"{checkpoint_version!r}"
+                )
+            if (
+                rackers_checkpoint.get("model_type")
+                != "RackersTholeDampingNN"
+            ):
+                raise ValueError(
+                    "Rackers checkpoint model_type mismatch: expected "
+                    "RackersTholeDampingNN, got "
+                    f"{rackers_checkpoint.get('model_type')!r}"
+                )
+            model_io.validate_checkpoint(
+                rackers_checkpoint,
+                expected_type="RackersTholeDampingNN",
+            )
+            rackers_config = rackers_checkpoint["config"]
+            if rackers_config.get("parameter_names") != list(
+                RACKERS_PARAMETER_NAMES
+            ):
+                raise ValueError(
+                    "Rackers checkpoint parameter_names must exactly match "
+                    f"{list(RACKERS_PARAMETER_NAMES)}"
+                )
+            if rackers_config.get("dimer_eval") != dimer_eval_type:
+                raise ValueError(
+                    "Rackers checkpoint dimer_eval mismatch: expected "
+                    f"{dimer_eval_type}, got "
+                    f"{rackers_config.get('dimer_eval')!r}"
+                )
+            if "nested_atom_model" not in rackers_config:
+                raise ValueError(
+                    "Rackers checkpoint missing nested_atom_model metadata"
+                )
+            self.atom_model = _rebuild_nested_atom_model(
+                rackers_config["nested_atom_model"], freeze_atom_model
+            )
+            am_type = AtomTypeParamNN
+        elif atom_model_type == "AtomMPNN":
             self.atom_model = AtomMPNN()
             am_type = AtomMPNN
         elif atom_model_type == "AtomHirshfeldMPNN":
@@ -2891,7 +3722,9 @@ class AM_DimerParam_Model:
         else:
             raise ValueError(f"Unknown atom_model_type: {atom_model_type}")
 
-        if atom_model_pre_trained_path:
+        if rackers_checkpoint is not None:
+            pass
+        elif atom_model_pre_trained_path:
             print(
                 f"Loading pre-trained AtomMPNN model from {atom_model_pre_trained_path}"
             )
@@ -2919,18 +3752,6 @@ class AM_DimerParam_Model:
                     n_params=am_config["n_params"],
                     freeze_atom_model=freeze_atom_model,
                 )
-            # elif atom_model_type == "AtomTypeParamMPNN":
-            #     self.atom_model = am_type(
-            #         n_message=checkpoint["config"]["n_message"],
-            #         n_rbf=checkpoint["config"]["n_rbf"],
-            #         n_neuron=checkpoint["config"]["n_neuron"],
-            #         n_embed=checkpoint["config"]["n_embed"],
-            #         r_cut=checkpoint["config"]["r_cut"],
-            #         param_start_mean=checkpoint["config"]["param_start_mean"],
-            #         param_start_std=checkpoint["config"]["param_start_std"],
-            #         n_params=checkpoint["config"]["n_params"],
-            #     )
-            # model_state_dict = checkpoint["model_state_dict"]
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.atom_model.load_state_dict(model_state_dict)
         elif atom_model:
@@ -2948,8 +3769,12 @@ class AM_DimerParam_Model:
             print(
                 f"Loading pre-trained MTP-MTP {model_type} from {pre_trained_model_path}"
             )
-            checkpoint = model_io.load_checkpoint(pre_trained_model_path)
-            config = model_io.load_config_from_checkpoint(checkpoint)
+            checkpoint = rackers_checkpoint or model_io.load_checkpoint(
+                pre_trained_model_path
+            )
+            config = rackers_config or model_io.load_config_from_checkpoint(
+                checkpoint
+            )
             if config is None:
                 config = checkpoint.get("config", {})
             # Load elst_damping_type from checkpoint if available, otherwise use default
@@ -2963,6 +3788,17 @@ class AM_DimerParam_Model:
                     param_start_mean=config["param_start_mean"],
                     param_start_std=config["param_start_std"],
                     n_params=config.get("n_params", 1),
+                    freeze_atom_model=freeze_atom_model,
+                )
+            elif model_type == "RackersTholeDampingNN":
+                self.model = RackersTholeDampingNN(
+                    atom_model=self.atom_model,
+                    n_message=config["n_message"],
+                    n_neuron=config["n_neuron"],
+                    n_embed=config["n_embed"],
+                    param_start_mean=config["param_start_mean"],
+                    param_start_std=config["param_start_std"],
+                    positivity_epsilon=config["positivity_epsilon"],
                     freeze_atom_model=freeze_atom_model,
                 )
             # elif model_type == "AtomTypeParamMPNN":
@@ -2991,6 +3827,17 @@ class AM_DimerParam_Model:
                     param_start_mean=param_start_mean,
                     param_start_std=param_start_std,
                     n_params=n_params,
+                    freeze_atom_model=freeze_atom_model,
+                )
+            elif model_type == "RackersTholeDampingNN":
+                self.model = RackersTholeDampingNN(
+                    atom_model=self.atom_model,
+                    n_message=n_message,
+                    n_neuron=n_neuron,
+                    n_embed=n_embed,
+                    param_start_mean=param_start_mean,
+                    param_start_std=param_start_std,
+                    positivity_epsilon=positivity_epsilon,
                     freeze_atom_model=freeze_atom_model,
                 )
             # elif model_type == "AtomTypeParamMPNN":
@@ -3026,35 +3873,43 @@ class AM_DimerParam_Model:
         else:
             self.dimer_model_elst = None
 
-        if n_message != self.model.n_message:
-            print(f"Changing n_mesage from {self.model.n_message} to {n_message}")
-            self.model.n_message = n_message
-        if n_neuron != self.model.n_neuron:
-            print(f"Changing n_neuron from {self.model.n_neuron} to {n_neuron}")
-            self.model.n_neuron = n_neuron
-        if n_embed != self.model.n_embed:
-            print(f"Changing n_embed from {self.model.n_embed} to {n_embed}")
-            self.model.n_embed = n_embed
-        # Handle param_start_mean/std as lists
-        if isinstance(param_start_mean, (list, tuple)):
-            if param_start_mean != self.model.param_start_mean:
+        if not pre_trained_model_path:
+            if n_message != self.model.n_message:
+                print(
+                    f"Changing n_mesage from {self.model.n_message} to {n_message}"
+                )
+                self.model.n_message = n_message
+            if n_neuron != self.model.n_neuron:
+                print(
+                    f"Changing n_neuron from {self.model.n_neuron} to {n_neuron}"
+                )
+                self.model.n_neuron = n_neuron
+            if n_embed != self.model.n_embed:
+                print(f"Changing n_embed from {self.model.n_embed} to {n_embed}")
+                self.model.n_embed = n_embed
+            if isinstance(param_start_mean, (list, tuple)):
+                if param_start_mean != self.model.param_start_mean:
+                    print(f"Changing param_start_mean to {param_start_mean}")
+                    self.model.param_start_mean = param_start_mean
+            elif not all(
+                p == param_start_mean for p in self.model.param_start_mean
+            ):
                 print(f"Changing param_start_mean to {param_start_mean}")
-                self.model.param_start_mean = param_start_mean
-        else:
-            # Scalar case, check if different from all current values
-            if not all(p == param_start_mean for p in self.model.param_start_mean):
-                print(f"Changing param_start_mean to {param_start_mean}")
-                self.model.param_start_mean = [param_start_mean] * self.model.n_params
+                self.model.param_start_mean = [
+                    param_start_mean
+                ] * self.model.n_params
 
-        if isinstance(param_start_std, (list, tuple)):
-            if param_start_std != self.model.param_start_std:
+            if isinstance(param_start_std, (list, tuple)):
+                if param_start_std != self.model.param_start_std:
+                    print(f"Changing param_start_std to {param_start_std}")
+                    self.model.param_start_std = param_start_std
+            elif not all(
+                p == param_start_std for p in self.model.param_start_std
+            ):
                 print(f"Changing param_start_std to {param_start_std}")
-                self.model.param_start_std = param_start_std
-        else:
-            # Scalar case
-            if not all(p == param_start_std for p in self.model.param_start_std):
-                print(f"Changing param_start_std to {param_start_std}")
-                self.model.param_start_std = [param_start_std] * self.model.n_params
+                self.model.param_start_std = [
+                    param_start_std
+                ] * self.model.n_params
 
         self.device = device
         self.atom_model.to(device)
@@ -3256,6 +4111,8 @@ class AM_DimerParam_Model:
             }
         model_config["elst_damping_type"] = self.elst_damping_type
         model_config["dimer_eval_type"] = self.dimer_eval_type
+        if type(model) is RackersTholeDampingNN:
+            model_config["dimer_eval"] = self.dimer_eval_type
 
         submodels = None
         if embed_atom_model and atom_model is not None:
@@ -3448,6 +4305,14 @@ class AM_DimerParam_Model:
             pair_energies_batch[i][atomA, atomB] += e_elst_lr
         return pair_energies_batch
 
+    def _dimer_index_for_output(self, batch):
+        if self.dimer_eval_type in {
+            "rackers_thole",
+            "rackers_thole_overlap",
+        }:
+            return batch.dimer_ind_full
+        return batch.dimer_ind
+
     @torch.inference_mode()
     def predict_qcel_mols_dimer(
         self,
@@ -3504,10 +4369,9 @@ class AM_DimerParam_Model:
             )
             dimer_batch.to(device=self.device)
             preds = self.dimer_model(dimer_batch)[0]
-            # Use dimer_ind_full for scatter_sum to include both sr and lr edges
             preds = scatter_sum_compile(
                 preds,
-                dimer_batch.dimer_ind_full,
+                self._dimer_index_for_output(dimer_batch),
                 dim_size=torch.tensor(
                     dimer_batch.total_charge_A.size(0), dtype=torch.long
                 ),
@@ -3656,7 +4520,7 @@ units angstrom
             # print(f"{preds = }")
             preds = scatter_sum_compile(
                 preds,
-                batch.dimer_ind,
+                self._dimer_index_for_output(batch),
                 dim_size=batch.total_charge_A.size(0),
             )
             comp_errors = preds - ref
@@ -3690,7 +4554,7 @@ units angstrom
                 ref = batch.y[:, y_ind]
                 preds = scatter_sum_compile(
                     preds,
-                    batch.dimer_ind,
+                    self._dimer_index_for_output(batch),
                     dim_size=torch.tensor(
                         batch.total_charge_A.size(0), dtype=torch.long
                     ),
@@ -3829,6 +4693,8 @@ units angstrom
         elif self.dimer_eval_type in [
             "elst_damping__induced_dipole",
             "ap3_elst_damping__induced_dipole",
+            "rackers_thole",
+            "rackers_thole_overlap",
         ]:
             assert isinstance(self.atom_model, AtomTypeParamNN), (
                 f"{self.dimer_eval_type} is only compatible with "
@@ -3952,8 +4818,17 @@ units angstrom
                 break
         # Publish the real final-epoch weights before restoring the best ones.
         stage_final_weights(self)
-        self.model = best_model
-        self.model.to(rank_device)
+        underlying_model = model_io.unwrap_model(self.model)
+        underlying_model.load_state_dict(best_model.state_dict())
+        underlying_model.to(rank_device)
+        self.atom_model = underlying_model.atom_model
+        if self.dimer_model.AtomTypeParam is not underlying_model:
+            self.dimer_model.AtomTypeParam = underlying_model
+        if (
+            self.dimer_model_elst is not None
+            and self.dimer_model_elst.AtomTypeParam is not underlying_model
+        ):
+            self.dimer_model_elst.AtomTypeParam = underlying_model
         return
 
     def train(
@@ -4072,6 +4947,57 @@ units angstrom
                 event_directory=_tracker_event_directory,
             )
         return
+
+
+class _RackersTholeDampingModelBase(AM_DimerParam_Model):
+    DIMER_EVAL: str
+
+    def __init__(
+        self,
+        dataset=None,
+        atom_model: AtomTypeParamNN | None = None,
+        pre_trained_model_path=None,
+        n_message: int = 3,
+        n_neuron: int = 64,
+        n_embed: int = 8,
+        param_start_mean=RACKERS_INITIAL_VALUES,
+        param_start_std=RACKERS_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        freeze_atom_model: bool = True,
+        **dataset_kwargs,
+    ):
+        param_start_mean, param_start_std, positivity_epsilon, _ = (
+            _validate_rackers_initialization(
+                param_start_mean,
+                param_start_std,
+                positivity_epsilon,
+            )
+        )
+        super().__init__(
+            dataset=dataset,
+            atom_model=atom_model,
+            atom_model_type="AtomTypeParamNN",
+            model_type="RackersTholeDampingNN",
+            pre_trained_model_path=pre_trained_model_path,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            positivity_epsilon=positivity_epsilon,
+            n_params=4,
+            dimer_eval_type=self.DIMER_EVAL,
+            freeze_atom_model=freeze_atom_model,
+            **dataset_kwargs,
+        )
+
+
+class RackersTholeDampingModel(_RackersTholeDampingModelBase):
+    DIMER_EVAL = "rackers_thole"
+
+
+class RackersTholeDampingOverlapModel(_RackersTholeDampingModelBase):
+    DIMER_EVAL = "rackers_thole_overlap"
 
 
 ### Atom Type Model Wrapper ####
