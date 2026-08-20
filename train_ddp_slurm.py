@@ -2,8 +2,9 @@
 """
 QCMLForge Distributed Data Parallel (DDP) Training Script for SLURM
 
-This script is designed to be launched via srun on SLURM clusters for
-multi-node, multi-process distributed training.
+This script is designed to be launched via srun with one process per SLURM
+task. Single-node external DDP is validated; multi-node operation remains
+experimental until a two-node smoke test is completed.
 
 Environment Variables Required:
     RANK: Global rank of the process (set by SLURM via srun)
@@ -27,6 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from apnet_pt import AtomModels
 from apnet_pt import atomic_datasets
+from apnet_pt.training_tracking import WandbConfig
 
 
 def parse_args():
@@ -158,6 +160,22 @@ def parse_args():
         default="29500",
         help="Master port",
     )
+    wandb_mode_default = os.getenv("WANDB_MODE", "disabled")
+    if wandb_mode_default not in {"disabled", "online", "offline"}:
+        wandb_mode_default = "disabled"
+    parser.add_argument(
+        "--wandb-mode",
+        choices=("disabled", "online", "offline"),
+        default=wandb_mode_default,
+    )
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-name", default=None)
+    parser.add_argument("--wandb-group", default=None)
+    parser.add_argument("--wandb-tags", nargs="*", default=())
+    parser.add_argument("--wandb-job-type", default=None)
+    parser.add_argument("--wandb-notes", default=None)
+    parser.add_argument("--wandb-dir", default=None)
 
     return parser.parse_args()
 
@@ -186,8 +204,7 @@ def setup_distributed(args):
 
     # Set environment variables for PyTorch DDP
     os.environ["RANK"] = str(args.rank)
-    # os.environ["LOCAL_RANK"] = str(args.local_rank)
-    os.environ["LOCAL_RANK"] = str(args.rank)
+    os.environ["LOCAL_RANK"] = str(args.local_rank)
     os.environ["WORLD_SIZE"] = str(args.world_size)
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = args.master_port
@@ -229,6 +246,17 @@ def main():
     """
     args = parse_args()
     args = setup_distributed(args)
+    wandb_config = WandbConfig(
+        mode=args.wandb_mode,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_name,
+        group=args.wandb_group,
+        tags=tuple(args.wandb_tags),
+        job_type=args.wandb_job_type,
+        notes=args.wandb_notes,
+        directory=args.wandb_dir,
+    )
 
     # Parse boolean arguments
     use_lmdb = args.use_lmdb.lower() in ("true", "yes", "1", "t", "y")
@@ -310,6 +338,9 @@ def main():
         world_size=args.world_size,
         omp_num_threads_per_process=args.omp_num_threads,
         random_seed=42,
+        wandb_config=wandb_config,
+        _external_rank=args.rank,
+        _external_local_rank=args.local_rank,
     )
 
     if args.rank == 0:

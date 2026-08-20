@@ -106,6 +106,11 @@ python3 ./train_models.py \
     --n_epochs 5 
 ```
 
+## Experiment tracking
+
+Optional experiment tracking is documented in
+[Training with Weights & Biases](docs/training-with-wandb.md).
+
 # PyTorch AtomicModule 
 Code re-implemented from TensorFlow version located [here](https://github.com/zachglick/apnet)
 

@@ -222,6 +222,62 @@ def test_forward_pass_equivalence(atomtype_hfvr_model):
     print(f"  Max quadrupole difference: {torch.abs(theta_pre - theta_trad).max():.2e}")
 
 
+def test_external_single_task_ddp_initializes_process_group(atomtype_hfvr_model):
+    """An external launcher with world_size=1 must still get a process group.
+
+    train_ddp_slurm.py defaults world_size to SLURM_NTASKS (1 outside SLURM)
+    while always passing _external_rank, so ddp_train runs with world_size=1.
+    Its metric reductions call dist.all_reduce, which raises
+    "Default process group has not been initialized" without a setup() call.
+    """
+    import torch.distributed as dist
+
+    ds = atomic_induced_dipole_precomputed_dataset(
+        root=data_path,
+        atomtype_hfvr_model=atomtype_hfvr_model,
+        spec_type=9,
+        max_size=4,
+        force_reprocess=False,
+        in_memory=True,
+        batch_size=2,
+    )
+    model = AtomInducedDipoleModel(
+        atomtype_hfvr_model=atomtype_hfvr_model,
+        n_message=2,
+        n_rbf=8,
+        n_neuron=32,
+        n_embed=4,
+        r_cut=5.0,
+        use_nn_screening=False,
+        precompute_hfvr=True,
+        use_GPU=False,
+        dataset=ds,
+        ignore_database_null=True,
+    )
+
+    assert not dist.is_initialized()
+    try:
+        model.train(
+            n_epochs=1,
+            batch_size=2,
+            split_percent=0.5,
+            model_path=None,
+            skip_compile=True,
+            shuffle=False,
+            dataloader_num_workers=0,
+            world_size=1,
+            omp_num_threads_per_process=1,
+            _external_rank=0,
+            _external_local_rank=0,
+        )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    # ddp_train tears the group down itself once training returns.
+    assert not dist.is_initialized()
+
+
 def test_training_with_precomputed(atomtype_hfvr_model):
     """Test that training works with pre-computed dataset."""
     # Create pre-computed dataset
