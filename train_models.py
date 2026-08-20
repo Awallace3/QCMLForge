@@ -30,8 +30,14 @@ def maybe_skip_training_after_dataset_setup(model_name, dataset, build_dataset_o
     return False
 
 
-def build_wandb_run_configs(args):
-    """Build atom/pairwise W&B configs, grouping sequential runs together."""
+def build_wandb_run_configs(args, environment=None):
+    """Build atom/pairwise W&B configs, grouping sequential runs together.
+
+    ``environment`` defaults to ``os.environ`` so callers and tests can supply
+    an explicit mapping instead of mutating the process environment.
+    """
+
+    env = os.environ if environment is None else environment
 
     base_config = WandbConfig(
         mode=args.wandb_mode,
@@ -45,10 +51,10 @@ def build_wandb_run_configs(args):
         directory=args.wandb_dir,
     )
     dual_run = args.train_am != "" and args.train_apnet != ""
-    resolved_group = base_config.group or os.getenv("WANDB_RUN_GROUP")
+    resolved_group = base_config.group or env.get("WANDB_RUN_GROUP")
     if dual_run and resolved_group is None:
         resolved_group = f"train-models-{uuid4().hex[:12]}"
-    resolved_name = base_config.name or os.getenv("WANDB_NAME")
+    resolved_name = base_config.name or env.get("WANDB_NAME")
     atom_config = replace(
         base_config,
         group=resolved_group,

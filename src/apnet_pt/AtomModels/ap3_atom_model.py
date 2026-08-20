@@ -1956,7 +1956,11 @@ units angstrom
             rank_device = "cpu"
         else:
             rank_device = rank
-        if world_size > 1:
+        # ddp_train is only reached from distributed entry points, including
+        # external launchers that run a single task (world_size == 1). The
+        # metric reductions below need an initialized process group either way.
+        owns_process_group = not dist.is_initialized()
+        if owns_process_group:
             self.setup(rank, world_size)
 
         self.model.to(rank_device)
@@ -2063,7 +2067,7 @@ units angstrom
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f} {test_lowered}",
                     flush=True,
                 )
-        if world_size > 1:
+        if owns_process_group:
             self.cleanup()
         return
 

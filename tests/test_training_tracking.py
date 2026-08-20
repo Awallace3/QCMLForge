@@ -8,6 +8,7 @@ import json
 import math
 import pickle
 import time
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,7 @@ from apnet_pt.training_tracking import (
     run_tracked_distributed,
     run_tracked_single_process,
     scalar_value,
+    stage_final_weights,
     track_epoch_from_locals,
     track_pretraining_from_locals,
 )
@@ -165,15 +167,17 @@ def _spawn_external_tracker(rank: int, world_size: int, event_directory: str) ->
     )
 
 
-def test_config_is_pickle_safe_and_resolves_environment(monkeypatch):
-    monkeypatch.setenv("WANDB_PROJECT", "environment-project")
-    monkeypatch.setenv("WANDB_ENTITY", "environment-entity")
-    monkeypatch.setenv("WANDB_RUN_GROUP", "environment-group")
-    monkeypatch.setenv("WANDB_JOB_TYPE", "environment-job")
+def test_config_is_pickle_safe_and_resolves_environment():
+    environment = {
+        "WANDB_PROJECT": "environment-project",
+        "WANDB_ENTITY": "environment-entity",
+        "WANDB_RUN_GROUP": "environment-group",
+        "WANDB_JOB_TYPE": "environment-job",
+    }
     config = WandbConfig(mode="offline", tags=("user",))
 
     restored = pickle.loads(pickle.dumps(config))
-    resolved = restored.resolved(("atomic", "user"))
+    resolved = restored.resolved(("atomic", "user"), environment=environment)
 
     assert resolved.project == "environment-project"
     assert resolved.entity == "environment-entity"
@@ -181,14 +185,20 @@ def test_config_is_pickle_safe_and_resolves_environment(monkeypatch):
     assert resolved.job_type == "environment-job"
     assert resolved.tags == ("user", "atomic")
 
-    explicit = WandbConfig(mode="offline", job_type="explicit-job").resolved()
+    explicit = WandbConfig(mode="offline", job_type="explicit-job").resolved(
+        environment=environment
+    )
     assert explicit.job_type == "explicit-job"
 
+    defaults = WandbConfig(mode="offline").resolved(environment={})
+    assert defaults.project == "qcmlforge"
+    assert defaults.job_type == "train"
+    assert defaults.entity is None
 
-def test_train_models_groups_and_names_two_sequential_runs(monkeypatch):
+
+def test_train_models_groups_and_names_two_sequential_runs():
     from train_models import build_wandb_run_configs
 
-    monkeypatch.delenv("WANDB_RUN_GROUP", raising=False)
     args = SimpleNamespace(
         wandb_mode="offline",
         wandb_project="project",
@@ -203,7 +213,7 @@ def test_train_models_groups_and_names_two_sequential_runs(monkeypatch):
         train_apnet="APNet2",
     )
 
-    atom_config, pairwise_config = build_wandb_run_configs(args)
+    atom_config, pairwise_config = build_wandb_run_configs(args, environment={})
 
     assert atom_config.group == pairwise_config.group
     assert atom_config.group.startswith("train-models-")
@@ -233,17 +243,21 @@ def test_run_context_sanitizes_paths_and_validates_extra():
         _context(extra={"bad": object()})
 
 
-def test_disabled_and_nonprimary_factory_do_not_import_wandb(monkeypatch):
+def test_disabled_and_nonprimary_factory_do_not_import_wandb():
     def fail_import(name):
         raise AssertionError(f"unexpected import: {name}")
 
-    monkeypatch.setattr(importlib, "import_module", fail_import)
-
-    disabled = create_training_tracker(None, is_primary=True, run_context=_context())
+    disabled = create_training_tracker(
+        None,
+        is_primary=True,
+        run_context=_context(),
+        module_loader=fail_import,
+    )
     nonprimary = create_training_tracker(
         WandbConfig(mode="online"),
         is_primary=False,
         run_context=_context(global_rank=1),
+        module_loader=fail_import,
     )
 
     assert isinstance(disabled, NullTrainingTracker)
@@ -253,7 +267,7 @@ def test_disabled_and_nonprimary_factory_do_not_import_wandb(monkeypatch):
     disabled.finish()
 
 
-def test_missing_wandb_has_actionable_error(monkeypatch):
+def test_missing_wandb_has_actionable_error():
     real_import = importlib.import_module
 
     def missing_import(name):
@@ -261,9 +275,11 @@ def test_missing_wandb_has_actionable_error(monkeypatch):
             raise ModuleNotFoundError("No module named 'wandb'", name="wandb")
         return real_import(name)
 
-    monkeypatch.setattr(importlib, "import_module", missing_import)
     tracker = create_training_tracker(
-        WandbConfig(mode="online"), is_primary=True, run_context=_context()
+        WandbConfig(mode="online"),
+        is_primary=True,
+        run_context=_context(),
+        module_loader=missing_import,
     )
 
     with pytest.raises(ImportError, match=r"qcmlforge\[tracking\]"):
@@ -272,7 +288,7 @@ def test_missing_wandb_has_actionable_error(monkeypatch):
     tracker.finish()
 
 
-def test_transitive_wandb_import_error_is_preserved(monkeypatch):
+def test_transitive_wandb_import_error_is_preserved():
     transitive_error = ModuleNotFoundError(
         "No module named 'wandb_dependency'", name="wandb_dependency"
     )
@@ -282,8 +298,9 @@ def test_transitive_wandb_import_error_is_preserved(monkeypatch):
             raise transitive_error
         raise AssertionError(f"unexpected import: {name}")
 
-    monkeypatch.setattr(importlib, "import_module", missing_dependency)
-    tracker = WandbTrainingTracker(WandbConfig(mode="online"), _context())
+    tracker = WandbTrainingTracker(
+        WandbConfig(mode="online"), _context(), missing_dependency
+    )
 
     with pytest.raises(ModuleNotFoundError) as exc_info:
         tracker.start(config={})
@@ -495,7 +512,7 @@ class _UpdateRecorder(dict):
     ],
 )
 def test_wandb_tracker_commits_online_and_uses_offline_alias_reference(
-    monkeypatch, tmp_path, mode, expected_reference, expected_waits
+    tmp_path, mode, expected_reference, expected_waits
 ):
     run = _FakeRun(tmp_path)
     init_calls = []
@@ -504,13 +521,10 @@ def test_wandb_tracker_commits_online_and_uses_offline_alias_reference(
         Artifact=_FakeArtifact,
     )
     real_import = importlib.import_module
-    monkeypatch.setattr(
-        importlib,
-        "import_module",
-        lambda name: fake_wandb if name == "wandb" else real_import(name),
-    )
     tracker = WandbTrainingTracker(
-        WandbConfig(mode=mode, project="project", tags=("user",)), _context()
+        WandbConfig(mode=mode, project="project", tags=("user",)),
+        _context(),
+        lambda name: fake_wandb if name == "wandb" else real_import(name),
     )
 
     tracker.start(config={"training/epochs": 1})
@@ -761,7 +775,13 @@ class _ToyTrackedHarness:
             ),
         }
 
-    def single_proc_train(self, n_epochs=1, nan_epoch=None):
+    def single_proc_train(
+        self,
+        n_epochs=1,
+        nan_epoch=None,
+        validation_losses=None,
+        restore_best=False,
+    ):
         optimizer = torch.optim.SGD(self.model.parameters(), lr=0.1)
         train_loss, *train_maes = self._result(train=True)
         test_loss, *validation_maes = self._result(train=False)
@@ -771,24 +791,84 @@ class _ToyTrackedHarness:
             **self._tracking_kwargs(),
         )
         lowest_test_loss = test_loss
+        best_model = deepcopy(self.model)
         for epoch in range(n_epochs):
             t1 = time.time()
             with torch.no_grad():
                 self.model.weight.add_(1.0)
             train_loss, *train_maes = self._result(train=True)
             test_loss, *validation_maes = self._result(train=False)
+            if validation_losses is not None:
+                test_loss = validation_losses[epoch]
             if epoch == nan_epoch:
                 test_loss = float("nan")
             star_marker = " "
             if test_loss < lowest_test_loss:
                 lowest_test_loss = test_loss
                 star_marker = "*"
+                best_model = deepcopy(self.model)
             dt = time.time() - t1
             track_epoch_from_locals(
                 self,
                 {**locals(), **self._mae_locals(train_maes, validation_maes)},
                 **self._tracking_kwargs(),
             )
+        if restore_best:
+            # Mirrors the real loops, which restore best weights before returning.
+            stage_final_weights(self)
+            self.model = best_model
+
+
+def test_final_artifact_keeps_final_epoch_weights_after_best_restore(tmp_path):
+    """`final`/`latest` must not carry the best weights a loop restored.
+
+    Seven pairwise loops assign `self.model = best_model` before returning, so
+    without stage_final_weights() the end-of-run serialization would snapshot
+    the restored best weights under the final aliases.
+    """
+    from apnet_pt import model_io
+
+    harness = _ToyTrackedHarness("pairwise")
+    dataset = list(range(4))
+    # Weight starts at 1.0 and gains 1.0 per epoch: 2.0, 3.0, then 4.0.
+    # Pre-training validation loss is 2.5, so epoch 2 is the best and epoch 3
+    # ends on worse weights.
+    run_tracked_single_process(
+        harness,
+        lambda: harness.single_proc_train(
+            n_epochs=3, validation_losses=[1.0, 0.5, 2.0], restore_best=True
+        ),
+        WandbConfig(mode="offline"),
+        model_family="pairwise",
+        train_dataset=dataset,
+        validation_dataset=dataset,
+        effective_batch_size=2,
+        world_size=1,
+        initial_config={"training/epochs": 3},
+        backend=TrackerBackend.FILE_EVENT,
+        event_directory=str(tmp_path),
+    )
+
+    # The loop restored the best weights, as the real harnesses do.
+    assert harness.model.weight.item() == pytest.approx(3.0)
+
+    events = _read_events(tmp_path)
+    published = [event for event in events if event["event"] == "checkpoint"]
+    by_alias = {alias: event for event in published for alias in event["aliases"]}
+    assert by_alias["best"]["metadata"]["best_epoch"] == 2
+    assert by_alias["best"]["metadata"]["checkpoint_role"] == "best"
+    assert by_alias["final"]["metadata"]["checkpoint_role"] == "final"
+    assert by_alias["final"]["path"] != by_alias["best"]["path"]
+
+    def checkpoint_of(event):
+        return model_io.load_checkpoint(event["path"])
+
+    best = checkpoint_of(by_alias["best"])
+    final = checkpoint_of(by_alias["final"])
+    assert best["metadata"]["source_epoch"] == 2
+    assert final["metadata"]["source_epoch"] == 3
+    assert best["model_state_dict"]["weight"].item() == pytest.approx(3.0)
+    assert final["model_state_dict"]["weight"].item() == pytest.approx(4.0)
 
 
 @pytest.mark.parametrize(

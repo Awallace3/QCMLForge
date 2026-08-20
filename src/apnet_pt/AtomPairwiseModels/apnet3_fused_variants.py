@@ -27,6 +27,7 @@ from ..training_tracking import (
     WandbConfig,
     configure_distributed_tracking,
     run_tracked_single_process,
+    stage_final_weights,
     track_epoch_from_locals,
     track_pretraining_from_locals,
     tracked_ddp_worker,
@@ -2805,6 +2806,8 @@ units angstrom
                 )
             if not self.device == "CPU":
                 torch.cuda.empty_cache()
+        # Publish the real final-epoch weights before restoring the best ones.
+        stage_final_weights(self)
         self.model = best_model
         self.model.to(rank_device)
         return

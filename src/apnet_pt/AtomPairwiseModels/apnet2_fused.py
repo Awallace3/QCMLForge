@@ -15,11 +15,13 @@ from ..pt_datasets.ap2_fused_ds import (
     qcel_dimer_to_fused_data,
 )
 from .. import constants
+from .. import model_io
 from ..training_tracking import (
     TrackerBackend,
     WandbConfig,
     configure_distributed_tracking,
     run_tracked_single_process,
+    stage_final_weights,
     track_epoch_from_locals,
     track_pretraining_from_locals,
     tracked_ddp_worker,
@@ -709,6 +711,27 @@ class APNet2_AM_Model:
                 f"Loading pre-trained APNet2_MPNN model from {pre_trained_model_path}"
             )
             checkpoint = torch.load(pre_trained_model_path, weights_only=False)
+            # The pairwise state dict carries the atom_model.* weights, so the
+            # embedded submodel config decides that architecture. Rebuilding
+            # from it avoids atom_model.* shape mismatches when the checkpoint
+            # was trained with a non-default AtomMPNN.
+            atom_submodel = model_io.get_submodel_checkpoint(
+                checkpoint, "atom_model"
+            )
+            if atom_submodel is not None:
+                atom_config = {
+                    key: value
+                    for key, value in (atom_submodel.get("config") or {}).items()
+                    if key in ("n_message", "n_rbf", "n_neuron", "n_embed", "r_cut")
+                }
+                print(f"Rebuilding embedded AtomMPNN from checkpoint: {atom_config}")
+                self.atom_model = AtomMPNN(**atom_config)
+                self.atom_model.load_state_dict(
+                    {
+                        k.replace("_orig_mod.", ""): v
+                        for k, v in atom_submodel["model_state_dict"].items()
+                    }
+                )
             self.model = APNet2_AM_MPNN(
                 atom_model=self.atom_model,
                 n_message=checkpoint["config"]["n_message"],
@@ -1839,6 +1862,8 @@ units angstrom
                 )
             if not self.device == "CPU":
                 torch.cuda.empty_cache()
+        # Publish the real final-epoch weights before restoring the best ones.
+        stage_final_weights(self)
         self.model = best_model
         self.model.to(rank_device)
         return

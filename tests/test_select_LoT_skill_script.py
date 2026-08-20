@@ -8,6 +8,10 @@ pytest.importorskip(
     "mcp.server.fastmcp",
     reason="requires the optional MCP server dependency",
 )
+pytest.importorskip(
+    "psi4",
+    reason="requires psi4, which the timing workflow calls directly",
+)
 
 from qcml_mcp.ie_time_esimator_script import main
 

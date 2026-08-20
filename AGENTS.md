@@ -8,7 +8,7 @@ Keep this section near the top and extend it as new recurring problems are ident
 
 - Do not use monkeypatch logic in production code or tests.
 - Do not loop over atoms when a vectorized NumPy/PyTorch operation is practical.
-- Do not introduce graph-breaking operations into code intended for `torch.compile()`.
+- Avoid introducing graph-breaking operations into code intended for `torch.compile()`.
 - Do not commit exploratory scripts; put throwaway work in the ignored `agent_scratch/` directory.
 
 ## Architecture
@@ -20,6 +20,7 @@ Every model has a low-level `nn.Module` and a high-level training/inference harn
 | `AtomMPNN` | `AtomModel` | Predict atomic charges, dipoles, and quadrupoles |
 | `APNet2` | `APNet2Model` | Predict dimer SAPT components |
 | `APNet3` | `APNet3_AtomType_Model` | AP-Net with atom-type parameters |
+| `dAPNet2_MPNN` | `dAPNet2Model` | Predict a SAPT delta correction on top of APNet2 |
 
 Main layout:
 
@@ -94,6 +95,8 @@ Tests should use deterministic inputs and weights where practical. Use `pytest.m
 Create molecules with `qcelemental`:
 
 ```python
+import qcelemental as qcel
+
 mol = qcel.models.Molecule.from_data("""
 0 1
 O 0.000000 0.000000 0.000000
@@ -108,6 +111,10 @@ units angstrom
 Load pretrained atomic models and predict pair energies through the harnesses:
 
 ```python
+import torch
+from apnet_pt import APNet2Model
+from apnet_pt.AtomModels.ap2_atom_model import AtomModel
+
 atom_model = AtomModel(
     ds_root=None,
     ignore_database_null=True,

@@ -14,6 +14,7 @@ from ..training_tracking import (
     WandbConfig,
     configure_distributed_tracking,
     run_tracked_single_process,
+    stage_final_weights,
     track_epoch_from_locals,
     track_pretraining_from_locals,
     tracked_ddp_worker,
@@ -1428,6 +1429,8 @@ units angstrom
                 f"{total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {star_marker}",
                 flush=True,
             )
+        # Publish the real final-epoch weights before restoring the best ones.
+        stage_final_weights(self)
         self.model = best_model
 
     def train(

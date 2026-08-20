@@ -65,19 +65,29 @@ class WandbConfig:
         if self.job_type == "":
             raise ValueError("W&B job_type must not be empty")
 
-    def resolved(self, generated_tags: Sequence[str] = ()) -> WandbConfig:
-        """Return configuration with standard W&B environment fallbacks applied."""
+    def resolved(
+        self,
+        generated_tags: Sequence[str] = (),
+        environment: Mapping[str, str] | None = None,
+    ) -> WandbConfig:
+        """Return configuration with standard W&B environment fallbacks applied.
 
+        ``environment`` defaults to ``os.environ`` and exists so callers and
+        tests can supply an explicit mapping instead of mutating the process
+        environment.
+        """
+
+        env = os.environ if environment is None else environment
         tags = tuple(dict.fromkeys((*self.tags, *generated_tags)))
         return replace(
             self,
-            project=self.project or os.getenv("WANDB_PROJECT") or "qcmlforge",
-            entity=self.entity or os.getenv("WANDB_ENTITY"),
-            name=self.name or os.getenv("WANDB_NAME"),
-            group=self.group or os.getenv("WANDB_RUN_GROUP"),
-            job_type=self.job_type or os.getenv("WANDB_JOB_TYPE") or "train",
-            notes=self.notes or os.getenv("WANDB_NOTES"),
-            directory=self.directory or os.getenv("WANDB_DIR"),
+            project=self.project or env.get("WANDB_PROJECT") or "qcmlforge",
+            entity=self.entity or env.get("WANDB_ENTITY"),
+            name=self.name or env.get("WANDB_NAME"),
+            group=self.group or env.get("WANDB_RUN_GROUP"),
+            job_type=self.job_type or env.get("WANDB_JOB_TYPE") or "train",
+            notes=self.notes or env.get("WANDB_NOTES"),
+            directory=self.directory or env.get("WANDB_DIR"),
             tags=tags,
         )
 
@@ -326,8 +336,14 @@ class NullTrainingTracker:
 class WandbTrainingTracker(_BaseTrainingTracker):
     """W&B-backed tracker with a lazy SDK import."""
 
-    def __init__(self, wandb_config: WandbConfig, run_context: RunContext) -> None:
+    def __init__(
+        self,
+        wandb_config: WandbConfig,
+        run_context: RunContext,
+        module_loader: Callable[[str], Any] = importlib.import_module,
+    ) -> None:
         super().__init__(wandb_config, run_context)
+        self._module_loader = module_loader
         self._wandb: Any = None
         self._run: Any = None
 
@@ -340,7 +356,7 @@ class WandbTrainingTracker(_BaseTrainingTracker):
         initial_config = {**self.run_context.to_config(), **dict(config)}
         _ensure_json_serializable(initial_config)
         try:
-            self._wandb = importlib.import_module("wandb")
+            self._wandb = self._module_loader("wandb")
         except ModuleNotFoundError as exc:
             if exc.name != "wandb":
                 raise
@@ -539,6 +555,7 @@ def create_training_tracker(
     run_context: RunContext,
     backend: TrackerBackend = TrackerBackend.WANDB,
     event_directory: str | None = None,
+    module_loader: Callable[[str], Any] = importlib.import_module,
 ) -> TrainingTracker:
     """Create a rank-safe tracker without importing the optional W&B SDK."""
 
@@ -553,7 +570,7 @@ def create_training_tracker(
         if event_directory is None:
             raise ValueError("File-event backend requires event_directory")
         return FileEventTrainingTracker(config, run_context, event_directory)
-    return WandbTrainingTracker(config, run_context)
+    return WandbTrainingTracker(config, run_context, module_loader)
 
 
 @contextmanager
@@ -622,6 +639,7 @@ def harness_tracking(
             ),
             "best_epoch": 0,
             "best_validation_loss": None,
+            "final_path": None,
             "last_validation_loss": None,
             "epochs_completed": 0,
             "defined_metrics": None,
@@ -634,6 +652,10 @@ def harness_tracking(
         # checkpoint when training ended on weights worse than the best.
         if state["best_epoch"] == state["epochs_completed"]:
             final_path = state["best_path"]
+        elif state["final_path"] is not None:
+            # Staged by stage_final_weights() before the loop restored its best
+            # weights, so it holds the real final-epoch weights.
+            final_path = state["final_path"]
         else:
             final_path = stage_harness_checkpoint(
                 tracker,
@@ -901,6 +923,31 @@ def track_epoch_from_locals(
         is_best=marker is True or marker == "*",
         metric_labels=metric_labels,
         exclude=exclude,
+    )
+
+
+def stage_final_weights(harness: Any) -> None:
+    """Stage the final-epoch checkpoint before a loop restores its best weights.
+
+    Several harness loops assign ``self.model = best_model`` before returning.
+    Without this call ``harness_tracking`` would serialize those restored best
+    weights and publish them under the ``final``/``latest`` aliases. Staging is
+    skipped when the last epoch was also the best one, since the staged best
+    checkpoint already holds the final weights.
+    """
+
+    state = getattr(harness, "_training_tracking_state", None)
+    if state is None:
+        # Tracking is disabled, or the loop was called outside ``harness_tracking``.
+        return
+    if state["best_epoch"] == state["epochs_completed"]:
+        return
+    state["final_path"] = stage_harness_checkpoint(
+        current_harness_tracker(harness),
+        harness,
+        role="final",
+        epoch=state["epochs_completed"],
+        validation_loss=state["last_validation_loss"],
     )
 
 

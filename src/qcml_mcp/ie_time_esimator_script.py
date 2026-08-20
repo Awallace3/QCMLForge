@@ -92,14 +92,16 @@ def parse_geoms(
                     print(f"Error converting raw string to qcelemental.models.Molecule: \n {e}")
                     continue
 
-                id.append(file.strip().split(".")[0])
-                n_atoms.append(len(mol_qcel.atomic_numbers))
-
-
                 fragments = mol_qcel.fragments
                 if len(fragments) != 2:
-                    raise ValueError("input geometry must be a dimer")
+                    print(
+                        f"Skipping {filepath}: input geometry must be a dimer, "
+                        f"found {len(fragments)} fragment(s)"
+                    )
+                    continue
 
+                id.append(file.strip().split(".")[0])
+                n_atoms.append(len(mol_qcel.atomic_numbers))
                 qcel_dimer.append(mol_qcel)
                 qcel_monA.append(mol_qcel.get_fragment(0))
                 qcel_monB.append(mol_qcel.get_fragment(1))
@@ -139,25 +141,31 @@ def compute_psi4_time_estimation_variables(
         "dft_pruning_scheme": "robust",
     })
 
-    wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
-    bs = wfn.basisset()
-    grid = psi4.core.DFTGrid.build(mol, bs)
-    print("compute vars: built wfn & grid")
+    try:
+        wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
+        bs = wfn.basisset()
+        grid = psi4.core.DFTGrid.build(mol, bs)
+        print("compute vars: built wfn & grid")
 
-    n_occupied = math.ceil((wfn.nalpha() + wfn.nbeta()) / 2)
-    n_virtual = bs.nbf() - n_occupied
-    np_total = grid.npoints()
+        n_occupied = math.ceil((wfn.nalpha() + wfn.nbeta()) / 2)
+        n_virtual = bs.nbf() - n_occupied
+        np_total = grid.npoints()
 
-    aux_basis = psi4.core.BasisSet.build(
-        wfn.molecule(),
-        "DF_BASIS_SCF",
-        psi4.core.get_option("SCF", "DF_BASIS_SCF"),
-        "JKFIT",
-        psi4.core.get_global_option("BASIS"),
-    )
-    print("compute vars: built aux basis")
+        aux_basis = psi4.core.BasisSet.build(
+            wfn.molecule(),
+            "DF_BASIS_SCF",
+            psi4.core.get_option("SCF", "DF_BASIS_SCF"),
+            "JKFIT",
+            psi4.core.get_global_option("BASIS"),
+        )
+        print("compute vars: built aux basis")
 
-    nbf_aux = aux_basis.nbf()
+        nbf_aux = aux_basis.nbf()
+
+    except Exception as e:
+        # One unbuildable molecule/basis pair must not abort a batch run.
+        print(f"Error when building grid, wavefunction, or aux basis: \n {e}")
+        return np.array([np.nan] * 4)
     psi4.core.clean()
 
     return np.array((
@@ -308,6 +316,13 @@ def predict_timing(
 
     if not mask.any():
         mask = (_coeffs.index == method) & (_coeffs["fit_label"] == "All data")
+
+    if not mask.any():
+        print(
+            f"No fitted coefficients are available for method {method!r} "
+            f"with fit label {fit_label!r}"
+        )
+        return np.nan
 
     coeffs = _coeffs.loc[mask, "coefficients"].values[0]
 
