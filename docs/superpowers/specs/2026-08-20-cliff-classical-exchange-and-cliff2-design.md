@@ -943,18 +943,25 @@ gradient step.
 The intended demonstration that the route optimizes at all. 96 dimers,
 100 epochs, `--grad_clip_norm 1.0`:
 
-| route | metric | epoch 0 | best |
-|---|---|---:|---:|
-| `CliffExchangeModel` (lr 1e-3) | Exch train MAE | 3.191 | **0.540** |
-| `CliffExchangeModel` (lr 5e-4) | Exch train MAE | 4.295 | 1.257 |
-| `CliffClassicalOverlapModel` | Elst train MAE | 0.984 | 0.849 |
-| | Exch train MAE | 4.133 | 0.940 |
-| | Ind train MAE | 5.620 | 1.680 |
+All runs completed 100 epochs. Train MAE, with the final validation MAE for
+comparison:
 
-Train MAE falling to 0.540 against a validation MAE of 1.289 is the expected
-overfitting signature and confirms the gradient path is intact for all three
-components. Electrostatics and induction were never the problem; only exchange
-was.
+| route | metric | epoch 0 | min train | final val |
+|---|---|---:|---:|---:|
+| `CliffExchangeModel` (lr 1e-3) | Exch | 3.191 | **0.495** | 1.279 |
+| `CliffExchangeModel` (lr 5e-4) | Exch | 4.295 | **0.511** | 1.269 |
+| `CliffClassicalOverlapModel` | Elst | 0.984 | **0.343** | 0.686 |
+| | Exch | 4.133 | **0.482** | 1.080 |
+| | Ind | 5.620 | **0.687** | 1.280 |
+
+Every component's train MAE lands well below its validation MAE, which is the
+expected overfitting signature on 96 dimers and confirms the gradient path is
+intact end to end. Exchange improves 8.6x on the combined route.
+
+Electrostatics and induction were never the problem. In the pre-ceiling
+5000-dimer run electrostatics appeared to *degrade* (2.404 -> 2.846); that was
+the dead exchange term corrupting a working component through the Eq. (23)
+total term, not a fault in the electrostatics path.
 
 ### Note on the reported loss magnitude
 
