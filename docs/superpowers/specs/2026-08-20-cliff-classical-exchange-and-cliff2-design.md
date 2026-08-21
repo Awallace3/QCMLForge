@@ -761,6 +761,106 @@ Reuse the existing fixtures in `tests/test_rackers_thole_damping.py`
 `:2251-2315`) rather than duplicating them; promote them to a shared conftest
 fixture module if both test files need them.
 
+## Amendment: trainability of the positive-parameter heads (2026-08-21)
+
+The design as originally specified is functionally correct and passes its whole
+test suite, but the first 100-epoch run on a 5000-dimer subset did not learn.
+This section records what failed, why, and the four changes made in response, so
+that the initialization contract above is read together with its correction.
+
+### What the first run did
+
+Exchange converged to a train MAE of 6.803, which is *exactly* the mean absolute
+`Exch` of the training subset — the predict-zero MAE. A held-out evaluation over
+640 dimers gave Pearson r = 0.0139 and R^2 = -0.1817, with predictions spanning
+`[0.00, 14.29]` against a reference span of `[0.00, 168.03]`. Dumping the trained
+`CliffClassicalNN` over 4264 atoms from 160 test dimers showed the cause was not
+confined to exchange:
+
+| column | seed | mean | median | max | % at `positivity_epsilon` |
+|---|---:|---:|---:|---:|---:|
+| `elst` | 1.8 | 22.17 | 13.86 | 164.7 | 0% |
+| `thole_direct` | 0.34 | 0.105 | 0.057 | 2.31 | 0% |
+| `thole_mutual` | 0.39 | 0.123 | 0.033 | 0.68 | 18% |
+| `ind_overlap` | 1.8 | 0.028 | 0.012 | 1.79 | 24% |
+| `exch` | 2.5 | 0.025 | 0.008 | 2.49 | 23% |
+
+Because `ind_overlap` was among the dead columns, `cliff_classical` and
+`cliff_classical_overlap` became numerically indistinguishable (val Elst 2.846
+vs 2.847, Exch 8.079 vs 8.080, Ind 2.605 vs 2.573), so the controlled comparison
+that motivates having both routes could not be made at all.
+
+The physics was cleared first and is unchanged: predicted valence widths match
+CLIFF Fig. 5 to 2-4% (H 0.373 / C 0.521 / N 0.443 / O 0.406 against 0.36 / 0.50 /
+0.45 / 0.39), and the Eq. (11) kernel reproduces its golden values.
+
+### Root causes
+
+1. **Softplus collapse is irreversible.** `K = softplus(raw) + epsilon` has
+   `dK/draw = sigmoid(raw)`. A column driven toward zero loses the gradient that
+   would bring it back: at `raw = -30` the derivative is 9.4e-14. Whatever
+   pushed a column down early in training permanently disabled it.
+2. **A uniform `K_exch` is wrong in the one place it matters most.** Eq. (8)
+   combines the parameter multiplicatively, so a uniform 2.5 makes an H-H pair
+   `6.25` where CLIFF's hydrogen types give `0.77 * 0.77 = 0.59`. Hydrogen
+   dominates the atom counts, so the cheapest way for the optimizer to remove
+   that error is to shrink every `K_exch` at once — straight into (1).
+3. **The random readout swamped the seed.** Measured at initialization, the
+   randomly drawn correction MLP contributed more exchange error than the entire
+   uniform-versus-per-element difference, so any care taken over seeds was
+   largely wasted.
+4. **Nothing bounded the update.** Gradient clipping was present but commented
+   out, SAPT components reach ~240 kcal/mol under MSE, and at `lr = 5e-4` Adam's
+   cumulative displacement over 100 epochs is by itself enough to carry a raw
+   parameter from its seed into saturation.
+
+### Changes
+
+- **`CLIFF_EXCH_INITIAL_VALUES_BY_Z`** seeds `K_exch` per element from CLIFF
+  Table I (H 0.77, C 2.40, N 4.20, O 5.60, F 7.60, S 3.20, Cl 3.80, Br 4.10).
+  Elements absent from the table fall back to the scalar seed. Columns 0-3 of
+  the combined head keep their scalar Rackers seeds; only `exch` has published
+  per-element values.
+- **`CLIFF_PARAM_FLOOR_FRACTION = 0.05` / `CLIFF_PARAM_CEILING_MULTIPLE = 10.0`**
+  clamp each raw parameter to `[0.05x, 10x]` of its column's seed through
+  `_ste_clamp`, which bounds the value on a detached copy and reattaches an
+  identity gradient. A collapsing column therefore parks where `sigmoid(raw)` is
+  still order 0.1 rather than 1e-8, and stays able to climb back out; the ceiling
+  catches the `elst` runaway. Both are config-recorded and both accept `None`
+  to reproduce the pre-bound forward exactly, which is what a checkpoint
+  predating them loads as.
+- **`CLIFF_READOUT_INIT_SCALE = 0.1`** scales the *output* layer of each readout
+  MLP at construction, so the per-element seed governs the initial prediction.
+  Only the output layer is scaled, which keeps the knob linear in the emitted
+  correction; scaling the whole four-deep stack would compound as `s ** 4`.
+- **`grad_clip_norm`** is a real, opt-in `train()` parameter and
+  `--grad_clip_norm` CLI flag, defaulting to `None` so every pre-existing route
+  is bitwise unchanged. `run_cliff.sh` sets it to 1.0 and drops the default
+  learning rate to 1e-4.
+
+At-init exchange MAE against SAPT `Exch` on held-out dimers, predict-zero
+baseline 18.555:
+
+| configuration | MAE |
+|---|---:|
+| uniform 2.5, no bounds, full readout | 7.04 |
+| + per-element seeds | 3.37 |
+| + readout x 0.1 (shipped default) | 3.10 |
+
+### Notes for the next reader
+
+- `None` is a *meaningful* value for all four knobs (no per-element table, no
+  bound, no readout scaling), so "unspecified" needs the distinct
+  `_CLIFF_HEAD_DEFAULT` sentinel. Passing `None` through as a default would
+  silently disable each feature for every caller that did not name it.
+- The bounds are registered as **non-persistent** buffers. They are fully
+  determined by config, so keeping them out of `state_dict` avoids a second
+  source of truth and leaves checkpoints loadable by builds predating them.
+- The obvious way to write a straight-through clamp,
+  `x + (bound - x).detach()`, is algebraically right but loses the bound to
+  catastrophic cancellation once `|x|` is large: a readout at `raw = 3e7` came
+  out at 32 rather than the requested 25. Clamp a detached copy instead.
+
 ## Incidental findings (documented, not addressed here)
 
 These were found while mapping the existing code. None is in scope; each is
@@ -815,3 +915,9 @@ The feature is accepted when:
     with Rackers error messages unchanged.
 12. All new focused tests pass and existing Rackers, polarization, model_io,
     and atom-type regressions are unchanged.
+13. (Amendment) No parameter column can be driven to a state with no usable
+    gradient: a hostile readout parks each column at its configured floor with
+    `dK/draw` still order 0.1, and a runaway readout is capped at the ceiling.
+    `K_exch` is seeded per element, the readout correction is scaled so that
+    seed governs the initial prediction, and `grad_clip_norm` defaults to `None`
+    so every pre-existing route is bitwise unchanged.
