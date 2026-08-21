@@ -861,6 +861,118 @@ baseline 18.555:
   catastrophic cancellation once `|x|` is large: a readout at `raw = 3e7` came
   out at 32 rather than the requested 25. Clamp a detached copy instead.
 
+## Amendment 2: the exchange error was out-of-domain valence widths (2026-08-21)
+
+Amendment 1 made the parameter heads trainable but exchange still sat far above
+the predict-zero baseline. This records the actual cause, which was neither the
+units nor the functional form.
+
+### Units are correct
+
+With CLIFF Table I parameters untouched and the MPNN correction bypassed
+entirely, over 1280 dimers:
+
+| convention | MAE | median pred | reference median |
+|---|---:|---:|---:|
+| sigma in bohr, x `h2kcalmol` | 15.961 | **0.3298** | **0.3411** |
+| sigma in bohr, no conversion | 6.583 | 0.0005 | 0.3411 |
+| sigma read as Angstrom, x `h2kcalmol` | 826.747 | 249.5001 | 0.3411 |
+| sigma read as Angstrom, no conversion | 5.618 | 0.3976 | 0.3411 |
+
+The shipped convention reproduces the reference *median* to 3% with no fitting,
+which is the strongest available check on both the units and the transplanted
+parameters. Note the trap in that table: the two "no conversion" rows have the
+lowest MAE while predicting essentially nothing -- their MAE is just the
+predict-zero baseline of 6.615. MAE alone cannot distinguish a working model
+from a silent one on this distribution; the median and the mean must be read
+together.
+
+`S_ij` is dimensionless and *scale-invariant* -- `x = r / sqrt(sigma_i sigma_j)`
+is a ratio of lengths -- so it is correct as long as `dR_AB` and the widths
+share units. Only the energy prefactor is a real choice, and Table I's `K_exch`
+are empirically in hartree^(1/2), not kcal/mol^(1/2), despite the paper quoting
+all energies in kcal/mol.
+
+### The cause: widths for elements the atom model does not support
+
+The frozen HFVR/valence-width model emits `sigma = 1.8952` bohr for **every** Na
+atom in the data -- identical to four decimal places across all 20 of them,
+which is an untrained per-element embedding bias, not a prediction -- against
+0.40-0.52 for C/N/O. Chlorine shows the same failure less uniformly
+(0.52-2.11). Since `S_ij ~ exp(-r / sqrt(sigma_i sigma_j))`, an over-large width
+flattens the exponential and the pair energy explodes: one Na-C edge at 3.2 A is
+worth ~158 kcal/mol unguarded.
+
+Consequences measured at initialization over 1280 dimers:
+
+- every one of the **fifteen** worst-error dimers contained Na or Cl
+- the **ten** worst dimers carried **95.2%** of the squared error
+- worst single prediction 2959.7 kcal/mol against a reference maximum of 239.7
+
+CLIFF Table I covers only H, C, N, O, S, F, Cl, Br
+(:data:`CLIFF_TABLE_I_ELEMENTS`). This dataset also contains Na (Z=11) and P
+(Z=15), which fall back to the scalar seed -- a guess.
+
+### Changes
+
+- :data:`OVERLAP_WIDTH_CEILING` = 1.0 bohr, applied in `cliff_exchange` only.
+  `atomic_overlap_S_ij` defaults `width_ceiling=None`, so the three legacy
+  induction-overlap call sites keep their exact numerics. 1.0 sits above every
+  width the atom model emits for an element it was trained on (P 0.70, S 0.67,
+  C 0.52, N 0.48, O 0.43, H 0.39) and below the invented ones. **This is a
+  guard on an input the exchange term cannot defend itself against, not a
+  fitted parameter.** Tightening it to 0.7 lowers at-init MAE further (2.393 vs
+  4.181) but starts clamping legitimate P and S widths, which would be fitting
+  the guard to the data. The real fix is an atom model that covers these
+  elements.
+- Per-element seeds are now the exact Table I atom-type means. C was 2.40 and
+  is 2.5079; S was 3.20 and is 3.2308; the rest were already correct.
+- Exchange `param_start_std` is 0.25 rather than 0.01. `K_exch` spans 0.60-7.60
+  across CLIFF's atom types and a per-`Z` embedding resolves only the element,
+  not the coordination-number refinement within it (C4/C3/C2 = 2.26/2.46/2.80),
+  so 0.01 in raw space was effectively a delta function.
+- Launcher learning rate back to 5e-4; the 1e-4 of amendment 1 was an
+  over-correction once the raw-parameter bounds made saturation unreachable.
+
+At-init exchange MAE over 1280 dimers, predict-zero baseline 6.615: **15.961
+without the ceiling, 4.181 with it.** The term is useful before a single
+gradient step.
+
+### Verification: overfitting a 100-dimer subset
+
+The intended demonstration that the route optimizes at all. 96 dimers,
+100 epochs, `--grad_clip_norm 1.0`:
+
+| route | metric | epoch 0 | best |
+|---|---|---:|---:|
+| `CliffExchangeModel` (lr 1e-3) | Exch train MAE | 3.191 | **0.540** |
+| `CliffExchangeModel` (lr 5e-4) | Exch train MAE | 4.295 | 1.257 |
+| `CliffClassicalOverlapModel` | Elst train MAE | 0.984 | 0.849 |
+| | Exch train MAE | 4.133 | 0.940 |
+| | Ind train MAE | 5.620 | 1.680 |
+
+Train MAE falling to 0.540 against a validation MAE of 1.289 is the expected
+overfitting signature and confirms the gradient path is intact for all three
+components. Electrostatics and induction were never the problem; only exchange
+was.
+
+### Note on the reported loss magnitude
+
+`train/loss_sum` and `val/loss_sum` reach ~1e6 while component MAEs are ~16.
+Both factors are real and neither is a bug:
+
+1. `total_loss += batch_loss.item()` accumulates per-batch mean MSE **without
+   dividing by the batch count**, so the reported number scales with dataset
+   size -- x80 for 1280 dimers at batch size 16, x312 for the 5000-dimer
+   subset. The metric name says `_sum` and it is one.
+2. MSE is dominated by the tail. At MAE 15.96 the RMSE is 148.14, a 9x ratio,
+   because ten dimers hold 95% of the squared error. `RMSE >> MAE` by that
+   margin is itself the tail diagnostic.
+
+Normalizing to a mean would be more legible but renames a metric shared with
+every other model family, so it is left as a documented follow-up rather than
+changed here.
+
 ## Incidental findings (documented, not addressed here)
 
 These were found while mapping the existing code. None is in scope; each is
