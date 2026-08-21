@@ -264,3 +264,62 @@ def test_atom_trainer_seeded_uniform_split_is_the_documented_baseline():
     )
     assert "np.random.seed(42)" in src
     assert "random_indices = np.random.permutation(len(self.dataset))" in src
+
+
+# --- skip_compile plumbing ------------------------------------------------
+
+def test_train_atom_model_captures_skip_compile_before_branches_clobber_it():
+    """Regression: the per-model-type branches assign `skip_compile` themselves.
+
+    Every branch does `skip_compile = False`, so reading the parameter after
+    them silently discards the caller's request -- the flag would appear to
+    work while changing nothing. The request has to be captured first.
+
+    The flag exists because AtomTypeParamModel's forward writes into a slice of
+    a mask-filtered tensor (`K_filtered[:, p] += ...`), which Inductor cannot
+    guard on; on some torch builds that raises GuardOnDataDependentSymNode
+    after the pre-training evaluation.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "train_models.py"
+    text = src.read_text()
+    tree = ast.parse(text)
+    fn = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "train_atom_model"
+    )
+    assert "skip_compile" in {a.arg for a in fn.args.args}
+
+    def line_of(needle):
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                seg = ast.get_source_segment(text, node) or ""
+                if needle in seg:
+                    return node.lineno
+        return None
+
+    capture = line_of("skip_compile_requested = skip_compile")
+    override = line_of("skip_compile = bool(skip_compile_requested)")
+    assert capture is not None, "the caller's skip_compile is never captured"
+    assert override is not None, "the captured request is never applied"
+    branch_writes = [
+        node.lineno
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "skip_compile"
+            for t in node.targets
+        )
+        and node.lineno not in (override,)
+    ]
+    assert branch_writes, "expected the per-type branches to assign it"
+    assert capture < min(branch_writes), (
+        f"capture at line {capture} must precede the branch assignments at "
+        f"{sorted(branch_writes)}"
+    )
+    assert override > max(branch_writes), (
+        f"override at line {override} must follow the branch assignments at "
+        f"{sorted(branch_writes)}"
+    )

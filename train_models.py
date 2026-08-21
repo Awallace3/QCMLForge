@@ -174,6 +174,7 @@ def train_atom_model(
     build_dataset_only=False,
     split_manifest=None,
     split_verify="all",
+    skip_compile=None,
     wandb_config=None,
 ):
     """
@@ -205,8 +206,12 @@ def train_atom_model(
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
         split_manifest (str or None): Path to a train/test split manifest CSV (columns index, split, fingerprint). When set, replaces the uniform random split_percent draw with the split the manifest describes.
         split_verify (str or int): How much of the manifest to verify against the dataset -- "all", "none", or a sample count. Verification is what distinguishes a valid manifest from a stale one.
+        skip_compile (bool or None): Force torch.compile off (True) or on (False). None keeps the per-model-type default. AtomTypeParamModel's forward writes into a slice of a mask-filtered tensor, which Inductor cannot guard on and which raises GuardOnDataDependentSymNode on some torch builds; running eager is the workaround.
 
     """
+    # The per-model-type branches below assign `skip_compile` themselves, so
+    # the caller's request has to be captured before they clobber it.
+    skip_compile_requested = skip_compile
     if atom_model_type == "AtomModel":
         AM = AtomModels.ap2_atom_model.AtomModel
         batch_size = 16
@@ -292,6 +297,8 @@ def train_atom_model(
         build_dataset_only,
     ):
         return
+    if skip_compile_requested is not None:
+        skip_compile = bool(skip_compile_requested)
     train_indices = test_indices = None
     if split_manifest:
         train_indices, test_indices = load_split_manifest(
@@ -1105,6 +1112,17 @@ def main():
         help="Limit dataset to N dataset objects",
     )
     args.add_argument(
+        "--skip_compile",
+        action="store_true",
+        help=(
+            "Run the atom model eager instead of under torch.compile. "
+            "AtomTypeParamModel's forward writes into a slice of a "
+            "mask-filtered tensor, which Inductor cannot guard on; on some "
+            "torch builds that raises GuardOnDataDependentSymNode after the "
+            "pre-training evaluation."
+        ),
+    )
+    args.add_argument(
         "--split_manifest",
         type=str,
         default=None,
@@ -1504,6 +1522,7 @@ def main():
             build_dataset_only=args.build_dataset_only,
             split_manifest=args.split_manifest,
             split_verify=args.split_verify,
+            skip_compile=True if args.skip_compile else None,
             wandb_config=atom_wandb_config,
         )
     if args.train_apnet != "":
