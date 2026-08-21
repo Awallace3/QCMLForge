@@ -1,6 +1,7 @@
 from apnet_pt import AtomModels
 from apnet_pt import AtomPairwiseModels
 from apnet_pt.training_tracking import WandbConfig
+from apnet_pt.util import load_split_manifest
 import argparse
 import inspect
 import os
@@ -171,6 +172,8 @@ def train_atom_model(
     precompute_hfvr=False,
     ds_use_lmdb=False,
     build_dataset_only=False,
+    split_manifest=None,
+    split_verify="all",
     wandb_config=None,
 ):
     """
@@ -200,6 +203,8 @@ def train_atom_model(
         precompute_hfvr (bool): If true, enable precomputation of HF/VR features where supported.
         ds_use_lmdb (bool): If true, configure dataset to use LMDB storage (applied to InducedDipoleModel).
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
+        split_manifest (str or None): Path to a train/test split manifest CSV (columns index, split, fingerprint). When set, replaces the uniform random split_percent draw with the split the manifest describes.
+        split_verify (str or int): How much of the manifest to verify against the dataset -- "all", "none", or a sample count. Verification is what distinguishes a valid manifest from a stale one.
 
     """
     if atom_model_type == "AtomModel":
@@ -287,11 +292,20 @@ def train_atom_model(
         build_dataset_only,
     ):
         return
+    train_indices = test_indices = None
+    if split_manifest:
+        train_indices, test_indices = load_split_manifest(
+            split_manifest,
+            dataset=atom_model.dataset,
+            verify=split_verify,
+        )
     atom_model.train(
         n_epochs=n_epochs,
         batch_size=batch_size,
         lr=lr,
         split_percent=0.9,
+        train_indices=train_indices,
+        test_indices=test_indices,
         model_path=model_path,
         shuffle=True,
         dataloader_num_workers=dataloader_num_workers,
@@ -333,6 +347,7 @@ def train_pairwise_model(
     ds_in_memory=False,
     ds_max_size=None,
     ds_exclude_elements=None,
+    split_manifest=None,
     ds_class_type="pt",
     DimerProp_model_type="AtomTypeParamNN",
     ap2_pretrained_model_only=None,
@@ -400,6 +415,15 @@ def train_pairwise_model(
     is_rackers_model = apnet_model_type in RACKERS_MODEL_TYPES
     is_cliff_model = apnet_model_type in CLIFF_MODEL_TYPES
     is_positive_param_model = apnet_model_type in POSITIVE_PARAM_MODEL_TYPES
+    if split_manifest:
+        # Only the atom-model route resolves a manifest into indices. Accepting
+        # it here would train on the trainer's own uniform draw while the run
+        # record claimed a designed split.
+        raise ValueError(
+            "split_manifest is only supported on the atom-model routes "
+            "(--train_am), not on --train_apnet "
+            f"{apnet_model_type}"
+        )
     if ds_exclude_elements and not is_positive_param_model:
         # Only the positive-parameter branch forwards ds_exclude_elements into
         # the dataset constructor. Accepting it elsewhere would train on the
@@ -1081,6 +1105,26 @@ def main():
         help="Limit dataset to N dataset objects",
     )
     args.add_argument(
+        "--split_manifest",
+        type=str,
+        default=None,
+        help=(
+            "Path to a train/test split manifest CSV with columns index, "
+            "split, fingerprint. Replaces the uniform random 90/10 draw with "
+            "the split the manifest describes. Atom-model routes only."
+        ),
+    )
+    args.add_argument(
+        "--split_verify",
+        default="all",
+        help=(
+            "How much of --split_manifest to verify against the dataset: "
+            "'all' (default), 'none', or an integer sample count. A stale "
+            "manifest silently scrambles the split, so 'none' is a deliberate "
+            "choice."
+        ),
+    )
+    args.add_argument(
         "--ds_exclude_elements",
         type=int,
         nargs="+",
@@ -1458,6 +1502,8 @@ def main():
             precompute_hfvr=args.precompute_hfvr,
             ds_use_lmdb=args.ds_use_lmdb,
             build_dataset_only=args.build_dataset_only,
+            split_manifest=args.split_manifest,
+            split_verify=args.split_verify,
             wandb_config=atom_wandb_config,
         )
     if args.train_apnet != "":
@@ -1510,6 +1556,7 @@ def main():
             include_total_mse=args.include_total_mse,
             ds_max_size=args.ds_max_size,
             ds_exclude_elements=args.ds_exclude_elements,
+            split_manifest=args.split_manifest,
             component_gamma=args.component_gamma,
             total_includes_d3=args.total_includes_d3,
             grad_clip_norm=args.grad_clip_norm,

@@ -650,3 +650,159 @@ if __name__ == "__main__":
     print(R)
     print(Z)
     print(aQ)
+
+
+# ---------------------------------------------------------------------------
+# Explicit train/test splits
+#
+# The trainers' default split is a uniform random permutation, which is fine
+# for the bulk but not for rare elements: sodium appears in 38 of the 53,168
+# AP3 monomers, so a uniform 90/10 has a real chance of holding out none of it
+# and reporting a validation MAE that says nothing about the element whose
+# predicted valence widths were four times too large. A manifest lets the split
+# be a designed, reviewable artifact instead.
+# ---------------------------------------------------------------------------
+
+SPLIT_MANIFEST_COLUMNS = ("index", "split", "fingerprint")
+
+
+def monomer_fingerprint(z, r, charge):
+    """Short intrinsic id for one monomer, stable across dtype round-trips.
+
+    A split manifest is keyed on dataset index, which only means anything while
+    the processed store is the one the manifest was built against. The
+    fingerprint lets a consumer prove that rather than assume it.
+
+    The float32 cast is load-bearing and must happen BEFORE rounding. Raw
+    pickles hold float64 coordinates while the processed store holds float32,
+    and |dR| between them is ~1e-7 -- enough to straddle a 4-decimal rounding
+    boundary for roughly one coordinate in 2,000. Rounding float64 directly
+    therefore disagrees on ~3.5% of monomers from tie-flips alone, which is
+    indistinguishable from a genuine reordering.
+    """
+    import hashlib
+
+    h = hashlib.blake2b(digest_size=6)
+    h.update(np.asarray(z, dtype=np.int64).reshape(-1).tobytes())
+    coords = np.asarray(r, dtype=np.float32).reshape(-1, 3)
+    h.update(np.round(coords, 4).tobytes())
+    h.update(np.int64(round(float(charge))).tobytes())
+    return h.hexdigest()
+
+
+def datapoint_fingerprint(data):
+    """`monomer_fingerprint` for a processed monomer `Data` object."""
+    return monomer_fingerprint(
+        data.x.reshape(-1).cpu().numpy(),
+        data.R.cpu().numpy(),
+        float(data.total_charge),
+    )
+
+
+def load_split_manifest(path, dataset=None, verify="all", print_level=1):
+    """Read a train/test split manifest into two index arrays.
+
+    Args:
+        path: CSV with columns index, split, fingerprint. `split` must be
+            exactly "train" or "test" on every row.
+        dataset: optional dataset to verify the manifest against.
+        verify: "all" checks every row's fingerprint, an int checks that many
+            random rows, "none" skips verification. Verification is the only
+            thing standing between a stale manifest and a silently scrambled
+            split, so "none" is never the default.
+
+    Returns:
+        (train_indices, test_indices) as int64 numpy arrays.
+    """
+    if isinstance(verify, str) and verify not in ("all", "none"):
+        # argparse hands this through as a string, so "2000" has to mean 2000
+        # rather than falling into the "check everything" branch by accident.
+        if not verify.isdigit():
+            raise ValueError(
+                f"verify must be 'all', 'none', or an integer count "
+                f"(got {verify!r})"
+            )
+        verify = int(verify)
+    if isinstance(verify, int) and verify <= 0:
+        raise ValueError(
+            f"verify sample count must be positive (got {verify}); use 'none' "
+            "to skip verification"
+        )
+    frame = pd.read_csv(path)
+    missing = [c for c in SPLIT_MANIFEST_COLUMNS if c not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"split manifest {path} is missing column(s) {missing}; expected "
+            f"{list(SPLIT_MANIFEST_COLUMNS)}"
+        )
+    bad_split = sorted(set(frame["split"]) - {"train", "test"})
+    if bad_split:
+        raise ValueError(
+            f"split manifest {path} has unexpected split value(s) {bad_split}; "
+            "only 'train' and 'test' are allowed"
+        )
+    idx = frame["index"].to_numpy(dtype=np.int64)
+    if len(np.unique(idx)) != len(idx):
+        raise ValueError(f"split manifest {path} has duplicate index values")
+    if idx.min() < 0:
+        raise ValueError(f"split manifest {path} has negative index values")
+
+    train_indices = idx[(frame["split"] == "train").to_numpy()]
+    test_indices = idx[(frame["split"] == "test").to_numpy()]
+    if len(train_indices) == 0 or len(test_indices) == 0:
+        raise ValueError(
+            f"split manifest {path} yields {len(train_indices)} train and "
+            f"{len(test_indices)} test datapoints; both must be non-empty"
+        )
+
+    if dataset is not None:
+        n = len(dataset)
+        if idx.max() >= n:
+            raise ValueError(
+                f"split manifest {path} references index {int(idx.max())} but "
+                f"the dataset has only {n} datapoints"
+            )
+        if len(idx) != n:
+            # A partial manifest silently drops data, which is a different
+            # experiment from the one the manifest describes.
+            raise ValueError(
+                f"split manifest {path} covers {len(idx)} datapoints but the "
+                f"dataset has {n}; the manifest must be exhaustive"
+            )
+        if verify != "none":
+            fingerprints = frame["fingerprint"].to_numpy()
+            order = np.argsort(idx)
+            if verify == "all":
+                probe = idx[order]
+                expected = fingerprints[order]
+            else:
+                rng = np.random.default_rng(0)
+                pick = rng.choice(len(idx), size=min(int(verify), len(idx)),
+                                  replace=False)
+                probe, expected = idx[pick], fingerprints[pick]
+            getter = getattr(dataset, "get", None)
+            if not callable(getter):
+                getter = dataset.__getitem__
+            mismatch = [
+                int(i) for i, want in zip(probe, expected)
+                if datapoint_fingerprint(getter(int(i))) != want
+            ]
+            if mismatch:
+                raise ValueError(
+                    f"split manifest {path} does not match this dataset: "
+                    f"{len(mismatch)} of {len(probe)} fingerprints differ, "
+                    f"first at index {mismatch[:5]}. The processed store was "
+                    "probably rebuilt or reordered since the manifest was made."
+                )
+            if print_level:
+                print(
+                    f"split manifest {path}: verified {len(probe)} "
+                    f"fingerprints against the dataset"
+                )
+    if print_level:
+        print(
+            f"split manifest: {len(train_indices)} train, "
+            f"{len(test_indices)} test "
+            f"({100.0 * len(test_indices) / len(idx):.2f}% held out)"
+        )
+    return train_indices, test_indices
