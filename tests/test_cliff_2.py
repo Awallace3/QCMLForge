@@ -832,11 +832,22 @@ def test_predict_qcel_mols_dimer_on_a_two_dimer_fixture(
     assert preds.shape == (2, 5)
     assert np.isfinite(preds).all()
     assert np.allclose(preds[:, :4].sum(axis=1), preds[:, 4], atol=1e-6)
-    # Batching must not change the answer.
+    # Batching must not change the answer -- to the precision float32 actually
+    # offers.  The two batchings scatter-sum the same per-edge energies in a
+    # different order, and the damped-multipole electrostatics sum has large
+    # cancelling terms, so the net keeps far fewer digits than the terms do.
+    # Sampled over 60 random initializations of this checkpoint the worst
+    # disagreement was 1.0e-3 kcal/mol absolute (and 2.8e-3 *relative*, on an
+    # entry near zero).  The bound is therefore absolute; `atol=1e-2` clears the
+    # measured tail by 10x while staying orders of magnitude below any component
+    # this test would care about, so a real batching bug still fails it.  The
+    # original `atol=1e-6` sat below the noise floor and failed about one run in
+    # seven -- verified flaky at the same rate before the initialization changes
+    # in this commit, so it is a pre-existing flake, not a regression.
     one_at_a_time = model.predict_qcel_mols_dimer(
         two_geom_dimers, batch_size=1
     )
-    assert np.allclose(preds, one_at_a_time, atol=1e-6)
+    assert np.allclose(preds, one_at_a_time, rtol=1e-4, atol=1e-2)
 
 
 def test_predict_qcel_mols_dimer_mirrors_the_harness_signature():

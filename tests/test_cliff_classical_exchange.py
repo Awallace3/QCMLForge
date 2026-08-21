@@ -1141,8 +1141,16 @@ def test_cliff_head_zeroed_corrections_recover_initial_values(
     model_type, _name, _parameter_names, values, _stds,
     atomic_batch, nested_hfvr_vw_model,
 ):
-    """Zeroed correction heads initialize near (2.5,) / (1.8,.34,.39,1.8,2.5)."""
-    model = _build_head(model_type, nested_hfvr_vw_model)
+    """Zeroed correction heads recover the *scalar* seeds when no per-Z table.
+
+    ``param_start_mean_by_Z={}`` opts out of the per-element seeding, which is
+    the only configuration in which every atom shares a column's scalar seed.
+    The default configuration seeds ``exch`` per element and is pinned by
+    :func:`test_cliff_head_zeroed_corrections_recover_per_element_values`.
+    """
+    model = _build_head(
+        model_type, nested_hfvr_vw_model, param_start_mean_by_Z={}
+    )
     _zero_readout_heads(model)
     parameters = model(atomic_batch)[-1]
     expected = torch.tensor(values, dtype=parameters.dtype)
@@ -1153,6 +1161,7 @@ def test_cliff_head_zeroed_corrections_recover_initial_values(
         model_type,
         copy.deepcopy(nested_hfvr_vw_model),
         param_start_std=[0.0] * len(values),
+        param_start_mean_by_Z={},
     )
     _zero_readout_heads(exact)
     exact_parameters = exact(atomic_batch)[-1]
@@ -1161,6 +1170,49 @@ def test_cliff_head_zeroed_corrections_recover_initial_values(
         expected.expand_as(exact_parameters),
         atol=1e-5,
     )
+
+
+@pytest.mark.parametrize(
+    "model_type,_name,parameter_names,values,_stds",
+    _HEAD_CASES,
+    ids=_HEAD_IDS,
+)
+def test_cliff_head_zeroed_corrections_recover_per_element_values(
+    model_type, _name, parameter_names, values, _stds,
+    atomic_batch, nested_hfvr_vw_model,
+):
+    """By default each atom recovers *its own element's* ``K_exch`` seed.
+
+    This is the load-bearing half of the initialization fix: a uniform
+    ``K_exch`` makes an H-H pair an order of magnitude too repulsive, because
+    Eq. (8) combines the two multiplicatively.  The batch is water, so oxygen
+    must come back at 5.6 and both hydrogens at 0.77 -- not all three at 2.5.
+    Columns without a per-element table keep their scalar seed.
+    """
+    exact = _build_head(
+        model_type,
+        nested_hfvr_vw_model,
+        param_start_std=[0.0] * len(values),
+    )
+    _zero_readout_heads(exact)
+    parameters = exact(atomic_batch)[-1]
+
+    by_Z = exact.param_start_mean_by_Z
+    assert by_Z == {"exch": dict(mtp_mtp.CLIFF_EXCH_INITIAL_VALUES_BY_Z)}
+
+    expected = torch.tensor(values, dtype=parameters.dtype).expand(
+        atomic_batch.x.shape[0], len(values)
+    ).clone()
+    for name, table in by_Z.items():
+        column = parameter_names.index(name)
+        for row, z in enumerate(atomic_batch.x.tolist()):
+            if z in table:
+                expected[row, column] = table[z]
+    assert torch.allclose(parameters, expected, atol=1e-5)
+
+    # Water is O/H/H, so the exchange column must not be constant.
+    exch_column = parameter_names.index("exch")
+    assert parameters[:, exch_column].std() > 1.0
 
 
 @pytest.mark.parametrize(
@@ -3946,3 +3998,452 @@ def test_train_models_help_exits_zero_and_advertises_the_cliff_routes():
     assert "RackersTholeDampingOverlapModel" in help_text
     assert "--component_gamma" in help_text
     assert "--total_includes_d3" in help_text
+    assert "--grad_clip_norm" in help_text
+
+
+# ---------------------------------------------------------------------------
+# Raw-parameter bounds and gradient survival
+#
+# The first 100-epoch CLIFF run collapsed four of the five parameter columns to
+# `positivity_epsilon` and inflated the fifth to ~90x its seed.  The mechanism
+# is that `K = softplus(raw) + eps` has `dK/draw = sigmoid(raw)`, so a column
+# driven toward zero loses the very gradient that would bring it back.  These
+# tests pin the two properties that fix it: the bound is enforced on the value,
+# and the gradient survives being outside it.
+# ---------------------------------------------------------------------------
+
+
+def test_ste_clamp_bounds_value_and_passes_gradient():
+    lower = torch.tensor([[-2.0]])
+    upper = torch.tensor([[3.0]])
+    raw = torch.tensor(
+        [[-40.0], [-2.5], [-2.0], [0.0], [3.0], [3.5], [40.0]],
+        requires_grad=True,
+    )
+    clamped = mtp_mtp._ste_clamp(raw, lower, upper)
+    assert torch.all(clamped >= lower)
+    assert torch.all(clamped <= upper)
+    # Inside the interval the clamp is the identity, not merely close to it.
+    inside = (raw.detach() >= lower) & (raw.detach() <= upper)
+    assert torch.equal(clamped.detach()[inside], raw.detach()[inside])
+
+    clamped.sum().backward()
+    # The whole point: an out-of-range parameter still receives gradient 1, so
+    # it can climb back in.  A plain `clamp` would give 0 here and freeze it.
+    assert torch.equal(raw.grad, torch.ones_like(raw))
+
+
+def test_ste_clamp_accepts_one_sided_bounds():
+    raw = torch.tensor([[-5.0], [5.0]], requires_grad=True)
+    lower_only = mtp_mtp._ste_clamp(raw, torch.tensor([[0.0]]), None)
+    assert lower_only.detach().tolist() == [[0.0], [5.0]]
+    upper_only = mtp_mtp._ste_clamp(raw, None, torch.tensor([[0.0]]))
+    assert upper_only.detach().tolist() == [[-5.0], [0.0]]
+    assert torch.equal(
+        mtp_mtp._ste_clamp(raw, None, None).detach(), raw.detach()
+    )
+
+
+@pytest.mark.parametrize(
+    "model_type,_name,_parameter_names,values,_stds",
+    _HEAD_CASES,
+    ids=_HEAD_IDS,
+)
+def test_cliff_head_bounds_are_the_configured_multiples_of_the_seed(
+    model_type, _name, _parameter_names, values, _stds,
+    atomic_batch, nested_hfvr_vw_model,
+):
+    """The raw buffers must map back to `fraction * seed` and `multiple * seed`."""
+    model = _build_head(model_type, nested_hfvr_vw_model)
+    seeds = torch.tensor(values, dtype=torch.get_default_dtype())
+
+    floor = F.softplus(model.raw_parameter_floor) + model.positivity_epsilon
+    ceiling = F.softplus(model.raw_parameter_ceiling) + model.positivity_epsilon
+    assert torch.allclose(
+        floor.reshape(-1), mtp_mtp.CLIFF_PARAM_FLOOR_FRACTION * seeds, atol=1e-5
+    )
+    assert torch.allclose(
+        ceiling.reshape(-1),
+        mtp_mtp.CLIFF_PARAM_CEILING_MULTIPLE * seeds,
+        atol=1e-4,
+    )
+    # Config-derived, so deliberately absent from the checkpoint: a build that
+    # predates the bound must still be able to load a checkpoint written now.
+    assert "raw_parameter_floor" not in model.state_dict()
+    assert "raw_parameter_ceiling" not in model.state_dict()
+
+
+@pytest.mark.parametrize(
+    "model_type,_name,_parameter_names,values,_stds",
+    _HEAD_CASES,
+    ids=_HEAD_IDS,
+)
+def test_cliff_head_survives_saturating_readout_with_live_gradient(
+    model_type, _name, _parameter_names, values, _stds,
+    atomic_batch, nested_hfvr_vw_model,
+):
+    """A hostile readout must park the head at the floor, still trainable.
+
+    This is the exact failure that killed the first run, reproduced in one
+    forward pass: drive the correction MLP hard negative and check both that
+    the emitted parameter stops at the floor and that gradient still flows back
+    into the readout weights.  Without the bound the parameter reaches
+    ``positivity_epsilon`` and the gradient underflows to ~1e-13.
+    """
+    bounded = _build_head(model_type, nested_hfvr_vw_model)
+    unbounded = _build_head(
+        model_type,
+        copy.deepcopy(nested_hfvr_vw_model),
+        param_floor_fraction=None,
+        param_ceiling_multiple=None,
+    )
+    floor = (
+        F.softplus(bounded.raw_parameter_floor) + bounded.positivity_epsilon
+    )
+
+    grads = {}
+    for label, model in (("bounded", bounded), ("unbounded", unbounded)):
+        with torch.no_grad():
+            for head in model.param_readout_layers:
+                for readout in head:
+                    for parameter in readout.parameters():
+                        parameter.fill_(-25.0)
+        parameters = model(atomic_batch)[-1]
+        assert torch.isfinite(parameters).all()
+        parameters.sum().backward()
+        grads[label] = max(
+            parameter.grad.abs().max().item()
+            for head in model.param_readout_layers
+            for readout in head
+            for parameter in readout.parameters()
+            if parameter.grad is not None
+        )
+        if label == "bounded":
+            assert torch.allclose(
+                parameters, floor.expand_as(parameters), atol=1e-5
+            )
+        else:
+            assert torch.all(parameters < 1e-3)
+
+    assert grads["unbounded"] < 1e-6, grads["unbounded"]
+    assert grads["bounded"] > 1e-3 * (1.0 + grads["unbounded"]), grads
+    assert grads["bounded"] > 1e6 * grads["unbounded"]
+
+
+@pytest.mark.parametrize(
+    "model_type,_name,_parameter_names,values,_stds",
+    _HEAD_CASES,
+    ids=_HEAD_IDS,
+)
+def test_cliff_head_ceiling_caps_a_runaway_readout(
+    model_type, _name, _parameter_names, values, _stds,
+    atomic_batch, nested_hfvr_vw_model,
+):
+    model = _build_head(model_type, nested_hfvr_vw_model)
+    with torch.no_grad():
+        for head in model.param_readout_layers:
+            for readout in head:
+                for parameter in readout.parameters():
+                    parameter.fill_(25.0)
+    parameters = model(atomic_batch)[-1]
+    ceiling = F.softplus(model.raw_parameter_ceiling) + model.positivity_epsilon
+    assert torch.isfinite(parameters).all()
+    assert torch.all(parameters <= ceiling + 1e-4)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [0.0, -1.0, float("nan"), float("inf"), "x", object()],
+)
+@pytest.mark.parametrize(
+    "field", ["param_floor_fraction", "param_ceiling_multiple"]
+)
+def test_cliff_head_rejects_invalid_bound_scale(
+    bad, field, nested_hfvr_vw_model
+):
+    with pytest.raises(ValueError, match=field):
+        _build_head(
+            mtp_mtp.CliffExchangeNN, nested_hfvr_vw_model, **{field: bad}
+        )
+
+
+def test_cliff_head_rejects_inverted_bounds(nested_hfvr_vw_model):
+    with pytest.raises(ValueError, match="strictly less than"):
+        _build_head(
+            mtp_mtp.CliffExchangeNN,
+            nested_hfvr_vw_model,
+            param_floor_fraction=2.0,
+            param_ceiling_multiple=1.0,
+        )
+
+
+def test_cliff_head_accepts_disabled_bounds(nested_hfvr_vw_model, atomic_batch):
+    """`None`/`None` reproduces the pre-bound forward exactly."""
+    model = _build_head(
+        mtp_mtp.CliffExchangeNN,
+        nested_hfvr_vw_model,
+        param_floor_fraction=None,
+        param_ceiling_multiple=None,
+    )
+    assert model.raw_parameter_floor is None
+    assert model.raw_parameter_ceiling is None
+    config = model.get_config()
+    assert config["param_floor_fraction"] is None
+    assert config["param_ceiling_multiple"] is None
+    assert torch.all(model(atomic_batch)[-1] > 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Per-element seeding
+# ---------------------------------------------------------------------------
+
+
+def test_cliff_exch_per_element_table_covers_the_dataset_elements():
+    table = mtp_mtp.CLIFF_EXCH_INITIAL_VALUES_BY_Z
+    # H/C/N/O/F/S/Cl/Br are the elements the SAPT training sets contain.
+    assert set(table) == {1, 6, 7, 8, 9, 16, 17, 35}
+    assert all(value > 0.0 for value in table.values())
+    # Hydrogen must be well below the scalar seed -- that asymmetry is the
+    # entire point, since `K_i K_j` squares it on the most common pair.
+    assert table[1] < mtp_mtp.CLIFF_EXCH_INITIAL_VALUES[0]
+    assert table[1] < table[6] < table[7] < table[8] < table[9]
+
+
+@pytest.mark.parametrize(
+    "bad,match",
+    [
+        ({"nope": {1: 1.0}}, "not one of"),
+        ({"exch": [1.0]}, "mapping of Z to value"),
+        ({"exch": {1: 0.0}}, "strictly positive"),
+        ({"exch": {1: -1.0}}, "strictly positive"),
+        ({"exch": {1: float("nan")}}, "strictly positive"),
+        ({"exch": {200: 1.0}}, "outside"),
+        ({"exch": {-1: 1.0}}, "outside"),
+        ({"exch": {"h": 1.0}}, "atomic numbers"),
+        ([("exch", {})], "mapping of parameter name"),
+    ],
+)
+def test_cliff_head_rejects_invalid_per_element_table(
+    bad, match, nested_hfvr_vw_model
+):
+    with pytest.raises(ValueError, match=match):
+        _build_head(
+            mtp_mtp.CliffExchangeNN,
+            nested_hfvr_vw_model,
+            param_start_mean_by_Z=bad,
+        )
+
+
+def test_cliff_head_per_element_table_survives_string_keys(
+    nested_hfvr_vw_model, atomic_batch
+):
+    """A config round-trip through JSON stringifies integer keys."""
+    model = _build_head(
+        mtp_mtp.CliffExchangeNN,
+        nested_hfvr_vw_model,
+        param_start_std=[0.0],
+        param_start_mean_by_Z={"exch": {"1": 0.5, "8": 4.0}},
+    )
+    assert model.param_start_mean_by_Z == {"exch": {1: 0.5, 8: 4.0}}
+    _zero_readout_heads(model)
+    parameters = model(atomic_batch)[-1]
+    assert torch.allclose(
+        parameters.reshape(-1),
+        torch.tensor([4.0, 0.5, 0.5], dtype=parameters.dtype),
+        atol=1e-5,
+    )
+
+
+def test_cliff_head_per_element_seeds_do_not_leak_across_columns(
+    nested_hfvr_vw_model, atomic_batch
+):
+    """Seeding `exch` must leave the four Rackers columns on their scalars."""
+    model = _build_head(
+        mtp_mtp.CliffClassicalNN,
+        nested_hfvr_vw_model,
+        param_start_std=[0.0] * 5,
+    )
+    _zero_readout_heads(model)
+    parameters = model(atomic_batch)[-1]
+    rackers = parameters[:, : mtp_mtp.CLIFF_CLASSICAL_EXCH_INDEX]
+    expected = torch.tensor(
+        mtp_mtp.CLIFF_CLASSICAL_INITIAL_VALUES[
+            : mtp_mtp.CLIFF_CLASSICAL_EXCH_INDEX
+        ],
+        dtype=parameters.dtype,
+    )
+    assert torch.allclose(rackers, expected.expand_as(rackers), atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Gradient clipping plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_train_declares_grad_clip_norm():
+    """`train_models.py` drops kwargs missing from the signature silently."""
+    signature = inspect.signature(mtp_mtp.AM_DimerParam_Model.train)
+    assert "grad_clip_norm" in signature.parameters
+    assert signature.parameters["grad_clip_norm"].default is None
+    inner = inspect.signature(mtp_mtp.AM_DimerParam_Model.single_proc_train)
+    assert "grad_clip_norm" in inner.parameters
+    assert inner.parameters["grad_clip_norm"].default is None
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), "x"])
+def test_validate_bound_scale_rejects_non_positive(bad):
+    with pytest.raises(ValueError, match="grad_clip_norm"):
+        mtp_mtp._validate_bound_scale(bad, "grad_clip_norm")
+
+
+def test_validate_bound_scale_allows_none_and_coerces_ints():
+    assert mtp_mtp._validate_bound_scale(None, "grad_clip_norm") is None
+    assert mtp_mtp._validate_bound_scale(2, "grad_clip_norm") == 2.0
+    with pytest.raises(ValueError, match="grad_clip_norm"):
+        mtp_mtp._validate_bound_scale(
+            None, "grad_clip_norm", allow_none=False
+        )
+
+
+def test_ste_clamp_is_exact_at_large_magnitudes():
+    """Regression: the bound must hold when `|x|` dwarfs it.
+
+    The first implementation used `x - (x - upper).clamp_min(0).detach()`,
+    which is algebraically correct but cancels: at `x = 3e7` in float32,
+    `x - upper` rounds back toward `x` and the "clamped" result came out at 32
+    instead of 25.  `test_cliff_head_ceiling_caps_a_runaway_readout` is what
+    caught it; this pins the helper directly.
+    """
+    lower = torch.tensor([[-25.0]])
+    upper = torch.tensor([[25.0]])
+    raw = torch.tensor(
+        [[-3.0e7], [-1.0e10], [3.0e7], [1.0e10], [3.4e7]], requires_grad=True
+    )
+    clamped = mtp_mtp._ste_clamp(raw, lower, upper)
+    expected = raw.detach().clamp(min=-25.0, max=25.0)
+    assert torch.equal(clamped.detach(), expected)
+    clamped.sum().backward()
+    assert torch.equal(raw.grad, torch.ones_like(raw))
+
+
+# ---------------------------------------------------------------------------
+# Readout initialization scaling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "model_type,_name,_parameter_names,_values,_stds",
+    _HEAD_CASES,
+    ids=_HEAD_IDS,
+)
+def test_readout_init_scale_shrinks_only_the_output_layer(
+    model_type, _name, _parameter_names, _values, _stds, nested_hfvr_vw_model
+):
+    """Scaling must be linear in the knob, so only the output layer is touched.
+
+    Scaling every layer of the four-deep readout stack would compound as
+    ``s ** 4`` and make the configured number unreadable.
+    """
+    scale = 0.25
+    # Both heads must draw the *same* random initialization, or nothing about
+    # their weights is comparable.
+    torch.manual_seed(0)
+    unscaled = _build_head(
+        model_type, copy.deepcopy(nested_hfvr_vw_model), readout_init_scale=None
+    )
+    torch.manual_seed(0)
+    scaled = _build_head(
+        model_type,
+        copy.deepcopy(nested_hfvr_vw_model),
+        readout_init_scale=scale,
+    )
+    assert scaled.readout_init_scale == scale
+    assert unscaled.readout_init_scale is None
+
+    checked_outputs = 0
+    for head_u, head_s in zip(
+        unscaled.param_readout_layers, scaled.param_readout_layers
+    ):
+        for readout_u, readout_s in zip(head_u, head_s):
+            linears_u = [
+                m for m in readout_u.modules() if isinstance(m, torch.nn.Linear)
+            ]
+            linears_s = [
+                m for m in readout_s.modules() if isinstance(m, torch.nn.Linear)
+            ]
+            assert len(linears_u) == len(linears_s) > 1
+            # Every layer but the last is untouched, bit for bit.
+            for layer_u, layer_s in zip(linears_u[:-1], linears_s[:-1]):
+                assert torch.equal(layer_u.weight, layer_s.weight)
+                assert torch.equal(layer_u.bias, layer_s.bias)
+            # The output layer is scaled exactly, weight and bias alike.
+            assert torch.allclose(
+                linears_s[-1].weight, scale * linears_u[-1].weight, atol=1e-7
+            )
+            assert torch.allclose(
+                linears_s[-1].bias, scale * linears_u[-1].bias, atol=1e-7
+            )
+            assert linears_u[-1].weight.abs().max() > 0.0
+            checked_outputs += 1
+    assert checked_outputs == len(unscaled.PARAMETER_NAMES) * (
+        unscaled.n_message + 1
+    )
+
+
+def test_readout_init_scale_shrinks_the_correction(
+    nested_hfvr_vw_model, atomic_batch
+):
+    """A scaled readout must leave the emitted parameter nearer its seed."""
+    seeds = torch.tensor(
+        [mtp_mtp.CLIFF_EXCH_INITIAL_VALUES_BY_Z[int(z)] for z in atomic_batch.x],
+        dtype=torch.get_default_dtype(),
+    ).reshape(-1, 1)
+
+    def deviation(scale):
+        torch.manual_seed(3)
+        model = _build_head(
+            mtp_mtp.CliffExchangeNN,
+            copy.deepcopy(nested_hfvr_vw_model),
+            param_start_std=[0.0],
+            readout_init_scale=scale,
+            # The bounds would clamp both variants to the same ceiling and make
+            # the comparison vacuous; this test is about the correction's size.
+            param_floor_fraction=None,
+            param_ceiling_multiple=None,
+        )
+        # Nudge the readout off its draw so there is a correction to shrink at
+        # all, small enough to stay off the softplus tails.
+        with torch.no_grad():
+            for head in model.param_readout_layers:
+                for readout in head:
+                    for parameter in readout.parameters():
+                        parameter.add_(0.02)
+        with torch.no_grad():
+            return (model(atomic_batch)[-1] - seeds).abs().mean().item()
+
+    full = deviation(None)
+    shrunk = deviation(0.1)
+    assert full > 0.0
+    assert shrunk < full, (shrunk, full)
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), "x"])
+def test_readout_init_scale_rejects_non_positive(bad, nested_hfvr_vw_model):
+    with pytest.raises(ValueError, match="readout_init_scale"):
+        _build_head(
+            mtp_mtp.CliffExchangeNN,
+            nested_hfvr_vw_model,
+            readout_init_scale=bad,
+        )
+
+
+def test_cliff_head_overrides_distinguishes_none_from_unset():
+    """`None` disables a feature; the sentinel means "use the head default"."""
+    sentinel = mtp_mtp._CLIFF_HEAD_DEFAULT
+    assert mtp_mtp._cliff_head_overrides(
+        param_floor_fraction=sentinel, readout_init_scale=None
+    ) == {"readout_init_scale": None}
+    assert mtp_mtp._cliff_head_overrides(param_floor_fraction=sentinel) == {}
+    assert mtp_mtp._cliff_head_overrides(param_floor_fraction=0.5) == {
+        "param_floor_fraction": 0.5
+    }

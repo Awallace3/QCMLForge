@@ -11,6 +11,18 @@
 set -euo pipefail
 
 PYTHON="${PYTHON:-python3}"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The environment carries an editable install of apnet_pt that resolves to a
+# *different* worktree, so without this the launcher trains code that has no
+# CLIFF routes at all (an AttributeError at best, silently stale code at worst).
+# Prepend this checkout's src and then assert we actually got it.
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+RESOLVED_APNET_PT="$("${PYTHON}" -c 'import apnet_pt; print(apnet_pt.__file__)')"
+if [[ "${RESOLVED_APNET_PT}" != "${REPO_ROOT}/src/apnet_pt/"* ]]; then
+    printf 'Error: apnet_pt resolves to %q, not this checkout (%q)\n' \
+        "${RESOLVED_APNET_PT}" "${REPO_ROOT}/src/apnet_pt" >&2
+    exit 2
+fi
 ITER="${ITER:-1}"
 MODEL_DIR="${MODEL_DIR:-./models/cliff/${ITER}}"
 # Prerequisites: an AtomMPNN multipole model and an AtomTypeParamNN HFVR /
@@ -27,7 +39,13 @@ RANDOM_SEED="${RANDOM_SEED:-${ITER}}"
 # ~1.5M-dimer set.
 DS_MAX_SIZE="${DS_MAX_SIZE:-5000}"
 N_EPOCHS="${N_EPOCHS:-15}"
-LEARNING_RATE="${LEARNING_RATE:-5e-4}"
+# 1e-4 rather than the 5e-4 default. At 5e-4 over 100 epochs Adam's cumulative
+# displacement budget (~lr per step) is large enough to carry a raw parameter
+# the full distance from its seed into softplus saturation, which is exactly
+# what the first 100-epoch run did to four of the five columns.
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+# Global gradient-norm clip. Empty disables it.
+GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
 N_RBF="${N_RBF:-8}"
 N_NEURON="${N_NEURON:-64}"
 N_EMBED="${N_EMBED:-8}"
@@ -130,6 +148,15 @@ COMMON_ARGS=(
 
 if [[ -n "${DS_MAX_SIZE}" ]]; then
     COMMON_ARGS+=(--ds_max_size "${DS_MAX_SIZE}")
+fi
+if [[ -n "${GRAD_CLIP_NORM}" ]]; then
+    if ! awk -v c="${GRAD_CLIP_NORM}" \
+        'BEGIN { exit !(c ~ /^[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$/ && c > 0) }'; then
+        printf 'Error: GRAD_CLIP_NORM must be a positive number (got %q)\n' \
+            "${GRAD_CLIP_NORM}" >&2
+        exit 2
+    fi
+    COMMON_ARGS+=(--grad_clip_norm "${GRAD_CLIP_NORM}")
 fi
 if [[ -n "${WANDB_ENTITY}" ]]; then
     COMMON_ARGS+=(--wandb-entity "${WANDB_ENTITY}")

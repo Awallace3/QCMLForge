@@ -344,6 +344,7 @@ def train_pairwise_model(
     include_total_mse=False,
     component_gamma=None,
     total_includes_d3=False,
+    grad_clip_norm=None,
     omp_num_threads=8,
     wandb_config=None,
 ):
@@ -390,6 +391,7 @@ def train_pairwise_model(
         include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms. On a CLIFF route it is instead shorthand for component_gamma=0.5 and cannot be combined with an explicit component_gamma.
         component_gamma (float or None): CLIFF Eq. (23) component/total loss weight for the combined CLIFF routes. None (the default) keeps the legacy plain multi-column MSE; any float in [0.0, 1.0] selects the Eq. (23) functional. Rejected on CliffExchangeModel and on every pre-existing route.
         total_includes_d3 (bool): If true, the CLIFF Eq. (23) total term includes D3 dispersion and is compared against all four SAPT columns. Requires an explicit component_gamma and one of the combined CLIFF routes.
+        grad_clip_norm (float or None): Global gradient-norm clip applied before each optimizer step. None (the default) leaves every route's update unclipped, as before.
         omp_num_threads (int): Number of OpenMP threads assigned to each training process.
 
     """
@@ -893,6 +895,11 @@ def train_pairwise_model(
         include_total_mse=include_total_mse,
         wandb_config=wandb_config,
     )
+    if grad_clip_norm is not None:
+        # Only inserted when requested so routes whose `train` has no
+        # `grad_clip_norm` parameter do not print a spurious "skipping
+        # unsupported kwarg" line on every unclipped run.
+        train_kwargs["grad_clip_norm"] = grad_clip_norm
     if is_cliff_model:
         # Added only for the CLIFF routes so every other route's train_kwargs
         # stay exactly as they were.  `component_gamma` is forwarded as-is,
@@ -1258,6 +1265,17 @@ def main():
         ),
     )
     args.add_argument(
+        "--grad_clip_norm",
+        type=float,
+        default=None,
+        help=(
+            "Clip the global gradient norm to this value before each optimizer "
+            "step. Unset (the default) leaves the update unclipped. SAPT "
+            "components reach ~240 kcal/mol, so a single close-contact dimer "
+            "can otherwise dominate a step under MSE."
+        ),
+    )
+    args.add_argument(
         "--total_includes_d3",
         action="store_true",
         default=False,
@@ -1469,6 +1487,7 @@ def main():
             ds_max_size=args.ds_max_size,
             component_gamma=args.component_gamma,
             total_includes_d3=args.total_includes_d3,
+            grad_clip_norm=args.grad_clip_norm,
             omp_num_threads=(
                 args.omp_num_threads
                 if args.omp_num_threads is not None

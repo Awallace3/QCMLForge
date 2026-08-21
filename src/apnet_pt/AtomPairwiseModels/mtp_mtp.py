@@ -83,6 +83,33 @@ CLIFF_EXCH_PARAMETER_NAMES = ("exch",)
 CLIFF_EXCH_INITIAL_VALUES = (2.5,)
 CLIFF_EXCH_INITIAL_STDS = (0.01,)
 
+# Per-element ``K_exch`` seeds, from the CLIFF Table I fitted values (Schriber
+# et al., J. Chem. Phys. 154, 184110 (2021)).  CLIFF assigns 17 atom types by
+# element *and* coordination number; these are the per-element centres of those
+# type groups, which is the resolution a per-``Z`` embedding can represent --
+# the MPNN readout correction supplies the coordination-number dependence.
+#
+# Seeding per element matters far more than it looks.  ``K_exch`` enters Eq. (8)
+# as the product ``K_i K_j``, so a uniform 2.5 makes an H-H pair
+# ``2.5 * 2.5 = 6.25`` when CLIFF's hydrogen types give ``0.77 * 0.77 = 0.59``:
+# an order of magnitude too repulsive on the *most common* pair in the data.
+# The optimizer's fastest way to undo that is to drive every ``K_exch`` toward
+# zero, and because ``softplus`` saturates, once it gets there the head has no
+# gradient left to come back.  A 100-epoch run at the uniform seed collapsed to
+# a mean ``K_exch`` of 0.025 with 23% of atoms pinned at ``positivity_epsilon``
+# and an exchange MAE equal to the predict-zero baseline.  Elements absent here
+# fall back to ``CLIFF_EXCH_INITIAL_VALUES``.
+CLIFF_EXCH_INITIAL_VALUES_BY_Z = {
+    1: 0.77,   # H
+    6: 2.40,   # C
+    7: 4.20,   # N
+    8: 5.60,   # O
+    9: 7.60,   # F
+    16: 3.20,  # S
+    17: 3.80,  # Cl
+    35: 4.10,  # Br
+}
+
 # Combined classical contract.  Columns 0-3 intentionally mirror
 # ``RACKERS_PARAMETER_NAMES`` so the electrostatics and induction physics paths
 # are reused unchanged and a Rackers checkpoint's learned columns remain
@@ -96,6 +123,52 @@ CLIFF_CLASSICAL_PARAMETER_NAMES = (
 )
 CLIFF_CLASSICAL_INITIAL_VALUES = (1.8, 0.34, 0.39, 1.8, 2.5)
 CLIFF_CLASSICAL_INITIAL_STDS = (0.01, 0.01, 0.01, 0.01, 0.01)
+
+# Per-element seeds for the combined route.  Only the exchange column has
+# published per-element values; columns 0-3 keep their scalar Rackers seeds.
+CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z = {
+    "exch": CLIFF_EXCH_INITIAL_VALUES_BY_Z,
+}
+
+# Straight-through bounds on the *raw* (pre-softplus) per-atom parameters,
+# expressed relative to each column's scalar seed: ``[fraction * seed,
+# multiple * seed]``.
+#
+# These exist because ``K = softplus(raw) + epsilon`` cannot recover from
+# collapse.  ``dK/draw = sigmoid(raw)``, so as ``K -> 0`` the gradient that
+# would lift it back vanishes too; a head driven to ``raw ~ -18`` is dead for
+# the rest of training no matter what the loss wants.  Clamping ``raw`` in the
+# *raw* domain with a straight-through gradient (see :func:`_ste_clamp`) parks a
+# collapsing head at ``fraction * seed`` -- where ``sigmoid(raw)`` is still
+# order 0.1, not 1e-8 -- so it stays trainable and can climb back out.
+#
+# The ceiling is the mirror image: the same 100-epoch run drove the ``elst``
+# damping column to a mean of 22.2 and a maximum of 164.7 from a seed of 1.8,
+# which is not a physical damping width.  ``10x`` the seed is loose enough to
+# let a column adapt by an order of magnitude and tight enough to catch a
+# runaway.
+CLIFF_PARAM_FLOOR_FRACTION = 0.05
+CLIFF_PARAM_CEILING_MULTIPLE = 10.0
+
+# Multiplier applied to the *output* layer of each per-message readout MLP at
+# construction, shrinking the random correction so the per-element seed actually
+# governs the initial prediction.
+#
+# Without it the seeding work above is largely wasted.  Measured at
+# initialization on held-out dimers, exchange MAE against SAPT ``Exch``:
+#
+#     uniform K = 2.5, full-size readout     12.4    (predict-zero: 18.6)
+#     per-element K,   full-size readout      5.5
+#     per-element K,   readout x 0.1          3.3
+#
+# So the random readout was contributing more error than the entire
+# uniform-versus-per-element difference.  ``AtomTypeParamNN.__init__`` has
+# carried a commented-out ``set_weights_excluding_guess(0.01)`` since it was
+# written, which is the same intent; that helper fills *every* weight with a
+# constant (including the frozen atom model's), so this scales only the readout
+# output layers, which makes the correction's magnitude scale linearly and
+# leaves the rest of the hierarchy alone.
+CLIFF_READOUT_INIT_SCALE = 0.1
 
 # Column indices into the 2-D parameter tensors returned by ``CliffExchangeNN``
 # and ``CliffClassicalNN``.  Both classes present a uniform ``[n_atoms, k]``
@@ -1707,6 +1780,114 @@ def _validate_model_width_floor(width_floor) -> float:
     return value
 
 
+def _ste_clamp(
+    x: torch.Tensor,
+    lower: torch.Tensor | None,
+    upper: torch.Tensor | None,
+) -> torch.Tensor:
+    """Clamp ``x`` to ``[lower, upper]`` while passing gradient through as 1.
+
+    A plain ``clamp`` would zero the gradient outside the interval, which is
+    precisely the failure this is meant to prevent: a parameter that has been
+    pushed out of range would then be frozen there permanently.  Adding a
+    *detached* correction gives ``max``/``min`` semantics on the value and an
+    identity Jacobian, so a clamped parameter keeps receiving the full gradient
+    signal and moves back inside as soon as the loss asks it to.
+
+    ``lower`` and ``upper`` broadcast against ``x``; either may be ``None``.
+
+    The value is clamped on a *detached* copy and the gradient is reattached
+    through ``x - x.detach()``, which is exactly ``0.0`` in floating point
+    because both terms are bit-identical.  Writing it the obvious way instead --
+    ``x + (bound - x).detach()`` -- is algebraically the same but loses the
+    bound to catastrophic cancellation once ``|x|`` is large enough that
+    ``bound - x`` rounds back to ``-x``: a readout driven to ``raw = 3e7`` came
+    out of that form at ``32`` rather than the requested ``25``.
+    """
+    if lower is None and upper is None:
+        return x
+    clamped = x.detach().clamp(min=lower, max=upper)
+    return clamped + (x - x.detach())
+
+
+def _validate_bound_scale(value, name: str, *, allow_none: bool = True):
+    """Validate a raw-parameter bound scale (``fraction`` or ``multiple``)."""
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{name} must be finite and strictly greater than zero")
+    try:
+        scale = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{name} must be finite and strictly greater than zero"
+        ) from exc
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"{name} must be finite and strictly greater than zero")
+    return scale
+
+
+def _validate_param_start_mean_by_Z(param_start_mean_by_Z, parameter_names):
+    """Validate and normalize per-element parameter seeds.
+
+    Accepts ``None`` or a mapping ``{parameter_name: {Z: value}}``.  Returned
+    keys are normalized to ``str`` parameter names and ``int`` atomic numbers so
+    a config round-trip through JSON (which stringifies integer keys) rebuilds
+    the same table.  Values are only range-checked here; the inverse-softplus
+    transform happens at embedding-seed time against the same
+    ``positivity_epsilon`` as the scalar means.
+    """
+    if param_start_mean_by_Z is None:
+        return None
+    if not isinstance(param_start_mean_by_Z, dict):
+        raise ValueError(
+            "param_start_mean_by_Z must be None or a mapping of parameter name "
+            "to {Z: value}"
+        )
+    allowed = set(parameter_names)
+    normalized: dict[str, dict[int, float]] = {}
+    for raw_name, table in param_start_mean_by_Z.items():
+        name = str(raw_name)
+        if name not in allowed:
+            raise ValueError(
+                f"param_start_mean_by_Z key {name!r} is not one of "
+                f"{tuple(parameter_names)}"
+            )
+        if not isinstance(table, dict):
+            raise ValueError(
+                f"param_start_mean_by_Z[{name!r}] must be a mapping of Z to value"
+            )
+        column: dict[int, float] = {}
+        for raw_z, raw_value in table.items():
+            try:
+                z = int(raw_z)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"param_start_mean_by_Z[{name!r}] keys must be atomic numbers"
+                ) from exc
+            if not 0 <= z <= max_Z:
+                raise ValueError(
+                    f"param_start_mean_by_Z[{name!r}] atomic number {z} is "
+                    f"outside [0, {max_Z}]"
+                )
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"param_start_mean_by_Z[{name!r}][{z}] must be finite and "
+                    "strictly positive"
+                ) from exc
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"param_start_mean_by_Z[{name!r}][{z}] must be finite and "
+                    "strictly positive"
+                )
+            column[z] = value
+        if column:
+            normalized[name] = column
+    return normalized or None
+
+
 class RackersTholeDampingNN(AtomTypeParamNN):
     def __init__(
         self,
@@ -1813,6 +1994,10 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         positivity_epsilon: float,
         width_floor: float,
         freeze_atom_model: bool,
+        param_start_mean_by_Z=None,
+        param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
+        param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        readout_init_scale=CLIFF_READOUT_INIT_SCALE,
     ):
         if type(atom_model) is not AtomTypeParamNN:
             raise ValueError("atom_model must be an AtomTypeParamNN")
@@ -1825,6 +2010,27 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
             )
         )
         width_floor = _validate_model_width_floor(width_floor)
+        param_start_mean_by_Z = _validate_param_start_mean_by_Z(
+            param_start_mean_by_Z, self.PARAMETER_NAMES
+        )
+        param_floor_fraction = _validate_bound_scale(
+            param_floor_fraction, "param_floor_fraction"
+        )
+        param_ceiling_multiple = _validate_bound_scale(
+            param_ceiling_multiple, "param_ceiling_multiple"
+        )
+        readout_init_scale = _validate_bound_scale(
+            readout_init_scale, "readout_init_scale"
+        )
+        if (
+            param_floor_fraction is not None
+            and param_ceiling_multiple is not None
+            and param_floor_fraction >= param_ceiling_multiple
+        ):
+            raise ValueError(
+                "param_floor_fraction must be strictly less than "
+                "param_ceiling_multiple"
+            )
         super().__init__(
             atom_model=atom_model,
             n_message=n_message,
@@ -1835,6 +2041,12 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
             n_params=len(self.PARAMETER_NAMES),
             freeze_atom_model=freeze_atom_model,
         )
+        self.param_start_mean_by_Z = param_start_mean_by_Z
+        self.param_floor_fraction = param_floor_fraction
+        self.param_ceiling_multiple = param_ceiling_multiple
+        self.readout_init_scale = readout_init_scale
+        self._seed_guess_layer_by_Z(param_start_mean_by_Z, positivity_epsilon)
+        self._scale_readout_output_layers(readout_init_scale)
         if any(
             not torch.isfinite(layer.weight).all().item()
             for layer in self.guess_layer
@@ -1848,7 +2060,118 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         self.param_start_std = raw_stds
         self.positivity_epsilon = positivity_epsilon
         self.width_floor = width_floor
+        self._register_raw_parameter_bounds(
+            positive_means,
+            positivity_epsilon,
+            param_floor_fraction,
+            param_ceiling_multiple,
+        )
         self.atom_model.requires_grad_(not freeze_atom_model)
+
+    def _seed_guess_layer_by_Z(self, param_start_mean_by_Z, positivity_epsilon):
+        """Overwrite per-element rows of the seed embeddings.
+
+        ``AtomTypeParamNN.__init__`` has already filled every row of
+        ``guess_layer[p]`` with the scalar pre-image plus noise; this replaces
+        the rows named in ``param_start_mean_by_Z`` with that element's own
+        pre-image, keeping the same noise scale so the two paths are
+        statistically identical apart from the centre.  Elements not named keep
+        the scalar seed.
+        """
+        if not param_start_mean_by_Z:
+            return
+        index_by_name = {
+            name: idx for idx, name in enumerate(self.PARAMETER_NAMES)
+        }
+        with torch.no_grad():
+            for name, table in param_start_mean_by_Z.items():
+                p = index_by_name[name]
+                weight = self.guess_layer[p].weight
+                std = float(self.param_start_std[p])
+                for z, value in table.items():
+                    raw = _inverse_softplus(value - positivity_epsilon)
+                    if not math.isfinite(raw):
+                        raise ValueError(
+                            f"param_start_mean_by_Z[{name!r}][{z}] = {value} "
+                            "has no finite inverse-softplus pre-image"
+                        )
+                    noise = std * torch.randn(
+                        weight.shape[1:],
+                        dtype=weight.dtype,
+                        device=weight.device,
+                    )
+                    weight[z].copy_(raw + noise)
+
+    def _scale_readout_output_layers(self, readout_init_scale):
+        """Shrink the random correction so the per-element seed dominates at init.
+
+        Only the *output* ``Linear`` of each per-message readout MLP is scaled,
+        so the correction's contribution scales linearly in
+        ``readout_init_scale``.  Scaling every layer instead would compound
+        across the four-layer stack (``s ** 4``) and make the knob unreadable.
+        See :data:`CLIFF_READOUT_INIT_SCALE` for the measurement motivating it.
+        """
+        if readout_init_scale is None or readout_init_scale == 1.0:
+            return
+        with torch.no_grad():
+            for head in self.param_readout_layers:
+                for readout in head:
+                    output_layer = None
+                    for module in readout.modules():
+                        if isinstance(module, nn.Linear):
+                            output_layer = module
+                    if output_layer is None:
+                        raise ValueError(
+                            f"{self.MODEL_TYPE} readout stack contains no "
+                            "Linear output layer to scale"
+                        )
+                    output_layer.weight.mul_(readout_init_scale)
+                    if output_layer.bias is not None:
+                        output_layer.bias.mul_(readout_init_scale)
+
+    def _register_raw_parameter_bounds(
+        self,
+        positive_means,
+        positivity_epsilon,
+        param_floor_fraction,
+        param_ceiling_multiple,
+    ):
+        """Precompute the raw-domain bounds handed to :func:`_ste_clamp`.
+
+        The bounds are specified in the *positive* domain (a fraction and a
+        multiple of each column's scalar seed) because that is where they are
+        interpretable, then mapped once through ``_inverse_softplus`` so the
+        forward pass does no transcendental work.  They are registered as
+        non-persistent buffers: they are fully determined by config, so keeping
+        them out of ``state_dict`` leaves checkpoints loadable by builds that
+        predate this bound and avoids two sources of truth for the same number.
+        """
+        def _raw_bound(scale, kind):
+            if scale is None:
+                return None
+            values = []
+            for name, mean in zip(self.PARAMETER_NAMES, positive_means):
+                target = scale * mean
+                if target <= positivity_epsilon:
+                    raise ValueError(
+                        f"param_{kind} for {name!r} resolves to {target}, which "
+                        "is not above positivity_epsilon"
+                    )
+                values.append(_inverse_softplus(target - positivity_epsilon))
+            return torch.tensor(values, dtype=torch.get_default_dtype()).reshape(
+                1, -1
+            )
+
+        self.register_buffer(
+            "raw_parameter_floor",
+            _raw_bound(param_floor_fraction, "floor_fraction"),
+            persistent=False,
+        )
+        self.register_buffer(
+            "raw_parameter_ceiling",
+            _raw_bound(param_ceiling_multiple, "ceiling_multiple"),
+            persistent=False,
+        )
 
     def forward(self, batch):
         output = super().forward(batch)
@@ -1861,6 +2184,16 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         # branch is folded away under `torch.compile`.
         if raw_parameters.dim() == 1:
             raw_parameters = raw_parameters.unsqueeze(-1)
+        # Bound the raw parameter *before* softplus, with gradient passed
+        # through.  Clamping the positive output instead would leave a
+        # collapsing head sitting at ``sigmoid(raw) ~ 0`` and unable to
+        # recover; see :func:`_ste_clamp` and
+        # :data:`CLIFF_PARAM_FLOOR_FRACTION`.
+        raw_parameters = _ste_clamp(
+            raw_parameters,
+            self.raw_parameter_floor,
+            self.raw_parameter_ceiling,
+        )
         parameters = F.softplus(raw_parameters) + self.positivity_epsilon
         return (*output[:-1], parameters)
 
@@ -1870,6 +2203,10 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
             "parameter_names": list(self.PARAMETER_NAMES),
             "param_start_mean": list(self.param_start_mean),
             "param_start_std": list(self.param_start_std),
+            "param_start_mean_by_Z": self.param_start_mean_by_Z,
+            "param_floor_fraction": self.param_floor_fraction,
+            "param_ceiling_multiple": self.param_ceiling_multiple,
+            "readout_init_scale": self.readout_init_scale,
             "positivity_epsilon": self.positivity_epsilon,
             "width_floor": self.width_floor,
             "n_message": self.n_message,
@@ -1905,7 +2242,13 @@ class CliffExchangeNN(_CliffPositiveParamNN):
         positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
         width_floor: float = OVERLAP_WIDTH_FLOOR,
         freeze_atom_model: bool = True,
+        param_start_mean_by_Z=None,
+        param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
+        param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        readout_init_scale=CLIFF_READOUT_INIT_SCALE,
     ):
+        if param_start_mean_by_Z is None:
+            param_start_mean_by_Z = {"exch": CLIFF_EXCH_INITIAL_VALUES_BY_Z}
         super().__init__(
             atom_model=atom_model,
             n_message=n_message,
@@ -1916,6 +2259,10 @@ class CliffExchangeNN(_CliffPositiveParamNN):
             positivity_epsilon=positivity_epsilon,
             width_floor=width_floor,
             freeze_atom_model=freeze_atom_model,
+            param_start_mean_by_Z=param_start_mean_by_Z,
+            param_floor_fraction=param_floor_fraction,
+            param_ceiling_multiple=param_ceiling_multiple,
+            readout_init_scale=readout_init_scale,
         )
 
 
@@ -1947,7 +2294,13 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
         width_floor: float = OVERLAP_WIDTH_FLOOR,
         freeze_atom_model: bool = True,
+        param_start_mean_by_Z=None,
+        param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
+        param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        readout_init_scale=CLIFF_READOUT_INIT_SCALE,
     ):
+        if param_start_mean_by_Z is None:
+            param_start_mean_by_Z = CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z
         super().__init__(
             atom_model=atom_model,
             n_message=n_message,
@@ -1958,6 +2311,10 @@ class CliffClassicalNN(_CliffPositiveParamNN):
             positivity_epsilon=positivity_epsilon,
             width_floor=width_floor,
             freeze_atom_model=freeze_atom_model,
+            param_start_mean_by_Z=param_start_mean_by_Z,
+            param_floor_fraction=param_floor_fraction,
+            param_ceiling_multiple=param_ceiling_multiple,
+            readout_init_scale=readout_init_scale,
         )
 
 
@@ -1968,6 +2325,25 @@ _CLIFF_PARAMETER_HEADS: dict[str, type[_CliffPositiveParamNN]] = {
     CliffExchangeNN.MODEL_TYPE: CliffExchangeNN,
     CliffClassicalNN.MODEL_TYPE: CliffClassicalNN,
 }
+
+# `None` is a meaningful value for every one of the four initialization knobs
+# below -- it disables the per-element table, a bound, or the readout scaling --
+# so "not specified" needs a distinct sentinel rather than reusing `None`.
+_CLIFF_HEAD_DEFAULT = object()
+
+
+def _cliff_head_overrides(**kwargs) -> dict:
+    """Drop unspecified CLIFF head initialization knobs.
+
+    Passing these through as `None` would silently disable each feature for
+    every caller that did not name it, so the ones left at
+    :data:`_CLIFF_HEAD_DEFAULT` are omitted and the head's own default applies.
+    """
+    return {
+        name: value
+        for name, value in kwargs.items()
+        if value is not _CLIFF_HEAD_DEFAULT
+    }
 
 
 def get_distances(RA, RB, e_source, e_target):
@@ -4404,6 +4780,10 @@ class AM_DimerParam_Model:
         freeze_atom_model=True,
         positivity_epsilon=RACKERS_POSITIVITY_EPSILON,
         width_floor=OVERLAP_WIDTH_FLOOR,
+        param_start_mean_by_Z=_CLIFF_HEAD_DEFAULT,
+        param_floor_fraction=_CLIFF_HEAD_DEFAULT,
+        param_ceiling_multiple=_CLIFF_HEAD_DEFAULT,
+        readout_init_scale=_CLIFF_HEAD_DEFAULT,
     ):
         """
         Construct an AtomTypeParamModel wrapper that builds or loads an atom-level model, a parameter-predicting model, and optional dimer evaluators and dataset.
@@ -4613,7 +4993,14 @@ class AM_DimerParam_Model:
             elif model_type in _CLIFF_PARAMETER_HEADS:
                 # `width_floor` follows the checkpoint rather than the caller,
                 # so a reloaded model reproduces the overlap it was trained
-                # with.
+                # with.  The raw-parameter bounds follow it for the same reason,
+                # and more sharply: they change `forward` output, so defaulting
+                # them on for a checkpoint trained without them would silently
+                # alter its predictions.  Absent keys therefore mean "no
+                # bounds", which is what a pre-bounds checkpoint was trained
+                # with.  `param_start_mean_by_Z` only seeds embeddings that
+                # `load_state_dict` immediately overwrites, so `{}` here is
+                # purely about `get_config` reporting the truth.
                 self.model = _CLIFF_PARAMETER_HEADS[model_type](
                     atom_model=self.atom_model,
                     n_message=config["n_message"],
@@ -4624,6 +5011,12 @@ class AM_DimerParam_Model:
                     positivity_epsilon=config["positivity_epsilon"],
                     width_floor=config.get("width_floor", width_floor),
                     freeze_atom_model=freeze_atom_model,
+                    param_start_mean_by_Z=config.get(
+                        "param_start_mean_by_Z", {}
+                    ) or {},
+                    param_floor_fraction=config.get("param_floor_fraction"),
+                    param_ceiling_multiple=config.get("param_ceiling_multiple"),
+                    readout_init_scale=config.get("readout_init_scale"),
                 )
             # elif model_type == "AtomTypeParamMPNN":
             #     self.model = AtomTypeParamMPNN(
@@ -4675,6 +5068,16 @@ class AM_DimerParam_Model:
                     positivity_epsilon=positivity_epsilon,
                     width_floor=width_floor,
                     freeze_atom_model=freeze_atom_model,
+                    # Omitted rather than passed as `None`, because for these
+                    # four `None` is a meaningful value ("no per-element table",
+                    # "no bound", "no readout scaling") distinct from "use the
+                    # head's default".
+                    **_cliff_head_overrides(
+                        param_start_mean_by_Z=param_start_mean_by_Z,
+                        param_floor_fraction=param_floor_fraction,
+                        param_ceiling_multiple=param_ceiling_multiple,
+                        readout_init_scale=readout_init_scale,
+                    ),
                 )
             # elif model_type == "AtomTypeParamMPNN":
             #     self.model = AtomTypeParamMPNN(
@@ -5443,7 +5846,14 @@ units angstrom
         return (1.0 - gamma) * total_mse + gamma * component_mse
 
     def __train_batches_single_proc(
-        self, dataloader, loss_fn, optimizer, rank_device, scheduler, y_ind=0
+        self,
+        dataloader,
+        loss_fn,
+        optimizer,
+        rank_device,
+        scheduler,
+        y_ind=0,
+        grad_clip_norm=None,
     ):
         """
         Single-process training loop body.
@@ -5469,7 +5879,17 @@ units angstrom
                 preds, ref, comp_errors, batch, loss_fn
             )
             batch_loss.backward()
-            # torch.nn.utils.clip_grad_norm_(self.dimer_model.parameters(), max_norm=0.2)
+            if grad_clip_norm is not None:
+                # SAPT components reach ~240 kcal/mol on close contacts, so a
+                # single such dimer produces a gradient orders of magnitude
+                # larger than a typical batch's under MSE.  Adam rescales by the
+                # running second moment rather than clipping, so those spikes
+                # both take a full-size step in an outlier direction and inflate
+                # `v` enough to stall the following steps.  Bounding the global
+                # norm keeps one batch from setting the trajectory.
+                torch.nn.utils.clip_grad_norm_(
+                    self.dimer_model.parameters(), max_norm=grad_clip_norm
+                )
             optimizer.step()
             total_loss += batch_loss.item()
             comp_errors_t.append(comp_errors.detach().cpu())
@@ -5551,6 +5971,7 @@ units angstrom
         pin_memory,
         num_workers,
         skip_compile=False,
+        grad_clip_norm=None,
     ):
         # (1) Compile Model
         """
@@ -5725,6 +6146,7 @@ units angstrom
                 rank_device=rank_device,
                 scheduler=scheduler,
                 y_ind=y_ind,
+                grad_clip_norm=grad_clip_norm,
             )
             v_out = self.__evaluate_batches_single_proc(
                 test_loader, loss_fn=criterion, rank_device=rank_device, y_ind=y_ind
@@ -5859,6 +6281,7 @@ units angstrom
         lr_decay=None,
         component_gamma=None,
         total_includes_d3=False,
+        grad_clip_norm=None,
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
         _tracker_event_directory=None,
@@ -5868,11 +6291,13 @@ units angstrom
         ``component_gamma=None`` (the default) keeps the legacy plain MSE; a
         float in ``[0.0, 1.0]`` selects CLIFF Eq. (23).  Both it and
         ``total_includes_d3`` are declared here as named parameters
-        *deliberately*: ``train_models.py`` filters ``train_kwargs`` through
+        *deliberately*, as is ``grad_clip_norm`` (``None`` keeps the legacy
+        unclipped update): ``train_models.py`` filters ``train_kwargs`` through
         ``inspect.signature(apnet.train).parameters`` before calling, so
         anything absent from this signature is silently dropped rather than
         raising.  See :meth:`_batch_loss` for the weighting itself.
         """
+        grad_clip_norm = _validate_bound_scale(grad_clip_norm, "grad_clip_norm")
         # Validated before any dataset work so a misconfigured route fails
         # immediately rather than after a dataset build.
         self.component_gamma, self.total_includes_d3 = (
@@ -5966,6 +6391,7 @@ units angstrom
                     pin_memory=pin_memory,
                     num_workers=dataloader_num_workers,
                     skip_compile=skip_compile,
+                    grad_clip_norm=grad_clip_norm,
                 ),
                 wandb_config,
                 model_family="parameter",
