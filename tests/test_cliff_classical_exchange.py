@@ -4611,3 +4611,200 @@ def test_exchange_initialization_std_is_wide_enough_to_separate_atom_types():
     assert mtp_mtp.CLIFF_CLASSICAL_INITIAL_STDS[
         : mtp_mtp.CLIFF_CLASSICAL_EXCH_INDEX
     ] == mtp_mtp.RACKERS_INITIAL_STDS
+
+
+# ---------------------------------------------------------------------------
+# Task-F: dataset element exclusion
+#
+# The frozen valence-width model cannot predict a monatomic ion's width -- a
+# one-atom monomer has no intramolecular edges, so message passing contributes
+# nothing -- and exchange goes as exp(-r / sqrt(sigma_i sigma_j)), so those
+# atoms dominate the loss. `OVERLAP_WIDTH_CEILING` bounds the damage;
+# `ds_exclude_elements` lets a run remove the elements outright instead.
+# ---------------------------------------------------------------------------
+
+
+class _FakeDimer:
+    def __init__(self, za, zb):
+        self.ZA = torch.tensor(za, dtype=torch.long)
+        self.ZB = torch.tensor(zb, dtype=torch.long)
+
+
+class _FakeDimerDataset:
+    """Minimal stand-in exposing only what the filter is allowed to touch.
+
+    Deliberately does NOT implement ``__getitem__``: the filter must go through
+    ``get`` so it never triggers this dataset family's ``len()``, which globs
+    the whole processed directory on every call.
+    """
+
+    def __init__(self, dimers):
+        self._dimers = list(dimers)
+        self.n_len_calls = 0
+        self.n_get_calls = 0
+
+    def len(self):
+        self.n_len_calls += 1
+        return len(self._dimers)
+
+    def get(self, idx):
+        self.n_get_calls += 1
+        return self._dimers[idx]
+
+
+def _mixed_dataset():
+    #        0        1         2         3         4         5
+    return _FakeDimerDataset([
+        _FakeDimer([1, 6], [8]),        # clean
+        _FakeDimer([11], [8, 1]),       # Na on side A
+        _FakeDimer([6, 6], [17]),       # Cl on side B
+        _FakeDimer([7, 1], [6, 8]),     # clean
+        _FakeDimer([17, 11], [1]),      # both
+        _FakeDimer([16, 1], [1, 1]),    # clean
+    ])
+
+
+def test_normalize_excluded_elements_accepts_none_scalar_and_iterable():
+    assert mtp_mtp.normalize_excluded_elements(None) == frozenset()
+    assert mtp_mtp.normalize_excluded_elements(11) == frozenset({11})
+    assert mtp_mtp.normalize_excluded_elements([11, 17, 11]) == frozenset(
+        {11, 17}
+    )
+    assert mtp_mtp.normalize_excluded_elements(
+        np.array([11, 17])
+    ) == frozenset({11, 17})
+    assert mtp_mtp.normalize_excluded_elements(()) == frozenset()
+
+
+def test_normalize_excluded_elements_rejects_symbols_and_bad_values():
+    # Element symbols are the tempting spelling and the dangerous one: mapping
+    # them here would let a typo become an empty exclusion set, which trains on
+    # exactly the data the caller asked to drop.
+    with pytest.raises(TypeError, match="not element symbols"):
+        mtp_mtp.normalize_excluded_elements("Cl")
+    with pytest.raises(TypeError, match="atomic numbers"):
+        mtp_mtp.normalize_excluded_elements(["Cl"])
+    with pytest.raises(TypeError, match="atomic numbers"):
+        mtp_mtp.normalize_excluded_elements([11.0])
+    with pytest.raises(TypeError, match="atomic numbers"):
+        mtp_mtp.normalize_excluded_elements(True)
+    with pytest.raises(ValueError, match=">= 1"):
+        mtp_mtp.normalize_excluded_elements([0])
+    with pytest.raises(ValueError, match=">= 1"):
+        mtp_mtp.normalize_excluded_elements([-6])
+
+
+def test_dimer_indices_excluding_elements_drops_either_monomer():
+    ds = _mixed_dataset()
+    keep = mtp_mtp.dimer_indices_excluding_elements(ds, [11, 17], print_level=0)
+    assert keep == [0, 3, 5]
+
+
+def test_dimer_indices_excluding_elements_single_element():
+    ds = _mixed_dataset()
+    assert mtp_mtp.dimer_indices_excluding_elements(
+        ds, [11], print_level=0
+    ) == [0, 2, 3, 5]
+    assert mtp_mtp.dimer_indices_excluding_elements(
+        ds, [17], print_level=0
+    ) == [0, 1, 3, 5]
+
+
+def test_dimer_indices_excluding_elements_empty_spec_is_plain_truncation():
+    ds = _mixed_dataset()
+    assert mtp_mtp.dimer_indices_excluding_elements(
+        ds, None, print_level=0
+    ) == [0, 1, 2, 3, 4, 5]
+    assert mtp_mtp.dimer_indices_excluding_elements(
+        ds, [], max_size=3, print_level=0
+    ) == [0, 1, 2]
+    # No scan at all when nothing is excluded.
+    assert ds.n_get_calls == 0
+
+
+def test_dimer_indices_excluding_elements_stops_at_max_size():
+    ds = _mixed_dataset()
+    keep = mtp_mtp.dimer_indices_excluding_elements(
+        ds, [11, 17], max_size=2, print_level=0
+    )
+    assert keep == [0, 3]
+    # Index 3 is the second survivor, so the scan must stop there rather than
+    # walking the rest of the store. This is what makes a filtered subset cost
+    # a scan proportional to the subset, not to the 1.5M-dimer set.
+    assert ds.n_get_calls == 4
+
+
+def test_dimer_indices_excluding_elements_warns_when_exhausted():
+    ds = _mixed_dataset()
+    with pytest.warns(RuntimeWarning, match="exhausted the dataset"):
+        keep = mtp_mtp.dimer_indices_excluding_elements(
+            ds, [11, 17], max_size=99, print_level=0
+        )
+    assert keep == [0, 3, 5]
+
+
+def test_dimer_indices_excluding_elements_avoids_len_per_item():
+    ds = _mixed_dataset()
+    mtp_mtp.dimer_indices_excluding_elements(ds, [11, 17], print_level=0)
+    # One len() for the loop bound; anything proportional to the item count
+    # means the scan is routing through Dataset.__getitem__/indices() again.
+    assert ds.n_len_calls == 1
+    assert ds.n_get_calls == 6
+
+
+def test_dimer_indices_excluding_elements_requires_za_zb():
+    class _NoZ:
+        def len(self):
+            return 1
+
+        def get(self, idx):
+            return object()
+
+    with pytest.raises(TypeError, match="ZA/ZB"):
+        mtp_mtp.dimer_indices_excluding_elements(_NoZ(), [11], print_level=0)
+
+
+def test_dimer_indices_excluding_elements_requires_get():
+    class _NoGet:
+        def len(self):
+            return 0
+
+    # An empty exclusion set never scans, so it must not need get().
+    assert mtp_mtp.dimer_indices_excluding_elements(
+        _NoGet(), None, print_level=0
+    ) == []
+    with pytest.raises(TypeError, match="no get\\(\\) method"):
+        mtp_mtp.dimer_indices_excluding_elements(_NoGet(), [11], print_level=0)
+
+
+def test_ds_exclude_elements_is_declared_on_the_model_constructor():
+    sig = inspect.signature(mtp_mtp.AM_DimerParam_Model.__init__)
+    assert "ds_exclude_elements" in sig.parameters
+    assert sig.parameters["ds_exclude_elements"].default is None
+    # The CLIFF routes reach it through **dataset_kwargs, so they must not
+    # shadow it with a positional-only or differently-named parameter.
+    for cls in (
+        mtp_mtp.CliffExchangeModel,
+        mtp_mtp.CliffClassicalModel,
+        mtp_mtp.CliffClassicalOverlapModel,
+    ):
+        params = inspect.signature(cls.__init__).parameters
+        assert any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ), cls.__name__
+        assert "ds_exclude_elements" not in params, cls.__name__
+
+
+def test_excluded_elements_are_recorded_for_tracking():
+    """A filtered run must be distinguishable from a full one on the dashboard.
+
+    The exclusion changes what the model is fit to, so a run config that omits
+    it is not a record of the experiment.
+    """
+    src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.train)
+    assert '"data/excluded_elements"' in src
+    assert '"training/grad_clip_norm"' in src
+    # And the attribute the tracking config reads must be set by __init__ for
+    # every route, not only when something is excluded.
+    init_src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.__init__)
+    assert "self.ds_excluded_elements" in init_src

@@ -2,6 +2,7 @@ import math
 import os
 import re
 import time
+import warnings
 from copy import deepcopy
 from importlib import resources
 
@@ -1286,6 +1287,114 @@ def _infer_atommpnn_from_state_dict(
         n_embed=n_embed,
         r_cut=r_cut,
     )
+
+
+def normalize_excluded_elements(excluded_elements):
+    """Validate an element-exclusion spec into a frozenset of atomic numbers.
+
+    Accepts None (nothing excluded), a bare atomic number, or an iterable of
+    them.  Element *symbols* are rejected on purpose: the dataset stores Z, and
+    silently mapping "Cl" to 17 here would hide a typo like "CL" as an empty
+    exclusion set that quietly trains on the data you meant to drop.
+    """
+    if excluded_elements is None:
+        return frozenset()
+    if isinstance(excluded_elements, (str, bytes)):
+        raise TypeError(
+            "excluded_elements must be atomic numbers, not element symbols "
+            f"(got {excluded_elements!r})"
+        )
+    if isinstance(excluded_elements, (bool, np.bool_)):
+        # Reject before the iterable branch, which would otherwise surface as
+        # "'bool' object is not iterable" and say nothing about the real
+        # mistake.
+        raise TypeError(
+            "excluded_elements entries must be atomic numbers "
+            f"(got {excluded_elements!r})"
+        )
+    if isinstance(excluded_elements, (int, np.integer)):
+        excluded_elements = (excluded_elements,)
+    normalized = set()
+    for value in excluded_elements:
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(
+                "excluded_elements entries must be atomic numbers "
+                f"(got {value!r})"
+            )
+        z = int(value)
+        if z < 1:
+            raise ValueError(
+                f"excluded_elements entries must be >= 1 (got {z})"
+            )
+        normalized.add(z)
+    return frozenset(normalized)
+
+
+def dimer_indices_excluding_elements(
+    dataset,
+    excluded_elements,
+    max_size=None,
+    print_level=1,
+    label="",
+):
+    """Indices of the dimers in ``dataset`` that contain none of the excluded Z.
+
+    Scanning stops as soon as ``max_size`` survivors have been found, so asking
+    for a filtered subset costs a scan proportional to the subset size and not
+    to the whole store.
+
+    ``dataset.get`` is called directly rather than indexing ``dataset[i]``:
+    ``Dataset.__getitem__`` routes through ``indices()``, which re-derives
+    ``len()`` on every access, and ``len()`` on this dataset globs the entire
+    processed directory.  For the uncapped 1.5M-dimer store that turns a linear
+    scan quadratic.
+    """
+    excluded = normalize_excluded_elements(excluded_elements)
+    total = dataset.len()
+    if not excluded:
+        return list(range(total if max_size is None else min(total, max_size)))
+
+    getter = getattr(dataset, "get", None)
+    if not callable(getter):
+        raise TypeError(
+            f"{type(dataset).__name__} has no get() method to scan for "
+            "element exclusion"
+        )
+    keep = []
+    scanned = 0
+    for idx in range(total):
+        data = getter(idx)
+        try:
+            present = set(data.ZA.reshape(-1).tolist())
+            present |= set(data.ZB.reshape(-1).tolist())
+        except AttributeError as exc:
+            raise TypeError(
+                "element exclusion needs per-dimer ZA/ZB atomic numbers; "
+                f"datapoint {idx} of {type(dataset).__name__} has none"
+            ) from exc
+        scanned += 1
+        if present.isdisjoint(excluded):
+            keep.append(idx)
+            if max_size is not None and len(keep) >= max_size:
+                break
+    if print_level:
+        where = f" ({label})" if label else ""
+        dropped = scanned - len(keep)
+        print(
+            f"element exclusion{where}: excluded Z="
+            f"{sorted(excluded)}; scanned {scanned} dimers, kept {len(keep)}, "
+            f"dropped {dropped}"
+            + (f" ({100.0 * dropped / scanned:.2f}%)" if scanned else "")
+        )
+    if max_size is not None and len(keep) < max_size:
+        warnings.warn(
+            f"element exclusion{f' ({label})' if label else ''} exhausted the "
+            f"dataset at {len(keep)} dimers, short of the requested "
+            f"{max_size}; only {total} were available before filtering",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return keep
 
 
 def _infer_atomtypeparamnn_from_state_dict(
@@ -4812,6 +4921,7 @@ class AM_DimerParam_Model:
         ds_spec_type=1,
         ds_root="data",
         ds_max_size=None,
+        ds_exclude_elements=None,
         ds_atomic_batch_size=200,
         ds_force_reprocess=False,
         ds_skip_process=False,
@@ -4862,7 +4972,8 @@ class AM_DimerParam_Model:
             ignore_database_null (bool): If False and no `dataset` is provided, build the dataset(s) from `ds_root` and related dataset args.
             ds_spec_type (int): Dataset specification / split type forwarded to dataset constructor.
             ds_root (str): Root directory for datasets.
-            ds_max_size (int, optional): Max dataset size (truncates when set).
+            ds_max_size (int, optional): Max dataset size (truncates when set). With `ds_exclude_elements` it caps the count *after* filtering.
+            ds_exclude_elements (iterable[int] or None): Atomic numbers to exclude; any dimer containing one is dropped before `ds_max_size` is applied. Atomic numbers only -- element symbols are rejected.
             ds_atomic_batch_size (int): Atomic batch size used by dataset construction.
             ds_force_reprocess (bool): Force dataset reprocessing.
             ds_skip_process (bool): Skip dataset processing.
@@ -5223,6 +5334,16 @@ class AM_DimerParam_Model:
             self.dimer_model.AtomTypeParam.atom_model.to(device)
 
         split_dbs = [2, 5, 6, 7]
+        # Element exclusion filters whole dimers, so it has to run before
+        # ds_max_size is applied -- otherwise a 5000-dimer request silently
+        # returns however many survive. The raw store is therefore built
+        # uncapped and the cap moves onto the filtered index list.
+        ds_excluded_elements = normalize_excluded_elements(ds_exclude_elements)
+        # Recorded so the tracked run config says which elements were dropped.
+        # Without it a filtered run is indistinguishable from a full one on the
+        # dashboard, which is the whole reason for logging the run.
+        self.ds_excluded_elements = sorted(ds_excluded_elements)
+        ds_raw_max_size = None if ds_excluded_elements else ds_max_size
         ds_qcel_split_db = (
             ds_qcel_molecules is not None
             and len(ds_qcel_molecules) == 2
@@ -5242,7 +5363,7 @@ class AM_DimerParam_Model:
                     r_cut=r_cut,
                     r_cut_im=torch.inf,
                     spec_type=ds_spec_type,
-                    max_size=ds_max_size,
+                    max_size=ds_raw_max_size,
                     force_reprocess=fp,
                     atom_model=self.atom_model,
                     atomic_batch_size=ds_atomic_batch_size,
@@ -5260,7 +5381,17 @@ class AM_DimerParam_Model:
 
             self.dataset = setup_ds()
             self.dataset = setup_ds(False)
-            if ds_max_size:
+            if ds_excluded_elements:
+                self.dataset = self.dataset[
+                    dimer_indices_excluding_elements(
+                        self.dataset,
+                        ds_excluded_elements,
+                        max_size=ds_max_size,
+                        print_level=1,
+                        label="all",
+                    )
+                ]
+            elif ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
         elif (
             not ignore_database_null
@@ -5279,7 +5410,7 @@ class AM_DimerParam_Model:
                         r_cut=r_cut,
                         r_cut_im=torch.inf,
                         spec_type=ds_spec_type,
-                        max_size=ds_max_size,
+                        max_size=ds_raw_max_size,
                         force_reprocess=fp,
                         atom_model=self.atom_model,
                         atomic_batch_size=ds_atomic_batch_size,
@@ -5300,7 +5431,7 @@ class AM_DimerParam_Model:
                         r_cut=r_cut,
                         r_cut_im=torch.inf,
                         spec_type=ds_spec_type,
-                        max_size=ds_max_size,
+                        max_size=ds_raw_max_size,
                         force_reprocess=fp,
                         atom_model=self.atom_model,
                         atomic_batch_size=ds_atomic_batch_size,
@@ -5320,7 +5451,18 @@ class AM_DimerParam_Model:
 
             self.dataset = setup_ds()
             self.dataset = setup_ds(False)
-            if ds_max_size:
+            if ds_excluded_elements:
+                for split_idx, split_label in ((0, "train"), (1, "test")):
+                    self.dataset[split_idx] = self.dataset[split_idx][
+                        dimer_indices_excluding_elements(
+                            self.dataset[split_idx],
+                            ds_excluded_elements,
+                            max_size=ds_max_size,
+                            print_level=1,
+                            label=split_label,
+                        )
+                    ]
+            elif ds_max_size:
                 self.dataset[0] = self.dataset[0][:ds_max_size]
                 self.dataset[1] = self.dataset[1][:ds_max_size]
         print(f"{self.dataset=}")
@@ -6420,6 +6562,13 @@ units angstrom
             "training/learning_rate_initial": lr,
             "training/random_seed": random_seed,
             "training/skip_compile": skip_compile,
+            "training/grad_clip_norm": grad_clip_norm,
+            # Always logged, even when empty: an absent key would have to be
+            # read as "unknown", while [] is a positive statement that nothing
+            # was filtered.
+            "data/excluded_elements": list(
+                getattr(self, "ds_excluded_elements", []) or []
+            ),
         }
         if world_size > 1:
             print("Running multi-process training", flush=True)

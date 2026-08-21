@@ -38,6 +38,18 @@ RANDOM_SEED="${RANDOM_SEED:-${ITER}}"
 # DS_MAX_SIZE truncates both the train and test splits; unset it for the full
 # ~1.5M-dimer set.
 DS_MAX_SIZE="${DS_MAX_SIZE:-5000}"
+# Space-separated atomic numbers to drop, e.g. "11 17" for Na and Cl. Filtering
+# runs before DS_MAX_SIZE, so DS_MAX_SIZE counts surviving dimers. Empty keeps
+# every element.
+#
+# Why you would want this: the frozen width model has no way to predict a
+# monatomic ion's valence width, because a one-atom monomer has no
+# intramolecular edges for message passing to act on, so every bare ion
+# collapses to ~1.9-2.1 bohr. Exchange goes as exp(-r / sqrt(sigma_i sigma_j)),
+# so those atoms dominate the loss. OVERLAP_WIDTH_CEILING bounds the damage;
+# excluding the elements removes it, at the cost of a model that has never seen
+# them.
+DS_EXCLUDE_ELEMENTS="${DS_EXCLUDE_ELEMENTS:-}"
 N_EPOCHS="${N_EPOCHS:-15}"
 # Back to 5e-4. Dropping it to 1e-4 was an over-correction: the raw-parameter
 # bounds already make saturation unreachable, so the low rate only slowed the
@@ -149,6 +161,18 @@ COMMON_ARGS=(
 
 if [[ -n "${DS_MAX_SIZE}" ]]; then
     COMMON_ARGS+=(--ds_max_size "${DS_MAX_SIZE}")
+fi
+if [[ -n "${DS_EXCLUDE_ELEMENTS}" ]]; then
+    # Word-split on purpose: this is a list of atomic numbers.
+    read -r -a EXCLUDE_Z <<< "${DS_EXCLUDE_ELEMENTS}"
+    for z in "${EXCLUDE_Z[@]}"; do
+        if ! [[ "${z}" =~ ^[0-9]+$ ]] || (( z < 1 )); then
+            printf 'Error: DS_EXCLUDE_ELEMENTS must be space-separated atomic numbers >= 1 (got %q in %q)\n' \
+                "${z}" "${DS_EXCLUDE_ELEMENTS}" >&2
+            exit 2
+        fi
+    done
+    COMMON_ARGS+=(--ds_exclude_elements "${EXCLUDE_Z[@]}")
 fi
 if [[ -n "${GRAD_CLIP_NORM}" ]]; then
     if ! awk -v c="${GRAD_CLIP_NORM}" \

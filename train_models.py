@@ -332,6 +332,7 @@ def train_pairwise_model(
     elst_damping_type="CLIFF",
     ds_in_memory=False,
     ds_max_size=None,
+    ds_exclude_elements=None,
     ds_class_type="pt",
     DimerProp_model_type="AtomTypeParamNN",
     ap2_pretrained_model_only=None,
@@ -382,6 +383,7 @@ def train_pairwise_model(
         elst_damping_type (str): Electrostatic damping variant for dimer prop models (e.g., "CLIFF", "AMOEBA").
         ds_in_memory (bool): Whether datasets should be loaded entirely into memory for applicable model types.
         ds_max_size (int or None): Truncate the pairwise dataset to N datapoints. Useful for small smoke-test runs; None uses the full dataset.
+        ds_exclude_elements (list[int] or None): Atomic numbers to exclude. Any dimer containing one is dropped before ds_max_size is applied, so ds_max_size counts surviving dimers. Positive-parameter routes only (Rackers and CLIFF).
         ds_class_type (str): Dataset class/storage type identifier (e.g., "pt").
         DimerProp_model_type (str): Dimer property model type name used when constructing AM-DimerParam models.
         ap2_pretrained_model_only (str or None): If provided for APNet3-fused variants, load AP2 weights from this path into the APNet.
@@ -398,6 +400,14 @@ def train_pairwise_model(
     is_rackers_model = apnet_model_type in RACKERS_MODEL_TYPES
     is_cliff_model = apnet_model_type in CLIFF_MODEL_TYPES
     is_positive_param_model = apnet_model_type in POSITIVE_PARAM_MODEL_TYPES
+    if ds_exclude_elements and not is_positive_param_model:
+        # Only the positive-parameter branch forwards ds_exclude_elements into
+        # the dataset constructor. Accepting it elsewhere would train on the
+        # full set while the run config claimed otherwise.
+        raise ValueError(
+            "ds_exclude_elements is only supported on the Rackers and CLIFF "
+            f"positive-parameter routes, not {apnet_model_type}"
+        )
     if is_cliff_model and include_total_mse:
         # `--include_total_mse` is the pre-CLIFF spelling of "also fit the
         # total".  Reinterpreting it keeps the flag meaningful on the new
@@ -612,6 +622,7 @@ def train_pairwise_model(
             ds_random_seed=random_seed,
             ds_in_memory=ds_in_memory,
             ds_max_size=ds_max_size,
+            ds_exclude_elements=ds_exclude_elements,
             param_start_mean=param_start_mean,
             param_start_std=param_start_std,
             elst_damping_type=elst_damping_type,
@@ -1070,6 +1081,19 @@ def main():
         help="Limit dataset to N dataset objects",
     )
     args.add_argument(
+        "--ds_exclude_elements",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="Z",
+        help=(
+            "Atomic numbers to exclude, e.g. --ds_exclude_elements 11 17 to "
+            "drop every dimer containing Na or Cl. Filtering runs before "
+            "--ds_max_size, so --ds_max_size counts surviving dimers. "
+            "Supported on the Rackers and CLIFF positive-parameter routes."
+        ),
+    )
+    args.add_argument(
         "--lr", type=float, default=5e-4, help="Learning Rate: (5e-4 is default)"
     )
     args.add_argument(
@@ -1485,6 +1509,7 @@ def main():
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
             ds_max_size=args.ds_max_size,
+            ds_exclude_elements=args.ds_exclude_elements,
             component_gamma=args.component_gamma,
             total_includes_d3=args.total_includes_d3,
             grad_clip_norm=args.grad_clip_norm,
