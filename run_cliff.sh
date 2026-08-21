@@ -39,11 +39,12 @@ RANDOM_SEED="${RANDOM_SEED:-${ITER}}"
 # ~1.5M-dimer set.
 DS_MAX_SIZE="${DS_MAX_SIZE:-5000}"
 N_EPOCHS="${N_EPOCHS:-15}"
-# 1e-4 rather than the 5e-4 default. At 5e-4 over 100 epochs Adam's cumulative
-# displacement budget (~lr per step) is large enough to carry a raw parameter
-# the full distance from its seed into softplus saturation, which is exactly
-# what the first 100-epoch run did to four of the five columns.
-LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+# Back to 5e-4. Dropping it to 1e-4 was an over-correction: the raw-parameter
+# bounds already make saturation unreachable, so the low rate only slowed the
+# fit. Measured over 12 epochs on the 5000-dimer subset, exchange train MAE
+# reached 18.26 at 5e-4 against 19.12 at 1e-4 from the same 19.20 start, and
+# the gradient clip norm (1.0 vs 0.1) made no measurable difference.
+LEARNING_RATE="${LEARNING_RATE:-5e-4}"
 # Global gradient-norm clip. Empty disables it.
 GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
 N_RBF="${N_RBF:-8}"

@@ -81,7 +81,14 @@ RACKERS_IND_OVERLAP_INDEX = 3
 # water-dimer-scale exchange at initialization.
 CLIFF_EXCH_PARAMETER_NAMES = ("exch",)
 CLIFF_EXCH_INITIAL_VALUES = (2.5,)
-CLIFF_EXCH_INITIAL_STDS = (0.01,)
+# Raw-space (pre-softplus) initialization spread.  0.25 rather than the Rackers
+# 0.01: `K_exch` spans 0.60-7.60 across CLIFF's atom types, and the per-element
+# seeds below only resolve the element, not CLIFF's coordination-number
+# refinement within it (C4/C3/C2 are 2.26/2.46/2.80; N3/N2/N1 are
+# 4.47/4.63/3.49).  0.25 in raw space is about the width of those
+# within-element spreads, so the readout starts with room to separate atom
+# types rather than having to climb out of a delta function.
+CLIFF_EXCH_INITIAL_STDS = (0.25,)
 
 # Per-element ``K_exch`` seeds, from the CLIFF Table I fitted values (Schriber
 # et al., J. Chem. Phys. 154, 184110 (2021)).  CLIFF assigns 17 atom types by
@@ -100,15 +107,21 @@ CLIFF_EXCH_INITIAL_STDS = (0.01,)
 # and an exchange MAE equal to the predict-zero baseline.  Elements absent here
 # fall back to ``CLIFF_EXCH_INITIAL_VALUES``.
 CLIFF_EXCH_INITIAL_VALUES_BY_Z = {
-    1: 0.77,   # H
-    6: 2.40,   # C
-    7: 4.20,   # N
-    8: 5.60,   # O
-    9: 7.60,   # F
-    16: 3.20,  # S
-    17: 3.80,  # Cl
-    35: 4.10,  # Br
+    1: 0.7676,   # mean of HC 0.9890, HN 0.6910, HO 0.5996, HS 0.7909
+    6: 2.5079,   # mean of C4 2.2649, C3 2.4566, C2 2.8023
+    7: 4.1936,   # mean of N3 4.4660, N2 4.6251, N1 3.4896
+    8: 5.5987,   # mean of O2 5.8538, O1 5.3435
+    9: 7.6036,   # F
+    16: 3.2308,  # mean of S2 3.2842, S1 3.1773
+    17: 3.8152,  # Cl
+    35: 4.1008,  # Br
 }
+
+# CLIFF Table I covers only these eight elements.  This dataset also contains
+# Na (Z=11) and P (Z=15), which fall back to the scalar
+# :data:`CLIFF_EXCH_INITIAL_VALUES` guess.  See :data:`OVERLAP_WIDTH_CEILING`
+# for why that is survivable.
+CLIFF_TABLE_I_ELEMENTS = frozenset(CLIFF_EXCH_INITIAL_VALUES_BY_Z)
 
 # Combined classical contract.  Columns 0-3 intentionally mirror
 # ``RACKERS_PARAMETER_NAMES`` so the electrostatics and induction physics paths
@@ -122,7 +135,7 @@ CLIFF_CLASSICAL_PARAMETER_NAMES = (
     "exch",
 )
 CLIFF_CLASSICAL_INITIAL_VALUES = (1.8, 0.34, 0.39, 1.8, 2.5)
-CLIFF_CLASSICAL_INITIAL_STDS = (0.01, 0.01, 0.01, 0.01, 0.01)
+CLIFF_CLASSICAL_INITIAL_STDS = (0.01, 0.01, 0.01, 0.01, 0.25)
 
 # Per-element seeds for the combined route.  Only the exchange column has
 # published per-element values; columns 0-3 keep their scalar Rackers seeds.
@@ -186,6 +199,29 @@ CLIFF_CLASSICAL_EXCH_INDEX = 4
 # can legitimately approach zero and blow ``B_ij`` up.  ``0.1`` matches the
 # floor that ``apnet3.valence_width_exch`` has always applied.
 OVERLAP_WIDTH_FLOOR = 0.1
+
+# Upper bound on predicted valence widths before they enter the ``rsqrt``.
+#
+# The floor above guards ``B_ij -> inf``; this guards the opposite and far more
+# damaging direction.  ``S_ij`` decays as ``exp(-r / sqrt(sigma_i sigma_j))``,
+# so an *over*-large width flattens the exponential and the pair energy
+# explodes.  The frozen HFVR/valence-width atom model emits
+# ``sigma = 1.8952`` for every Na atom in this dataset -- identical to four
+# decimal places across all of them, i.e. an untrained per-element embedding
+# bias rather than a prediction -- against 0.40-0.52 for C/N/O.  That is a
+# ~100x inflation of ``S_ij``, and combined with the fallback ``K = 2.5`` it
+# produced single-dimer exchange predictions of 2960 kcal/mol against a
+# reference of 42.  Chlorine shows the same failure less uniformly
+# (sigma 0.52-2.11).  Measured over 1280 dimers, the ten worst carried 95% of
+# the squared error and every one of the fifteen worst contained Na or Cl.
+#
+# 1.0 bohr sits above every legitimate width observed (P 0.70, S 0.67, C 0.52,
+# N 0.48, O 0.43, H 0.39) and below the pathological ones, so it caps the
+# atom model's out-of-domain extrapolation without touching any element it was
+# actually trained on.  This is a guard on an input the exchange term cannot
+# defend itself against, not a fitted parameter; the real fix is an atom model
+# that covers these elements.
+OVERLAP_WIDTH_CEILING = 1.0
 
 # Dimer evaluation modes whose per-edge energies live on the *full*
 # intermolecular edge domain (``e_ABfull_source`` / ``e_ABfull_target``).  Those
@@ -2382,6 +2418,7 @@ def atomic_overlap_S_ij(
     e_AB_target: torch.Tensor,
     dR_AB: torch.Tensor,
     width_floor: float = OVERLAP_WIDTH_FLOOR,
+    width_ceiling: float | None = None,
 ) -> torch.Tensor:
     """Dimensionless per-edge atomic overlap ``S_ij``.
 
@@ -2450,6 +2487,11 @@ def atomic_overlap_S_ij(
     if width_floor:
         sigma_i = sigma_i.clamp_min(width_floor)
         sigma_j = sigma_j.clamp_min(width_floor)
+    if width_ceiling is not None:
+        # Defaults to `None` so the three legacy induction-overlap call sites
+        # keep their exact pre-existing numerics; only `cliff_exchange` opts in.
+        sigma_i = sigma_i.clamp_max(width_ceiling)
+        sigma_j = sigma_j.clamp_max(width_ceiling)
     # rsqrt fuses the reciprocal and the square root into one op.
     B_ij = torch.rsqrt(sigma_i * sigma_j)
     x = B_ij * dR_AB
@@ -2468,6 +2510,7 @@ def cliff_exchange(
     K_exch_B: torch.Tensor,
     dR_AB: torch.Tensor | None = None,
     width_floor: float = OVERLAP_WIDTH_FLOOR,
+    width_ceiling: float | None = OVERLAP_WIDTH_CEILING,
 ) -> torch.Tensor:
     """CLIFF classical exchange repulsion, per intermolecular edge, kcal/mol.
 
@@ -2504,6 +2547,11 @@ def cliff_exchange(
         here.
     width_floor
         Forwarded to :func:`atomic_overlap_S_ij`.
+    width_ceiling
+        Forwarded to :func:`atomic_overlap_S_ij`.  Defaults to
+        :data:`OVERLAP_WIDTH_CEILING` here (and to ``None`` in the helper), so
+        exchange is guarded while the legacy induction-overlap call sites keep
+        their exact pre-existing numerics.
 
     Returns
     -------
@@ -2526,6 +2574,7 @@ def cliff_exchange(
         e_AB_target,
         dR_AB,
         width_floor=width_floor,
+        width_ceiling=width_ceiling,
     )
     K_i = K_exch_A.reshape(-1).index_select(0, e_AB_source)
     K_j = K_exch_B.reshape(-1).index_select(0, e_AB_target)

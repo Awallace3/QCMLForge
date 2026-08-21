@@ -1154,7 +1154,17 @@ def test_cliff_head_zeroed_corrections_recover_initial_values(
     _zero_readout_heads(model)
     parameters = model(atomic_batch)[-1]
     expected = torch.tensor(values, dtype=parameters.dtype)
-    assert torch.allclose(parameters.mean(dim=0), expected, atol=0.05)
+    # The tolerance is derived from the configured initialization spread rather
+    # than hard-coded: `param_start_std` is a *raw*-space standard deviation and
+    # `dK/draw = sigmoid(raw) <= 1`, so the emitted per-atom noise is at most
+    # `std`, and the mean over `n_atoms` has standard error at most
+    # `std / sqrt(n_atoms)`.  Four of those is a ~4-sigma band.  Hard-coding
+    # 0.05 silently pinned this to `std = 0.01` and broke the moment the
+    # exchange column moved to 0.25; the exact contract is asserted below with
+    # zero noise.
+    n_atoms = parameters.shape[0]
+    atol = 4.0 * max(model.param_start_std) / math.sqrt(n_atoms)
+    assert torch.allclose(parameters.mean(dim=0), expected, atol=atol)
 
     # With zero initialization noise the recovery is exact, not merely close.
     exact = _build_head(
@@ -4447,3 +4457,157 @@ def test_cliff_head_overrides_distinguishes_none_from_unset():
     assert mtp_mtp._cliff_head_overrides(param_floor_fraction=0.5) == {
         "param_floor_fraction": 0.5
     }
+
+
+# ---------------------------------------------------------------------------
+# Valence-width ceiling
+#
+# `S_ij` decays as `exp(-r / sqrt(sigma_i sigma_j))`, so an over-large width
+# flattens the exponential and the pair energy explodes.  The frozen atom model
+# emits sigma = 1.8952 for every Na atom in the training data (identical to four
+# decimals, i.e. an untrained embedding bias, not a prediction) against 0.40-0.52
+# for C/N/O, which produced single-dimer exchange predictions three orders of
+# magnitude above reference.  The floor guards `B_ij -> inf`; these pin the
+# guard on the opposite, far more damaging direction.
+# ---------------------------------------------------------------------------
+
+
+def test_overlap_ceiling_defaults_off_in_the_helper_and_on_in_exchange():
+    """Legacy induction-overlap sites must keep their exact numerics."""
+    assert (
+        inspect.signature(mtp_mtp.atomic_overlap_S_ij)
+        .parameters["width_ceiling"]
+        .default
+        is None
+    )
+    assert (
+        inspect.signature(mtp_mtp.cliff_exchange)
+        .parameters["width_ceiling"]
+        .default
+        == mtp_mtp.OVERLAP_WIDTH_CEILING
+    )
+    # The ceiling must sit above every width the atom model legitimately emits
+    # and below the out-of-domain ones it invents.
+    assert mtp_mtp.OVERLAP_WIDTH_FLOOR < mtp_mtp.OVERLAP_WIDTH_CEILING
+    assert 0.75 < mtp_mtp.OVERLAP_WIDTH_CEILING < 1.8952
+
+
+def test_overlap_ceiling_clamps_only_widths_above_it():
+    src = torch.arange(4)
+    tgt = torch.arange(4)
+    dR = torch.full((4,), 6.0)
+    # 1.8952 is the Na width the atom model actually emits; 0.70 is the largest
+    # legitimate one observed (phosphorus).
+    wide = torch.tensor([1.8952, 1.8952, 0.70, 0.45])
+    narrow = torch.tensor([1.8952, 0.45, 0.70, 0.45])
+    ceiling = mtp_mtp.OVERLAP_WIDTH_CEILING
+
+    unbounded = mtp_mtp.atomic_overlap_S_ij(wide, narrow, src, tgt, dR)
+    bounded = mtp_mtp.atomic_overlap_S_ij(
+        wide, narrow, src, tgt, dR, width_ceiling=ceiling
+    )
+    reference = mtp_mtp.atomic_overlap_S_ij(
+        wide.clamp_max(ceiling), narrow.clamp_max(ceiling), src, tgt, dR
+    )
+    assert torch.allclose(bounded, reference)
+    # Edges whose widths are both already under the ceiling are untouched.
+    assert torch.equal(bounded[2:], unbounded[2:])
+    # The Na-Na edge is strongly suppressed.  At this separation (6 bohr) the
+    # factor is ~6.7x; because the clamp acts inside the exponent it grows
+    # without bound with distance, which the sweep below pins.
+    assert bounded[0] < unbounded[0] / 5.0
+    ratios = []
+    for r in (6.0, 9.0, 12.0):
+        dRr = torch.full((4,), r)
+        u = mtp_mtp.atomic_overlap_S_ij(wide, narrow, src, tgt, dRr)
+        g = mtp_mtp.atomic_overlap_S_ij(
+            wide, narrow, src, tgt, dRr, width_ceiling=ceiling
+        )
+        ratios.append((u[0] / g[0]).item())
+    assert ratios[0] < ratios[1] < ratios[2], ratios
+
+
+def test_overlap_ceiling_suppresses_the_na_blowup_in_exchange():
+    """A Na-like width must not produce a runaway per-edge exchange energy."""
+    RA = torch.tensor([[0.0, 0.0, 0.0]])
+    RB = torch.tensor([[3.2, 0.0, 0.0]])   # Angstrom, a close contact
+    src = torch.zeros(1, dtype=torch.long)
+    tgt = torch.zeros(1, dtype=torch.long)
+    na_width = torch.tensor([1.8952])
+    c_width = torch.tensor([0.5])
+    K = torch.tensor([2.5])
+
+    def exchange(width_ceiling):
+        return mtp_mtp.cliff_exchange(
+            RA=RA, RB=RB, e_AB_source=src, e_AB_target=tgt,
+            valence_widths_A=na_width, valence_widths_B=c_width,
+            K_exch_A=K, K_exch_B=K, width_ceiling=width_ceiling,
+        ).item()
+
+    unguarded = exchange(None)
+    guarded = exchange(mtp_mtp.OVERLAP_WIDTH_CEILING)
+    # Unguarded, a single Na-C edge at 3.2 A is already worth ~158 kcal/mol,
+    # which is why a handful of Na dimers could carry 95% of the squared error.
+    assert unguarded > 100.0, unguarded
+    assert guarded < unguarded / 5.0, (guarded, unguarded)
+    # Still strictly positive: the guard must not flip or zero the term.
+    assert guarded > 0.0
+
+
+def test_overlap_ceiling_leaves_covered_elements_untouched():
+    """Widths for the elements CLIFF covers must pass through unchanged."""
+    # Largest per-element mean widths the frozen model emits for Table I
+    # elements, from the training data: S 0.591, C 0.521, N 0.453, O 0.404,
+    # H 0.373, F 0.346.
+    widths = torch.tensor([0.591, 0.521, 0.453, 0.404, 0.373, 0.346])
+    assert torch.all(widths < mtp_mtp.OVERLAP_WIDTH_CEILING)
+    src = torch.arange(widths.numel())
+    tgt = torch.arange(widths.numel())
+    dR = torch.full((widths.numel(),), 6.0)
+    assert torch.equal(
+        mtp_mtp.atomic_overlap_S_ij(widths, widths, src, tgt, dR),
+        mtp_mtp.atomic_overlap_S_ij(
+            widths, widths, src, tgt, dR,
+            width_ceiling=mtp_mtp.OVERLAP_WIDTH_CEILING,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLIFF Table I fidelity
+# ---------------------------------------------------------------------------
+
+
+def test_per_element_seeds_are_the_table_i_means():
+    """Each seed must be the mean of that element's CLIFF Table I atom types."""
+    table_i_atom_types = {
+        1: (0.9890, 0.6910, 0.5996, 0.7909),   # HC, HN, HO, HS
+        6: (2.2649, 2.4566, 2.8023),           # C4, C3, C2
+        7: (4.4660, 4.6251, 3.4896),           # N3, N2, N1
+        8: (5.8538, 5.3435),                   # O2, O1
+        9: (7.6036,),                          # F
+        16: (3.2842, 3.1773),                  # S2, S1
+        17: (3.8152,),                         # Cl
+        35: (4.1008,),                         # Br
+    }
+    seeds = mtp_mtp.CLIFF_EXCH_INITIAL_VALUES_BY_Z
+    assert set(seeds) == set(table_i_atom_types)
+    for z, types in table_i_atom_types.items():
+        assert seeds[z] == pytest.approx(sum(types) / len(types), abs=1e-4), z
+    assert mtp_mtp.CLIFF_TABLE_I_ELEMENTS == frozenset(seeds)
+    # Na (11) and P (15) appear in the training data and are *not* covered.
+    assert 11 not in mtp_mtp.CLIFF_TABLE_I_ELEMENTS
+    assert 15 not in mtp_mtp.CLIFF_TABLE_I_ELEMENTS
+
+
+def test_exchange_initialization_std_is_wide_enough_to_separate_atom_types():
+    """`K_exch` spans 0.60-7.60, so a 0.01 raw std would be a delta function."""
+    assert mtp_mtp.CLIFF_EXCH_INITIAL_STDS == (0.25,)
+    assert (
+        mtp_mtp.CLIFF_CLASSICAL_INITIAL_STDS[mtp_mtp.CLIFF_CLASSICAL_EXCH_INDEX]
+        == 0.25
+    )
+    # The four Rackers columns keep their original, much tighter spread.
+    assert mtp_mtp.CLIFF_CLASSICAL_INITIAL_STDS[
+        : mtp_mtp.CLIFF_CLASSICAL_EXCH_INDEX
+    ] == mtp_mtp.RACKERS_INITIAL_STDS

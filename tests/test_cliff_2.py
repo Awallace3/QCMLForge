@@ -22,6 +22,7 @@ import torch
 
 from apnet_pt import model_io
 from apnet_pt.AtomPairwiseModels import cliff_2
+from apnet_pt.AtomPairwiseModels import mtp_mtp
 from apnet_pt.AtomPairwiseModels.cliff_2 import (
     CLIFF2_COMPONENT_LABELS,
     CLIFF2_DIMER_EVAL,
@@ -307,10 +308,20 @@ def test_merge_rackers_only_leaves_exchange_at_initialization(
         )
         + epsilon
     )
-    assert initialized.mean().item() == pytest.approx(
-        CLIFF_CLASSICAL_INITIAL_VALUES[CLIFF_CLASSICAL_EXCH_INDEX],
-        abs=0.1,
-    )
+    # The mean is over the *whole* embedding table, so it is a mixture: the
+    # eight elements CLIFF Table I covers carry their own seeds and every other
+    # atomic number carries the scalar default.  Asserting the scalar alone
+    # would only pass while the per-element seeding did not exist.
+    scalar = CLIFF_CLASSICAL_INITIAL_VALUES[CLIFF_CLASSICAL_EXCH_INDEX]
+    per_element = mtp_mtp.CLIFF_EXCH_INITIAL_VALUES_BY_Z
+    n_rows = initialized.numel()
+    expected_mean = (
+        (n_rows - len(per_element)) * scalar + sum(per_element.values())
+    ) / n_rows
+    # Initialization noise is `param_start_std` in raw space; averaged over
+    # `n_rows` its standard error is far below this, so the bound is loose in
+    # sigma terms while still being tight enough to catch a wrong mixture.
+    assert initialized.mean().item() == pytest.approx(expected_mean, abs=0.05)
     assert merged["metadata"]["unclaimed_columns"] == ["exch"]
     assert merged["config"]["dimer_eval"] == "cliff_classical_overlap"
 
