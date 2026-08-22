@@ -4824,8 +4824,12 @@ def test_exclude_scan_multiple_bounds_the_raw_dataset_cap():
     assert sig.parameters["ds_exclude_scan_multiple"].default == 2.0
 
     src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.__init__)
-    assert "ds_raw_max_size = ds_max_size" in src
-    assert "math.ceil(ds_max_size * float(ds_exclude_scan_multiple))" in src
+    # One helper now derives the raw cap for each split, so the train and the
+    # validation store are bounded by the same rule.
+    assert "def _raw_cap(cap):" in src
+    assert "math.ceil(cap * float(ds_exclude_scan_multiple))" in src
+    assert "ds_raw_max_size = _raw_cap(ds_max_size)" in src
+    assert "ds_raw_max_size_test = _raw_cap(ds_max_size_test)" in src
     # The reason has to survive in the source, or the next person "simplifies"
     # it back to None.
     assert "processing job" in src

@@ -393,6 +393,8 @@ def train_pairwise_model(
     elst_damping_type="CLIFF",
     ds_in_memory=False,
     ds_max_size=None,
+    ds_max_size_val=None,
+    batch_size=None,
     ds_exclude_elements=None,
     split_manifest=None,
     ds_class_type="pt",
@@ -444,7 +446,9 @@ def train_pairwise_model(
         dimer_eval_type (str): Evaluation mode for dimer models (e.g., "elst_damping", "elst_damping__induced_dipole").
         elst_damping_type (str): Electrostatic damping variant for dimer prop models (e.g., "CLIFF", "AMOEBA").
         ds_in_memory (bool): Whether datasets should be loaded entirely into memory for applicable model types.
-        ds_max_size (int or None): Truncate the pairwise dataset to N datapoints. Useful for small smoke-test runs; None uses the full dataset.
+        ds_max_size (int or None): Truncate the pairwise dataset to N datapoints. Useful for small smoke-test runs; None uses the full dataset. On a split store it caps both splits unless ds_max_size_val overrides the validation one.
+        ds_max_size_val (int or None): Separate cap for the validation split. None (the default) reuses ds_max_size, which is the historical behaviour. Positive-parameter routes only (Rackers and CLIFF), and requires ds_max_size.
+        batch_size (int or None): Dimers per optimizer step. None (the default) keeps each route's historical dataset batch size. The trainers read this off the dataset as `training_batch_size`, so it is set there rather than on train().
         ds_exclude_elements (list[int] or None): Atomic numbers to exclude. Any dimer containing one is dropped before ds_max_size is applied, so ds_max_size counts surviving dimers. Positive-parameter routes only (Rackers and CLIFF).
         ds_class_type (str): Dataset class/storage type identifier (e.g., "pt").
         DimerProp_model_type (str): Dimer property model type name used when constructing AM-DimerParam models.
@@ -478,6 +482,20 @@ def train_pairwise_model(
         raise ValueError(
             "ds_exclude_elements is only supported on the Rackers and CLIFF "
             f"positive-parameter routes, not {apnet_model_type}"
+        )
+    if ds_max_size_val is not None and not is_positive_param_model:
+        # Same reason as ds_exclude_elements: only that branch forwards it, so
+        # elsewhere the run would evaluate the full validation split while its
+        # record claimed a capped one.
+        raise ValueError(
+            "ds_max_size_val is only supported on the Rackers and CLIFF "
+            f"positive-parameter routes, not {apnet_model_type}"
+        )
+    if batch_size is not None:
+        # Validated here so a bad value costs nothing: the alternative is
+        # discovering it after the atom model and the dataset are built.
+        batch_size = AtomPairwiseModels.mtp_mtp._validate_positive_count(
+            batch_size, "batch_size"
         )
     if is_cliff_model and include_total_mse:
         # `--include_total_mse` is the pre-CLIFF spelling of "also fit the
@@ -661,6 +679,10 @@ def train_pairwise_model(
     else:
         pretrained_model = None
         print("\nTraining from scratch...\n")
+    if batch_size is not None:
+        # Applied after the per-route defaults above so an explicit request
+        # wins over them rather than being overwritten by the branch.
+        ds_batch_size = batch_size
     if is_positive_param_model:
         # Two-stage construction shared by the Rackers and CLIFF routes: build
         # the HFVR/valence-width AtomTypeParamModel from --am_model_path plus
@@ -693,6 +715,8 @@ def train_pairwise_model(
             ds_random_seed=random_seed,
             ds_in_memory=ds_in_memory,
             ds_max_size=ds_max_size,
+            ds_max_size_val=ds_max_size_val,
+            ds_batch_size=ds_batch_size,
             ds_exclude_elements=ds_exclude_elements,
             param_start_mean=param_start_mean,
             param_start_std=param_start_std,
@@ -757,6 +781,7 @@ def train_pairwise_model(
             ds_datapoint_storage_n_objects=ds_datapoint_storage_n_objects,
             ds_prebatched=False,
             ds_random_seed=random_seed,
+            ds_batch_size=ds_batch_size,
             param_start_mean=param_start_mean,
             param_start_std=param_start_std,
             dimer_eval_type=dimer_eval_type,
@@ -1159,6 +1184,28 @@ def main():
         help="Limit dataset to N dataset objects",
     )
     args.add_argument(
+        "--ds_max_size_val",
+        type=int,
+        default=None,
+        help=(
+            "Separate cap on the validation split of a split dataset. "
+            "Unset, --ds_max_size caps both splits, so a 100k-dimer run "
+            "evaluates 100k validation dimers every epoch -- as much work as "
+            "the training pass. Requires --ds_max_size. Supported on the "
+            "Rackers and CLIFF positive-parameter routes."
+        ),
+    )
+    args.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help=(
+            "Dimers per optimizer step for the pairwise routes. Unset, each "
+            "route keeps its historical dataset batch size of 16, which "
+            "starves a GPU on a model of any size."
+        ),
+    )
+    args.add_argument(
         "--skip_compile",
         action="store_true",
         help=(
@@ -1541,6 +1588,18 @@ def main():
         return
     atom_wandb_config, pairwise_wandb_config = build_wandb_run_configs(args)
     if args.train_am != "":
+        # Rejected rather than ignored. The atom routes have their own hard-coded
+        # batch size and a single monomer store, so accepting either flag here
+        # would leave a run record claiming a shape the run never had.
+        for flag, value in (
+            ("--batch_size", args.batch_size),
+            ("--ds_max_size_val", args.ds_max_size_val),
+        ):
+            if value is not None:
+                raise ValueError(
+                    f"{flag} applies to the pairwise routes (--train_apnet), "
+                    "not --train_am"
+                )
         train_atom_model(
             atom_model_type=args.train_am,
             atom_type_param_model_path=args.atom_type_param_model_path,
@@ -1623,6 +1682,8 @@ def main():
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
             ds_max_size=args.ds_max_size,
+            ds_max_size_val=args.ds_max_size_val,
+            batch_size=args.batch_size,
             ds_exclude_elements=args.ds_exclude_elements,
             split_manifest=args.split_manifest,
             component_gamma=args.component_gamma,

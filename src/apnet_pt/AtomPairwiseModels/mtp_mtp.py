@@ -1305,6 +1305,25 @@ def _validate_scan_multiple(value, name="ds_exclude_scan_multiple"):
 _validate_scan_multiple_for_test = _validate_scan_multiple
 
 
+def _validate_positive_count(value, name):
+    """Validate a strictly positive integer dataset/loader count.
+
+    `bool` is rejected explicitly because `True` would otherwise pass as 1 and
+    silently train one dimer at a time; floats are rejected rather than
+    truncated so `--batch_size 2.5` is an error instead of a 2.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be an integer (got {value!r})")
+    value = int(value)
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1 (got {value})")
+    return value
+
+
+# Test seam, for the same reason as `_validate_scan_multiple_for_test`.
+_validate_positive_count_for_test = _validate_positive_count
+
+
 def normalize_excluded_elements(excluded_elements):
     """Validate an element-exclusion spec into a frozenset of atomic numbers.
 
@@ -4937,9 +4956,11 @@ class AM_DimerParam_Model:
         ds_spec_type=1,
         ds_root="data",
         ds_max_size=None,
+        ds_max_size_val=None,
         ds_exclude_elements=None,
         ds_exclude_scan_multiple=2.0,
         ds_atomic_batch_size=200,
+        ds_batch_size=16,
         ds_force_reprocess=False,
         ds_skip_process=False,
         ds_skip_compile=False,
@@ -4989,10 +5010,12 @@ class AM_DimerParam_Model:
             ignore_database_null (bool): If False and no `dataset` is provided, build the dataset(s) from `ds_root` and related dataset args.
             ds_spec_type (int): Dataset specification / split type forwarded to dataset constructor.
             ds_root (str): Root directory for datasets.
-            ds_max_size (int, optional): Max dataset size (truncates when set). With `ds_exclude_elements` it caps the count *after* filtering.
+            ds_max_size (int, optional): Max dataset size (truncates when set). With `ds_exclude_elements` it caps the count *after* filtering. On a split store it caps both splits unless `ds_max_size_val` overrides the validation one.
+            ds_max_size_val (int, optional): Separate cap for the validation split of a split store. `None` (the default) reuses `ds_max_size`, which is the historical behaviour. Bounds processing as well as truncation, and requires `ds_max_size`.
             ds_exclude_elements (iterable[int] or None): Atomic numbers to exclude; any dimer containing one is dropped before `ds_max_size` is applied. Atomic numbers only -- element symbols are rejected.
             ds_exclude_scan_multiple (float): How much raw data to make available to the exclusion scan, as a multiple of `ds_max_size`. Must be >= 1. This bounds both the scan and, on an unprocessed store, how many dimers get processed.
             ds_atomic_batch_size (int): Atomic batch size used by dataset construction.
+            ds_batch_size (int): Dimers per optimizer step. Recorded on the dataset as `training_batch_size`, which is where `train` reads it from; it is not part of the on-disk layout, so changing it does not invalidate a processed store.
             ds_force_reprocess (bool): Force dataset reprocessing.
             ds_skip_process (bool): Skip dataset processing.
             ds_skip_compile (bool): Skip any compilation steps when building dataset.
@@ -5365,21 +5388,54 @@ class AM_DimerParam_Model:
         ds_exclude_scan_multiple = _validate_scan_multiple(
             ds_exclude_scan_multiple
         )
+        ds_batch_size = _validate_positive_count(
+            ds_batch_size, "ds_batch_size"
+        )
         # Recorded so the tracked run config says which elements were dropped.
         # Without it a filtered run is indistinguishable from a full one on the
         # dashboard, which is the whole reason for logging the run.
         self.ds_excluded_elements = sorted(ds_excluded_elements)
-        if not ds_excluded_elements or ds_max_size is None:
-            ds_raw_max_size = ds_max_size
-        else:
-            ds_raw_max_size = int(
-                math.ceil(ds_max_size * float(ds_exclude_scan_multiple))
-            )
+
+        def _raw_cap(cap):
+            """How much raw data the exclusion scan may reach for one split."""
+            if not ds_excluded_elements or cap is None:
+                return cap
+            return int(math.ceil(cap * float(ds_exclude_scan_multiple)))
+
+        ds_raw_max_size = _raw_cap(ds_max_size)
         ds_qcel_split_db = (
             ds_qcel_molecules is not None
             and len(ds_qcel_molecules) == 2
             and isinstance(ds_qcel_molecules[0], list)
         )
+        # A validation cap only means something when there is a second store to
+        # cap. On a single-store spec `train` splits by percentage, so honoring
+        # it would be a no-op that the run record reports as a bounded run.
+        if ds_max_size_val is not None:
+            ds_max_size_val = _validate_positive_count(
+                ds_max_size_val, "ds_max_size_val"
+            )
+            if not (self.ds_spec_type in split_dbs or ds_qcel_split_db):
+                raise ValueError(
+                    "ds_max_size_val applies to the validation split of a "
+                    f"split dataset; spec_type {self.ds_spec_type} has one "
+                    "store that train() splits by percentage"
+                )
+            if ds_max_size is None:
+                # An uncapped train split with a capped validation split reads
+                # as a small run and costs a full-store processing job.
+                raise ValueError(
+                    "ds_max_size_val requires ds_max_size; capping only the "
+                    "validation split leaves the training split unbounded"
+                )
+        # `None` keeps the historical behaviour exactly: one cap for both.
+        ds_max_size_test = (
+            ds_max_size if ds_max_size_val is None else ds_max_size_val
+        )
+        ds_raw_max_size_test = _raw_cap(ds_max_size_test)
+        self.ds_max_size = ds_max_size
+        self.ds_max_size_val = ds_max_size_test
+        self.ds_batch_size = ds_batch_size
         self.dataset = dataset
         if (
             not ignore_database_null
@@ -5398,6 +5454,7 @@ class AM_DimerParam_Model:
                     force_reprocess=fp,
                     atom_model=self.atom_model,
                     atomic_batch_size=ds_atomic_batch_size,
+                    batch_size=ds_batch_size,
                     num_devices=ds_num_devices,
                     skip_processed=ds_skip_process,
                     skip_compile=ds_skip_compile,
@@ -5445,6 +5502,7 @@ class AM_DimerParam_Model:
                         force_reprocess=fp,
                         atom_model=self.atom_model,
                         atomic_batch_size=ds_atomic_batch_size,
+                        batch_size=ds_batch_size,
                         num_devices=ds_num_devices,
                         skip_processed=ds_skip_process,
                         skip_compile=ds_skip_compile,
@@ -5462,10 +5520,11 @@ class AM_DimerParam_Model:
                         r_cut=r_cut,
                         r_cut_im=torch.inf,
                         spec_type=ds_spec_type,
-                        max_size=ds_raw_max_size,
+                        max_size=ds_raw_max_size_test,
                         force_reprocess=fp,
                         atom_model=self.atom_model,
                         atomic_batch_size=ds_atomic_batch_size,
+                        batch_size=ds_batch_size,
                         num_devices=ds_num_devices,
                         skip_processed=ds_skip_process,
                         skip_compile=ds_skip_compile,
@@ -5482,20 +5541,24 @@ class AM_DimerParam_Model:
 
             self.dataset = setup_ds()
             self.dataset = setup_ds(False)
+            split_caps = ((0, "train", ds_max_size), (1, "test", ds_max_size_test))
             if ds_excluded_elements:
-                for split_idx, split_label in ((0, "train"), (1, "test")):
+                for split_idx, split_label, split_cap in split_caps:
                     self.dataset[split_idx] = self.dataset[split_idx][
                         dimer_indices_excluding_elements(
                             self.dataset[split_idx],
                             ds_excluded_elements,
-                            max_size=ds_max_size,
+                            max_size=split_cap,
                             print_level=1,
                             label=split_label,
                         )
                     ]
-            elif ds_max_size:
-                self.dataset[0] = self.dataset[0][:ds_max_size]
-                self.dataset[1] = self.dataset[1][:ds_max_size]
+            else:
+                for split_idx, _, split_cap in split_caps:
+                    if split_cap:
+                        self.dataset[split_idx] = self.dataset[split_idx][
+                            :split_cap
+                        ]
         print(f"{self.dataset=}")
         self.batch_size = None
         self.shuffle = False
@@ -6600,6 +6663,12 @@ units angstrom
             "data/excluded_elements": list(
                 getattr(self, "ds_excluded_elements", []) or []
             ),
+            # Same argument as the exclusion list: a run whose validation split
+            # is capped differently from its training split is a different
+            # experiment, and the dashboard has to say so.
+            "data/train_cap": getattr(self, "ds_max_size", None),
+            "data/validation_cap": getattr(self, "ds_max_size_val", None),
+            "data/batch_size": batch_size,
         }
         if world_size > 1:
             print("Running multi-process training", flush=True)
