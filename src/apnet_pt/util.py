@@ -806,3 +806,61 @@ def load_split_manifest(path, dataset=None, verify="all", print_level=1):
             f"({100.0 * len(test_indices) / len(idx):.2f}% held out)"
         )
     return train_indices, test_indices
+
+def resolve_split_indices(
+    dataset,
+    split_percent=0.9,
+    train_indices=None,
+    test_indices=None,
+    label="dataset",
+):
+    """Return (train_indices, test_indices), explicit if given, else uniform.
+
+    Both trainers used to inline this. They now share it, because the explicit
+    branch has validation worth writing once: an overlap between the two sides
+    is a silent leak, and supplying only one side while the other falls back to
+    a random draw guarantees one.
+
+    The uniform fallback keeps its historical `np.random.seed(42)` so existing
+    runs reproduce, and so that a designed split can honestly report what the
+    default would have held out.
+    """
+    n_data = len(dataset)
+    if train_indices is None and test_indices is None:
+        np.random.seed(42)
+        torch.manual_seed(42)
+        order = np.random.permutation(n_data)
+        cut = int(n_data * split_percent)
+        return order[:cut], order[cut:], False
+
+    if train_indices is None or test_indices is None:
+        raise ValueError(
+            "train_indices and test_indices must be supplied together; "
+            "letting one fall back to a random draw would overlap them"
+        )
+    train_indices = np.asarray(train_indices, dtype=np.int64)
+    test_indices = np.asarray(test_indices, dtype=np.int64)
+    if train_indices.size == 0 or test_indices.size == 0:
+        raise ValueError(
+            f"explicit split has {train_indices.size} train and "
+            f"{test_indices.size} test indices; both must be non-empty"
+        )
+    overlap = np.intersect1d(train_indices, test_indices)
+    if overlap.size:
+        raise ValueError(
+            f"explicit split leaks {overlap.size} indices into both train and "
+            f"test, first {overlap[:5].tolist()}"
+        )
+    for name, arr in (("train", train_indices), ("test", test_indices)):
+        if arr.min() < 0 or arr.max() >= n_data:
+            raise ValueError(
+                f"explicit {name} indices fall outside [0, {n_data}) "
+                f"(min {int(arr.min())}, max {int(arr.max())})"
+            )
+    print(
+        f"Using explicit split on {label}: {train_indices.size} train, "
+        f"{test_indices.size} test "
+        f"({100.0 * test_indices.size / n_data:.2f}% of the dataset held out)",
+        flush=True,
+    )
+    return train_indices, test_indices, True

@@ -4808,3 +4808,40 @@ def test_excluded_elements_are_recorded_for_tracking():
     # every route, not only when something is excluded.
     init_src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.__init__)
     assert "self.ds_excluded_elements" in init_src
+
+
+def test_exclude_scan_multiple_bounds_the_raw_dataset_cap():
+    """Element exclusion must not turn into a full-store processing job.
+
+    `max_size` on the fused dataset bounds not just the file list but how much
+    of the raw pickle gets *processed* on first use. An earlier version passed
+    None here so the scan could reach `ds_max_size` survivors, which on any
+    machine whose processed store is not already built silently turns "give me
+    5000 filtered dimers" into processing all 1.6M.
+    """
+    sig = inspect.signature(mtp_mtp.AM_DimerParam_Model.__init__)
+    assert "ds_exclude_scan_multiple" in sig.parameters
+    assert sig.parameters["ds_exclude_scan_multiple"].default == 2.0
+
+    src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.__init__)
+    assert "ds_raw_max_size = ds_max_size" in src
+    assert "math.ceil(ds_max_size * float(ds_exclude_scan_multiple))" in src
+    # The reason has to survive in the source, or the next person "simplifies"
+    # it back to None.
+    assert "processing job" in src
+
+
+def test_exclude_scan_multiple_rejects_bad_values():
+    import math as _math
+
+    bad_values = [0.99, 0.0, -1.0, float("nan"), float("inf")]
+    for value in bad_values:
+        with pytest.raises((ValueError,)):
+            mtp_mtp._validate_scan_multiple_for_test(value)
+    for value in ["2", None, True]:
+        with pytest.raises(TypeError):
+            mtp_mtp._validate_scan_multiple_for_test(value)
+    # Valid values pass through.
+    for value in (1, 1.0, 2.0, 10):
+        assert mtp_mtp._validate_scan_multiple_for_test(value) == float(value)
+    assert _math.isfinite(1.0)

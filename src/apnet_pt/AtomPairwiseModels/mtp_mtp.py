@@ -17,6 +17,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.data import Data
 
 from apnet_pt.torch_util import set_weights_to_value
+from apnet_pt.util import resolve_split_indices
 from qcml_dftd3.d3 import d3, resolve_d3_damping_parameters
 
 from .. import constants
@@ -1287,6 +1288,21 @@ def _infer_atommpnn_from_state_dict(
         n_embed=n_embed,
         r_cut=r_cut,
     )
+
+
+def _validate_scan_multiple(value, name="ds_exclude_scan_multiple"):
+    """Bound the exclusion scan, and with it how much raw data gets processed."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError(f"{name} must be a number (got {value!r})")
+    value = float(value)
+    if not math.isfinite(value) or value < 1.0:
+        raise ValueError(f"{name} must be finite and >= 1 (got {value})")
+    return value
+
+
+# Test seam: the caller above runs inside a 600-line __init__ that needs a
+# dataset and an atom model to construct, so the validation is reachable here.
+_validate_scan_multiple_for_test = _validate_scan_multiple
 
 
 def normalize_excluded_elements(excluded_elements):
@@ -4922,6 +4938,7 @@ class AM_DimerParam_Model:
         ds_root="data",
         ds_max_size=None,
         ds_exclude_elements=None,
+        ds_exclude_scan_multiple=2.0,
         ds_atomic_batch_size=200,
         ds_force_reprocess=False,
         ds_skip_process=False,
@@ -4974,6 +4991,7 @@ class AM_DimerParam_Model:
             ds_root (str): Root directory for datasets.
             ds_max_size (int, optional): Max dataset size (truncates when set). With `ds_exclude_elements` it caps the count *after* filtering.
             ds_exclude_elements (iterable[int] or None): Atomic numbers to exclude; any dimer containing one is dropped before `ds_max_size` is applied. Atomic numbers only -- element symbols are rejected.
+            ds_exclude_scan_multiple (float): How much raw data to make available to the exclusion scan, as a multiple of `ds_max_size`. Must be >= 1. This bounds both the scan and, on an unprocessed store, how many dimers get processed.
             ds_atomic_batch_size (int): Atomic batch size used by dataset construction.
             ds_force_reprocess (bool): Force dataset reprocessing.
             ds_skip_process (bool): Skip dataset processing.
@@ -5336,14 +5354,27 @@ class AM_DimerParam_Model:
         split_dbs = [2, 5, 6, 7]
         # Element exclusion filters whole dimers, so it has to run before
         # ds_max_size is applied -- otherwise a 5000-dimer request silently
-        # returns however many survive. The raw store is therefore built
-        # uncapped and the cap moves onto the filtered index list.
+        # returns however many survive. The raw cap is therefore loosened, and
+        # the requested size moves onto the filtered index list.
+        #
+        # Loosened, NOT removed. `max_size` also bounds how much of the raw
+        # store gets *processed* on first use, so passing None here would turn
+        # "give me 5000 filtered dimers" into a full 1.6M-dimer processing job
+        # on any machine whose processed store is not already built.
         ds_excluded_elements = normalize_excluded_elements(ds_exclude_elements)
+        ds_exclude_scan_multiple = _validate_scan_multiple(
+            ds_exclude_scan_multiple
+        )
         # Recorded so the tracked run config says which elements were dropped.
         # Without it a filtered run is indistinguishable from a full one on the
         # dashboard, which is the whole reason for logging the run.
         self.ds_excluded_elements = sorted(ds_excluded_elements)
-        ds_raw_max_size = None if ds_excluded_elements else ds_max_size
+        if not ds_excluded_elements or ds_max_size is None:
+            ds_raw_max_size = ds_max_size
+        else:
+            ds_raw_max_size = int(
+                math.ceil(ds_max_size * float(ds_exclude_scan_multiple))
+            )
         ds_qcel_split_db = (
             ds_qcel_molecules is not None
             and len(ds_qcel_molecules) == 2
@@ -7590,6 +7621,8 @@ class AtomTypeParamModel:
         batch_size=16,
         lr=5e-4,
         split_percent=0.9,
+        train_indices=None,
+        test_indices=None,
         model_path=None,
         skip_compile=True,
         shuffle=True,
@@ -7613,14 +7646,18 @@ class AtomTypeParamModel:
             raise ValueError("No dataset provided")
         self.train_shuffle = shuffle
 
-        np.random.seed(42)
-        torch.manual_seed(42)
-        random_indices = np.random.permutation(len(self.dataset))
-        train_indices = random_indices[: int(len(self.dataset) * split_percent)]
-        test_indices = random_indices[int(len(self.dataset) * split_percent) :]
+        train_indices, test_indices, explicit_split = resolve_split_indices(
+            self.dataset,
+            split_percent=split_percent,
+            train_indices=train_indices,
+            test_indices=test_indices,
+            label="AtomTypeParamNN monomers",
+        )
         if random_seed:
             np.random.seed(random_seed)
             torch.manual_seed(random_seed)
+            # Shuffles the order within the training set only; the split itself
+            # is untouched, so an explicit split stays exactly as designed.
             train_indices = np.random.permutation(train_indices)
         train_dataset = self.dataset[train_indices]
         test_dataset = self.dataset[test_indices]
@@ -7652,6 +7689,8 @@ class AtomTypeParamModel:
             "training/learning_rate_initial": lr,
             "training/random_seed": random_seed,
             "training/skip_compile": skip_compile,
+            "data/split_kind": "explicit" if explicit_split else "uniform",
+            "data/split_percent": None if explicit_split else split_percent,
         }
         if world_size > 1:
             # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)

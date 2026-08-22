@@ -175,6 +175,8 @@ def train_atom_model(
     split_manifest=None,
     split_verify="all",
     skip_compile=None,
+    am_model_path_for_inner=None,
+    freeze_inner_atom_model=True,
     wandb_config=None,
 ):
     """
@@ -207,6 +209,8 @@ def train_atom_model(
         split_manifest (str or None): Path to a train/test split manifest CSV (columns index, split, fingerprint). When set, replaces the uniform random split_percent draw with the split the manifest describes.
         split_verify (str or int): How much of the manifest to verify against the dataset -- "all", "none", or a sample count. Verification is what distinguishes a valid manifest from a stale one.
         skip_compile (bool or None): Force torch.compile off (True) or on (False). None keeps the per-model-type default. AtomTypeParamModel's forward writes into a slice of a mask-filtered tensor, which Inductor cannot guard on and which raises GuardOnDataDependentSymNode on some torch builds; running eager is the workaround.
+        am_model_path_for_inner (str or None): AtomTypeParamNN only -- the pretrained AtomMPNN checkpoint that supplies the inner multipole model.
+        freeze_inner_atom_model (bool): AtomTypeParamNN only -- keep the inner AtomMPNN frozen (default) so only the parameter head is fitted.
 
     """
     # The per-model-type branches below assign `skip_compile` themselves, so
@@ -219,7 +223,23 @@ def train_atom_model(
         AM = AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel
         batch_size = 1
     elif atom_model_type == "AtomTypeParamModel":
+        # NOTE: this is AtomModels.ap3_atomtype_mpnn.AtomTypeParamModel, whose
+        # module is AtomTypeParamMPNN -- a standalone MPNN with its own
+        # embedding and per-parameter layers (133 tensors). It predicts the same
+        # two targets but is NOT the class the CLIFF routes load. Use
+        # "AtomTypeParamNN" below for that. The name collision between the two
+        # AtomTypeParamModel classes is easy to trip over: a checkpoint from
+        # this route fails to load into CLIFF with a wall of missing
+        # "atom_model.*" keys.
         AM = AtomModels.ap3_atomtype_mpnn.AtomTypeParamModel
+        batch_size = 16
+    elif atom_model_type == "AtomTypeParamNN":
+        # AtomPairwiseModels.mtp_mtp.AtomTypeParamModel, whose module is
+        # AtomTypeParamNN: a full AtomMPNN under `atom_model.*` plus a
+        # guess_layer and per-parameter readouts (201 tensors). This is what
+        # --atom_type_param_model_path feeds to the CLIFF and Rackers routes,
+        # and what models/ap3_saptpbe0/1/atp_hfvr_1.pt is.
+        AM = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel
         batch_size = 16
     elif atom_model_type == "AtomInducedDipoleModel":
         AM = AtomModels.ap3_atom_model.AtomInducedDipoleModel
@@ -234,7 +254,27 @@ def train_atom_model(
         pretrained_model = model_path
     print("Training {}...".format(atom_model_type))
     # TODO complete
-    if atom_model_type in ["AtomModel", "AtomHirshfeldModel", "AtomTypeParamModel"]:
+    if atom_model_type == "AtomTypeParamNN":
+        # This class takes its inner AtomMPNN from a checkpoint rather than
+        # building one from n_* hyperparameters, so its constructor differs
+        # from the three below.
+        atom_model = AM(
+            atom_model_pre_trained_path=am_model_path_for_inner,
+            pre_trained_model_path=pretrained_model,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            r_cut=r_cut,
+            ds_root=data_dir,
+            ds_spec_type=spec_type,
+            ds_max_size=ds_max_size,
+            ignore_database_null=False,
+            ds_in_memory=True,
+            use_GPU=True,
+            freeze_atom_model=freeze_inner_atom_model,
+        )
+        skip_compile = False
+    elif atom_model_type in ["AtomModel", "AtomHirshfeldModel", "AtomTypeParamModel"]:
         atom_model = AM(
             n_message=n_message,
             n_rbf=n_rbf,
@@ -1051,7 +1091,14 @@ def main():
         "--train_am",
         type=str,
         default="",
-        help="Train AtomModel: (AtomModel, AtomHirshfeldModel)",
+        help=(
+            "Train an atom model: AtomModel, AtomHirshfeldModel, "
+            "AtomTypeParamNN, AtomTypeParamModel, AtomInducedDipoleModel, or "
+            "InducedDipoleModel. AtomTypeParamNN is the class the CLIFF and "
+            "Rackers routes load via --atom_type_param_model_path; "
+            "AtomTypeParamModel is a different, standalone architecture that "
+            "predicts the same targets but will not load there."
+        ),
     )
     args.add_argument(
         "--train_apnet",
@@ -1523,6 +1570,8 @@ def main():
             split_manifest=args.split_manifest,
             split_verify=args.split_verify,
             skip_compile=True if args.skip_compile else None,
+            am_model_path_for_inner=args.atom_mpnn_pretrained_path,
+            freeze_inner_atom_model=not args.unfreeze_atom_model,
             wandb_config=atom_wandb_config,
         )
     if args.train_apnet != "":
