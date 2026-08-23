@@ -37,7 +37,12 @@ from apnet_pt.training_tracking import (
     track_epoch_from_locals,
     track_pretraining_from_locals,
 )
-from apnet_pt.training_tracking import _metrics_from_locals
+from apnet_pt.training_tracking import (
+    _metrics_from_locals,
+    _TrackerState,
+    define_epoch_metrics,
+    log_epoch_metrics,
+)
 
 
 def _context(**overrides):
@@ -781,8 +786,15 @@ class _ToyTrackedHarness:
         nan_epoch=None,
         validation_losses=None,
         restore_best=False,
+        with_loaders=False,
+        world_size=None,
     ):
         optimizer = torch.optim.SGD(self.model.parameters(), lr=0.1)
+        if with_loaders:
+            # Named exactly as every real loop names them, and sized so the
+            # train and validation denominators cannot be confused.
+            train_loader = [0, 1, 2, 3]
+            test_loader = [0, 1]
         train_loss, *train_maes = self._result(train=True)
         test_loss, *validation_maes = self._result(train=False)
         track_pretraining_from_locals(
@@ -1343,3 +1355,200 @@ def test_nan_validation_loss_is_logged_without_ending_training(tmp_path):
         "exit_code": 0,
         "pid": events[-1]["pid"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Mean-per-batch loss alongside the summed one
+#
+# Every epoch loop in the package accumulates `total_loss += batch_loss.item()`
+# and returns it without dividing, while `batch_loss` is already a mean over
+# the batch. So `train/loss_sum` is `n_batches x mean_batch_loss`: large, and
+# -- the actual problem -- proportional to the batch count. Moving the CLIFF
+# routes from batch_size 16 to 128 on 100k dimers took the train batch count
+# from 6250 to 782, so an unchanged model logs an 8x smaller `loss_sum`. The
+# summed value stays because it is exactly what the harnesses' own
+# `lowest_test_loss` comparison uses, and dropping it would make that decision
+# unauditable; the mean is added beside it.
+
+
+def test_epoch_metrics_log_the_mean_beside_the_sum():
+    logged = []
+
+    class _Tracker:
+        def log(self, payload):
+            logged.append(payload)
+
+    log_epoch_metrics(
+        _Tracker(),
+        epoch=3,
+        metric_names=["total"],
+        train_values=[0.5],
+        validation_values=[0.6],
+        train_loss=1000.0,
+        validation_loss=200.0,
+        train_batches=100,
+        validation_batches=20,
+    )
+    payload = logged[0]
+    assert payload["train/loss_sum"] == 1000.0
+    assert payload["val/loss_sum"] == 200.0
+    assert payload["train/loss_mean"] == pytest.approx(10.0)
+    assert payload["val/loss_mean"] == pytest.approx(10.0)
+
+
+def test_epoch_metrics_omit_the_mean_without_a_batch_count():
+    """A loop whose loader has no length still logs everything it can."""
+    logged = []
+
+    class _Tracker:
+        def log(self, payload):
+            logged.append(payload)
+
+    log_epoch_metrics(
+        _Tracker(),
+        epoch=1,
+        metric_names=["total"],
+        train_values=[0.5],
+        validation_values=[0.6],
+        train_loss=1000.0,
+        validation_loss=200.0,
+    )
+    payload = logged[0]
+    assert payload["train/loss_sum"] == 1000.0
+    assert "train/loss_mean" not in payload
+    assert "val/loss_mean" not in payload
+
+
+@pytest.mark.parametrize("count", [0, None])
+def test_epoch_metrics_refuse_to_divide_by_a_useless_count(count):
+    """Zero batches means the epoch ran on nothing; do not emit 0/0."""
+    logged = []
+
+    class _Tracker:
+        def log(self, payload):
+            logged.append(payload)
+
+    log_epoch_metrics(
+        _Tracker(),
+        epoch=1,
+        metric_names=["total"],
+        train_values=[0.5],
+        validation_values=[0.6],
+        train_loss=1000.0,
+        validation_loss=200.0,
+        train_batches=count,
+        validation_batches=count,
+    )
+    assert "train/loss_mean" not in logged[0]
+    assert "val/loss_mean" not in logged[0]
+
+
+def test_defined_metrics_include_the_means_and_minimize_the_validation_one():
+    defined = []
+
+    class _Tracker:
+        def define_metrics(self, names):
+            defined.extend(names)
+
+    define_epoch_metrics(_Tracker(), ["total", "elst"])
+    assert "train/loss_mean" in defined
+    assert "val/loss_mean" in defined
+
+    # And the validation mean must carry the same "lower is better" summary as
+    # the summed one, or the run overview reports its last value instead of its
+    # best.
+    recorded = {}
+
+    class _Run:
+        dir = "."
+
+        def define_metric(self, name, **kwargs):
+            recorded[name] = kwargs
+
+    tracker = WandbTrainingTracker.__new__(WandbTrainingTracker)
+    tracker._run = _Run()
+    tracker._state = _TrackerState.STARTED
+    tracker.define_metrics(["val/loss_mean", "train/loss_mean"])
+    assert recorded["val/loss_mean"]["summary"] == "min"
+    assert "summary" not in recorded["train/loss_mean"]
+
+
+def test_batch_counts_come_from_the_loops_own_loaders(tmp_path):
+    """Every tracked loop names its loaders `train_loader`/`test_loader`.
+
+    Reading the counts there rather than threading a new argument through 14
+    harness files is what makes this one change cover all of them.
+    """
+    harness = _ToyTrackedHarness("pairwise")
+
+    run_tracked_single_process(
+        harness,
+        lambda: harness.single_proc_train(n_epochs=2, with_loaders=True),
+        WandbConfig(mode="offline"),
+        model_family="pairwise",
+        train_dataset=[0, 1],
+        validation_dataset=[2, 3],
+        effective_batch_size=2,
+        world_size=1,
+        initial_config={"training/epochs": 2},
+        backend=TrackerBackend.FILE_EVENT,
+        event_directory=str(tmp_path),
+    )
+
+    logs = [e["metrics"] for e in _read_events(tmp_path) if e["event"] == "log"]
+    # The toy loop builds a 4-batch train loader and a 2-batch test loader.
+    for log in logs:
+        assert log["train/loss_mean"] == pytest.approx(log["train/loss_sum"] / 4)
+        assert log["val/loss_mean"] == pytest.approx(log["val/loss_sum"] / 2)
+
+
+def test_ddp_batch_count_spans_every_rank(tmp_path):
+    """In DDP the loss is all-reduced with SUM before it reaches tracking.
+
+    Each rank contributes its own sum over its own shard, so the denominator is
+    world_size x the per-rank loader length. Dividing by the local length alone
+    would report a mean world_size times too large.
+    """
+    harness = _ToyTrackedHarness("pairwise")
+
+    run_tracked_single_process(
+        harness,
+        lambda: harness.single_proc_train(
+            n_epochs=1, with_loaders=True, world_size=4
+        ),
+        WandbConfig(mode="offline"),
+        model_family="pairwise",
+        train_dataset=[0, 1],
+        validation_dataset=[2, 3],
+        effective_batch_size=2,
+        world_size=1,
+        initial_config={"training/epochs": 1},
+        backend=TrackerBackend.FILE_EVENT,
+        event_directory=str(tmp_path),
+    )
+
+    logs = [e["metrics"] for e in _read_events(tmp_path) if e["event"] == "log"]
+    assert logs[-1]["train/loss_mean"] == pytest.approx(
+        logs[-1]["train/loss_sum"] / (4 * 4)
+    )
+    assert logs[-1]["val/loss_mean"] == pytest.approx(
+        logs[-1]["val/loss_sum"] / (4 * 2)
+    )
+
+
+def test_the_summed_loss_really_is_a_sum_of_batch_means():
+    """The invariant the mean's denominator depends on.
+
+    If a loop ever starts dividing by its own batch count, `loss_mean` would
+    divide twice. Pinned on the CLIFF/parameter loop that is in production use.
+    """
+    from apnet_pt.AtomPairwiseModels import mtp_mtp
+
+    src = inspect.getsource(
+        mtp_mtp.AM_DimerParam_Model._AM_DimerParam_Model__train_batches_single_proc
+    )
+    assert "total_loss += batch_loss.item()" in src
+    assert "return total_loss, total_MAE_t" in src
+    # No division of the accumulator anywhere in the function.
+    assert "total_loss /" not in src
+    assert "total_loss/" not in src

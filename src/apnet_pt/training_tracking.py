@@ -395,7 +395,7 @@ class WandbTrainingTracker(_BaseTrainingTracker):
         self._run.define_metric("epoch")
         for name in metric_names:
             kwargs: dict[str, Any] = {"step_metric": "epoch"}
-            if name in {"val/loss_sum", "val/mae/total"}:
+            if name in {"val/loss_sum", "val/loss_mean", "val/mae/total"}:
                 kwargs["summary"] = "min"
             self._run.define_metric(name, **kwargs)
 
@@ -982,6 +982,14 @@ def _track_evaluation_boundary(
         raise ValueError("Training metric shape changed during a tracked run")
     validation_loss = values.get("test_loss")
     optimizer = values.get("optimizer")
+    # Every tracked loop names its loaders `train_loader` / `test_loader`, so
+    # the counts are read from the caller's locals rather than threaded as new
+    # arguments through fourteen harness files.
+    world_size = values.get("world_size")
+    train_batches = _loader_batch_count(values.get("train_loader"), world_size)
+    validation_batches = _loader_batch_count(
+        values.get("test_loader"), world_size
+    )
     if is_best:
         state["best_epoch"] = epoch
         state["best_validation_loss"] = validation_loss
@@ -1002,6 +1010,8 @@ def _track_evaluation_boundary(
         validation_values=validation_values,
         train_loss=values.get("train_loss"),
         validation_loss=validation_loss,
+        train_batches=train_batches,
+        validation_batches=validation_batches,
         learning_rate=(
             optimizer.param_groups[0]["lr"] if optimizer is not None else None
         ),
@@ -1060,6 +1070,33 @@ def _metrics_from_locals(
     return names, train_values, validation_values
 
 
+def _loader_batch_count(loader: Any, world_size: Any = None) -> int | None:
+    """Batches one epoch draws from ``loader``, across every rank.
+
+    Returns ``None`` whenever the count cannot be established -- an absent
+    loader, or one without a length (an ``IterableDataset``). The caller then
+    logs only the summed loss rather than inventing a denominator.
+
+    Under DDP the epoch loops all-reduce their loss with ``ReduceOp.SUM``
+    before it reaches tracking, so each rank contributes a sum over its own
+    shard and the denominator spans every rank. ``world_size`` is read from the
+    calling loop, where it is a parameter of the DDP entry points.
+    """
+    if loader is None:
+        return None
+    try:
+        count = len(loader)
+    except TypeError:
+        return None
+    if count <= 0:
+        return None
+    try:
+        ranks = int(world_size) if world_size is not None else 1
+    except (TypeError, ValueError):
+        ranks = 1
+    return count * max(ranks, 1)
+
+
 def _value_width(value: Any) -> int:
     if hasattr(value, "numel"):
         return int(value.numel())
@@ -1077,11 +1114,27 @@ def log_epoch_metrics(
     validation_values: Sequence[Any],
     train_loss: Any | None = None,
     validation_loss: Any | None = None,
+    train_batches: int | None = None,
+    validation_batches: int | None = None,
     learning_rate: Any | None = None,
     epoch_seconds: Any | None = None,
     is_best: bool | None = None,
 ) -> None:
-    """Log one evaluation boundary with stable train/validation metric names."""
+    """Log one evaluation boundary with stable train/validation metric names.
+
+    Two loss metrics are emitted per split. ``*/loss_sum`` is the raw
+    accumulator every epoch loop in the package returns: it adds each batch's
+    already-averaged loss without dividing, so it is proportional to the batch
+    count and cannot be compared between runs at different batch sizes. It is
+    logged anyway because it is exactly the value the harnesses' own
+    ``lowest_test_loss`` comparison uses, and the best-epoch decision has to
+    stay auditable.
+
+    ``*/loss_mean`` divides by the batch count, giving the mean per-batch
+    objective -- the number the optimizer actually saw, on the same scale
+    regardless of batch size. It is the unweighted mean of batch means, which
+    differs from a true per-sample mean only by the short final batch.
+    """
 
     if len(metric_names) != len(train_values) or len(metric_names) != len(
         validation_values
@@ -1093,14 +1146,19 @@ def log_epoch_metrics(
         epoch_seconds=epoch_seconds,
         is_best=is_best,
     )
-    if train_loss is not None:
-        payload["train/loss_sum"] = scalar_value(
-            train_loss, metric_name="train/loss_sum"
+    for prefix, loss, batches in (
+        ("train", train_loss, train_batches),
+        ("val", validation_loss, validation_batches),
+    ):
+        if loss is None:
+            continue
+        payload[f"{prefix}/loss_sum"] = scalar_value(
+            loss, metric_name=f"{prefix}/loss_sum"
         )
-    if validation_loss is not None:
-        payload["val/loss_sum"] = scalar_value(
-            validation_loss, metric_name="val/loss_sum"
-        )
+        if batches:
+            payload[f"{prefix}/loss_mean"] = scalar_value(
+                loss / batches, metric_name=f"{prefix}/loss_mean"
+            )
     for name, train_value, validation_value in zip(
         metric_names, train_values, validation_values
     ):
@@ -1118,7 +1176,12 @@ def define_epoch_metrics(
 ) -> None:
     """Define the exact common and model-specific epoch metric namespace."""
 
-    names = ["train/loss_sum", "val/loss_sum"]
+    names = [
+        "train/loss_sum",
+        "val/loss_sum",
+        "train/loss_mean",
+        "val/loss_mean",
+    ]
     for name in metric_names:
         names.extend((f"train/mae/{name}", f"val/mae/{name}"))
     names.extend(
