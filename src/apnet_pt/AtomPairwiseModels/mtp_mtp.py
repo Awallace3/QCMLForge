@@ -200,7 +200,19 @@ CLIFF_READOUT_INIT_SCALE = 0.1
 # 0.60 to 7.60 against a 2.5 seed, so hydrogen sits at 0.31x and any floor above
 # that would clamp the most common element in the data away from its fitted
 # value -- the failure `CLIFF_EXCH_INITIAL_VALUES_BY_Z` documents.
-CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION = (0.05, 0.5, 0.5, 0.5, 0.05)
+#
+# `ind_overlap` gets 0.1, not the 0.5 the Thole columns get. Both endpoints were
+# measured: at 0.05 the 50-epoch dense runs drifted onto the floor, and at 0.5
+# the overlap route's validation induction MAE went from ~2.5 to 4.69 within two
+# epochs while its electrostatics and exchange both improved -- a clamp holding
+# the parameter away from what the loss wanted, not a fit. 0.5 was also by far
+# the largest absolute change of the three (0.09 -> 0.9 against 0.017 -> 0.17
+# for Thole), because `ind_overlap`'s seed is 1.8 rather than ~0.35.
+#
+# This is a guardrail, not a cure. If induction now stalls while the other
+# components improve, the problem is in the induction functional or the mutual
+# polarization solve, and no choice of bound will fix it.
+CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION = (0.05, 0.5, 0.5, 0.1, 0.05)
 
 # Column indices into the 2-D parameter tensors returned by ``CliffExchangeNN``
 # and ``CliffClassicalNN``.  Both classes present a uniform ``[n_atoms, k]``
@@ -2766,6 +2778,24 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             self.param_feature_width, self.param_hidden
         )
         self.param_type_embed = nn.Embedding(max_Z + 1, self.param_hidden)
+        # One LayerNorm per hidden state, including the initial projection.
+        #
+        # Not optional polish. Without it this head's pre-clip gradient norm
+        # measured 6.7e4 against the dense head's 1.2 on the same toy objective
+        # -- roughly five orders of magnitude -- because `h (x) rbf` feeds a
+        # ~1160-wide MLP whose input is *summed* over neighbours, and the result
+        # is fed back in for the next message step with nothing bounding the
+        # recursion. On real dimers, where SAPT components reach ~240 kcal/mol
+        # on close contacts, that overflows float32: job 12235379 skipped 753 of
+        # 782 batches on non-finite gradients and its validation metrics never
+        # moved. `clip_grad_norm_` cannot rescue this, because by the time the
+        # norm is non-finite the gradients already are.
+        self.param_hidden_norms = nn.ModuleList(
+            [
+                nn.LayerNorm(self.param_hidden)
+                for _ in range(self.param_n_message + 1)
+            ]
+        )
         message_width = (
             4 * self.param_hidden * self.param_n_rbf
             + 4 * self.param_hidden
@@ -2880,15 +2910,24 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             charge, dipole, qpole, nested_params, h_list, keep_mask
         )
         h_states = [
-            self.param_input_layer(features)
-            + self.param_type_embed(Z[keep_mask])
+            self.param_hidden_norms[0](
+                self.param_input_layer(features)
+                + self.param_type_embed(Z[keep_mask])
+            )
         ]
         for i in range(self.param_n_message):
             m_ij = self._param_messages(
                 h_states[0], h_states[-1], rbf, e_source, e_target
             )
             m_i = scatter_sum_compile(m_ij, e_source, n_kept, reduce="sum")
-            h_states.append(self.param_update_layers[i](m_i))
+            # Normalized before it is stored, so both the next message step and
+            # every readout see an O(1) state regardless of depth or how many
+            # neighbours were summed into it.
+            h_states.append(
+                self.param_hidden_norms[i + 1](
+                    self.param_update_layers[i](m_i)
+                )
+            )
 
         # One column per parameter, each summing that parameter's own readout
         # over every message step. Built as a list and concatenated rather than

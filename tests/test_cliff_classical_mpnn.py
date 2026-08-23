@@ -585,12 +585,21 @@ def test_checkpoint_records_the_head_type_not_the_dense_one(
 
 def test_induction_columns_get_a_tight_floor_and_exch_keeps_a_loose_one():
     assert mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION == (
-        0.05, 0.5, 0.5, 0.5, 0.05
+        0.05, 0.5, 0.5, 0.1, 0.05
     )
     names = CLIFF_CLASSICAL_PARAMETER_NAMES
     floors = dict(zip(names, mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION))
-    for column in ("thole_direct", "thole_mutual", "ind_overlap"):
+    # The two Thole parameters have a narrow physical range (~0.3-0.4), so a
+    # tight floor costs nothing real.
+    for column in ("thole_direct", "thole_mutual"):
         assert floors[column] == 0.5, column
+    # `ind_overlap` is looser: measured at 0.5 it clamped validation induction
+    # MAE up from ~2.5 to 4.69 while elst and exch improved, which is a bound
+    # fighting the loss rather than a fit.
+    assert floors["ind_overlap"] == 0.1
+    # Still an order of magnitude above the 0.05 that the 50-epoch dense runs
+    # drifted onto.
+    assert floors["ind_overlap"] > 0.05
     # `exch` must stay below hydrogen's Table I value as a fraction of the
     # scalar seed, or the most common element in the data is clamped away from
     # its fitted value.
@@ -627,6 +636,9 @@ def test_both_five_column_heads_use_the_per_column_floor(
     )
     assert float(floor[CLIFF_CLASSICAL_EXCH_INDEX]) == pytest.approx(
         0.05 * float(seeds[CLIFF_CLASSICAL_EXCH_INDEX]), rel=1e-4
+    )
+    assert float(floor[CLIFF_CLASSICAL_IND_OVERLAP_INDEX]) == pytest.approx(
+        0.1 * float(seeds[CLIFF_CLASSICAL_IND_OVERLAP_INDEX]), rel=1e-4
     )
 
 
@@ -718,3 +730,92 @@ def test_non_finite_gradient_skips_the_step_instead_of_the_run():
     assert "self.last_epoch_skipped_batches = n_skipped" in src
     # And a silent drop would misreport the run, so it prints.
     assert "WARNING: skipped" in src
+
+
+# ---------------------------------------------------------------------------
+# Hidden-state normalization
+#
+# Without it this head's pre-clip gradient norm measured 6.7e4 against the dense
+# head's 1.2 on the same objective: `h (x) rbf` feeds a wide MLP whose input is
+# summed over neighbours, and the output is fed back in for the next message
+# step with nothing bounding the recursion. On real dimers that overflows
+# float32 -- job 12235379 skipped 753 of 782 batches on non-finite gradients and
+# its validation metrics never moved across an entire epoch.
+
+
+def test_every_hidden_state_is_normalized(nested_hfvr_vw_model):
+    torch.manual_seed(0)
+    head = _head(nested_hfvr_vw_model)
+    assert len(head.param_hidden_norms) == head.param_n_message + 1
+    for norm in head.param_hidden_norms:
+        assert isinstance(norm, torch.nn.LayerNorm)
+        assert norm.normalized_shape == (head.param_hidden,)
+    src = inspect.getsource(mtp_mtp.CliffClassicalMPNN._raw_head_output)
+    # Normalized before being stored, so the next message step and every
+    # readout see the bounded state, not just the readouts.
+    assert "self.param_hidden_norms[0](" in src
+    assert "self.param_hidden_norms[i + 1](" in src
+
+
+def test_hidden_states_stay_order_one(atomic_batch, nested_hfvr_vw_model):
+    """What the readouts consume must not scale with depth or coordination."""
+    torch.manual_seed(0)
+    head = _head(nested_hfvr_vw_model, param_n_message=3)
+    captured = []
+    for norm in head.param_hidden_norms:
+        norm.register_forward_hook(
+            lambda _m, _i, out: captured.append(out.detach())
+        )
+    head(atomic_batch)
+    assert len(captured) == head.param_n_message + 1
+    for step, state in enumerate(captured):
+        rms = float(state.pow(2).mean().sqrt())
+        assert rms < 10.0, f"hidden state {step} rms {rms}"
+
+
+def test_gradient_scale_stays_near_the_dense_head(
+    atomic_batch, nested_hfvr_vw_model
+):
+    """A regression bound on the failure that killed job 12235379.
+
+    Deliberately loose -- two orders of magnitude -- because the point is to
+    catch a return to five, not to pin a number.
+    """
+    import copy
+
+    target = torch.zeros(atomic_batch.x.numel(), 5)
+    target[:, 0] = CLIFF_CLASSICAL_INITIAL_VALUES[0]
+    target[:, 4] = CLIFF_CLASSICAL_INITIAL_VALUES[4]
+
+    def worst_grad_norm(build):
+        torch.manual_seed(0)
+        head = build()
+        opt = torch.optim.Adam(
+            [q for q in head.parameters() if q.requires_grad], lr=5e-4
+        )
+        worst = 0.0
+        for _ in range(150):
+            opt.zero_grad(set_to_none=True)
+            ((head(atomic_batch)[-1] - target) ** 2).mean().backward()
+            norm = torch.nn.utils.clip_grad_norm_(
+                head.parameters(), max_norm=1.0
+            )
+            assert torch.isfinite(norm)
+            worst = max(worst, float(norm))
+            opt.step()
+        return worst
+
+    dense = worst_grad_norm(
+        lambda: CliffClassicalNN(
+            atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+        )
+    )
+    mpnn = worst_grad_norm(
+        lambda: CliffClassicalMPNN(
+            atom_model=copy.deepcopy(nested_hfvr_vw_model),
+            **{**HEAD_KWARGS, **MPNN_KWARGS},
+        )
+    )
+    assert mpnn < 100.0 * max(dense, 1.0), (
+        f"message-passing head gradient norm {mpnn:.3e} vs dense {dense:.3e}"
+    )
