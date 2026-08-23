@@ -571,3 +571,150 @@ def test_checkpoint_records_the_head_type_not_the_dense_one(
     checkpoint = harness._create_checkpoint()
     assert checkpoint["model_type"] == "CliffClassicalMPNN"
     assert checkpoint["config"]["model_type"] == "CliffClassicalMPNN"
+
+
+# ---------------------------------------------------------------------------
+# Per-column bounds and the non-finite-gradient guard
+#
+# Measured, not assumed. With one global floor fraction of 0.05 the Thole floor
+# is 0.017 against a 0.34 seed -- twenty times below any physical value. Both
+# dense 50-epoch runs drove an induction column onto that floor, and this head
+# reached all three inside a single epoch and then produced non-finite Thole
+# values, killing job 12229494 in epoch 1 via `geometric_mean_edge_values`.
+
+
+def test_induction_columns_get_a_tight_floor_and_exch_keeps_a_loose_one():
+    assert mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION == (
+        0.05, 0.5, 0.5, 0.5, 0.05
+    )
+    names = CLIFF_CLASSICAL_PARAMETER_NAMES
+    floors = dict(zip(names, mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION))
+    for column in ("thole_direct", "thole_mutual", "ind_overlap"):
+        assert floors[column] == 0.5, column
+    # `exch` must stay below hydrogen's Table I value as a fraction of the
+    # scalar seed, or the most common element in the data is clamped away from
+    # its fitted value.
+    hydrogen_fraction = (
+        CLIFF_EXCH_INITIAL_VALUES_BY_Z[1] / CLIFF_CLASSICAL_INITIAL_VALUES[4]
+    )
+    assert floors["exch"] < hydrogen_fraction
+
+
+@pytest.mark.parametrize(
+    "head_type", ["CliffClassicalNN", "CliffClassicalMPNN"]
+)
+def test_both_five_column_heads_use_the_per_column_floor(
+    nested_hfvr_vw_model, head_type
+):
+    """The dense head has the same failure mode, so it gets the same floor."""
+    torch.manual_seed(0)
+    cls = getattr(mtp_mtp, head_type)
+    kwargs = dict(HEAD_KWARGS)
+    if head_type == "CliffClassicalMPNN":
+        kwargs.update(MPNN_KWARGS)
+    head = cls(atom_model=nested_hfvr_vw_model, **kwargs)
+    assert list(head.param_floor_fraction) == list(
+        mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION
+    )
+    floor = (
+        torch.nn.functional.softplus(head.raw_parameter_floor)
+        + head.positivity_epsilon
+    ).reshape(-1)
+    seeds = torch.tensor(CLIFF_CLASSICAL_INITIAL_VALUES)
+    # thole_direct: 0.5 * 0.34, not 0.05 * 0.34.
+    assert float(floor[CLIFF_CLASSICAL_THOLE_DIRECT_INDEX]) == pytest.approx(
+        0.5 * float(seeds[CLIFF_CLASSICAL_THOLE_DIRECT_INDEX]), rel=1e-4
+    )
+    assert float(floor[CLIFF_CLASSICAL_EXCH_INDEX]) == pytest.approx(
+        0.05 * float(seeds[CLIFF_CLASSICAL_EXCH_INDEX]), rel=1e-4
+    )
+
+
+def test_a_scalar_floor_is_still_accepted(nested_hfvr_vw_model):
+    """Checkpoints written before this change record a single float."""
+    torch.manual_seed(0)
+    head = _head(nested_hfvr_vw_model, param_floor_fraction=0.05)
+    floor = (
+        torch.nn.functional.softplus(head.raw_parameter_floor)
+        + head.positivity_epsilon
+    ).reshape(-1)
+    seeds = torch.tensor(CLIFF_CLASSICAL_INITIAL_VALUES)
+    assert torch.allclose(floor, 0.05 * seeds, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "bad,match",
+    [
+        ([0.5, 0.5], "exactly 5"),
+        ([0.5, 0.5, 0.5, 0.5, 0.0], r"param_floor_fraction\[4\]"),
+        ([0.5, 0.5, 0.5, 0.5, -1.0], r"param_floor_fraction\[4\]"),
+        ("0.5", "sequence"),
+    ],
+)
+def test_per_column_floor_is_validated(nested_hfvr_vw_model, bad, match):
+    with pytest.raises(ValueError, match=match):
+        _head(nested_hfvr_vw_model, param_floor_fraction=bad)
+
+
+def test_per_column_floor_must_stay_below_the_ceiling(nested_hfvr_vw_model):
+    """Compared per column, since either side may now vary across them."""
+    with pytest.raises(ValueError, match="thole_direct"):
+        _head(
+            nested_hfvr_vw_model,
+            param_floor_fraction=[0.05, 20.0, 0.5, 0.5, 0.05],
+            param_ceiling_multiple=10.0,
+        )
+
+
+def test_per_column_floor_round_trips_through_config(
+    tmp_path, nested_hfvr_vw_model, atomic_batch
+):
+    harness = mtp_mtp.CliffClassicalOverlapMPNNModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        **MPNN_KWARGS,
+    )
+    assert list(harness.model.param_floor_fraction) == list(
+        mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION
+    )
+    before = harness.model(atomic_batch)[-1].detach().clone()
+    path = tmp_path / "floors.pt"
+    model_io.save_checkpoint(harness._create_checkpoint(), str(path))
+    reloaded = mtp_mtp.CliffClassicalOverlapMPNNModel(
+        atom_model=None,
+        pre_trained_model_path=str(path),
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+    )
+    assert list(reloaded.model.param_floor_fraction) == list(
+        mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION
+    )
+    assert torch.allclose(
+        before, reloaded.model(atomic_batch)[-1].detach(), atol=1e-6
+    )
+
+
+def test_non_finite_gradient_skips_the_step_instead_of_the_run():
+    """`clip_grad_norm_` scales by `max_norm / total_norm`.
+
+    With a non-finite total norm that leaves every gradient nan, so the step
+    writes nan into every weight and the run is over -- which is how job
+    12229494 died. The guard drops the batch instead.
+    """
+    src = inspect.getsource(
+        mtp_mtp.AM_DimerParam_Model._AM_DimerParam_Model__train_batches_single_proc
+    )
+    assert "total_norm = torch.nn.utils.clip_grad_norm_" in src
+    assert "if not torch.isfinite(total_norm):" in src
+    # The batch is dropped, not stepped, and the count is surfaced.
+    assert "n_skipped += 1" in src
+    assert "continue" in src
+    assert "self.last_epoch_skipped_batches = n_skipped" in src
+    # And a silent drop would misreport the run, so it prints.
+    assert "WARNING: skipped" in src

@@ -4117,13 +4117,25 @@ def test_cliff_head_bounds_are_the_configured_multiples_of_the_seed(
 
     floor = F.softplus(model.raw_parameter_floor) + model.positivity_epsilon
     ceiling = F.softplus(model.raw_parameter_ceiling) + model.positivity_epsilon
-    assert torch.allclose(
-        floor.reshape(-1), mtp_mtp.CLIFF_PARAM_FLOOR_FRACTION * seeds, atol=1e-5
+    # The floor is per column on the five-parameter contract: the induction
+    # columns are held at 0.5x their seed because near-zero Thole damping makes
+    # the mutual polarization solve diverge, while `exch` keeps the loose 0.05x
+    # it needs for hydrogen's Table I value at 0.31x the seed.
+    expected_floor = torch.tensor(
+        mtp_mtp._broadcast_bound_scale(
+            model.param_floor_fraction, seeds.numel()
+        ),
+        dtype=seeds.dtype,
+    )
+    assert torch.allclose(floor.reshape(-1), expected_floor * seeds, atol=1e-5)
+    expected_ceiling = torch.tensor(
+        mtp_mtp._broadcast_bound_scale(
+            model.param_ceiling_multiple, seeds.numel()
+        ),
+        dtype=seeds.dtype,
     )
     assert torch.allclose(
-        ceiling.reshape(-1),
-        mtp_mtp.CLIFF_PARAM_CEILING_MULTIPLE * seeds,
-        atol=1e-4,
+        ceiling.reshape(-1), expected_ceiling * seeds, atol=1e-4
     )
     # Config-derived, so deliberately absent from the checkpoint: a build that
     # predates the bound must still be able to load a checkpoint written now.

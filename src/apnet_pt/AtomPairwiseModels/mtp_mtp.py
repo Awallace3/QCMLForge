@@ -186,6 +186,22 @@ CLIFF_PARAM_CEILING_MULTIPLE = 10.0
 # leaves the rest of the hierarchy alone.
 CLIFF_READOUT_INIT_SCALE = 0.1
 
+# Per-column floor fractions for the five-parameter classical contract, in
+# ``CLIFF_CLASSICAL_PARAMETER_NAMES`` order.
+#
+# The three induction columns get 0.5 rather than the shared 0.05. With 0.05 the
+# Thole floor is 0.017 against a 0.34 seed -- twenty times below any physical
+# value, and the point-dipole interaction it is there to damp diverges long
+# before that. Both dense 50-epoch runs drove an induction column onto the 0.05
+# floor, and the message-passing head reached all three inside one epoch and
+# then produced non-finite Thole values (job 12229494).
+#
+# `elst` and `exch` keep 0.05 deliberately: `K_exch` spans CLIFF Table I from
+# 0.60 to 7.60 against a 2.5 seed, so hydrogen sits at 0.31x and any floor above
+# that would clamp the most common element in the data away from its fitted
+# value -- the failure `CLIFF_EXCH_INITIAL_VALUES_BY_Z` documents.
+CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION = (0.05, 0.5, 0.5, 0.5, 0.05)
+
 # Column indices into the 2-D parameter tensors returned by ``CliffExchangeNN``
 # and ``CliffClassicalNN``.  Both classes present a uniform ``[n_atoms, k]``
 # contract, so these indices are the only sanctioned way to read a column.
@@ -2046,6 +2062,45 @@ def _validate_bound_scale(value, name: str, *, allow_none: bool = True):
     return scale
 
 
+def _validate_bound_scales(value, name: str, n_params: int):
+    """Validate a bound scale that may differ per parameter column.
+
+    A single global fraction cannot serve a contract whose columns have
+    different physical ranges. On the CLIFF classical contract the exchange
+    amplitude legitimately needs a loose floor -- CLIFF Table I puts hydrogen's
+    ``K_exch`` at 0.31x the scalar seed -- while the Thole damping parameters
+    need a tight one, because their physical range is narrow (~0.3-0.4) and
+    driving them toward zero removes the damping that keeps the mutual
+    polarization solve finite. Measured, not assumed: with one global 0.05
+    floor, all three induction columns reached it inside a single epoch and the
+    next epoch produced non-finite Thole values.
+
+    Returns ``None``, a single float, or a list of ``n_params`` floats.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        raise ValueError(f"{name} must be a number or a sequence of numbers")
+    if isinstance(value, (list, tuple)):
+        if len(value) != n_params:
+            raise ValueError(
+                f"{name} must contain exactly {n_params} values "
+                f"(got {len(value)})"
+            )
+        return [
+            _validate_bound_scale(item, f"{name}[{i}]", allow_none=False)
+            for i, item in enumerate(value)
+        ]
+    return _validate_bound_scale(value, name)
+
+
+def _broadcast_bound_scale(scale, n_params: int) -> list[float]:
+    """One bound scale per column, from a scalar or an already-sized sequence."""
+    if isinstance(scale, (list, tuple)):
+        return [float(item) for item in scale]
+    return [float(scale)] * n_params
+
+
 def _validate_param_start_mean_by_Z(param_start_mean_by_Z, parameter_names):
     """Validate and normalize per-element parameter seeds.
 
@@ -2239,24 +2294,27 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         param_start_mean_by_Z = _validate_param_start_mean_by_Z(
             param_start_mean_by_Z, self.PARAMETER_NAMES
         )
-        param_floor_fraction = _validate_bound_scale(
-            param_floor_fraction, "param_floor_fraction"
+        n_columns = len(self.PARAMETER_NAMES)
+        param_floor_fraction = _validate_bound_scales(
+            param_floor_fraction, "param_floor_fraction", n_columns
         )
-        param_ceiling_multiple = _validate_bound_scale(
-            param_ceiling_multiple, "param_ceiling_multiple"
+        param_ceiling_multiple = _validate_bound_scales(
+            param_ceiling_multiple, "param_ceiling_multiple", n_columns
         )
         readout_init_scale = _validate_bound_scale(
             readout_init_scale, "readout_init_scale"
         )
-        if (
-            param_floor_fraction is not None
-            and param_ceiling_multiple is not None
-            and param_floor_fraction >= param_ceiling_multiple
-        ):
-            raise ValueError(
-                "param_floor_fraction must be strictly less than "
-                "param_ceiling_multiple"
-            )
+        if param_floor_fraction is not None and param_ceiling_multiple is not None:
+            # Compared per column, since either may now differ across them.
+            floors = _broadcast_bound_scale(param_floor_fraction, n_columns)
+            ceilings = _broadcast_bound_scale(param_ceiling_multiple, n_columns)
+            for name, low, high in zip(self.PARAMETER_NAMES, floors, ceilings):
+                if low >= high:
+                    raise ValueError(
+                        "param_floor_fraction must be strictly less than "
+                        f"param_ceiling_multiple (column {name!r}: "
+                        f"{low} >= {high})"
+                    )
         super().__init__(
             atom_model=atom_model,
             n_message=n_message,
@@ -2375,9 +2433,14 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         def _raw_bound(scale, kind):
             if scale is None:
                 return None
+            scales = _broadcast_bound_scale(
+                scale, len(self.PARAMETER_NAMES)
+            )
             values = []
-            for name, mean in zip(self.PARAMETER_NAMES, positive_means):
-                target = scale * mean
+            for name, mean, column_scale in zip(
+                self.PARAMETER_NAMES, positive_means, scales
+            ):
+                target = column_scale * mean
                 if target <= positivity_epsilon:
                     raise ValueError(
                         f"param_{kind} for {name!r} resolves to {target}, which "
@@ -2523,7 +2586,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         width_floor: float = OVERLAP_WIDTH_FLOOR,
         freeze_atom_model: bool = True,
         param_start_mean_by_Z=None,
-        param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
+        param_floor_fraction=CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
     ):
@@ -2645,7 +2708,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         width_floor: float = OVERLAP_WIDTH_FLOOR,
         freeze_atom_model: bool = True,
         param_start_mean_by_Z=None,
-        param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
+        param_floor_fraction=CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         param_n_message: int = CLIFF_MPNN_N_MESSAGE,
@@ -6554,6 +6617,7 @@ units angstrom
         self.model.train()
         comp_errors_t = []
         total_loss = 0.0
+        n_skipped = 0
         for n, batch in enumerate(dataloader):
             optimizer.zero_grad(set_to_none=True)  # minor speed-up
             batch = batch.to(rank_device, non_blocking=True)
@@ -6580,14 +6644,35 @@ units angstrom
                 # both take a full-size step in an outlier direction and inflate
                 # `v` enough to stall the following steps.  Bounding the global
                 # norm keeps one batch from setting the trajectory.
-                torch.nn.utils.clip_grad_norm_(
+                #
+                # `clip_grad_norm_` returns the pre-clip norm and does *not*
+                # sanitize a non-finite one: scaling by `max_norm / nan` leaves
+                # every gradient nan, so the step below would write nan into
+                # every weight and the run is over. Job 12229494 died that way.
+                total_norm = torch.nn.utils.clip_grad_norm_(
                     self.dimer_model.parameters(), max_norm=grad_clip_norm
                 )
+                if not torch.isfinite(total_norm):
+                    # Drop the batch rather than the run. One diverged dimer is
+                    # not worth four GPU-hours, and the parameters that produced
+                    # it are still bounded, so the next batch can recover.
+                    n_skipped += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
             optimizer.step()
             total_loss += batch_loss.item()
             comp_errors_t.append(comp_errors.detach().cpu())
         if scheduler is not None:
             scheduler.step()
+        if n_skipped:
+            # Printed, not swallowed: a run that quietly dropped a third of its
+            # batches is not the run the record claims.
+            print(
+                f"  WARNING: skipped {n_skipped} batch(es) this epoch on a "
+                "non-finite gradient norm",
+                flush=True,
+            )
+        self.last_epoch_skipped_batches = n_skipped
         comp_errors_t = torch.cat(comp_errors_t, dim=0)
         total_MAE_t = torch.mean(torch.abs(comp_errors_t), dim=0)
         return total_loss, total_MAE_t
