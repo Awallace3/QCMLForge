@@ -1264,6 +1264,43 @@ def test_cliff_head_preserves_wrapped_outputs(
     _HEAD_CASES,
     ids=_HEAD_IDS,
 )
+def test_cliff_head_parameters_are_mutually_independent(
+    model_type, _name, parameter_names, _values, _stds,
+    atomic_batch, nested_hfvr_vw_model,
+):
+    """Each column must be its own learned function of the shared features.
+
+    These are per-component atom-type parameters: the electrostatic damping K
+    and the Thole damping parameters describe different physics and must not
+    share a learned parameter. Nothing in the architecture forces that -- one
+    reused ``param_readout_layers`` index would couple two components silently,
+    and every other test here would still pass -- so it is pinned directly.
+    """
+    head = _build_head(model_type, nested_hfvr_vw_model)
+    for column in range(len(parameter_names)):
+        head.zero_grad(set_to_none=True)
+        head(atomic_batch)[-1][:, column].sum().backward()
+        for p, name in enumerate(parameter_names):
+            embedding_grad = head.guess_layer[p].weight.grad
+            touched = embedding_grad is not None and bool(
+                embedding_grad.abs().sum() > 0
+            )
+            touched = touched or any(
+                q.grad is not None and bool(q.grad.abs().sum() > 0)
+                for readout in head.param_readout_layers[p]
+                for q in readout.parameters()
+            )
+            assert touched is (p == column), (
+                f"d(K[:, {column}])/d({name} head) should be "
+                f"{'nonzero' if p == column else 'zero'}"
+            )
+
+
+@pytest.mark.parametrize(
+    "model_type,_name,parameter_names,_values,_stds",
+    _HEAD_CASES,
+    ids=_HEAD_IDS,
+)
 def test_cliff_head_gradients_finite_at_every_readout(
     model_type, _name, parameter_names, _values, _stds,
     atomic_batch, nested_hfvr_vw_model,
@@ -2366,6 +2403,10 @@ def test_positive_parameter_contracts_cover_every_head():
         "RackersTholeDampingNN": RACKERS_PARAMETER_NAMES,
         "CliffExchangeNN": CLIFF_EXCH_PARAMETER_NAMES,
         "CliffClassicalNN": CLIFF_CLASSICAL_PARAMETER_NAMES,
+        # Same five-parameter contract as CliffClassicalNN, different
+        # featurizer; the contract is what the physics reads, so it must match
+        # exactly rather than merely have the same length.
+        "CliffClassicalMPNN": CLIFF_CLASSICAL_PARAMETER_NAMES,
     }
 
 
@@ -3424,18 +3465,25 @@ COMBINED_CLIFF_CLI_ROUTES = [
 COMBINED_CLIFF_CLI_IDS = [route[0] for route in COMBINED_CLIFF_CLI_ROUTES]
 
 
-def test_cliff_cli_route_sets_are_exactly_the_three_identifiers():
+def test_cliff_cli_route_sets_are_exactly_the_declared_identifiers():
     assert train_models.CLIFF_MODEL_TYPES == {
         "CliffExchangeModel",
         "CliffClassicalModel",
         "CliffClassicalOverlapModel",
+        "CliffClassicalOverlapMPNNModel",
     }
     # The exchange route has no total/component split, so it is deliberately
     # absent from the combined set even though it is a CLIFF route.
     assert train_models.COMBINED_CLIFF_MODEL_TYPES == {
         "CliffClassicalModel",
         "CliffClassicalOverlapModel",
+        "CliffClassicalOverlapMPNNModel",
     }
+    # Only the message-passing head has an architecture to size.
+    assert train_models.CLIFF_MPNN_MODEL_TYPES == {
+        "CliffClassicalOverlapMPNNModel",
+    }
+    assert train_models.CLIFF_MPNN_MODEL_TYPES <= train_models.CLIFF_MODEL_TYPES
     assert train_models.POSITIVE_PARAM_MODEL_TYPES == (
         train_models.RACKERS_MODEL_TYPES | train_models.CLIFF_MODEL_TYPES
     )

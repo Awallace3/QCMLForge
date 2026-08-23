@@ -27,6 +27,14 @@ CLIFF_MODEL_TYPES = {
     "CliffExchangeModel",
     "CliffClassicalModel",
     "CliffClassicalOverlapModel",
+    "CliffClassicalOverlapMPNNModel",
+}
+# The CLIFF routes whose parameter head does its own message passing, and which
+# therefore accept the `--param_*` architecture flags. Rejected elsewhere: the
+# other heads have no message passing to size, so accepting the flags would
+# report an architecture the run never had.
+CLIFF_MPNN_MODEL_TYPES = {
+    "CliffClassicalOverlapMPNNModel",
 }
 # The CLIFF routes predicting more than one SAPT component.  Only these have a
 # meaningful total-versus-component loss split, so `--component_gamma` and
@@ -35,6 +43,7 @@ CLIFF_MODEL_TYPES = {
 COMBINED_CLIFF_MODEL_TYPES = {
     "CliffClassicalModel",
     "CliffClassicalOverlapModel",
+    "CliffClassicalOverlapMPNNModel",
 }
 # `--include_total_mse` predates `--component_gamma` and is filtered out of
 # `AM_DimerParam_Model.train`, which never accepted it.  On a CLIFF route it is
@@ -395,6 +404,10 @@ def train_pairwise_model(
     ds_max_size=None,
     ds_max_size_val=None,
     batch_size=None,
+    param_n_message=None,
+    param_n_rbf=None,
+    param_hidden=None,
+    param_r_cut=None,
     ds_exclude_elements=None,
     split_manifest=None,
     ds_class_type="pt",
@@ -448,6 +461,10 @@ def train_pairwise_model(
         ds_in_memory (bool): Whether datasets should be loaded entirely into memory for applicable model types.
         ds_max_size (int or None): Truncate the pairwise dataset to N datapoints. Useful for small smoke-test runs; None uses the full dataset. On a split store it caps both splits unless ds_max_size_val overrides the validation one.
         ds_max_size_val (int or None): Separate cap for the validation split. None (the default) reuses ds_max_size, which is the historical behaviour. Positive-parameter routes only (Rackers and CLIFF), and requires ds_max_size.
+        param_n_message (int or None): Message-passing depth of the parameter head. Message-passing CLIFF routes only; None keeps the head's default.
+        param_n_rbf (int or None): Radial basis size of the parameter head's own distance expansion. Message-passing CLIFF routes only.
+        param_hidden (int or None): Hidden-state width of the parameter head's message passing. Message-passing CLIFF routes only.
+        param_r_cut (float or None): Cutoff radius for the parameter head's message passing. Message-passing CLIFF routes only.
         batch_size (int or None): Dimers per optimizer step. None (the default) keeps each route's historical dataset batch size. The trainers read this off the dataset as `training_batch_size`, so it is set there rather than on train().
         ds_exclude_elements (list[int] or None): Atomic numbers to exclude. Any dimer containing one is dropped before ds_max_size is applied, so ds_max_size counts surviving dimers. Positive-parameter routes only (Rackers and CLIFF).
         ds_class_type (str): Dataset class/storage type identifier (e.g., "pt").
@@ -496,6 +513,25 @@ def train_pairwise_model(
         # discovering it after the atom model and the dataset are built.
         batch_size = AtomPairwiseModels.mtp_mtp._validate_positive_count(
             batch_size, "batch_size"
+        )
+    parameter_head_kwargs = {
+        name: value
+        for name, value in (
+            ("param_n_message", param_n_message),
+            ("param_n_rbf", param_n_rbf),
+            ("param_hidden", param_hidden),
+            ("param_r_cut", param_r_cut),
+        )
+        if value is not None
+    }
+    if parameter_head_kwargs and apnet_model_type not in CLIFF_MPNN_MODEL_TYPES:
+        # Rejected, not dropped: the other heads have no message passing to
+        # size, so accepting these would leave a run record describing an
+        # architecture that never existed.
+        raise ValueError(
+            f"{', '.join(sorted(parameter_head_kwargs))} "
+            "is only supported on the message-passing CLIFF routes "
+            f"{sorted(CLIFF_MPNN_MODEL_TYPES)}, not {apnet_model_type!r}"
         )
     if is_cliff_model and include_total_mse:
         # `--include_total_mse` is the pre-CLIFF spelling of "also fit the
@@ -722,6 +758,9 @@ def train_pairwise_model(
             param_start_std=param_start_std,
             elst_damping_type=elst_damping_type,
             freeze_atom_model=freeze_atom_model,
+            # Empty for every head without its own architecture, so the call is
+            # byte-for-byte what it was for those routes.
+            **parameter_head_kwargs,
         )
     elif apnet_model_type.startswith("dAPNet"):
         apnet = APNet(
@@ -1132,7 +1171,8 @@ def main():
         help=(
             "Train APNet model, including RackersTholeDampingModel, "
             "RackersTholeDampingOverlapModel, CliffExchangeModel, "
-            "CliffClassicalModel, or CliffClassicalOverlapModel (plus legacy "
+            "CliffClassicalModel, CliffClassicalOverlapModel, or "
+            "CliffClassicalOverlapMPNNModel (plus legacy "
             "APNet2, APNet3-fused variants, dAPNet2, APNet2-fused, and "
             "AM-DimerParam routes)."
         ),
@@ -1193,6 +1233,43 @@ def main():
             "evaluates 100k validation dimers every epoch -- as much work as "
             "the training pass. Requires --ds_max_size. Supported on the "
             "Rackers and CLIFF positive-parameter routes."
+        ),
+    )
+    args.add_argument(
+        "--param_n_message",
+        type=int,
+        default=None,
+        help=(
+            "Message-passing depth of the parameter head "
+            "(CliffClassicalOverlapMPNNModel only). Unset, the head's own "
+            "default applies."
+        ),
+    )
+    args.add_argument(
+        "--param_n_rbf",
+        type=int,
+        default=None,
+        help=(
+            "Radial basis size for the parameter head's own distance "
+            "expansion (CliffClassicalOverlapMPNNModel only)."
+        ),
+    )
+    args.add_argument(
+        "--param_hidden",
+        type=int,
+        default=None,
+        help=(
+            "Hidden-state width of the parameter head's message passing "
+            "(CliffClassicalOverlapMPNNModel only)."
+        ),
+    )
+    args.add_argument(
+        "--param_r_cut",
+        type=float,
+        default=None,
+        help=(
+            "Cutoff radius for the parameter head's message passing "
+            "(CliffClassicalOverlapMPNNModel only)."
         ),
     )
     args.add_argument(
@@ -1684,6 +1761,10 @@ def main():
             ds_max_size=args.ds_max_size,
             ds_max_size_val=args.ds_max_size_val,
             batch_size=args.batch_size,
+            param_n_message=args.param_n_message,
+            param_n_rbf=args.param_n_rbf,
+            param_hidden=args.param_hidden,
+            param_r_cut=args.param_r_cut,
             ds_exclude_elements=args.ds_exclude_elements,
             split_manifest=args.split_manifest,
             component_gamma=args.component_gamma,

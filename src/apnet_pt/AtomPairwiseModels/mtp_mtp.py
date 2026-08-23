@@ -38,8 +38,9 @@ from ..atomic_datasets import (
     atomic_collate_update_no_target,
     atomic_collate_update_prebatched,
 )
-from ..AtomModels.ap2_atom_model import (  # isolate_atomic_property_predictions,; DistanceLayer,
+from ..AtomModels.ap2_atom_model import (  # isolate_atomic_property_predictions,
     AtomMPNN,
+    DistanceLayer,
     qcel_mon_to_pyg_data,
     unwrap_model,
 )
@@ -277,6 +278,7 @@ POSITIVE_PARAMETER_CONTRACTS: dict[str, tuple[str, ...]] = {
     "RackersTholeDampingNN": RACKERS_PARAMETER_NAMES,
     "CliffExchangeNN": CLIFF_EXCH_PARAMETER_NAMES,
     "CliffClassicalNN": CLIFF_CLASSICAL_PARAMETER_NAMES,
+    "CliffClassicalMPNN": CLIFF_CLASSICAL_PARAMETER_NAMES,
 }
 
 # Human-readable prefix used in the checkpoint-contract error messages.  The
@@ -1320,8 +1322,21 @@ def _validate_positive_count(value, name):
     return value
 
 
+def _validate_positive_float(value, name):
+    """Validate a strictly positive finite float (a cutoff radius)."""
+    if isinstance(value, bool) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError(f"{name} must be a number (got {value!r})")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be finite and > 0 (got {value})")
+    return value
+
+
 # Test seam, for the same reason as `_validate_scan_multiple_for_test`.
 _validate_positive_count_for_test = _validate_positive_count
+_validate_positive_float_for_test = _validate_positive_float
 
 
 def normalize_excluded_elements(excluded_elements):
@@ -1587,7 +1602,7 @@ class AtomTypeParamNN(nn.Module):
             [nn.ModuleList() for _ in range(n_params)]
         )
         layer_nodes_readout = [
-            n_embed,
+            self._readout_input_width(),
             n_neuron * 2,
             n_neuron,
             n_neuron // 2,
@@ -1600,10 +1615,26 @@ class AtomTypeParamNN(nn.Module):
             None,
         ]
         for p in range(n_params):
-            for i in range(n_message + 1):
+            for i in range(self._readout_stack_count()):
                 self.param_readout_layers[p].append(
                     self._make_layers(layer_nodes_readout, layer_activations)
                 )
+
+    def _readout_input_width(self) -> int:
+        """Feature width each per-parameter readout MLP consumes.
+
+        The default head gives each parameter one readout per message step of
+        the *nested* model, each reading that step's hidden state, so the width
+        is the nested embedding size. A head that builds its own features
+        overrides this. The override is called from ``__init__`` before
+        ``nn.Module`` state exists, so it may only read plain attributes the
+        subclass assigns before calling ``super().__init__()``.
+        """
+        return self.n_embed
+
+    def _readout_stack_count(self) -> int:
+        """How many readout MLPs each parameter gets. Same timing caveat."""
+        return self.n_message + 1
 
     def set_weights_excluding_guess(self, value=0.01):
         """Sets all weights and biases in the model to a specific value."""
@@ -1676,13 +1707,21 @@ class AtomTypeParamNN(nn.Module):
 
         print(model_tree_string(self, unicode=True))
 
-    def forward(
+    def forward(self, batch):
+        return self._raw_head_output(batch)
+
+    def _raw_head_output(
         self,
         batch,
     ):
         """
         Use each h_list to predict a correction to the initial guess, might be
         overkill for some properties...
+
+        Separated from ``forward`` so a subclass can supply its own featurizer
+        while the positive-parameter subclasses keep applying the shared
+        straight-through bounds and ``softplus`` on top of whatever raw
+        parameters it returns.
         """
         x = batch.x
         edge_index = batch.edge_index
@@ -2117,7 +2156,9 @@ class RackersTholeDampingNN(AtomTypeParamNN):
         self.atom_model.requires_grad_(not freeze_atom_model)
 
     def forward(self, batch):
-        output = super().forward(batch)
+        # The hook rather than `super().forward`, so a subclass that replaces
+        # the featurizer still gets the transform below.
+        output = self._raw_head_output(batch)
         raw_parameters = output[-1]
         parameters = F.softplus(raw_parameters) + self.positivity_epsilon
         return (*output[:-1], parameters)
@@ -2162,6 +2203,11 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
 
     MODEL_TYPE: str = ""
     PARAMETER_NAMES: tuple[str, ...] = ()
+    # Constructor arguments beyond the shared set that this head needs, and
+    # that its `get_config` therefore has to record. `AM_DimerParam_Model`
+    # forwards exactly these, so a head with its own architecture does not
+    # require another branch at either construction site.
+    ARCHITECTURE_CONFIG_KEYS: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -2354,7 +2400,9 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         )
 
     def forward(self, batch):
-        output = super().forward(batch)
+        # The hook rather than `super().forward`, so a subclass that replaces
+        # the featurizer still gets the transform below.
+        output = self._raw_head_output(batch)
         raw_parameters = output[-1]
         # `AtomTypeParamNN.forward` returns `K.squeeze(-1)` when
         # `n_params == 1`, so a single-parameter head arrives here as
@@ -2498,12 +2546,329 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         )
 
 
+# --- CLIFF classical head with its own message passing -----------------------
+#
+# `CliffClassicalNN` reads the *frozen* AtomMPNN hidden states through one MLP
+# per parameter per message step. Those states were fitted to reproduce
+# multipoles, and nothing about that task asks them to encode what a damping
+# exponent or an exchange amplitude depends on; every parameter is then a purely
+# per-atom function of them, with no learnable exchange of information between
+# neighbours. `CliffClassicalMPNN` keeps the same five-column output contract
+# and the same positive-parameter machinery, and replaces that featurizer with
+# its own trainable message passing over the monomer graph.
+
+CLIFF_MPNN_N_MESSAGE = 2
+CLIFF_MPNN_N_RBF = 8
+CLIFF_MPNN_HIDDEN = 32
+CLIFF_MPNN_R_CUT = 5.0
+# Per-atom scalars concatenated onto the flattened nested hidden states. The
+# multipoles enter as norms so the features stay rotation-invariant, which the
+# per-atom parameters must be. The Hirshfeld volume ratio and valence width are
+# the nested model's two physical outputs and are the quantities the physics
+# downstream actually consumes -- the valence width *is* the overlap exponent in
+# `atomic_overlap_S_ij`, and the volume ratio scales the induction
+# polarizabilities -- so a head predicting damping and exchange parameters sees
+# them directly rather than having to re-derive them from hidden states.
+CLIFF_MPNN_SCALAR_FEATURES = (
+    "charge",
+    "dipole_norm",
+    "quadrupole_norm",
+    "hirshfeld_volume_ratio",
+    "valence_width",
+)
+# Guards the gradient of `sqrt` at exactly zero, which the dipole and
+# quadrupole reach for a lone atom (the nested model initializes both to zeros
+# and returns them unchanged when a monomer has no edges).
+_NORM_EPSILON = 1e-12
+
+
+def _innermost_atom_mpnn(model: nn.Module) -> nn.Module:
+    """Return the model whose hidden states a parameter head actually reads.
+
+    ``AtomTypeParamNN`` passes its nested model's ``h_list`` straight through,
+    so an arbitrarily deep stack still exposes the innermost ``AtomMPNN``'s
+    states. Reading ``n_message`` / ``n_embed`` from there is what makes the
+    feature width a static number rather than something discovered on the first
+    forward -- a lazily built input layer would not round-trip through
+    ``state_dict``.
+    """
+    while isinstance(model, AtomTypeParamNN):
+        model = model.atom_model
+    if not isinstance(model, (AtomMPNN, AtomHirshfeldMPNN)):
+        raise ValueError(
+            "Expected an AtomMPNN at the base of the nested atom model, got "
+            f"{type(model).__name__}"
+        )
+    return model
+
+
+class CliffClassicalMPNN(_CliffPositiveParamNN):
+    """Predict the five classical CLIFF parameters with its own message passing.
+
+    Same contract as :class:`CliffClassicalNN` -- ``forward`` returns
+    ``(*nested_output, parameters)`` with ``parameters`` of shape
+    ``[n_atoms, 5]`` in :data:`CLIFF_CLASSICAL_PARAMETER_NAMES` order, read
+    through the ``CLIFF_CLASSICAL_*_INDEX`` constants -- so it drops into the
+    unchanged classical physics path.
+
+    What differs is everything upstream of the readouts. Node features are the
+    flattened nested hidden states plus :data:`CLIFF_MPNN_SCALAR_FEATURES`;
+    those are projected, added to a *trainable* element embedding, and passed
+    through ``param_n_message`` rounds of message passing over the monomer
+    graph with their own radial basis. Each parameter then reads every message
+    step, exactly as the default head reads every nested step, so the
+    per-parameter heads stay independent of one another.
+
+    The nested atom model is still frozen by default: the point is not to
+    fine-tune the multipole task, it is to stop being restricted to its
+    representation.
+    """
+
+    MODEL_TYPE = "CliffClassicalMPNN"
+    PARAMETER_NAMES = CLIFF_CLASSICAL_PARAMETER_NAMES
+    ARCHITECTURE_CONFIG_KEYS = (
+        "param_n_message",
+        "param_n_rbf",
+        "param_hidden",
+        "param_r_cut",
+    )
+
+    def __init__(
+        self,
+        atom_model: AtomTypeParamNN,
+        n_message: int = 3,
+        n_neuron: int = 128,
+        n_embed: int = 8,
+        param_start_mean=CLIFF_CLASSICAL_INITIAL_VALUES,
+        param_start_std=CLIFF_CLASSICAL_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        width_floor: float = OVERLAP_WIDTH_FLOOR,
+        freeze_atom_model: bool = True,
+        param_start_mean_by_Z=None,
+        param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
+        param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        readout_init_scale=CLIFF_READOUT_INIT_SCALE,
+        param_n_message: int = CLIFF_MPNN_N_MESSAGE,
+        param_n_rbf: int = CLIFF_MPNN_N_RBF,
+        param_hidden: int = CLIFF_MPNN_HIDDEN,
+        param_r_cut: float = CLIFF_MPNN_R_CUT,
+    ):
+        if type(atom_model) is not AtomTypeParamNN:
+            raise ValueError("atom_model must be an AtomTypeParamNN")
+        # Assigned before `super().__init__()` because it calls
+        # `_readout_input_width` / `_readout_stack_count`, which read them.
+        # Plain numbers only -- `nn.Module.__setattr__` has no state yet.
+        self.param_n_message = _validate_positive_count(
+            param_n_message, "param_n_message"
+        )
+        self.param_n_rbf = _validate_positive_count(
+            param_n_rbf, "param_n_rbf"
+        )
+        self.param_hidden = _validate_positive_count(
+            param_hidden, "param_hidden"
+        )
+        self.param_r_cut = _validate_positive_float(
+            param_r_cut, "param_r_cut"
+        )
+        nested = _innermost_atom_mpnn(atom_model)
+        self.param_hidden_state_steps = nested.n_message + 1
+        self.param_hidden_state_width = nested.n_embed
+        self.param_feature_width = (
+            self.param_hidden_state_steps * self.param_hidden_state_width
+            + len(CLIFF_MPNN_SCALAR_FEATURES)
+        )
+        if param_start_mean_by_Z is None:
+            param_start_mean_by_Z = CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z
+        super().__init__(
+            atom_model=atom_model,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            positivity_epsilon=positivity_epsilon,
+            width_floor=width_floor,
+            freeze_atom_model=freeze_atom_model,
+            param_start_mean_by_Z=param_start_mean_by_Z,
+            param_floor_fraction=param_floor_fraction,
+            param_ceiling_multiple=param_ceiling_multiple,
+            readout_init_scale=readout_init_scale,
+        )
+        # Built after `super().__init__()`, which is what makes `nn.Module`
+        # able to register them.
+        self.param_distance_layer = DistanceLayer(
+            self.param_n_rbf, self.param_r_cut
+        )
+        self.param_input_layer = nn.Linear(
+            self.param_feature_width, self.param_hidden
+        )
+        self.param_type_embed = nn.Embedding(max_Z + 1, self.param_hidden)
+        message_width = (
+            4 * self.param_hidden * self.param_n_rbf
+            + 4 * self.param_hidden
+            + self.param_n_rbf
+        )
+        self.param_message_width = message_width
+        self.param_update_layers = nn.ModuleList(
+            [
+                self._make_layers(
+                    [
+                        message_width,
+                        n_neuron * 2,
+                        n_neuron,
+                        max(n_neuron // 2, 1),
+                        self.param_hidden,
+                    ],
+                    [nn.ReLU(), nn.ReLU(), nn.ReLU(), None],
+                )
+                for _ in range(self.param_n_message)
+            ]
+        )
+        # The element embedding starts at zero so the head's output at
+        # initialization is still the per-element CLIFF seed plus the scaled
+        # random readout, exactly as for `CliffClassicalNN`. Seeding it randomly
+        # would move every parameter off its Table I value before training
+        # starts, which is the failure `CLIFF_EXCH_INITIAL_VALUES_BY_Z`
+        # documents at length.
+        nn.init.zeros_(self.param_type_embed.weight)
+
+    def _readout_input_width(self) -> int:
+        return self.param_hidden
+
+    def _readout_stack_count(self) -> int:
+        return self.param_n_message + 1
+
+    def _param_messages(self, h0, h, rbf, e_source, e_target):
+        """Edge messages, mirroring ``AtomMPNN.get_messages``.
+
+        The ``h (x) rbf`` outer product is what makes a message distance
+        resolved rather than only neighbour-weighted.
+        """
+        nedge = e_source.size(0)
+        h_all = torch.cat(
+            [
+                h0.index_select(0, e_source),
+                h0.index_select(0, e_target),
+                h.index_select(0, e_source),
+                h.index_select(0, e_target),
+            ],
+            dim=-1,
+        )
+        h_all_dot = torch.einsum("ez,er->ezr", h_all, rbf).reshape(nedge, -1)
+        return torch.cat([h_all, h_all_dot, rbf], dim=-1)
+
+    def _node_features(self, charge, dipole, qpole, nested_params, h_list, keep_mask):
+        """Concatenate the nested representation with the physical scalars."""
+        q = charge.reshape(charge.size(0), -1)[:, :1]
+        mu = torch.sqrt(
+            torch.sum(dipole * dipole, dim=-1, keepdim=True) + _NORM_EPSILON
+        )
+        quad = torch.sqrt(
+            torch.sum(qpole * qpole, dim=(-2, -1)) + _NORM_EPSILON
+        ).unsqueeze(-1)
+        # `abs` on the volume ratio matches how the physics path reads it; the
+        # nested model's raw column can be negative.
+        hfvr = torch.abs(nested_params[:, :1])
+        valence_width = nested_params[:, 1:2]
+        scalars = torch.cat([q, mu, quad, hfvr, valence_width], dim=-1)
+        return torch.cat(
+            [h_list.reshape(h_list.size(0), -1), scalars[keep_mask]], dim=-1
+        )
+
+    def _raw_head_output(self, batch):
+        am_out = self.atom_model(batch)
+        charge, dipole, qpole = am_out[0], am_out[1], am_out[2]
+        h_list = am_out[self.h_list_ind]
+        nested_params = am_out[-1]
+        Z = batch.x
+        edge_index = batch.edge_index
+        natom = Z.size(0)
+
+        # Per-element seed for every atom, one independent embedding table per
+        # parameter, exactly as the default head does.
+        K = torch.cat(
+            [self.guess_layer[p](Z) for p in range(self.n_params)], dim=-1
+        )
+        if edge_index.size(1) == 0:
+            # No graph, so no message passing and no correction: the seed is
+            # the answer. Returned unsqueezed, unlike `AtomTypeParamNN`'s
+            # no-edge branch, so this head's output rank does not depend on
+            # whether the monomer had edges.
+            return (charge, dipole, qpole, *am_out[3:], K)
+
+        keep_mask = torch.zeros(natom, dtype=torch.bool, device=Z.device)
+        keep_mask.scatter_(0, edge_index[0], True)
+        keep_mask.scatter_(0, edge_index[1], True)
+
+        e_source, e_target = edge_index[0], edge_index[1]
+        edge_keep = keep_mask[e_source] & keep_mask[e_target]
+        e_source = e_source[edge_keep]
+        e_target = e_target[edge_keep]
+        idx_map = (torch.cumsum(keep_mask, dim=0) - 1).long()
+        e_source = idx_map[e_source]
+        e_target = idx_map[e_target]
+
+        R = batch.R[keep_mask, :]
+        n_kept = R.size(0)
+        dR, _ = get_distances(R, R, e_source, e_target)
+        rbf = self.param_distance_layer(dR)
+
+        features = self._node_features(
+            charge, dipole, qpole, nested_params, h_list, keep_mask
+        )
+        h_states = [
+            self.param_input_layer(features)
+            + self.param_type_embed(Z[keep_mask])
+        ]
+        for i in range(self.param_n_message):
+            m_ij = self._param_messages(
+                h_states[0], h_states[-1], rbf, e_source, e_target
+            )
+            m_i = scatter_sum_compile(m_ij, e_source, n_kept, reduce="sum")
+            h_states.append(self.param_update_layers[i](m_i))
+
+        # One column per parameter, each summing that parameter's own readout
+        # over every message step. Built as a list and concatenated rather than
+        # accumulated into a slice in place: the result is the same, and it
+        # keeps the graph free of the indexed in-place writes that the atom
+        # route's compile failure is attributed to.
+        columns = []
+        for p in range(self.n_params):
+            column = self.param_readout_layers[p][0](h_states[0])
+            for step in range(1, len(h_states)):
+                column = column + self.param_readout_layers[p][step](
+                    h_states[step]
+                )
+            columns.append(column)
+        correction = torch.cat(columns, dim=-1)
+
+        # Scatter the per-kept-atom correction back onto every atom without a
+        # boolean-mask write. `idx_map` already maps each atom to its row in the
+        # filtered arrays; clamping makes the leading -1 a valid gather index and
+        # `where` discards those rows along with every other unkept one. The
+        # equivalent `K[keep_mask] = ...` is what makes Inductor fall back on
+        # `aten.nonzero`, and this form is static-shaped instead.
+        gathered = correction.index_select(0, idx_map.clamp(min=0))
+        K = K + torch.where(
+            keep_mask.unsqueeze(-1), gathered, torch.zeros_like(gathered)
+        )
+        return (charge, dipole, qpole, *am_out[3:], K)
+
+    def get_config(self) -> dict:
+        config = super().get_config()
+        config.update(
+            {key: getattr(self, key) for key in self.ARCHITECTURE_CONFIG_KEYS}
+        )
+        return config
+
+
 # Constructor for each CLIFF parameter head, keyed by the ``model_type`` its
 # ``get_config`` records.  ``AM_DimerParam_Model.__init__`` builds through this
 # mapping so adding a head is one entry rather than two more ``elif`` blocks.
 _CLIFF_PARAMETER_HEADS: dict[str, type[_CliffPositiveParamNN]] = {
     CliffExchangeNN.MODEL_TYPE: CliffExchangeNN,
     CliffClassicalNN.MODEL_TYPE: CliffClassicalNN,
+    CliffClassicalMPNN.MODEL_TYPE: CliffClassicalMPNN,
 }
 
 # `None` is a meaningful value for every one of the four initialization knobs
@@ -4981,6 +5346,10 @@ class AM_DimerParam_Model:
         param_floor_fraction=_CLIFF_HEAD_DEFAULT,
         param_ceiling_multiple=_CLIFF_HEAD_DEFAULT,
         readout_init_scale=_CLIFF_HEAD_DEFAULT,
+        param_n_message=_CLIFF_HEAD_DEFAULT,
+        param_n_rbf=_CLIFF_HEAD_DEFAULT,
+        param_hidden=_CLIFF_HEAD_DEFAULT,
+        param_r_cut=_CLIFF_HEAD_DEFAULT,
     ):
         """
         Construct an AtomTypeParamModel wrapper that builds or loads an atom-level model, a parameter-predicting model, and optional dimer evaluators and dataset.
@@ -5042,6 +5411,31 @@ class AM_DimerParam_Model:
             device = torch.device("cpu")
             print("running on the CPU")
         self.ds_spec_type = ds_spec_type
+        # Resolved once for both construction paths below. Unspecified knobs are
+        # dropped rather than passed as `None`, and any that survive are checked
+        # against the selected head's declared architecture so asking for a
+        # message-passing depth on a head that has none is an error rather than
+        # a silently ignored argument.
+        architecture_overrides = _cliff_head_overrides(
+            param_n_message=param_n_message,
+            param_n_rbf=param_n_rbf,
+            param_hidden=param_hidden,
+            param_r_cut=param_r_cut,
+        )
+        if architecture_overrides:
+            supported = set(
+                getattr(
+                    _CLIFF_PARAMETER_HEADS.get(model_type),
+                    "ARCHITECTURE_CONFIG_KEYS",
+                    (),
+                )
+            )
+            unsupported = sorted(set(architecture_overrides) - supported)
+            if unsupported:
+                raise ValueError(
+                    f"{model_type} does not accept "
+                    f"{', '.join(unsupported)}"
+                )
         param_checkpoint = None
         param_config = None
         if pre_trained_model_path and model_type in POSITIVE_PARAMETER_CONTRACTS:
@@ -5218,6 +5612,19 @@ class AM_DimerParam_Model:
                     param_floor_fraction=config.get("param_floor_fraction"),
                     param_ceiling_multiple=config.get("param_ceiling_multiple"),
                     readout_init_scale=config.get("readout_init_scale"),
+                    # The head's own architecture, replayed from what it
+                    # recorded. Absent keys mean the head has none, so its
+                    # defaults apply -- but a head that *does* have them and
+                    # omitted one would build a different shape than the
+                    # state_dict about to be loaded, which `load_state_dict`
+                    # reports rather than absorbing.
+                    **{
+                        key: config[key]
+                        for key in _CLIFF_PARAMETER_HEADS[
+                            model_type
+                        ].ARCHITECTURE_CONFIG_KEYS
+                        if key in config
+                    },
                 )
             # elif model_type == "AtomTypeParamMPNN":
             #     self.model = AtomTypeParamMPNN(
@@ -5279,6 +5686,7 @@ class AM_DimerParam_Model:
                         param_ceiling_multiple=param_ceiling_multiple,
                         readout_init_scale=readout_init_scale,
                     ),
+                    **architecture_overrides,
                 )
             # elif model_type == "AtomTypeParamMPNN":
             #     self.model = AtomTypeParamMPNN(
@@ -6912,6 +7320,66 @@ class CliffClassicalModel(_CliffClassicalModelBase):
 
 class CliffClassicalOverlapModel(_CliffClassicalModelBase):
     DIMER_EVAL = "cliff_classical_overlap"
+
+
+class CliffClassicalOverlapMPNNModel(_CliffParamModelBase):
+    """``CliffClassicalOverlapModel`` with a message-passing parameter head.
+
+    Identical physics -- the same five parameters, the same Eq. (23) loss, the
+    same short-range induction overlap correction -- fitted through
+    :class:`CliffClassicalMPNN` instead of :class:`CliffClassicalNN`. Kept as
+    its own harness rather than a flag on the existing one so a checkpoint's
+    ``model_type`` names the architecture that produced it, and so the two can
+    be compared without either route changing.
+
+    The four ``param_*`` knobs size the parameter head's own message passing and
+    are forwarded through ``dataset_kwargs`` to ``AM_DimerParam_Model``, which
+    validates them against the selected head's ``ARCHITECTURE_CONFIG_KEYS``.
+    """
+
+    MODEL_TYPE = "CliffClassicalMPNN"
+    PARAMETER_NAMES = CLIFF_CLASSICAL_PARAMETER_NAMES
+    DIMER_EVAL = "cliff_classical_overlap"
+
+    def __init__(
+        self,
+        dataset=None,
+        atom_model: AtomTypeParamNN | None = None,
+        pre_trained_model_path=None,
+        n_message: int = 3,
+        n_neuron: int = 64,
+        n_embed: int = 8,
+        param_start_mean=CLIFF_CLASSICAL_INITIAL_VALUES,
+        param_start_std=CLIFF_CLASSICAL_INITIAL_STDS,
+        positivity_epsilon: float = RACKERS_POSITIVITY_EPSILON,
+        width_floor: float = OVERLAP_WIDTH_FLOOR,
+        freeze_atom_model: bool = True,
+        param_n_message: int = CLIFF_MPNN_N_MESSAGE,
+        param_n_rbf: int = CLIFF_MPNN_N_RBF,
+        param_hidden: int = CLIFF_MPNN_HIDDEN,
+        param_r_cut: float = CLIFF_MPNN_R_CUT,
+        **dataset_kwargs,
+    ):
+        self._init_cliff_harness(
+            dataset=dataset,
+            atom_model=atom_model,
+            pre_trained_model_path=pre_trained_model_path,
+            n_message=n_message,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            positivity_epsilon=positivity_epsilon,
+            width_floor=width_floor,
+            freeze_atom_model=freeze_atom_model,
+            dataset_kwargs={
+                **dataset_kwargs,
+                "param_n_message": param_n_message,
+                "param_n_rbf": param_n_rbf,
+                "param_hidden": param_hidden,
+                "param_r_cut": param_r_cut,
+            },
+        )
 
 
 ### Atom Type Model Wrapper ####
