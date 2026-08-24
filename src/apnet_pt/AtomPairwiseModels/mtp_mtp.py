@@ -4141,8 +4141,27 @@ def rackers_thole_induction(
     convergence_threshold: float = 1e-8,
     omega: float = 0.7,
     polarizability_table: torch.Tensor = constants.polarizability_table,
+    return_diagnostics: bool = False,
 ) -> torch.Tensor:
-    """Compute Rackers induction with distinct direct and mutual damping."""
+    """Compute Rackers induction with distinct direct and mutual damping.
+
+    ``return_diagnostics`` additionally returns the audit quantities that
+    `ARCHITECTURE_HANDOFF.md` asks for before any induction redesign: the SCF
+    iteration count, final residual and converged flag, and the polarization
+    energy evaluated two ways on the *same* converged dipoles.
+
+    The two energies are expected to disagree, and that is the point. The
+    returned `energy_edge_contraction` sums only over intermolecular (AB) edges,
+    while the dipoles it uses were solved against the full AA+BB+AB permanent
+    field -- see `_rackers_initial_permanent_fields`, which accumulates
+    intramolecular terms into `mu_induced_0`. An energy that is not the
+    variational functional of its own response solve carries no
+    `E = -1/2 mu . E_perm <= 0` guarantee, which is a candidate mechanism for
+    the positive induction energies observed on 16 of 32 S66x8 geometries.
+
+    Off by default and returning a bare tensor, so the training path is
+    unchanged.
+    """
     del quadA, quadB
     polarizability_table = _polarizability_table_on_device(
         polarizability_table,
@@ -4276,7 +4295,11 @@ def rackers_thole_induction(
     mu_induced_A = mu_induced_0_A.clone()
     mu_induced_B = mu_induced_0_B.clone()
 
+    scf_iterations = 0
+    scf_residual = torch.zeros((), device=RA.device, dtype=mu_induced_A.dtype)
+    scf_converged = False
     for _ in range(max_iterations):
+        scf_iterations += 1
         mu_induced_A_old = mu_induced_A.clone()
         mu_induced_B_old = mu_induced_B.clone()
         mu_induced_A_new, mu_induced_B_new = _rackers_scf_update(
@@ -4304,7 +4327,9 @@ def rackers_thole_induction(
         )
         delta_A = torch.norm(mu_induced_A - mu_induced_A_old)
         delta_B = torch.norm(mu_induced_B - mu_induced_B_old)
+        scf_residual = torch.maximum(delta_A, delta_B)
         if max(delta_A, delta_B) < convergence_threshold:
+            scf_converged = True
             break
 
     qA_source = qA.reshape(-1).index_select(0, e_AB_source)
@@ -4335,6 +4360,7 @@ def rackers_thole_induction(
         )
     ) * constants.h2kcalmol
     E_ind = (E_qu + E_uu) / 2.0
+    overlap_edge = torch.zeros_like(E_ind)
 
     if include_overlap:
         # width_floor=0.0 preserves the historical numerics of this route: it
@@ -4352,7 +4378,40 @@ def rackers_thole_induction(
         K_A = ind_overlap_A.index_select(0, e_AB_source)
         K_B = ind_overlap_B.index_select(0, e_AB_target)
         E_ind -= K_A * S_ij * K_B * constants.h2kcalmol
-    return E_ind
+        overlap_edge = -K_A * S_ij * K_B * constants.h2kcalmol
+    if not return_diagnostics:
+        return E_ind
+
+    # `mu_induced_0 = alpha * E_permanent` by construction, so dividing it back
+    # out recovers the permanent field the solve actually responded to --
+    # including the intramolecular part the energy above never contracts.
+    with torch.no_grad():
+        field_A = mu_induced_0_A / alpha_A.unsqueeze(-1)
+        field_B = mu_induced_0_B / alpha_B.unsqueeze(-1)
+        variational = -0.5 * (
+            torch.sum(mu_induced_A * field_A)
+            + torch.sum(mu_induced_B * field_B)
+        ) * constants.h2kcalmol
+    diagnostics = {
+        "scf_iterations": scf_iterations,
+        "scf_residual": float(scf_residual.detach()),
+        "scf_converged": bool(scf_converged),
+        # Summed over AB edges: what the model trains on.
+        "energy_edge_contraction": float(E_ind.detach().sum()),
+        "energy_qu": float(E_qu.detach().sum()),
+        "energy_uu": float(E_uu.detach().sum()),
+        # Dimer-total variational polarization energy on the same dipoles. Not
+        # the interaction induction (it retains the monomers' own
+        # polarization), so compare its *sign* and its disagreement with the
+        # contraction above, not its magnitude.
+        "energy_variational_total": float(variational),
+        "overlap_contribution": (
+            float(overlap_edge.detach().sum()) if include_overlap else 0.0
+        ),
+        "n_edges_positive": int((E_ind.detach() > 0).sum()),
+        "n_edges": int(E_ind.numel()),
+    }
+    return E_ind, diagnostics
 
 
 # @torch.compile

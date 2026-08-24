@@ -895,3 +895,134 @@ def test_bound_occupancy_reaches_the_tracked_epoch_payload():
     )
     log_src = inspect.getsource(training_tracking.log_epoch_metrics)
     assert "for key, value in (extra_metrics or {}).items():" in log_src
+
+
+# ---------------------------------------------------------------------------
+# Induction audit instrumentation
+#
+# From analysis/s66x8_classical_profile/.../ARCHITECTURE_HANDOFF.md: CLIFF2
+# induction is *positive* on 16 of 32 S66x8 geometries, which is physically
+# impossible. The doc asks for these quantities to be exported before any
+# induction redesign, so that nonconvergence, loss of positive definiteness,
+# and an energy-contraction/sign bug can be told apart.
+
+
+def _induction_kwargs(head, batch):
+    outA = head(batch.batch_atomic_A)
+    outB = head(batch.batch_atomic_B)
+    pA, pB = outA[-1], outB[-1]
+    return dict(
+        ZA=batch.ZA, RA=batch.RA, qA=outA[0], muA=outA[1], quadA=outA[2],
+        ZB=batch.ZB, RB=batch.RB, qB=outB[0], muB=outB[1], quadB=outB[2],
+        e_AB_source=batch.e_ABfull_source,
+        e_AB_target=batch.e_ABfull_target,
+        e_AA_source=batch.e_AA_source, e_BB_source=batch.e_BB_source,
+        e_AA_target=batch.e_AA_target, e_BB_target=batch.e_BB_target,
+        hirshfeld_volume_ratio_A=torch.abs(outA[-2][:, 0]),
+        hirshfeld_volume_ratio_B=torch.abs(outB[-2][:, 0]),
+        valence_widths_A=outA[-2][:, 1],
+        valence_widths_B=outB[-2][:, 1],
+        thole_direct_A=pA[:, CLIFF_CLASSICAL_THOLE_DIRECT_INDEX],
+        thole_direct_B=pB[:, CLIFF_CLASSICAL_THOLE_DIRECT_INDEX],
+        thole_mutual_A=pA[:, CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX],
+        thole_mutual_B=pB[:, CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX],
+        ind_overlap_A=pA[:, CLIFF_CLASSICAL_IND_OVERLAP_INDEX],
+        ind_overlap_B=pB[:, CLIFF_CLASSICAL_IND_OVERLAP_INDEX],
+    )
+
+
+def test_induction_diagnostics_are_off_by_default(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    """The training path must be unchanged: a bare tensor, same values."""
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    kwargs = _induction_kwargs(head, synthetic_dimer_batch)
+    plain = mtp_mtp.rackers_thole_induction(**kwargs, include_overlap=True)
+    assert isinstance(plain, torch.Tensor)
+    energy, diagnostics = mtp_mtp.rackers_thole_induction(
+        **kwargs, include_overlap=True, return_diagnostics=True
+    )
+    assert isinstance(diagnostics, dict)
+    # Instrumenting must not perturb the number the model trains on.
+    assert torch.equal(plain, energy)
+
+
+def test_induction_diagnostics_report_the_audit_quantities(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    _, diagnostics = mtp_mtp.rackers_thole_induction(
+        **_induction_kwargs(head, synthetic_dimer_batch),
+        include_overlap=True,
+        return_diagnostics=True,
+    )
+    for key in (
+        "scf_iterations",
+        "scf_residual",
+        "scf_converged",
+        "energy_edge_contraction",
+        "energy_qu",
+        "energy_uu",
+        "energy_variational_total",
+        "overlap_contribution",
+        "n_edges_positive",
+        "n_edges",
+    ):
+        assert key in diagnostics, key
+    # A converged solve must report a residual under the threshold, and an
+    # unconverged one must be distinguishable -- returning the last iterate
+    # silently is what the handoff doc calls out as breaking the contract.
+    if diagnostics["scf_converged"]:
+        assert diagnostics["scf_residual"] < 1e-8
+    assert 1 <= diagnostics["scf_iterations"] <= 200
+    assert diagnostics["n_edges"] == synthetic_dimer_batch.e_ABfull_source.numel()
+
+
+def test_induction_energy_is_not_the_variational_functional_of_its_solve(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    """Pins the discrepancy this instrumentation exists to expose.
+
+    The dipoles are solved against the full AA+BB+AB permanent field --
+    `_rackers_initial_permanent_fields` accumulates intramolecular terms into
+    `mu_induced_0` -- while the energy contracts over AB edges only. So the
+    trained energy is not `-1/2 mu . E_perm` of its own response, and carries no
+    guarantee of being attractive.
+
+    This test asserts the *current* behaviour so a redesign that makes the two
+    agree fails loudly and gets read, rather than passing silently.
+    """
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    _, diagnostics = mtp_mtp.rackers_thole_induction(
+        **_induction_kwargs(head, synthetic_dimer_batch),
+        include_overlap=False,
+        return_diagnostics=True,
+    )
+    contraction = diagnostics["energy_edge_contraction"]
+    variational = diagnostics["energy_variational_total"]
+    assert contraction != pytest.approx(variational, rel=1e-3), (
+        "the two energies now agree -- if the response solve and energy "
+        "expression were made consistent, delete this test and assert the "
+        "sign invariant from ARCHITECTURE_HANDOFF.md instead"
+    )
+    # The variational energy of a converged linear response is attractive.
+    assert variational < 0.0
+
+    src = inspect.getsource(mtp_mtp.rackers_thole_induction)
+    assert "direct_tensors_AB[3]" in src and "direct_tensors_AB[4]" in src
+    assert "e_AA_source" in src and "e_BB_source" in src
