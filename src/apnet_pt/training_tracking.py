@@ -1017,6 +1017,10 @@ def _track_evaluation_boundary(
         ),
         epoch_seconds=values.get("dt"),
         is_best=is_best,
+        # Read off the harness rather than threaded through fourteen call
+        # sites, the same way the excluded-element list is. The guard above
+        # compares only the MAE names, so extra keys are free to appear.
+        extra_metrics=getattr(harness, "last_bound_occupancy", None),
     )
 
 
@@ -1119,6 +1123,7 @@ def log_epoch_metrics(
     learning_rate: Any | None = None,
     epoch_seconds: Any | None = None,
     is_best: bool | None = None,
+    extra_metrics: Mapping[str, Any] | None = None,
 ) -> None:
     """Log one evaluation boundary with stable train/validation metric names.
 
@@ -1168,6 +1173,8 @@ def log_epoch_metrics(
         payload[validation_key] = scalar_value(
             validation_value, metric_name=validation_key
         )
+    for key, value in (extra_metrics or {}).items():
+        payload[key] = scalar_value(value, metric_name=key)
     tracker.log(payload)
 
 

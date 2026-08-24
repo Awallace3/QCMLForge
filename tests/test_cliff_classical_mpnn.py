@@ -583,39 +583,39 @@ def test_checkpoint_records_the_head_type_not_the_dense_one(
 # values, killing job 12229494 in epoch 1 via `geometric_mean_edge_values`.
 
 
-def test_induction_columns_get_a_tight_floor_and_exch_keeps_a_loose_one():
-    assert mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION == (
-        0.05, 0.5, 0.5, 0.1, 0.05
+def test_every_column_floor_is_the_measured_best():
+    """0.05 everywhere, restored after measuring the alternatives.
+
+    Two tighter settings were tried over full 50-epoch runs on 100k dimers and
+    both were worse on every component. Decisively, they made *induction* worse
+    (2.431 against 1.897) -- the component the bound existed to protect -- which
+    removes the rationale rather than weakening it. `exch` also cannot take a
+    tight floor at all: hydrogen's Table I value is 0.31x the scalar seed.
+    """
+    floors = dict(
+        zip(
+            CLIFF_CLASSICAL_PARAMETER_NAMES,
+            mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
+        )
     )
-    names = CLIFF_CLASSICAL_PARAMETER_NAMES
-    floors = dict(zip(names, mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION))
-    # The two Thole parameters have a narrow physical range (~0.3-0.4), so a
-    # tight floor costs nothing real.
-    for column in ("thole_direct", "thole_mutual"):
-        assert floors[column] == 0.5, column
-    # `ind_overlap` is looser: measured at 0.5 it clamped validation induction
-    # MAE up from ~2.5 to 4.69 while elst and exch improved, which is a bound
-    # fighting the loss rather than a fit.
-    assert floors["ind_overlap"] == 0.1
-    # Still an order of magnitude above the 0.05 that the 50-epoch dense runs
-    # drifted onto.
-    assert floors["ind_overlap"] > 0.05
-    # `exch` must stay below hydrogen's Table I value as a fraction of the
-    # scalar seed, or the most common element in the data is clamped away from
-    # its fitted value.
+    assert set(floors.values()) == {0.05}
     hydrogen_fraction = (
         CLIFF_EXCH_INITIAL_VALUES_BY_Z[1] / CLIFF_CLASSICAL_INITIAL_VALUES[4]
     )
     assert floors["exch"] < hydrogen_fraction
+    # The reasoning has to survive in the source, or the next person retries
+    # the tighter floors without knowing they were measured.
+    src = inspect.getsource(mtp_mtp)
+    assert "A bound that fights the fit is worse than" in src
 
 
 @pytest.mark.parametrize(
     "head_type", ["CliffClassicalNN", "CliffClassicalMPNN"]
 )
-def test_both_five_column_heads_use_the_per_column_floor(
+def test_both_five_column_heads_share_the_same_floor(
     nested_hfvr_vw_model, head_type
 ):
-    """The dense head has the same failure mode, so it gets the same floor."""
+    """The dense head has the same drift, so it gets the same treatment."""
     torch.manual_seed(0)
     cls = getattr(mtp_mtp, head_type)
     kwargs = dict(HEAD_KWARGS)
@@ -630,16 +630,7 @@ def test_both_five_column_heads_use_the_per_column_floor(
         + head.positivity_epsilon
     ).reshape(-1)
     seeds = torch.tensor(CLIFF_CLASSICAL_INITIAL_VALUES)
-    # thole_direct: 0.5 * 0.34, not 0.05 * 0.34.
-    assert float(floor[CLIFF_CLASSICAL_THOLE_DIRECT_INDEX]) == pytest.approx(
-        0.5 * float(seeds[CLIFF_CLASSICAL_THOLE_DIRECT_INDEX]), rel=1e-4
-    )
-    assert float(floor[CLIFF_CLASSICAL_EXCH_INDEX]) == pytest.approx(
-        0.05 * float(seeds[CLIFF_CLASSICAL_EXCH_INDEX]), rel=1e-4
-    )
-    assert float(floor[CLIFF_CLASSICAL_IND_OVERLAP_INDEX]) == pytest.approx(
-        0.1 * float(seeds[CLIFF_CLASSICAL_IND_OVERLAP_INDEX]), rel=1e-4
-    )
+    assert torch.allclose(floor, 0.05 * seeds, atol=1e-5)
 
 
 def test_a_scalar_floor_is_still_accepted(nested_hfvr_vw_model):
@@ -819,3 +810,88 @@ def test_gradient_scale_stays_near_the_dense_head(
     assert mpnn < 100.0 * max(dense, 1.0), (
         f"message-passing head gradient norm {mpnn:.3e} vs dense {dense:.3e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bound occupancy: measured, not constrained
+#
+# The tighter floors were reverted after full 50-epoch runs measured them worse
+# on every component -- including induction itself, which was the thing the
+# bound existed to protect. The drift onto a bound is real, but a bound that
+# fights the fit costs more than the drift. So it is logged instead.
+
+
+def test_classical_floor_is_back_to_the_measured_best():
+    assert mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION == (
+        0.05, 0.05, 0.05, 0.05, 0.05
+    )
+    # The per-column machinery stays, so retrying is a one-line change.
+    sig = inspect.signature(CliffClassicalMPNN.__init__)
+    assert sig.parameters["param_floor_fraction"].default is (
+        mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION
+    )
+
+
+def test_bound_occupancy_reports_a_fraction_per_column_and_bound(
+    atomic_batch, nested_hfvr_vw_model
+):
+    torch.manual_seed(0)
+    head = _head(nested_hfvr_vw_model)
+    occupancy = head.bound_occupancy(atomic_batch)
+    for name in CLIFF_CLASSICAL_PARAMETER_NAMES:
+        for bound in ("floor", "ceiling"):
+            key = f"bounds/{name}_at_{bound}"
+            assert key in occupancy, key
+            assert 0.0 <= occupancy[key] <= 1.0
+    # A freshly seeded head sits at neither bound.
+    assert all(v == 0.0 for v in occupancy.values())
+
+
+def test_bound_occupancy_detects_a_pinned_column(
+    atomic_batch, nested_hfvr_vw_model
+):
+    """Drive one column onto its floor and confirm it is reported.
+
+    This is the situation both dense 50-epoch runs reached without anything in
+    the logs saying so.
+    """
+    torch.manual_seed(0)
+    head = _head(nested_hfvr_vw_model)
+    column = CLIFF_CLASSICAL_THOLE_DIRECT_INDEX
+    with torch.no_grad():
+        # Push the seed embedding far below the floor for every element.
+        head.guess_layer[column].weight.fill_(-50.0)
+        for readout in head.param_readout_layers[column]:
+            for parameter in readout.parameters():
+                parameter.zero_()
+    occupancy = head.bound_occupancy(atomic_batch)
+    pinned = f"bounds/{CLIFF_CLASSICAL_PARAMETER_NAMES[column]}_at_floor"
+    assert occupancy[pinned] == 1.0
+    for other, name in enumerate(CLIFF_CLASSICAL_PARAMETER_NAMES):
+        if other != column:
+            assert occupancy[f"bounds/{name}_at_floor"] == 0.0, name
+    # And the clamp still returns a usable positive parameter, which is exactly
+    # why this is invisible without the metric.
+    parameters = head(atomic_batch)[-1]
+    assert torch.isfinite(parameters).all() and (parameters > 0).all()
+
+
+def test_bound_occupancy_reaches_the_tracked_epoch_payload():
+    """It has to appear per epoch, not once in the run config."""
+    eval_src = inspect.getsource(
+        mtp_mtp.AM_DimerParam_Model._AM_DimerParam_Model__evaluate_batches_single_proc
+    )
+    assert "self.last_bound_occupancy" in eval_src
+    # First validation batch only: one extra forward, not one per batch.
+    assert "if n == 0" in eval_src
+
+    from apnet_pt import training_tracking
+
+    boundary_src = inspect.getsource(
+        training_tracking._track_evaluation_boundary
+    )
+    assert 'extra_metrics=getattr(harness, "last_bound_occupancy", None)' in (
+        boundary_src
+    )
+    log_src = inspect.getsource(training_tracking.log_epoch_metrics)
+    assert "for key, value in (extra_metrics or {}).items():" in log_src

@@ -189,30 +189,31 @@ CLIFF_READOUT_INIT_SCALE = 0.1
 # Per-column floor fractions for the five-parameter classical contract, in
 # ``CLIFF_CLASSICAL_PARAMETER_NAMES`` order.
 #
-# The three induction columns get 0.5 rather than the shared 0.05. With 0.05 the
-# Thole floor is 0.017 against a 0.34 seed -- twenty times below any physical
-# value, and the point-dipole interaction it is there to damp diverges long
-# before that. Both dense 50-epoch runs drove an induction column onto the 0.05
-# floor, and the message-passing head reached all three inside one epoch and
-# then produced non-finite Thole values (job 12229494).
+# All 0.05, i.e. the original single global value -- restored after measuring
+# both alternatives over full 50-epoch runs on 100k dimers:
 #
-# `elst` and `exch` keep 0.05 deliberately: `K_exch` spans CLIFF Table I from
-# 0.60 to 7.60 against a 2.5 seed, so hydrogen sits at 0.31x and any floor above
-# that would clamp the most common element in the data away from its fitted
-# value -- the failure `CLIFF_EXCH_INITIAL_VALUES_BY_Z` documents.
+#   floors (elst, tho_d, tho_m, ind_ovl, exch)   overlap route val MAE at 50 ep
+#   0.05 everywhere                              elst 0.813  exch 1.066  ind 1.897
+#   (0.05, 0.5, 0.5, 0.5,  0.05)                 diverged/clamped, cancelled early
+#   (0.05, 0.5, 0.5, 0.1,  0.05)                 elst 0.986  exch 1.773  ind 2.431
 #
-# `ind_overlap` gets 0.1, not the 0.5 the Thole columns get. Both endpoints were
-# measured: at 0.05 the 50-epoch dense runs drifted onto the floor, and at 0.5
-# the overlap route's validation induction MAE went from ~2.5 to 4.69 within two
-# epochs while its electrostatics and exchange both improved -- a clamp holding
-# the parameter away from what the loss wanted, not a fit. 0.5 was also by far
-# the largest absolute change of the three (0.09 -> 0.9 against 0.017 -> 0.17
-# for Thole), because `ind_overlap`'s seed is 1.8 rather than ~0.35.
+# The tighter floors made *induction itself* worse (2.431 against 1.897), which
+# removes the rationale rather than weakening it: the bound was there to protect
+# induction. The damage also tracked the column: the `classical` route, which
+# does not use `ind_overlap`, was almost unaffected (exch 1.787 -> 1.831) while
+# the `overlap` route went 1.066 -> 1.773.
 #
-# This is a guardrail, not a cure. If induction now stalls while the other
-# components improve, the problem is in the induction functional or the mutual
-# polarization solve, and no choice of bound will fix it.
-CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION = (0.05, 0.5, 0.5, 0.1, 0.05)
+# `component_gamma` puts 60% of the loss on the *total* energy, so a
+# systematically wrong induction term drags electrostatics and exchange away
+# from their own optima to compensate. A bound that fights the fit is worse than
+# the drift it prevents.
+#
+# What the drift means is still open: the parameters walk onto the floor, so the
+# fitted induction is physically degenerate even though it fits better. That is
+# a problem for the induction functional or the mutual polarization solve, not
+# for a bound -- which is why occupancy is now *logged* rather than constrained.
+# The per-column machinery is kept and tested so a future attempt is one line.
+CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION = (0.05, 0.05, 0.05, 0.05, 0.05)
 
 # Column indices into the 2-D parameter tensors returned by ``CliffExchangeNN``
 # and ``CliffClassicalNN``.  Both classes present a uniform ``[n_atoms, k]``
@@ -2499,6 +2500,42 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         )
         parameters = F.softplus(raw_parameters) + self.positivity_epsilon
         return (*output[:-1], parameters)
+
+    @torch.no_grad()
+    def bound_occupancy(self, batch) -> dict:
+        """Fraction of atoms sitting on each column's floor or ceiling.
+
+        The drift onto a bound is invisible in the loss -- a clamped column
+        still produces a number, and both dense 50-epoch runs reached the floor
+        without anything in the logs saying so. Logging it makes a degenerate
+        fit visible without a bound fighting the fit, which is what constraining
+        it turned out to cost.
+
+        Cheap and non-differentiable: one extra forward, no gradient, and the
+        comparisons are done on the raw parameters so `softplus` monotonicity
+        makes them exact rather than tolerance-dependent.
+        """
+        raw = self._raw_head_output(batch)[-1]
+        if raw.dim() == 1:
+            raw = raw.unsqueeze(-1)
+        n_atoms = max(raw.shape[0], 1)
+        occupancy = {}
+        for bound_name, bound in (
+            ("floor", self.raw_parameter_floor),
+            ("ceiling", self.raw_parameter_ceiling),
+        ):
+            if bound is None:
+                continue
+            if bound_name == "floor":
+                hit = raw <= bound
+            else:
+                hit = raw >= bound
+            counts = hit.sum(dim=0)
+            for column, name in enumerate(self.PARAMETER_NAMES):
+                occupancy[f"bounds/{name}_at_{bound_name}"] = (
+                    float(counts[column]) / n_atoms
+                )
+        return occupancy
 
     def get_config(self) -> dict:
         return {
@@ -6721,9 +6758,19 @@ units angstrom
         self.model.eval()
         comp_errors_t = []
         total_loss = 0.0
+        # Recorded once per epoch on the first validation batch rather than the
+        # whole split: one extra forward is negligible, and a trend only needs a
+        # consistent sample. `analysis/bound_occupancy.py` does the full split.
+        self.last_bound_occupancy = {}
         with torch.no_grad():
             for n, batch in enumerate(dataloader):
                 batch = batch.to(rank_device, non_blocking=True)
+                if n == 0 and hasattr(
+                    model_io.unwrap_model(self.model), "bound_occupancy"
+                ):
+                    self.last_bound_occupancy = model_io.unwrap_model(
+                        self.model
+                    ).bound_occupancy(batch.batch_atomic_A)
                 preds = self.dimer_model(batch)[0]
                 ref = batch.y[:, y_ind]
                 preds = scatter_sum_compile(
