@@ -13,14 +13,14 @@ Only trigger this skill when the user explicitly says `select-LoT`.
 
 ## Inputs you must collect
 
-- Path to a directory of geometry files accepted by `src/qcml_mcp/ie_time_esimator_script.py`.
+- Path to a directory of geometry files accepted by `qcml_mcp.ie_time_esimator_script`.
 - Compute budget in walltime seconds (not CPU-seconds). Ask for a number of seconds.
 - Optional: list of methods and bases. If not provided, use all 10 methods and 6 basis sets from the script (60 LoTs total).
 - Optional: whether to use CP-corrected timing (`using_cp`). Default to False unless the user requests CP.
 
 ## Required workflow (do not skip)
 
-1. Call the script `src/qcml_mcp/ie_time_esimator_script.py` to build the prediction dataframe:
+1. Import `main` from `qcml_mcp.ie_time_esimator_script` to build the prediction dataframe:
    - Use its `main(...)` function.
    - Provide the geometry directory path.
    - Pass `methods` and `bases` if the user specifies them; otherwise omit to use defaults.
@@ -55,4 +55,4 @@ Only trigger this skill when the user explicitly says `select-LoT`.
 
 ## Notes on file formats
 
-The geometry files must be in formats accepted by `parse_geoms` in `src/qcml_mcp/ie_time_esimator_script.py` (QCElemental-recognized formats such as xyz/psi4 with charge, multiplicity, and units).
+The geometry files must be in formats accepted by `parse_geoms` in `qcml_mcp.ie_time_esimator_script` (QCElemental-recognized formats such as xyz/psi4 with charge, multiplicity, and units).

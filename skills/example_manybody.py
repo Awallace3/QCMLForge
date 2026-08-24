@@ -1,4 +1,3 @@
-import re
 import qcportal
 import qcelemental as qcel
 import numpy as np
@@ -193,7 +192,7 @@ def check_manybody_progress(df: pd.DataFrame, max_print=5):
 def main():
     pd.set_option("display.max_rows", None)
     pd.set_option("display.max_columns", None)
-    df = pd.read_pickle("../../../src/qcml_mcp/select-LoT/runs/local-only-test-2/select_lot_df.pkl")
+    df = pd.read_pickle("select_lot_df.pkl")
     pp(df)
     # df1 = queue_manybodys(df)
     # pp(df1)

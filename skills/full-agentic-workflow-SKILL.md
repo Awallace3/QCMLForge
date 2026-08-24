@@ -51,13 +51,13 @@ If `select-LoT` fails while importing `apnet_pt` or pretrained-model dependencie
 Use these rules:
 - Prefer the exact Python binary for the phase (`qcml` for `select-LoT`, `p4_qcml` for QCFractal/run-IEs).
 - Set `PYTHONPATH=<repo>/src` when importing project modules from ad hoc scripts.
-- If importing `qcml_mcp` triggers `ModuleNotFoundError: No module named 'mcp'`, import the specific script by file path with `importlib.util.spec_from_file_location(...)` instead of importing the package root.
-- If the `run-IEs` helper path contains a hyphen (`src/qcml_mcp/run-IEs/example_manybody.py`), import it by file path with `importlib.util`; do not use dotted import syntax for that directory.
+- Import the estimator from `qcml_mcp.ie_time_esimator_script`; do not load it from a repository-relative source path.
+- Load bundled skill scripts by their resolved skill-resource paths, not paths relative to the current working directory.
 - If dependencies or model weights are missing, report the blocker and ask the user whether they want to run that phase in their prepared environment or provide the resulting dataframe. Do not install packages or edit source unless the user explicitly approves.
 
 ## Inputs you must collect
 
-- **Geometry input**: Path to either a directory of dimer geometry files or a single dimer geometry file accepted by `src/qcml_mcp/ie_time_esimator_script.py`. If the user gives one file, create/use a temporary workflow directory containing that file because `parse_geoms()` expects a directory.
+- **Geometry input**: Path to either a directory of dimer geometry files or a single dimer geometry file accepted by `qcml_mcp.ie_time_esimator_script`. If the user gives one file, create/use a temporary workflow directory containing that file because `parse_geoms()` expects a directory.
 - **Compute budget**: Walltime in seconds (not CPU-seconds).
 - **Reference energies**: Required for LoT accuracy bucketing and optional only when the user explicitly wants budget/timing filtering without accuracy classes. Interaction energies may be provided in any format (CSV, text, dataframe, screenshot). The model is responsible for parsing these into a usable format.
 - **Optional**: List of QM methods and basis sets. Defaults to all 10 methods and 6 basis sets if not specified.
@@ -70,17 +70,11 @@ Use the qcml Python binary: `/home/vlita3/miniconda3/envs/qcml/bin/python3`.
 
 ### Step 1: Build the prediction dataframe
 
-Call `src/qcml_mcp/ie_time_esimator_script.py`'s `main()` function. To avoid importing the `qcml_mcp` package root, load the script directly when needed:
+Import and call `qcml_mcp.ie_time_esimator_script.main()`:
 ```python
-import importlib.util
-from pathlib import Path
+from qcml_mcp.ie_time_esimator_script import main
 
-script_path = Path(<repo_root>) / "src/qcml_mcp/ie_time_esimator_script.py"
-spec = importlib.util.spec_from_file_location("ie_time_esimator_script", script_path)
-lot = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(lot)
-
-df = lot.main(
+df = main(
     geom_path=<geometry_directory>,
     methods=<methods or None>,
     bases=<bases or None>,
@@ -186,7 +180,7 @@ Follow the `connect-qcf` skill workflow:
 1. Ensure `QCF_BASE_FOLDER` is set. If not, ask the user.
 2. Check if a QCFractal instance already exists at `$QCF_BASE_FOLDER`.
 3. If it exists but is inactive, start server and compute manager in background.
-4. If no setup exists, initialize using `src/qcmlforge/qca.py` conventions (port 7777, no security). Ensure the following resource config is used (not the default values):
+4. If no setup exists, initialize using `qcmlforge.qca` conventions (port 7777, no security). Ensure the following resource config is used (not the default values):
 ```
     resources_config={
         "update_frequency": 15,
@@ -244,7 +238,7 @@ Only queue fresh manybody computations for rows where no matching record exists 
 import importlib.util
 from pathlib import Path
 
-mod_path = Path(<repo_root>) / "src/qcml_mcp/run-IEs/example_manybody.py"
+mod_path = Path(<resolved_skill_dir>) / "example_manybody.py"
 spec = importlib.util.spec_from_file_location("run_ies_example_manybody", mod_path)
 run_ies = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run_ies)
@@ -422,8 +416,6 @@ If manybody jobs error out:
 ## Skill interaction notes
 
 - This skill does NOT modify or replace the three sub-skills. It orchestrates them.
-- When calling code from `select-LoT` or `run-IEs` sub-skill scripts, import from the canonical module paths:
-  - `src/qcml_mcp/ie_time_esimator_script.py` via direct file import when package-root imports fail
-  - `src/qcml_mcp/run-IEs/example_manybody.py` via direct file import because `run-IEs` is not a valid dotted module name
+- Import select-LoT code from `qcml_mcp.ie_time_esimator_script`; load the bundled `example_manybody.py` resource by its resolved skill-resource path.
   - `qcmlforge.qca` (for QCFractal setup)
 - If source edits become necessary, limit them to workflow/helper code the user asked you to modify. Do not patch unrelated model package files as part of running this workflow.

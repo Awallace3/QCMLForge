@@ -215,6 +215,9 @@ GEMINI.md
 .opencode
 OpenCode.md
 data/
+!src/qcml_mcp/data/
+src/qcml_mcp/data/*
+!src/qcml_mcp/data/polynomial_coefficients.pkl
 data_dimer*
 tests/dataset_data/ap2_ensemble_test.pt
 tests/dataset_data/ap2_fused_ensemble_test.pt

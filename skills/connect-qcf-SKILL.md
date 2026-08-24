@@ -1,6 +1,6 @@
 ---
 name: connect-qcf
-description: Set up, verify, start, and reconnect to a local QCArchive QCFractal instance using src/qcmlforge/qca.py conventions. Only use this skill when the user explicitly includes the phrase "connect-qcf" in their request.
+description: Set up, verify, start, and reconnect to a local QCArchive QCFractal instance using qcmlforge.qca conventions. Only use this skill when the user explicitly includes the phrase "connect-qcf" in their request.
 ---
 
 # connect-qcf
@@ -11,7 +11,7 @@ Primary goals:
 - Detect whether a local instance already exists.
 - Confirm service health with both process checks and a real `qcportal` connection test.
 - Start services in the background when needed so the terminal remains usable.
-- Follow the setup logic and defaults from `src/qcmlforge/qca.py`.
+- Follow the setup logic and defaults from `qcmlforge.qca`.
 
 ## Required Preconditions
 
@@ -63,7 +63,7 @@ Expected artifacts:
 
 Interpretation:
 - If artifacts exist: treat as existing instance setup and continue to active/inactive detection.
-- If not: treat as fresh setup and initialize via `src/qcmlforge/qca.py` logic.
+- If not: treat as fresh setup and initialize via `qcmlforge.qca` logic.
 
 ### Phase 2: Active/inactive detection (must do both)
 
@@ -127,7 +127,7 @@ qcfractal-compute-manager --config="$QCF_BASE_FOLDER/resources.yml"
 
 ### Phase 3C: No setup exists
 
-Follow `src/qcmlforge/qca.py` setup defaults:
+Follow `qcmlforge.qca` setup defaults:
 - initialize config if missing
 - initialize database if missing
 - keep security disabled for this local workflow
