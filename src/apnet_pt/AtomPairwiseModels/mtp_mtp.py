@@ -380,6 +380,7 @@ class DimerProp(nn.Module):
         elst_damping_type="CLIFF",
         d3_damping_parameters=None,
         freeze_atom_model=True,
+        variational_induction=False,
     ):
         """
         Create a DimerProp configured with an AtomTypeParam and selected evaluation and damping modes.
@@ -394,6 +395,13 @@ class DimerProp(nn.Module):
         if freeze_atom_model:
             self.AtomTypeParam.atom_model.requires_grad_(False)
         self.elst_damping_type = elst_damping_type
+        # Off by default so every checkpoint trained before this existed keeps
+        # predicting exactly what it did. New runs should turn it on: with it
+        # off, induction is the AB-only contraction, which is not the
+        # variational functional of its own response solve and is positive --
+        # physically impossible -- on 16 of 32 S66x8 geometries. See
+        # `rackers_thole_induction` and ARCHITECTURE_HANDOFF.md.
+        self.variational_induction = variational_induction
         self.set_d3_damping_parameters(d3_damping_parameters)
         self.set_forward(dimer_eval)
         return
@@ -760,6 +768,13 @@ class DimerProp(nn.Module):
             ],
             include_overlap=include_overlap,
             polarizability_table=self.polarizability_table,
+            variational_energy=self.variational_induction,
+            molecule_ind_A=(
+                batch.molecule_ind_A if self.variational_induction else None
+            ),
+            molecule_ind_B=(
+                batch.molecule_ind_B if self.variational_induction else None
+            ),
         )
         if include_d3:
             Disp = d3(batch, params=self.d3_damping_parameters)
@@ -4109,6 +4124,76 @@ def _rackers_scf_update(
     return mu_induced_A_new, mu_induced_B_new
 
 
+def _rackers_converge_dipoles(
+    alpha_A, alpha_B, qA, muA, qB, muB,
+    e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+    e_BB_source, e_BB_target,
+    direct_T1_AB, direct_T2_AB, direct_T1_AA, direct_T2_AA,
+    direct_T1_BB, direct_T2_BB,
+    mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
+    max_iterations, convergence_threshold, omega,
+):
+    """Solve the induced dipoles and report how the solve went.
+
+    Factored out so the *same* solver can be run twice: once with the
+    intermolecular edges present (the dimer) and once with them removed (the
+    two monomers, which do not couple to each other and so solve together).
+    The interaction induction is the difference of the two polarization
+    energies, which is what makes it an interaction energy rather than the
+    dimer's total polarization.
+    """
+    mu_0_A, mu_0_B = _rackers_initial_permanent_fields(
+        alpha_A, alpha_B, qA, muA, qB, muB,
+        e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+        e_BB_source, e_BB_target,
+        direct_T1_AB, direct_T2_AB, direct_T1_AA, direct_T2_AA,
+        direct_T1_BB, direct_T2_BB,
+    )
+    mu_A, mu_B = mu_0_A.clone(), mu_0_B.clone()
+    iterations = 0
+    residual = torch.zeros((), device=mu_A.device, dtype=mu_A.dtype)
+    converged = False
+    for _ in range(max_iterations):
+        iterations += 1
+        mu_A_old, mu_B_old = mu_A.clone(), mu_B.clone()
+        mu_A_new, mu_B_new = _rackers_scf_update(
+            alpha_A, alpha_B,
+            e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+            e_BB_source, e_BB_target,
+            mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
+            mu_A, mu_B, mu_0_A, mu_0_B,
+        )
+        mu_A = (1 - omega) * mu_A_old + omega * mu_A_new
+        mu_B = (1 - omega) * mu_B_old + omega * mu_B_new
+        residual = torch.maximum(
+            torch.norm(mu_A - mu_A_old), torch.norm(mu_B - mu_B_old)
+        )
+        if float(residual.detach()) < convergence_threshold:
+            converged = True
+            break
+    return mu_A, mu_B, mu_0_A, mu_0_B, iterations, residual, converged
+
+
+def _rackers_polarization_energy(
+    mu_A, mu_0_A, alpha_A, mu_B, mu_0_B, alpha_B,
+    molecule_ind_A, molecule_ind_B, n_dimers,
+):
+    """Per-dimer variational polarization energy of a converged solve.
+
+    ``E_pol = -1/2 mu . E_perm`` with ``E_perm = mu_0 / alpha``, which is the
+    energy the response solve actually minimizes. Evaluating the energy with
+    the same functional is what makes attraction follow mathematically instead
+    of having to be imposed on the output.
+    """
+    field_A = mu_0_A / alpha_A.unsqueeze(-1)
+    field_B = mu_0_B / alpha_B.unsqueeze(-1)
+    per_atom_A = -0.5 * torch.sum(mu_A * field_A, dim=-1)
+    per_atom_B = -0.5 * torch.sum(mu_B * field_B, dim=-1)
+    return scatter_sum_compile(
+        per_atom_A, molecule_ind_A, dim_size=n_dimers
+    ) + scatter_sum_compile(per_atom_B, molecule_ind_B, dim_size=n_dimers)
+
+
 def rackers_thole_induction(
     ZA: torch.Tensor,
     RA: torch.Tensor,
@@ -4142,6 +4227,9 @@ def rackers_thole_induction(
     omega: float = 0.7,
     polarizability_table: torch.Tensor = constants.polarizability_table,
     return_diagnostics: bool = False,
+    variational_energy: bool = False,
+    molecule_ind_A: torch.Tensor | None = None,
+    molecule_ind_B: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute Rackers induction with distinct direct and mutual damping.
 
@@ -4361,6 +4449,67 @@ def rackers_thole_induction(
     ) * constants.h2kcalmol
     E_ind = (E_qu + E_uu) / 2.0
     overlap_edge = torch.zeros_like(E_ind)
+
+    if variational_energy:
+        # The interaction induction, as the difference of two polarization
+        # energies evaluated with the same functional the solve minimizes:
+        #
+        #     E_ind = E_pol(dimer) - E_pol(A alone) - E_pol(B alone)
+        #
+        # The legacy branch above instead contracts `E_qu`/`E_uu` over AB edges
+        # only, while the dipoles it uses responded to the full AA+BB+AB field.
+        # That is not the variational functional of its own solve, so it has no
+        # `E <= 0` guarantee -- and on S66x8 it is positive for 16 of 32
+        # geometries, which induction cannot physically be.
+        #
+        # Removing the AB edges decouples the monomers, so one extra solve
+        # yields both isolated references at once.
+        if molecule_ind_A is None or molecule_ind_B is None:
+            raise ValueError(
+                "variational_energy requires molecule_ind_A/molecule_ind_B "
+                "to aggregate per-atom energies onto dimers"
+            )
+        n_dimers = int(molecule_ind_A.max().item()) + 1 if (
+            molecule_ind_A.numel() > 0
+        ) else 0
+        empty = e_AB_source[:0]
+        alone = _rackers_converge_dipoles(
+            alpha_A, alpha_B, qA, muA, qB, muB,
+            empty, e_AB_target[:0], e_AA_source, e_AA_target,
+            e_BB_source, e_BB_target,
+            direct_tensors_AB[3][:0], direct_tensors_AB[4][:0],
+            direct_tensors_AA[3], direct_tensors_AA[4],
+            direct_tensors_BB[3], direct_tensors_BB[4],
+            mutual_tensors_AB[4][:0], mutual_tensors_AA[4],
+            mutual_tensors_BB[4],
+            max_iterations, convergence_threshold, omega,
+        )
+        energy_dimer = _rackers_polarization_energy(
+            mu_induced_A, mu_induced_0_A, alpha_A,
+            mu_induced_B, mu_induced_0_B, alpha_B,
+            molecule_ind_A, molecule_ind_B, n_dimers,
+        )
+        energy_alone = _rackers_polarization_energy(
+            alone[0], alone[2], alpha_A, alone[1], alone[3], alpha_B,
+            molecule_ind_A, molecule_ind_B, n_dimers,
+        )
+        per_dimer = (energy_dimer - energy_alone) * constants.h2kcalmol
+        # The caller's contract is one value per intermolecular edge, which the
+        # harness scatter-sums back per dimer. Polarization is many-body and has
+        # no honest per-pair decomposition, so the per-dimer energy is spread
+        # evenly over that dimer's edges: the sum -- the quantity trained on and
+        # evaluated -- is exact, and the per-edge values are explicitly a
+        # representation rather than a pair energy.
+        edge_dimer = molecule_ind_A.index_select(0, e_AB_source)
+        edge_counts = scatter_sum_compile(
+            torch.ones_like(E_ind), edge_dimer, dim_size=n_dimers
+        ).clamp(min=1.0)
+        E_ind = per_dimer.index_select(0, edge_dimer) / (
+            edge_counts.index_select(0, edge_dimer)
+        )
+        scf_iterations = max(scf_iterations, alone[4])
+        scf_residual = torch.maximum(scf_residual, alone[5])
+        scf_converged = scf_converged and alone[6]
 
     if include_overlap:
         # width_floor=0.0 preserves the historical numerics of this route: it

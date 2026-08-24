@@ -1026,3 +1026,171 @@ def test_induction_energy_is_not_the_variational_functional_of_its_solve(
     src = inspect.getsource(mtp_mtp.rackers_thole_induction)
     assert "direct_tensors_AB[3]" in src and "direct_tensors_AB[4]" in src
     assert "e_AA_source" in src and "e_BB_source" in src
+
+
+# ---------------------------------------------------------------------------
+# Variational interaction induction
+#
+# The legacy energy contracts E_qu/E_uu over AB edges only while the dipoles
+# responded to the full AA+BB+AB field, so it is not the variational functional
+# of its own solve and carries no sign guarantee. On a trained overlap
+# checkpoint it returns +0.172 kcal/mol for a dimer -- repulsive induction,
+# which cannot happen. Computing E_pol(dimer) - E_pol(monomers) with the same
+# functional the solve minimizes gives -0.871 on the same inputs.
+
+
+def _variational_kwargs(head, batch):
+    kwargs = _induction_kwargs(head, batch)
+    kwargs.update(
+        variational_energy=True,
+        molecule_ind_A=batch.molecule_ind_A,
+        molecule_ind_B=batch.molecule_ind_B,
+    )
+    return kwargs
+
+
+def test_variational_induction_is_attractive_where_legacy_is_not(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    from apnet_pt.util import scatter_sum_compile
+
+    dimer_ind = synthetic_dimer_batch.dimer_ind_full
+    n_dimers = int(dimer_ind.max()) + 1
+    legacy = mtp_mtp.rackers_thole_induction(
+        **_induction_kwargs(head, synthetic_dimer_batch), include_overlap=False
+    )
+    variational = mtp_mtp.rackers_thole_induction(
+        **_variational_kwargs(head, synthetic_dimer_batch),
+        include_overlap=False,
+    )
+    per_dimer = scatter_sum_compile(variational, dimer_ind, dim_size=n_dimers)
+    # The invariant from ARCHITECTURE_HANDOFF.md acceptance test 1/2.
+    assert bool((per_dimer <= 1e-8).all()), per_dimer
+    assert variational.shape == legacy.shape
+
+
+def test_variational_induction_preserves_the_per_edge_contract(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    """Polarization is many-body, so per-edge values are a representation.
+
+    What must be exact is the per-dimer sum, because that is what the harness
+    scatter-sums and what the loss sees.
+    """
+    import copy
+
+    from apnet_pt.util import scatter_sum_compile
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    energy, diagnostics = mtp_mtp.rackers_thole_induction(
+        **_variational_kwargs(head, synthetic_dimer_batch),
+        include_overlap=False,
+        return_diagnostics=True,
+    )
+    dimer_ind = synthetic_dimer_batch.dimer_ind_full
+    n_dimers = int(dimer_ind.max()) + 1
+    per_dimer = scatter_sum_compile(energy, dimer_ind, dim_size=n_dimers)
+    # Every edge of a dimer carries the same share, so the scatter-sum is exact.
+    for dimer in range(n_dimers):
+        mask = dimer_ind == dimer
+        assert torch.allclose(
+            energy[mask], energy[mask][0].expand(int(mask.sum())), atol=1e-6
+        )
+    assert torch.isfinite(per_dimer).all()
+    assert diagnostics["scf_converged"] in (True, False)
+
+
+def test_variational_induction_requires_the_dimer_index(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    """Silently falling back to the legacy contraction would be worse."""
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    with pytest.raises(ValueError, match="molecule_ind"):
+        mtp_mtp.rackers_thole_induction(
+            **_induction_kwargs(head, synthetic_dimer_batch),
+            include_overlap=False,
+            variational_energy=True,
+        )
+
+
+def test_variational_induction_is_off_by_default_on_dimerprop(
+    nested_hfvr_vw_model
+):
+    """Existing checkpoints must keep predicting what they predicted."""
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    dimer = mtp_mtp.DimerProp(
+        ATParam=head, dimer_eval="cliff_classical_overlap",
+        freeze_atom_model=True,
+    )
+    assert dimer.variational_induction is False
+    opted_in = mtp_mtp.DimerProp(
+        ATParam=head, dimer_eval="cliff_classical_overlap",
+        freeze_atom_model=True, variational_induction=True,
+    )
+    assert opted_in.variational_induction is True
+
+
+def test_variational_induction_changes_the_dimerprop_energy(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    legacy = mtp_mtp.DimerProp(
+        ATParam=head, dimer_eval="cliff_classical_overlap",
+        freeze_atom_model=True,
+    )(synthetic_dimer_batch)[0]
+    variational = mtp_mtp.DimerProp(
+        ATParam=head, dimer_eval="cliff_classical_overlap",
+        freeze_atom_model=True, variational_induction=True,
+    )(synthetic_dimer_batch)[0]
+    # Electrostatics and exchange are untouched: the handoff doc says to keep
+    # exchange as a control while induction is redesigned.
+    assert torch.allclose(legacy[:, 0], variational[:, 0], atol=1e-6)
+    assert torch.allclose(legacy[:, 1], variational[:, 1], atol=1e-6)
+    assert not torch.allclose(legacy[:, 2], variational[:, 2], atol=1e-6)
+
+
+def test_variational_induction_gradients_are_finite(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    dimer = mtp_mtp.DimerProp(
+        ATParam=head, dimer_eval="cliff_classical_overlap",
+        freeze_atom_model=True, variational_induction=True,
+    )
+    dimer(synthetic_dimer_batch)[0].sum().backward()
+    grads = [
+        q.grad for q in head.parameters()
+        if q.requires_grad and q.grad is not None
+    ]
+    assert grads
+    assert all(torch.isfinite(g).all() for g in grads)
+    assert any(bool(g.abs().sum() > 0) for g in grads)
