@@ -33,9 +33,9 @@ def setup_qcarchive_qcfractal(
     },
     resources_config={
         "update_frequency": 15,
-        "cores_per_worker": 8,
-        "max_workers": 4,
-        "memory_per_worker": 16,
+        "cores_per_worker": 10,
+        "max_workers": 1,
+        "memory_per_worker": 250,
     },
     worker_sh="""#!/usr/bin/bash
 conda activate p4_qcml
@@ -105,13 +105,17 @@ conda activate p4_qcml
     with open(f"{QCF_BASE_FOLDER}/worker.sh", "w") as f:
         f.write("""        """)
     if conda_env:
-        conda_env_str = f"""environments:
-            use_manager_environment: False
-          conda:
-            - {conda_env}"""
+        conda_env_str = (
+            "    environments:\n"
+            "      use_manager_environment: False\n"
+            "      conda:\n"
+            f"        - {conda_env}"
+        )
     else:
-        conda_env_str = """environments:
-            use_manager_environment: True"""
+        conda_env_str = (
+            "    environments:\n"
+            "      use_manager_environment: True"
+        )
     with open(f"{QCF_BASE_FOLDER}/resources.yml", "w") as f:
         f.write(
             f"""
@@ -136,7 +140,7 @@ executors:
     max_workers: {resources_config.get('max_workers', '4')}
     queue_tags:
       - '*'
-    {conda_env_str}
+{conda_env_str}
     worker_init:
       - source {QCF_BASE_FOLDER}/worker.sh
 """
