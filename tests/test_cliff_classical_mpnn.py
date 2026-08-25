@@ -1348,6 +1348,59 @@ def test_frozen_parameters_round_trip_through_a_checkpoint(
     )
 
 
+def test_shared_damping_reaches_the_dense_route_and_survives_a_reload(
+    tmp_path, nested_hfvr_vw_model, atomic_batch
+):
+    """The dense harness is the route the shared-damping arm actually runs on.
+
+    `CliffClassicalOverlapModel.__init__` collects unrecognised keywords into
+    `**dataset_kwargs` and hands them to `AM_DimerParam_Model`, so whether a
+    head keyword reaches the head is a property of that forwarding chain, not
+    of the head's own signature. A keyword that fell out of the chain would be
+    accepted in silence and the run would fit per-element damping while its
+    W&B config claimed otherwise.
+    """
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        shared_damping_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
+    )
+    assert tuple(harness.model.shared_damping_parameters) == (
+        mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS
+    )
+    params = harness.model(atomic_batch)[-1]
+    direct = params[:, mtp_mtp.CLIFF_CLASSICAL_THOLE_DIRECT_INDEX]
+    mutual = params[:, mtp_mtp.CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX]
+    # One scalar: constant across atoms, and the same one in both columns.
+    assert torch.allclose(direct, direct[0].expand_as(direct), atol=1e-6)
+    assert torch.allclose(mutual, direct, atol=1e-6)
+    # Still learnable -- a shared parameter is not a frozen one.
+    direct.sum().backward()
+    assert harness.model.shared_damping_raw.grad is not None
+    assert torch.any(harness.model.shared_damping_raw.grad != 0)
+
+    path = tmp_path / "shared.pt"
+    model_io.save_checkpoint(harness._create_checkpoint(), str(path))
+    reloaded = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=None,
+        pre_trained_model_path=str(path),
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+    )
+    assert tuple(reloaded.model.shared_damping_parameters) == (
+        mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS
+    )
+    assert torch.allclose(
+        params.detach(), reloaded.model(atomic_batch)[-1].detach(), atol=1e-6
+    )
+
+
 def test_nothing_is_frozen_by_default(nested_hfvr_vw_model):
     torch.manual_seed(0)
     head = _head(nested_hfvr_vw_model)
@@ -1418,6 +1471,71 @@ def test_mpnn_architecture_flags_still_rejected_on_dense_routes(tmp_path):
             model_out=str(tmp_path / "out.pt"),
             param_hidden=32,
         )
+
+
+def test_shared_damping_dispatches_onto_the_dense_cliff_head(
+    tmp_path, cliff_dispatch
+):
+    """The shared-damping arm is a dense-route experiment, not an MPNN one.
+
+    `_CliffPositiveParamNN` has accepted `shared_damping_parameters` since the
+    seeds were aligned with CLIFF, but no training flag ever reached it, so the
+    arm could only be run from Python. A Phoenix chunk configures its run
+    entirely through `train_models.py`, so without this the arm is unrunnable
+    there.
+    """
+    train_models.train_pairwise_model(
+        apnet_model_type="CliffClassicalModel",
+        model_out=str(tmp_path / "out.pt"),
+        shared_damping_parameters=["thole_direct", "thole_mutual"],
+        ds_max_size=100,
+    )
+    harness = cliff_dispatch.calls[0]
+    assert harness.kwargs["shared_damping_parameters"] == (
+        "thole_direct",
+        "thole_mutual",
+    )
+
+
+def test_shared_damping_rejected_off_the_cliff_routes(tmp_path):
+    with pytest.raises(ValueError, match="shared_damping_parameters"):
+        train_models.train_pairwise_model(
+            apnet_model_type="APNet2",
+            model_out=str(tmp_path / "out.pt"),
+            shared_damping_parameters=["thole_direct"],
+        )
+
+
+def test_shared_damping_is_not_an_mpnn_only_architecture_flag(
+    tmp_path, cliff_dispatch
+):
+    """It must not be swept up by the `--param_*` rejection.
+
+    The architecture guard rejects anything left in `parameter_head_kwargs` on
+    a dense route apart from an explicit allow-list. Adding a new head kwarg
+    without extending that list makes the dense route -- the only route this
+    arm runs on -- reject its own flag.
+    """
+    train_models.train_pairwise_model(
+        apnet_model_type="CliffClassicalModel",
+        model_out=str(tmp_path / "out.pt"),
+        shared_damping_parameters=["thole_direct", "thole_mutual"],
+        ds_max_size=100,
+    )
+    assert cliff_dispatch.calls, "dense route rejected the shared-damping flag"
+
+
+def test_help_advertises_shared_damping_parameters():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(REPO_ROOT / "src"), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    result = subprocess.run(
+        [sys.executable, "train_models.py", "--help"],
+        cwd=REPO_ROOT, capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--shared_damping_parameters" in result.stdout
 
 
 def test_help_advertises_frozen_parameters():

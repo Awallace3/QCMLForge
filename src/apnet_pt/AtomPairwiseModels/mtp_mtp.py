@@ -5883,6 +5883,7 @@ class AM_DimerParam_Model:
         param_ceiling_multiple=_CLIFF_HEAD_DEFAULT,
         readout_init_scale=_CLIFF_HEAD_DEFAULT,
         frozen_parameters=_CLIFF_HEAD_DEFAULT,
+        shared_damping_parameters=_CLIFF_HEAD_DEFAULT,
         param_n_message=_CLIFF_HEAD_DEFAULT,
         param_n_rbf=_CLIFF_HEAD_DEFAULT,
         param_hidden=_CLIFF_HEAD_DEFAULT,
@@ -5955,6 +5956,7 @@ class AM_DimerParam_Model:
         # a silently ignored argument.
         architecture_overrides = _cliff_head_overrides(
             frozen_parameters=frozen_parameters,
+            shared_damping_parameters=shared_damping_parameters,
             param_n_message=param_n_message,
             param_n_rbf=param_n_rbf,
             param_hidden=param_hidden,

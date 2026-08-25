@@ -409,6 +409,7 @@ def train_pairwise_model(
     param_hidden=None,
     param_r_cut=None,
     frozen_parameters=None,
+    shared_damping_parameters=None,
     ds_exclude_elements=None,
     split_manifest=None,
     ds_class_type="pt",
@@ -467,6 +468,7 @@ def train_pairwise_model(
         param_hidden (int or None): Hidden-state width of the parameter head's message passing. Message-passing CLIFF routes only.
         param_r_cut (float or None): Cutoff radius for the parameter head's message passing. Message-passing CLIFF routes only.
         frozen_parameters (list[str] or None): Parameter columns to hold at their per-element seed instead of fitting, e.g. thole_direct thole_mutual to stop the induced-dipole response operator being a learned object. CLIFF routes only.
+        shared_damping_parameters (list[str] or None): Damping columns to fit as one global scalar shared by every atom and every listed column, instead of one value per element. CLIFF routes only, and disjoint from frozen_parameters.
         batch_size (int or None): Dimers per optimizer step. None (the default) keeps each route's historical dataset batch size. The trainers read this off the dataset as `training_batch_size`, so it is set there rather than on train().
         ds_exclude_elements (list[int] or None): Atomic numbers to exclude. Any dimer containing one is dropped before ds_max_size is applied, so ds_max_size counts surviving dimers. Positive-parameter routes only (Rackers and CLIFF).
         ds_class_type (str): Dataset class/storage type identifier (e.g., "pt").
@@ -533,12 +535,22 @@ def train_pairwise_model(
                 f"{sorted(CLIFF_MODEL_TYPES)}, not {apnet_model_type!r}"
             )
         parameter_head_kwargs["frozen_parameters"] = tuple(frozen_parameters)
+    if shared_damping_parameters:
+        if not is_cliff_model:
+            raise ValueError(
+                "shared_damping_parameters is only supported on the CLIFF "
+                f"routes {sorted(CLIFF_MODEL_TYPES)}, not {apnet_model_type!r}"
+            )
+        parameter_head_kwargs["shared_damping_parameters"] = tuple(
+            shared_damping_parameters
+        )
     if parameter_head_kwargs and apnet_model_type not in CLIFF_MPNN_MODEL_TYPES:
         # Rejected, not dropped: the other heads have no message passing to
         # size, so accepting these would leave a run record describing an
         # architecture that never existed.
         architecture_only = sorted(
-            set(parameter_head_kwargs) - {"frozen_parameters"}
+            set(parameter_head_kwargs)
+            - {"frozen_parameters", "shared_damping_parameters"}
         )
         if architecture_only:
             raise ValueError(
@@ -1301,6 +1313,22 @@ def main():
         ),
     )
     args.add_argument(
+        "--shared_damping_parameters",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Damping columns to fit as a single global scalar shared by every "
+            "atom and every listed column, e.g. "
+            "--shared_damping_parameters thole_direct thole_mutual. CLIFF "
+            "publishes one smearing coefficient, not one per element, so this "
+            "is the arm that fits what CLIFF actually parameterises; the "
+            "per-element default is the more ambitious fit. Disjoint from "
+            "--frozen_parameters. CLIFF routes only."
+        ),
+    )
+    args.add_argument(
         "--batch_size",
         type=int,
         default=None,
@@ -1794,6 +1822,7 @@ def main():
             param_hidden=args.param_hidden,
             param_r_cut=args.param_r_cut,
             frozen_parameters=args.frozen_parameters,
+            shared_damping_parameters=args.shared_damping_parameters,
             ds_exclude_elements=args.ds_exclude_elements,
             split_manifest=args.split_manifest,
             component_gamma=args.component_gamma,
