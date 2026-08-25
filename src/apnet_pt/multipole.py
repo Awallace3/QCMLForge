@@ -1396,7 +1396,13 @@ def thole_damping_direct_torch(r_ij, alpha_i, alpha_j, a, exponent=1.5):
     u = r_ij / ((alpha_i * alpha_j) ** (1.0 / 6.0))
     au3 = a * (u ** exponent)
     l3 = 1 - torch.exp(-au3)
-    l5 = 1 - (1 + 0.5 * au3) * torch.exp(-au3)
+    # Thole's rho(u) ~ exp(-a u**n) integrates to
+    # l5 = 1 - (1 + (n/3) a u**n) exp(-a u**n), so the coefficient is tied to
+    # the same exponent as the exponential. It read 0.5 while the exponent was
+    # hard-wired to 1.5, which is that formula evaluated at n = 1.5; once
+    # `exponent` became an argument the constant no longer followed it, and
+    # asking for CLIFF's n = 3 gave l3 from n = 3 with l5 from n = 1.5.
+    l5 = 1 - (1 + (exponent / 3.0) * au3) * torch.exp(-au3)
     return au3, l3, l5
 
 

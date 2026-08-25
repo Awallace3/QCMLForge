@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import train_models
-from apnet_pt import constants, model_io
+from apnet_pt import constants, model_io, multipole
 from apnet_pt.AtomModels.ap2_atom_model import AtomMPNN
 from apnet_pt.AtomPairwiseModels import mtp_mtp
 from apnet_pt.AtomPairwiseModels.mtp_mtp import (
@@ -2778,3 +2778,72 @@ def test_cli_help_names_both_rackers_routes(capsys, monkeypatch):
     assert "RackersTholeDampingModel" in help_output
     assert "RackersTholeDampingOverlapModel" in help_output
     assert "exactly four" in help_output
+
+
+# ---------------------------------------------------------------------------
+# The lambda_5 coefficient is a function of the exponent, not a constant
+#
+# Thole smears each site with rho(u) proportional to exp(-a u**n). Integrating
+# it gives lambda_3 = 1 - exp(-a u**n) and
+# lambda_5 = 1 - (1 + (n/3) a u**n) exp(-a u**n): the coefficient on the
+# `a u**n` term inside lambda_5 is n/3, tied to the same exponent that appears
+# in the exponential. `thole_damping_mutual_torch` hard-codes n = 3 and so
+# writes that coefficient as 1. `thole_damping_direct_torch` hard-coded n = 1.5
+# and so wrote it as 0.5 -- correct while the exponent was also hard-coded, and
+# silently wrong once `exponent` became an argument whose docstring offers 3.0
+# as the way to match CLIFF Eq. (22).
+# ---------------------------------------------------------------------------
+
+
+def _damping_inputs():
+    r = torch.tensor([2.0, 4.0, 6.5, 9.0], dtype=torch.float64)
+    alpha_i = torch.tensor([4.5, 4.5, 9.0, 2.0], dtype=torch.float64)
+    alpha_j = torch.tensor([9.0, 2.0, 4.5, 4.5], dtype=torch.float64)
+    a = torch.full_like(r, 0.38539)
+    return r, alpha_i, alpha_j, a
+
+
+def test_direct_damping_at_exponent_three_is_the_mutual_functional_form():
+    """At n = 3 the two dampings are the same function; only the caller differs.
+
+    Direct and mutual damping differ solely in which exponent they use, so
+    asking the direct one for n = 3 must reproduce the mutual one exactly --
+    including lambda_5. Asserted against the *other* implementation rather than
+    against a number, so neither can drift into agreeing with a hand-copied
+    constant.
+    """
+    r, alpha_i, alpha_j, a = _damping_inputs()
+    _, l3_direct, l5_direct = multipole.thole_damping_direct_torch(
+        r, alpha_i, alpha_j, a, exponent=3.0
+    )
+    _, l3_mutual, l5_mutual = multipole.thole_damping_mutual_torch(
+        r, alpha_i, alpha_j, a
+    )
+    assert torch.allclose(l3_direct, l3_mutual, atol=1e-14)
+    assert torch.allclose(l5_direct, l5_mutual, atol=1e-14)
+
+
+def test_lambda5_coefficient_tracks_the_exponent():
+    """n/3 for each n, computed here from the closed form, not from the code."""
+    r, alpha_i, alpha_j, a = _damping_inputs()
+    u = r / ((alpha_i * alpha_j) ** (1.0 / 6.0))
+    for exponent in (1.5, 2.0, 3.0):
+        aun = a * u**exponent
+        expected_l3 = 1 - torch.exp(-aun)
+        expected_l5 = 1 - (1 + (exponent / 3.0) * aun) * torch.exp(-aun)
+        _, l3, l5 = multipole.thole_damping_direct_torch(
+            r, alpha_i, alpha_j, a, exponent=exponent
+        )
+        assert torch.allclose(l3, expected_l3, atol=1e-14), exponent
+        assert torch.allclose(l5, expected_l5, atol=1e-14), exponent
+
+
+def test_the_amoeba_plus_default_is_numerically_unchanged():
+    """The fix must not move any trained checkpoint: n/3 = 0.5 at n = 1.5."""
+    r, alpha_i, alpha_j, a = _damping_inputs()
+    u = r / ((alpha_i * alpha_j) ** (1.0 / 6.0))
+    au = a * u**1.5
+    _, _, l5 = multipole.thole_damping_direct_torch(r, alpha_i, alpha_j, a)
+    assert torch.allclose(
+        l5, 1 - (1 + 0.5 * au) * torch.exp(-au), atol=1e-15
+    )
