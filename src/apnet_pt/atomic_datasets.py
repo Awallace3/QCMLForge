@@ -771,6 +771,10 @@ class atomic_module_dataset(Dataset):
         raise ValueError("spec_type must be 1, 2, or 3!")
         return []
 
+    def _invalidate_processed_file_names(self):
+        """Drop the memoized processed-file listing after the directory changes."""
+        self._processed_file_names_cache = None
+
     @property
     def processed_file_names(self):
         if self.force_reprocess:
@@ -778,6 +782,14 @@ class atomic_module_dataset(Dataset):
         if self.testing:
             return [f"data_{i}.pt" for i in range(self.MAX_SIZE - 1)]
         else:
+            # len() consults this on every element access, so without a cache
+            # the glob and natural_key sort below run once per __getitem__.
+            # Over a 53k-file processed directory that is ~0.3 s each, which
+            # makes a single pass across the dataset quadratic. The listing
+            # only changes in process(), which invalidates the cache.
+            cached = getattr(self, "_processed_file_names_cache", None)
+            if cached is not None:
+                return cached
             if self.split == "train":
                 file_cmd = (
                     f"{self.root}/processed/data_train_spec_{self.spec_type}_*.pt"
@@ -793,9 +805,10 @@ class atomic_module_dataset(Dataset):
                 spec_files.sort(key=natural_key)
                 if self.MAX_SIZE is not None and len(spec_files) > self.MAX_SIZE:
                     spec_files = spec_files[: self.MAX_SIZE]
-                return spec_files
             else:
-                return [f"data_missing_{i}.pt" for i in range(1)]
+                spec_files = [f"data_missing_{i}.pt" for i in range(1)]
+            self._processed_file_names_cache = spec_files
+            return spec_files
 
     def download(self):
         if self.spec_type in [1, 2]:
@@ -924,6 +937,7 @@ class atomic_module_dataset(Dataset):
                 if self.MAX_SIZE is not None and idx > self.MAX_SIZE:
                     break
                 idx += 1
+        self._invalidate_processed_file_names()
         return
 
     def len(self):
