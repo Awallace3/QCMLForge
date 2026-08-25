@@ -408,6 +408,7 @@ def train_pairwise_model(
     param_n_rbf=None,
     param_hidden=None,
     param_r_cut=None,
+    frozen_parameters=None,
     ds_exclude_elements=None,
     split_manifest=None,
     ds_class_type="pt",
@@ -465,6 +466,7 @@ def train_pairwise_model(
         param_n_rbf (int or None): Radial basis size of the parameter head's own distance expansion. Message-passing CLIFF routes only.
         param_hidden (int or None): Hidden-state width of the parameter head's message passing. Message-passing CLIFF routes only.
         param_r_cut (float or None): Cutoff radius for the parameter head's message passing. Message-passing CLIFF routes only.
+        frozen_parameters (list[str] or None): Parameter columns to hold at their per-element seed instead of fitting, e.g. thole_direct thole_mutual to stop the induced-dipole response operator being a learned object. CLIFF routes only.
         batch_size (int or None): Dimers per optimizer step. None (the default) keeps each route's historical dataset batch size. The trainers read this off the dataset as `training_batch_size`, so it is set there rather than on train().
         ds_exclude_elements (list[int] or None): Atomic numbers to exclude. Any dimer containing one is dropped before ds_max_size is applied, so ds_max_size counts surviving dimers. Positive-parameter routes only (Rackers and CLIFF).
         ds_class_type (str): Dataset class/storage type identifier (e.g., "pt").
@@ -524,15 +526,26 @@ def train_pairwise_model(
         )
         if value is not None
     }
+    if frozen_parameters:
+        if not is_cliff_model:
+            raise ValueError(
+                "frozen_parameters is only supported on the CLIFF routes "
+                f"{sorted(CLIFF_MODEL_TYPES)}, not {apnet_model_type!r}"
+            )
+        parameter_head_kwargs["frozen_parameters"] = tuple(frozen_parameters)
     if parameter_head_kwargs and apnet_model_type not in CLIFF_MPNN_MODEL_TYPES:
         # Rejected, not dropped: the other heads have no message passing to
         # size, so accepting these would leave a run record describing an
         # architecture that never existed.
-        raise ValueError(
-            f"{', '.join(sorted(parameter_head_kwargs))} "
-            "is only supported on the message-passing CLIFF routes "
-            f"{sorted(CLIFF_MPNN_MODEL_TYPES)}, not {apnet_model_type!r}"
+        architecture_only = sorted(
+            set(parameter_head_kwargs) - {"frozen_parameters"}
         )
+        if architecture_only:
+            raise ValueError(
+                f"{', '.join(architecture_only)} "
+                "is only supported on the message-passing CLIFF routes "
+                f"{sorted(CLIFF_MPNN_MODEL_TYPES)}, not {apnet_model_type!r}"
+            )
     if is_cliff_model and include_total_mse:
         # `--include_total_mse` is the pre-CLIFF spelling of "also fit the
         # total".  Reinterpreting it keeps the flag meaningful on the new
@@ -1273,6 +1286,21 @@ def main():
         ),
     )
     args.add_argument(
+        "--frozen_parameters",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Parameter columns to hold at their per-element seed instead of "
+            "fitting, e.g. --frozen_parameters thole_direct thole_mutual. "
+            "Fitting the Thole parameters per atom makes the induced-dipole "
+            "response operator a learned object, whose positive definiteness "
+            "is what the interaction induction needs to be attractive. CLIFF "
+            "routes only."
+        ),
+    )
+    args.add_argument(
         "--batch_size",
         type=int,
         default=None,
@@ -1765,6 +1793,7 @@ def main():
             param_n_rbf=args.param_n_rbf,
             param_hidden=args.param_hidden,
             param_r_cut=args.param_r_cut,
+            frozen_parameters=args.frozen_parameters,
             ds_exclude_elements=args.ds_exclude_elements,
             split_manifest=args.split_manifest,
             component_gamma=args.component_gamma,

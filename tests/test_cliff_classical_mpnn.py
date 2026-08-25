@@ -1353,3 +1353,81 @@ def test_nothing_is_frozen_by_default(nested_hfvr_vw_model):
     head = _head(nested_hfvr_vw_model)
     assert head.frozen_parameters == ()
     assert head._frozen_parameter_indices == ()
+
+
+class _FakeCliffHarness:
+    """Records constructor kwargs without building anything heavy."""
+
+    calls: list = []
+
+    def __init__(self, **kwargs):
+        type(self).calls.append(self)
+        self.kwargs = kwargs
+        self.dataset = object()
+        self.model = None
+
+    def train(self, **kwargs):
+        pass
+
+
+class _FakeAtomTypeWrapper:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.model = None
+
+
+@pytest.fixture
+def cliff_dispatch(monkeypatch):
+    _FakeCliffHarness.calls = []
+    monkeypatch.setattr(
+        mtp_mtp, "AtomTypeParamModel", _FakeAtomTypeWrapper
+    )
+    monkeypatch.setattr(mtp_mtp, "CliffClassicalModel", _FakeCliffHarness)
+    return _FakeCliffHarness
+
+
+def test_frozen_parameters_dispatch_on_both_cliff_heads(tmp_path, cliff_dispatch):
+    """Allowed on every CLIFF route: the dense one is the control."""
+    train_models.train_pairwise_model(
+        apnet_model_type="CliffClassicalModel",
+        model_out=str(tmp_path / "out.pt"),
+        frozen_parameters=["thole_direct", "thole_mutual"],
+        ds_max_size=100,
+    )
+    harness = cliff_dispatch.calls[0]
+    assert harness.kwargs["frozen_parameters"] == (
+        "thole_direct",
+        "thole_mutual",
+    )
+
+
+def test_frozen_parameters_rejected_off_the_cliff_routes(tmp_path):
+    with pytest.raises(ValueError, match="frozen_parameters"):
+        train_models.train_pairwise_model(
+            apnet_model_type="APNet2",
+            model_out=str(tmp_path / "out.pt"),
+            frozen_parameters=["thole_direct"],
+        )
+
+
+def test_mpnn_architecture_flags_still_rejected_on_dense_routes(tmp_path):
+    """Freezing is general; message-passing geometry is not."""
+    with pytest.raises(ValueError, match="param_hidden"):
+        train_models.train_pairwise_model(
+            apnet_model_type="CliffClassicalOverlapModel",
+            model_out=str(tmp_path / "out.pt"),
+            param_hidden=32,
+        )
+
+
+def test_help_advertises_frozen_parameters():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(REPO_ROOT / "src"), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    result = subprocess.run(
+        [sys.executable, "train_models.py", "--help"],
+        cwd=REPO_ROOT, capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--frozen_parameters" in result.stdout
