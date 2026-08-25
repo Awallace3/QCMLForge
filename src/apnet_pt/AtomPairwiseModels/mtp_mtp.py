@@ -215,6 +215,17 @@ CLIFF_READOUT_INIT_SCALE = 0.1
 # The per-column machinery is kept and tested so a future attempt is one line.
 CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION = (0.05, 0.05, 0.05, 0.05, 0.05)
 
+# The two columns that parameterize the induced-dipole response operator.
+#
+# Fitting these per atom makes the response matrix a learned object, and
+# ARCHITECTURE_HANDOFF.md hypothesis 2 is that independently learned direct and
+# mutual Thole parameters break its positive definiteness -- the guarantee the
+# interaction induction `E_pol(dimer) - E_pol(monomers)` needs in order to be
+# attractive. Freezing them at CLIFF's fitted values leaves induction with one
+# learnable term, `-S_ij K_i K_j`, which is attractive by construction because
+# `K > 0` and `S_ij > 0`.
+CLIFF_INDUCTION_DAMPING_PARAMETERS = ("thole_direct", "thole_mutual")
+
 # Column indices into the 2-D parameter tensors returned by ``CliffExchangeNN``
 # and ``CliffClassicalNN``.  Both classes present a uniform ``[n_atoms, k]``
 # contract, so these indices are the only sanctioned way to read a column.
@@ -1798,7 +1809,12 @@ class AtomTypeParamNN(nn.Module):
             )
         K_filtered = K[keep_mask]  # shape (n_atoms_filtered, n_params)
         n_message_steps = min(self.n_message + 1, h_list.size(1))
+        frozen = getattr(self, "_frozen_parameter_indices", ())
         for p in range(self.n_params):
+            if p in frozen:
+                # Held at its per-element seed: no correction, and __init__ has
+                # already detached this column's parameters from the graph.
+                continue
             for i in range(n_message_steps):
                 param_update = self.param_readout_layers[p][i](h_list[:, i, :])
                 K_filtered[:, p] += param_update.squeeze(-1)
@@ -2122,6 +2138,31 @@ def _validate_bound_scales(value, name: str, n_params: int):
     return _validate_bound_scale(value, name)
 
 
+def _validate_frozen_parameters(frozen_parameters, parameter_names):
+    """Resolve column names to hold fixed into indices, rejecting unknowns.
+
+    Names rather than indices, so a config records *what* was frozen instead of
+    a position that a contract change would silently repoint.
+    """
+    if isinstance(frozen_parameters, (str, bytes)):
+        raise TypeError(
+            "frozen_parameters must be a sequence of parameter names, not a "
+            f"bare string (got {frozen_parameters!r})"
+        )
+    if not frozen_parameters:
+        return (), ()
+    indices = []
+    for name in frozen_parameters:
+        if name not in parameter_names:
+            raise ValueError(
+                f"unknown frozen parameter {name!r}; this contract has "
+                f"{list(parameter_names)}"
+            )
+        indices.append(parameter_names.index(name))
+    ordered = tuple(sorted(set(indices)))
+    return tuple(parameter_names[i] for i in ordered), ordered
+
+
 def _broadcast_bound_scale(scale, n_params: int) -> list[float]:
     """One bound scale per column, from a scalar or an already-sized sequence."""
     if isinstance(scale, (list, tuple)):
@@ -2290,7 +2331,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
     # that its `get_config` therefore has to record. `AM_DimerParam_Model`
     # forwards exactly these, so a head with its own architecture does not
     # require another branch at either construction site.
-    ARCHITECTURE_CONFIG_KEYS: tuple[str, ...] = ()
+    ARCHITECTURE_CONFIG_KEYS: tuple[str, ...] = ("frozen_parameters",)
 
     def __init__(
         self,
@@ -2307,9 +2348,18 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
+        frozen_parameters=(),
     ):
         if type(atom_model) is not AtomTypeParamNN:
             raise ValueError("atom_model must be an AtomTypeParamNN")
+        # Assigned before `super().__init__()` because the forward reads it.
+        # Validated before being turned into a tuple: `tuple("thole_direct")`
+        # is a tuple of characters, which would pass silently.
+        self.frozen_parameters, self._frozen_parameter_indices = (
+            _validate_frozen_parameters(
+                frozen_parameters, list(self.PARAMETER_NAMES)
+            )
+        )
         positive_means, raw_stds, positivity_epsilon, raw_means = (
             _validate_positive_initialization(
                 self.PARAMETER_NAMES,
@@ -2379,6 +2429,12 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
             param_ceiling_multiple,
         )
         self.atom_model.requires_grad_(not freeze_atom_model)
+        # A frozen column keeps its seed exactly: its embedding and its now
+        # unused readout stack are detached, so no optimizer touches them
+        # and no gradient is computed and silently discarded.
+        for p in self._frozen_parameter_indices:
+            self.guess_layer[p].requires_grad_(False)
+            self.param_readout_layers[p].requires_grad_(False)
 
     def _seed_guess_layer_by_Z(self, param_start_mean_by_Z, positivity_epsilon):
         """Overwrite per-element rows of the seed embeddings.
@@ -2564,6 +2620,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
             "readout_init_scale": self.readout_init_scale,
             "positivity_epsilon": self.positivity_epsilon,
             "width_floor": self.width_floor,
+            "frozen_parameters": list(self.frozen_parameters),
             "n_message": self.n_message,
             "n_neuron": self.n_neuron,
             "n_embed": self.n_embed,
@@ -2601,6 +2658,7 @@ class CliffExchangeNN(_CliffPositiveParamNN):
         param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
+        frozen_parameters=(),
     ):
         if param_start_mean_by_Z is None:
             param_start_mean_by_Z = {"exch": CLIFF_EXCH_INITIAL_VALUES_BY_Z}
@@ -2618,6 +2676,7 @@ class CliffExchangeNN(_CliffPositiveParamNN):
             param_floor_fraction=param_floor_fraction,
             param_ceiling_multiple=param_ceiling_multiple,
             readout_init_scale=readout_init_scale,
+            frozen_parameters=frozen_parameters,
         )
 
 
@@ -2653,6 +2712,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         param_floor_fraction=CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
+        frozen_parameters=(),
     ):
         if param_start_mean_by_Z is None:
             param_start_mean_by_Z = CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z
@@ -2670,6 +2730,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
             param_floor_fraction=param_floor_fraction,
             param_ceiling_multiple=param_ceiling_multiple,
             readout_init_scale=readout_init_scale,
+            frozen_parameters=frozen_parameters,
         )
 
 
@@ -2754,6 +2815,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
     MODEL_TYPE = "CliffClassicalMPNN"
     PARAMETER_NAMES = CLIFF_CLASSICAL_PARAMETER_NAMES
     ARCHITECTURE_CONFIG_KEYS = (
+        "frozen_parameters",
         "param_n_message",
         "param_n_rbf",
         "param_hidden",
@@ -2775,6 +2837,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         param_floor_fraction=CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
+        frozen_parameters=(),
         param_n_message: int = CLIFF_MPNN_N_MESSAGE,
         param_n_rbf: int = CLIFF_MPNN_N_RBF,
         param_hidden: int = CLIFF_MPNN_HIDDEN,
@@ -2820,6 +2883,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             param_floor_fraction=param_floor_fraction,
             param_ceiling_multiple=param_ceiling_multiple,
             readout_init_scale=readout_init_scale,
+            frozen_parameters=frozen_parameters,
         )
         # Built after `super().__init__()`, which is what makes `nn.Module`
         # able to register them.
@@ -2986,8 +3050,12 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         # accumulated into a slice in place: the result is the same, and it
         # keeps the graph free of the indexed in-place writes that the atom
         # route's compile failure is attributed to.
+        frozen = getattr(self, "_frozen_parameter_indices", ())
         columns = []
         for p in range(self.n_params):
+            if p in frozen:
+                columns.append(torch.zeros_like(h_states[0][:, :1]))
+                continue
             column = self.param_readout_layers[p][0](h_states[0])
             for step in range(1, len(h_states)):
                 column = column + self.param_readout_layers[p][step](
@@ -5693,6 +5761,7 @@ class AM_DimerParam_Model:
         param_floor_fraction=_CLIFF_HEAD_DEFAULT,
         param_ceiling_multiple=_CLIFF_HEAD_DEFAULT,
         readout_init_scale=_CLIFF_HEAD_DEFAULT,
+        frozen_parameters=_CLIFF_HEAD_DEFAULT,
         param_n_message=_CLIFF_HEAD_DEFAULT,
         param_n_rbf=_CLIFF_HEAD_DEFAULT,
         param_hidden=_CLIFF_HEAD_DEFAULT,
@@ -5764,6 +5833,7 @@ class AM_DimerParam_Model:
         # message-passing depth on a head that has none is an error rather than
         # a silently ignored argument.
         architecture_overrides = _cliff_head_overrides(
+            frozen_parameters=frozen_parameters,
             param_n_message=param_n_message,
             param_n_rbf=param_n_rbf,
             param_hidden=param_hidden,

@@ -331,6 +331,7 @@ def test_config_records_the_architecture(nested_hfvr_vw_model):
     head = _head(nested_hfvr_vw_model)
     config = head.get_config()
     assert CliffClassicalMPNN.ARCHITECTURE_CONFIG_KEYS == (
+        "frozen_parameters",
         "param_n_message",
         "param_n_rbf",
         "param_hidden",
@@ -342,10 +343,12 @@ def test_config_records_the_architecture(nested_hfvr_vw_model):
     assert config["parameter_names"] == list(CLIFF_CLASSICAL_PARAMETER_NAMES)
 
 
-def test_dense_head_declares_no_architecture_keys():
-    """So the shared construction path forwards nothing to it."""
-    assert CliffClassicalNN.ARCHITECTURE_CONFIG_KEYS == ()
-    assert mtp_mtp._CliffPositiveParamNN.ARCHITECTURE_CONFIG_KEYS == ()
+def test_dense_head_declares_only_the_shared_architecture_key():
+    """Every positive head can freeze columns; only the MPNN head adds more."""
+    assert CliffClassicalNN.ARCHITECTURE_CONFIG_KEYS == ("frozen_parameters",)
+    assert mtp_mtp._CliffPositiveParamNN.ARCHITECTURE_CONFIG_KEYS == (
+        "frozen_parameters",
+    )
 
 
 def test_nested_model_must_be_an_atomtypeparamnn():
@@ -1194,3 +1197,159 @@ def test_variational_induction_gradients_are_finite(
     assert grads
     assert all(torch.isfinite(g).all() for g in grads)
     assert any(bool(g.abs().sum() > 0) for g in grads)
+
+
+# ---------------------------------------------------------------------------
+# Frozen induction damping
+#
+# Fitting the Thole parameters per atom makes the response operator a learned
+# object, and the interaction induction E_pol(dimer) - E_pol(monomers) is only
+# guaranteed attractive when that operator is positive definite. Making the
+# energy variational was not enough on its own: on S66x8 it left 24/32
+# geometries positive, because a difference of two negative energies has no
+# sign guarantee without that condition. Holding the damping at CLIFF's fitted
+# values leaves induction one learnable term, `-S_ij K_i K_j`, which is
+# attractive by construction.
+
+
+def test_induction_damping_columns_are_named_once():
+    assert mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS == (
+        "thole_direct", "thole_mutual"
+    )
+    for name in mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS:
+        assert name in CLIFF_CLASSICAL_PARAMETER_NAMES
+
+
+def test_frozen_columns_hold_their_seed_exactly(
+    atomic_batch, nested_hfvr_vw_model
+):
+    torch.manual_seed(0)
+    head = _head(
+        nested_hfvr_vw_model,
+        param_start_std=[0.0] * 5,
+        frozen_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
+    )
+    parameters = head(atomic_batch)[-1].detach()
+    for name in mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS:
+        column = CLIFF_CLASSICAL_PARAMETER_NAMES.index(name)
+        values = parameters[:, column]
+        # Identical across atoms and equal to the seed.
+        assert float(values.max() - values.min()) < 1e-6, name
+        assert float(values[0]) == pytest.approx(
+            CLIFF_CLASSICAL_INITIAL_VALUES[column], rel=1e-4
+        ), name
+    # The unfrozen columns still vary per atom.
+    exch = parameters[:, CLIFF_CLASSICAL_EXCH_INDEX]
+    assert float(exch.max() - exch.min()) > 1.0
+
+
+def test_frozen_columns_receive_no_gradient(
+    atomic_batch, nested_hfvr_vw_model
+):
+    """Detached, not merely unused: an optimizer must not touch them."""
+    torch.manual_seed(0)
+    head = _head(
+        nested_hfvr_vw_model,
+        frozen_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
+    )
+    head(atomic_batch)[-1].sum().backward()
+    for name in CLIFF_CLASSICAL_PARAMETER_NAMES:
+        column = CLIFF_CLASSICAL_PARAMETER_NAMES.index(name)
+        frozen = name in mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS
+        embedding = head.guess_layer[column]
+        assert embedding.weight.requires_grad is (not frozen), name
+        touched = (
+            embedding.weight.grad is not None
+            and bool(embedding.weight.grad.abs().sum() > 0)
+        )
+        assert touched is (not frozen), name
+        for readout in head.param_readout_layers[column]:
+            for parameter in readout.parameters():
+                assert parameter.requires_grad is (not frozen), name
+
+
+def test_freezing_reduces_the_trainable_parameter_count(
+    nested_hfvr_vw_model
+):
+    import copy
+
+    torch.manual_seed(0)
+    learned = _head(copy.deepcopy(nested_hfvr_vw_model))
+    torch.manual_seed(0)
+    frozen = _head(
+        copy.deepcopy(nested_hfvr_vw_model),
+        frozen_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
+    )
+    count = lambda m: sum(  # noqa: E731
+        q.numel() for q in m.parameters() if q.requires_grad
+    )
+    assert count(frozen) < count(learned)
+
+
+def test_the_dense_head_can_freeze_too(atomic_batch, nested_hfvr_vw_model):
+    """Needed as the control for the message-passing experiment."""
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=nested_hfvr_vw_model,
+        param_start_std=[0.0] * 5,
+        frozen_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
+        **HEAD_KWARGS,
+    )
+    parameters = head(atomic_batch)[-1].detach()
+    column = CLIFF_CLASSICAL_THOLE_DIRECT_INDEX
+    assert float(parameters[:, column].max() - parameters[:, column].min()) < 1e-6
+    assert float(parameters[0, column]) == pytest.approx(
+        CLIFF_CLASSICAL_INITIAL_VALUES[column], rel=1e-4
+    )
+
+
+@pytest.mark.parametrize(
+    "bad,error", [("thole_direct", TypeError), (["nope"], ValueError)]
+)
+def test_frozen_parameters_are_validated(nested_hfvr_vw_model, bad, error):
+    with pytest.raises(error):
+        _head(nested_hfvr_vw_model, frozen_parameters=bad)
+
+
+def test_frozen_parameters_round_trip_through_a_checkpoint(
+    tmp_path, nested_hfvr_vw_model, atomic_batch
+):
+    """A checkpoint that forgot what it froze would silently unfreeze on load."""
+    harness = mtp_mtp.CliffClassicalOverlapMPNNModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        frozen_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
+        **MPNN_KWARGS,
+    )
+    assert harness.model.frozen_parameters == (
+        mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS
+    )
+    before = harness.model(atomic_batch)[-1].detach().clone()
+    path = tmp_path / "frozen.pt"
+    model_io.save_checkpoint(harness._create_checkpoint(), str(path))
+    reloaded = mtp_mtp.CliffClassicalOverlapMPNNModel(
+        atom_model=None,
+        pre_trained_model_path=str(path),
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+    )
+    assert tuple(reloaded.model.frozen_parameters) == (
+        mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS
+    )
+    assert reloaded.model._frozen_parameter_indices == (1, 2)
+    assert torch.allclose(
+        before, reloaded.model(atomic_batch)[-1].detach(), atol=1e-6
+    )
+
+
+def test_nothing_is_frozen_by_default(nested_hfvr_vw_model):
+    torch.manual_seed(0)
+    head = _head(nested_hfvr_vw_model)
+    assert head.frozen_parameters == ()
+    assert head._frozen_parameter_indices == ()

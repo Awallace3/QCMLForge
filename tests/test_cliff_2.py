@@ -318,10 +318,15 @@ def test_merge_rackers_only_leaves_exchange_at_initialization(
     expected_mean = (
         (n_rows - len(per_element)) * scalar + sum(per_element.values())
     ) / n_rows
-    # Initialization noise is `param_start_std` in raw space; averaged over
-    # `n_rows` its standard error is far below this, so the bound is loose in
-    # sigma terms while still being tight enough to catch a wrong mixture.
-    assert initialized.mean().item() == pytest.approx(expected_mean, abs=0.05)
+    # Initialization noise is `param_start_std` (0.25) in raw space. Measured
+    # over 4000 seeds the deviation of this mean has p95 0.042 and max 0.087,
+    # so the previous 0.05 bound sat at about the 97.8th percentile and failed
+    # roughly one run in 45 -- a real flake that only surfaced once random test
+    # ordering started reseeding. 0.15 is ~1-in-10^4 while still being far
+    # tighter than any wrong mixture: dropping the per-element seeds entirely
+    # moves this mean by 0.6, and filling `exch` from a Rackers column moves it
+    # by more than 1.
+    assert initialized.mean().item() == pytest.approx(expected_mean, abs=0.15)
     assert merged["metadata"]["unclaimed_columns"] == ["exch"]
     assert merged["config"]["dimer_eval"] == "cliff_classical_overlap"
 
