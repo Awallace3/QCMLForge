@@ -499,3 +499,104 @@ def test_the_pre_fix_construction_disagreed_with_ap3d3_by_a_kcal_per_mol():
         shared, n_a, n_b, intramolecular_permanent_field=True
     )
     assert abs(pre_fix - reference) == pytest.approx(1.104, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Stopping a pre-fix checkpoint from being warm-started silently
+#
+# Stage 4 warm-starts whenever the checkpoint file exists, and the cancelled
+# arms left pre-fix checkpoints sitting at exactly the paths a relaunch would
+# reuse. Loading one produces a model whose elst and exch heads were fitted
+# against a wrong induction gradient, and nothing in the logs would say so --
+# the same silent-failure class as the defect itself.
+# ---------------------------------------------------------------------------
+
+
+def test_the_induction_functional_version_is_recorded_and_current():
+    assert mtp_mtp.INDUCTION_FUNCTIONAL_VERSION >= 2
+
+
+def test_a_checkpoint_records_the_functional_it_was_trained_under(
+    tmp_path, nested_hfvr_vw_model
+):
+    from apnet_pt import model_io
+
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    path = tmp_path / "ckpt.pt"
+    model_io.save_checkpoint(harness._create_checkpoint(), str(path))
+    config = torch.load(str(path), weights_only=False)["config"]
+    assert (
+        config["induction_functional_version"]
+        == mtp_mtp.INDUCTION_FUNCTIONAL_VERSION
+    )
+
+
+def test_loading_a_pre_fix_checkpoint_is_refused_with_an_explanation(
+    tmp_path, nested_hfvr_vw_model
+):
+    """The refusal has to name the problem, not just the version numbers."""
+    from apnet_pt import model_io
+
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    path = tmp_path / "stale.pt"
+    checkpoint = harness._create_checkpoint()
+    # Exactly what a checkpoint written before the fix looks like: the key is
+    # simply absent.
+    del checkpoint["config"]["induction_functional_version"]
+    model_io.save_checkpoint(checkpoint, str(path))
+
+    with pytest.raises(ValueError, match="induction"):
+        mtp_mtp.CliffClassicalOverlapModel(
+            atom_model=None,
+            pre_trained_model_path=str(path),
+            ds_root=None,
+            use_GPU=False,
+            ignore_database_null=True,
+        )
+
+
+def test_a_pre_fix_checkpoint_can_still_be_loaded_deliberately(
+    tmp_path, nested_hfvr_vw_model
+):
+    """Reproducing a tainted result must stay possible, just not accidental."""
+    from apnet_pt import model_io
+
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    path = tmp_path / "stale.pt"
+    checkpoint = harness._create_checkpoint()
+    del checkpoint["config"]["induction_functional_version"]
+    model_io.save_checkpoint(checkpoint, str(path))
+
+    reloaded = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=None,
+        pre_trained_model_path=str(path),
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        allow_stale_induction_functional=True,
+    )
+    assert reloaded.model is not None

@@ -272,6 +272,38 @@ CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION = (0.05, 0.05, 0.05, 0.05, 0.05)
 # `K > 0` and `S_ij > 0`.
 CLIFF_INDUCTION_DAMPING_PARAMETERS = ("thole_direct", "thole_mutual")
 
+# Which induction functional a checkpoint's weights were fitted against.
+#
+# 1 (implicit -- the key is simply absent): `mu_induced_0` was driven by the
+#   AA and BB permanent fields as well as AB, so the dipoles carried each
+#   monomer's isolated-state polarization into an energy contracted over
+#   intermolecular edges alone. Positive on 421 of 528 S66x8 geometries.
+# 2: intermolecular driving field only. Matches `dimer_induced_dipole_torch`
+#   and is the variational functional of its own solve.
+#
+# This is versioned rather than left implicit because training warm-starts
+# from whatever checkpoint file is present, and the affected checkpoints sit
+# at exactly the paths a rerun reuses. The taint is not confined to induction:
+# the Eq. (23) loss is joint, so a version-1 checkpoint's electrostatics and
+# exchange heads were fitted against a wrong induction gradient too, and
+# resuming from one silently contaminates every component.
+INDUCTION_FUNCTIONAL_VERSION = 2
+
+# The `dimer_eval` modes whose forward calls `rackers_thole_induction`, and so
+# the ones a stale functional version applies to. The `*induced_dipole*` modes
+# are deliberately absent: they go through `induced_dipole_induction` /
+# `dimer_induced_dipole_torch`, which never had the defect. `cliff_exch` is
+# absent because it computes no induction at all.
+INDUCTION_DIMER_EVAL_MODES = frozenset(
+    {
+        "rackers_thole",
+        "rackers_thole_overlap",
+        "cliff_classical",
+        "cliff_classical_overlap",
+        "cliff_classical_d3",
+    }
+)
+
 # Column indices into the 2-D parameter tensors returned by ``CliffExchangeNN``
 # and ``CliffClassicalNN``.  Both classes present a uniform ``[n_atoms, k]``
 # contract, so these indices are the only sanctioned way to read a column.
@@ -3209,6 +3241,38 @@ _CLIFF_PARAMETER_HEADS: dict[str, type[_CliffPositiveParamNN]] = {
 _CLIFF_HEAD_DEFAULT = object()
 
 
+def _validate_induction_functional_version(
+    model_config, dimer_eval_type, allow_stale, label, path
+):
+    """Refuse to resume from weights fitted against the old induction energy.
+
+    Training warm-starts from whatever checkpoint file is present, and the
+    affected checkpoints sit at exactly the paths a rerun reuses -- so without
+    this the correction is one accidental relaunch away from being undone, with
+    nothing in the logs to say so. The message names the physics rather than
+    just the version numbers, because a bare integer mismatch invites being
+    silenced rather than read.
+    """
+    if dimer_eval_type not in INDUCTION_DIMER_EVAL_MODES:
+        return
+    version = model_config.get("induction_functional_version", 1)
+    if version == INDUCTION_FUNCTIONAL_VERSION or allow_stale:
+        return
+    raise ValueError(
+        f"{label} refusing to load {path}: it was trained with induction "
+        f"functional version {version}, and this build computes version "
+        f"{INDUCTION_FUNCTIONAL_VERSION}. Version 1 drove the induced dipoles "
+        "with each monomer's own permanent field as well as the partner's, "
+        "while contracting the energy over intermolecular edges only, which "
+        "put induction positive on 421 of 528 S66x8 geometries. Because the "
+        "CLIFF Eq. (23) loss is joint, the electrostatics and exchange heads "
+        "in such a checkpoint were also fitted against that wrong gradient, so "
+        "resuming from it contaminates every component and not just induction. "
+        "Retrain from scratch, or pass allow_stale_induction_functional=True "
+        "to reproduce the old result deliberately."
+    )
+
+
 def _cliff_head_overrides(**kwargs) -> dict:
     """Drop unspecified CLIFF head initialization knobs.
 
@@ -5929,6 +5993,7 @@ class AM_DimerParam_Model:
         readout_init_scale=_CLIFF_HEAD_DEFAULT,
         frozen_parameters=_CLIFF_HEAD_DEFAULT,
         shared_damping_parameters=_CLIFF_HEAD_DEFAULT,
+        allow_stale_induction_functional=False,
         param_n_message=_CLIFF_HEAD_DEFAULT,
         param_n_rbf=_CLIFF_HEAD_DEFAULT,
         param_hidden=_CLIFF_HEAD_DEFAULT,
@@ -6053,6 +6118,13 @@ class AM_DimerParam_Model:
             model_io.validate_checkpoint(
                 param_checkpoint,
                 expected_type=model_type,
+            )
+            _validate_induction_functional_version(
+                param_checkpoint.get("config") or {},
+                dimer_eval_type,
+                allow_stale_induction_functional,
+                label,
+                pre_trained_model_path,
             )
             param_config = param_checkpoint["config"]
             if param_config.get("parameter_names") != expected_parameter_names:
@@ -6647,6 +6719,13 @@ class AM_DimerParam_Model:
             # `dimer_eval` is the key the contract validation in `__init__`
             # cross-checks, so every positive-parameter head records it.
             model_config["dimer_eval"] = self.dimer_eval_type
+        if self.dimer_eval_type in INDUCTION_DIMER_EVAL_MODES:
+            # Stamped only on the routes that actually compute induction, so a
+            # pure-exchange checkpoint is not gated on a functional it never
+            # used.
+            model_config["induction_functional_version"] = (
+                INDUCTION_FUNCTIONAL_VERSION
+            )
         if type(model).__name__ in _CLIFF_PARAMETER_HEADS:
             model_config["d3_damping_parameters"] = deepcopy(
                 self.dimer_model.d3_damping_parameters

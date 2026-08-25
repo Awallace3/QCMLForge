@@ -39,6 +39,7 @@ from .mtp_mtp import (
     CLIFF_CLASSICAL_INITIAL_VALUES,
     CLIFF_CLASSICAL_PARAMETER_NAMES,
     FULL_EDGE_DIMER_EVAL_MODES,
+    INDUCTION_FUNCTIONAL_VERSION,
     OVERLAP_WIDTH_FLOOR,
     POSITIVE_PARAMETER_CONTRACTS,
     CliffClassicalNN,
@@ -393,6 +394,15 @@ def merge_classical_parameter_checkpoints(
     # loss weighting is reset to the neutral default.
     config["component_gamma"] = None
     config["total_includes_d3"] = False
+    # The merged checkpoint is only as current as the source that carries the
+    # induction columns. Exchange contributes column 4 and no induction, so it
+    # cannot make the result stale; with no Rackers source at all the induction
+    # columns are untrained seeds, which the current functional produced.
+    config["induction_functional_version"] = (
+        rackers["config"].get("induction_functional_version", 1)
+        if rackers is not None
+        else INDUCTION_FUNCTIONAL_VERSION
+    )
 
     checkpoint = model_io.create_checkpoint(
         model=destination,

@@ -1129,3 +1129,50 @@ def test_merge_cli_rejects_incomplete_argument_sets(
     assert result.returncode != 0, reason
     assert "ValueError" in result.stderr
     assert not (tmp_path / "unused.pt").exists()
+
+
+def test_merge_inherits_the_induction_version_from_the_rackers_source(
+    component_checkpoints, tmp_path
+):
+    """A merge is only as current as the source carrying the induction columns.
+
+    Exchange contributes column 4 and no induction, so it cannot make the
+    result stale; the Rackers source can, and a merged checkpoint that silently
+    claimed to be current would launder a pre-fix fit straight back into
+    training.
+    """
+    from apnet_pt.AtomPairwiseModels import mtp_mtp
+
+    merged = merge_classical_parameter_checkpoints(
+        component_checkpoints["rackers_path"],
+        component_checkpoints["exchange_path"],
+        None,
+    )
+    assert (
+        merged["config"]["induction_functional_version"]
+        == mtp_mtp.INDUCTION_FUNCTIONAL_VERSION
+    )
+
+    stale = torch.load(
+        component_checkpoints["rackers_path"], weights_only=False
+    )
+    del stale["config"]["induction_functional_version"]
+    stale_path = tmp_path / "stale_rackers.pt"
+    model_io.save_checkpoint(stale, str(stale_path))
+    merged_stale = merge_classical_parameter_checkpoints(
+        str(stale_path), component_checkpoints["exchange_path"], None
+    )
+    assert merged_stale["config"]["induction_functional_version"] == 1
+
+
+def test_merging_exchange_alone_is_current(component_checkpoints):
+    """No Rackers source: the induction columns are untrained seeds."""
+    from apnet_pt.AtomPairwiseModels import mtp_mtp
+
+    merged = merge_classical_parameter_checkpoints(
+        None, component_checkpoints["exchange_path"], None
+    )
+    assert (
+        merged["config"]["induction_functional_version"]
+        == mtp_mtp.INDUCTION_FUNCTIONAL_VERSION
+    )
