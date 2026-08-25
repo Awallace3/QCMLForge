@@ -260,3 +260,124 @@ def test_at_the_seed_the_overlap_term_is_a_small_correction(
     assert abs(total - pol) / abs(pol) == pytest.approx(
         expected_share, abs=0.001
     )
+
+
+# ---------------------------------------------------------------------------
+# Why induction comes out repulsive on most of S66x8
+#
+# The S66x8 gate on the two finished 50-epoch arms put `cliff2_ind_ipd` -- the
+# polarization energy with the overlap term switched off -- positive on 421 of
+# 528 geometries, maximum +4.36 kcal/mol, while `cliff2_ind_overlap` was
+# non-positive on all 528. So the overlap term is not the problem; the IPD
+# energy is. The same panel puts `ap3d3_classical_ind`, this repository's other
+# induced-point-dipole path, non-positive on all 528.
+#
+# The two paths differ in one place. `dimer_induced_dipole_torch` (AP3-D3)
+# builds `mu_induced_0` from the intermolecular edges alone.
+# `_rackers_initial_permanent_fields` (CLIFF2) additionally accumulates the AA
+# and BB permanent fields, so its induced dipoles include the polarization each
+# monomer already had in isolation -- and then the energy contracts those
+# dipoles over intermolecular edges only. The monomer-intrinsic part of mu
+# contracted with the other monomer's field is not an induction energy and
+# carries no sign constraint.
+#
+# The pair below is the minimal demonstration: identical geometry, identical
+# parameters, differing only in whether the intramolecular edges are supplied.
+# ---------------------------------------------------------------------------
+
+_INTRA_Q = (0.9, -0.9)
+# Bohr, like every other length in this file; positions are converted to the
+# Angstrom the function expects exactly once, at the boundary.
+_INTRA_SEP_BOHR = 1.2
+_INTRA_R_BOHR = 4.5
+
+
+def _two_atom_monomer_inputs(*, with_intramolecular):
+    empty = torch.tensor([], dtype=torch.long)
+    intra_source = torch.tensor([0, 1])
+    intra_target = torch.tensor([1, 0])
+    return dict(
+        ZA=torch.tensor([Z, Z]),
+        RA=torch.tensor(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, _INTRA_SEP_BOHR * constants.au2ang]],
+            dtype=D,
+        ),
+        qA=torch.tensor(_INTRA_Q, dtype=D),
+        muA=torch.zeros((2, 3), dtype=D),
+        quadA=torch.zeros((2, 3, 3), dtype=D),
+        ZB=torch.tensor([Z]),
+        RB=torch.tensor(
+            [[0.0, 0.0, _INTRA_R_BOHR * constants.au2ang]], dtype=D
+        ),
+        qB=torch.tensor([0.0], dtype=D),
+        muB=torch.zeros((1, 3), dtype=D),
+        quadB=torch.zeros((1, 3, 3), dtype=D),
+        e_AB_source=torch.tensor([0, 1]),
+        e_AB_target=torch.tensor([0, 0]),
+        e_AA_source=intra_source if with_intramolecular else empty,
+        e_AA_target=intra_target if with_intramolecular else empty,
+        e_BB_source=empty,
+        e_BB_target=empty,
+        hirshfeld_volume_ratio_A=torch.ones(2, dtype=D),
+        hirshfeld_volume_ratio_B=torch.ones(1, dtype=D),
+        valence_widths_A=torch.full((2,), SIGMA, dtype=D),
+        valence_widths_B=torch.full((1,), SIGMA, dtype=D),
+        thole_direct_A=torch.full((2,), A_THOLE, dtype=D),
+        thole_direct_B=torch.full((1,), A_THOLE, dtype=D),
+        thole_mutual_A=torch.full((2,), A_THOLE, dtype=D),
+        thole_mutual_B=torch.full((1,), A_THOLE, dtype=D),
+        ind_overlap_A=torch.full((2,), K_IND, dtype=D),
+        ind_overlap_B=torch.full((1,), K_IND, dtype=D),
+        convergence_threshold=1e-13,
+        max_iterations=500,
+    )
+
+
+def test_the_intermolecular_field_alone_gives_attractive_induction():
+    """The AP3-D3 construction, on the geometry that breaks the other one."""
+    E = mtp_mtp.rackers_thole_induction(
+        **_two_atom_monomer_inputs(with_intramolecular=False)
+    ).sum()
+    assert E.item() == pytest.approx(-0.498250, rel=1e-4)
+    assert E.item() < 0
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known defect: mu_induced_0 accumulates the AA/BB permanent fields "
+        "while the energy contracts only AB edges, so the monomers' intrinsic "
+        "polarization enters an energy that has no sign constraint. This is "
+        "the mechanism behind cliff2_ind_ipd being positive on 421 of 528 "
+        "S66x8 geometries. Remove this marker with the fix -- strict=True "
+        "means it fails loudly once induction here becomes attractive."
+    ),
+)
+def test_induction_must_be_attractive_with_intramolecular_fields_too():
+    """Same geometry and parameters; only the AA edges are added.
+
+    Attractive without them (-0.498 kcal/mol), repulsive with them (+0.346).
+    Nothing about adding a monomer's own internal field to its own dipole solve
+    should be able to turn an interaction induction repulsive.
+    """
+    E = mtp_mtp.rackers_thole_induction(
+        **_two_atom_monomer_inputs(with_intramolecular=True)
+    ).sum()
+    assert E.item() < 0, f"induction is repulsive: {E.item():+.6f} kcal/mol"
+
+
+def test_the_intramolecular_contribution_is_repulsive_and_this_is_its_size():
+    """Pinned so the fix has something quantitative to move.
+
+    Not a tolerance on a physical quantity -- a record of how large the
+    unconstrained term is on a deliberately unfavourable geometry, so a change
+    to the functional can be checked against it rather than against intuition.
+    """
+    without = mtp_mtp.rackers_thole_induction(
+        **_two_atom_monomer_inputs(with_intramolecular=False)
+    ).sum().item()
+    with_intra = mtp_mtp.rackers_thole_induction(
+        **_two_atom_monomer_inputs(with_intramolecular=True)
+    ).sum().item()
+    assert with_intra - without == pytest.approx(+0.844, abs=0.002)
+    assert with_intra > 0 > without
