@@ -28,6 +28,15 @@ import h5py
 AP3_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9, 10})
 
 
+def _progress_percent_milestones(previous_cursor, current_cursor, total_rows):
+    """Return newly crossed integer percentages for committed raw rows."""
+    if total_rows <= 0:
+        return ()
+    previous_percent = min(100, max(0, previous_cursor) * 100 // total_rows)
+    current_percent = min(100, max(0, current_cursor) * 100 // total_rows)
+    return range(previous_percent + 1, current_percent + 1)
+
+
 def spec_type_uses_split_files(spec_type):
     return spec_type in AP3_FUSED_SPLIT_SPEC_TYPES
 
@@ -2031,9 +2040,34 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         t2 = time()
         print(f"{len(RAs)=}, {self.atomic_batch_size=}, {self.batch_size=}")
 
+        total_raw_rows = len(RAs)
+        progress_raw_cursor = resume_raw_cursor
+        if total_raw_rows > 0:
+            print(
+                "AP3 fused dataset progress "
+                f"[{self.split}]: resume at "
+                f"{resume_raw_cursor}/{total_raw_rows} "
+                f"({resume_raw_cursor * 100 / total_raw_rows:.2f}%) committed",
+                flush=True,
+            )
+
+        def report_committed_progress(committed_raw_cursor):
+            nonlocal progress_raw_cursor
+            for percent in _progress_percent_milestones(
+                progress_raw_cursor, committed_raw_cursor, total_raw_rows
+            ):
+                print(
+                    "AP3 fused dataset progress "
+                    f"[{self.split}]: {percent}% "
+                    f"({committed_raw_cursor}/{total_raw_rows} raw rows committed; "
+                    f"{self._length} objects stored)",
+                    flush=True,
+                )
+            progress_raw_cursor = committed_raw_cursor
+
         batch_data_objects = []
         processed_raw_cursor = resume_raw_cursor
-        for i in range(len(RAs)):
+        for i in range(total_raw_rows):
             if self.skip_processed and i < resume_raw_cursor:
                 continue
             processed_raw_cursor = i + 1
@@ -2078,6 +2112,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
 
             if len(data_objects) >= self.datapoint_storage_n_objects:
                 self._store_to_lmdb(data_objects, stored_idx, i + 1)
+                report_committed_progress(i + 1)
 
                 if self.print_level >= 2:
                     print(
@@ -2100,6 +2135,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
 
         if len(data_objects) > 0:
             self._store_to_lmdb(data_objects, stored_idx, processed_raw_cursor)
+            report_committed_progress(processed_raw_cursor)
 
             if self.print_level >= 2:
                 print(
@@ -2107,6 +2143,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 )
         elif processed_raw_cursor > resume_raw_cursor:
             self._store_to_lmdb([], stored_idx, processed_raw_cursor)
+            report_committed_progress(processed_raw_cursor)
 
         print(f"Processing complete. Total time: {time() - t1:.2f}s")
 
