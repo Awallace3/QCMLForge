@@ -447,6 +447,11 @@ def test_overlap_is_differentiable_and_finite():
 # widths (0.04, 0.07) that AtomHirshfeldMPNN's relu(...) + 1e-4 head can
 # really emit, so clamping there would move these numbers substantially.
 
+# Pins for the LEGACY path (`intramolecular_permanent_field=True`). They
+# still do the job they were written for -- guarding a refactor against
+# numerical drift -- but they are not physically meaningful: three of the
+# six no-overlap edges are positive and the sum is repulsive. Kept so a
+# checkpoint trained before the fix can be reproduced exactly.
 _PRE_REFACTOR_RACKERS_OVERLAP = [
     -0.2079548809718,
     -1.444842017749,
@@ -518,7 +523,7 @@ def overlap_regression_inputs():
     )
 
 
-def _run_rackers(d, include_overlap):
+def _run_rackers(d, include_overlap, legacy=False):
     return mtp_mtp.rackers_thole_induction(
         d["ZA"], d["RA"], d["qA"], d["muA"], d["quadA"],
         d["ZB"], d["RB"], d["qB"], d["muB"], d["quadB"],
@@ -530,6 +535,7 @@ def _run_rackers(d, include_overlap):
         d["thole_mutual_A"], d["thole_mutual_B"],
         d["K_A"], d["K_B"],
         include_overlap=include_overlap,
+        intramolecular_permanent_field=legacy,
         polarizability_table=d["table"],
     )
 
@@ -550,7 +556,9 @@ def _run_induced_dipole(d, fn):
 def test_rackers_thole_induction_overlap_matches_pre_refactor(
     overlap_regression_inputs,
 ):
-    got = _run_rackers(overlap_regression_inputs, include_overlap=True)
+    got = _run_rackers(
+        overlap_regression_inputs, include_overlap=True, legacy=True
+    )
     torch.testing.assert_close(
         got,
         torch.tensor(_PRE_REFACTOR_RACKERS_OVERLAP, dtype=torch.float64),
@@ -562,7 +570,9 @@ def test_rackers_thole_induction_overlap_matches_pre_refactor(
 def test_rackers_thole_induction_no_overlap_matches_pre_refactor(
     overlap_regression_inputs,
 ):
-    got = _run_rackers(overlap_regression_inputs, include_overlap=False)
+    got = _run_rackers(
+        overlap_regression_inputs, include_overlap=False, legacy=True
+    )
     torch.testing.assert_close(
         got,
         torch.tensor(_PRE_REFACTOR_RACKERS_NO_OVERLAP, dtype=torch.float64),
@@ -572,8 +582,79 @@ def test_rackers_thole_induction_no_overlap_matches_pre_refactor(
     # The overlap branch must actually be doing something on this fixture,
     # otherwise the regression pin above would be vacuous.
     assert not torch.allclose(
-        got, _run_rackers(overlap_regression_inputs, include_overlap=True)
+        got,
+        _run_rackers(
+            overlap_regression_inputs, include_overlap=True, legacy=True
+        ),
     )
+
+
+# The corrected path. Per-edge values are deliberately not sign-constrained --
+# induction is many-body and a single intermolecular pair's share of it can be
+# either sign -- so the invariant is on the sum, which is the quantity that is
+# trained on, evaluated, and gated. On this fixture the sum goes from +1.202
+# (repulsive, and impossible) to -1.450.
+_CORRECTED_RACKERS_NO_OVERLAP = [
+    0.089248862996,
+    0.227372857839,
+    -1.663607802379,
+    0.310104689048,
+    -0.472203538697,
+    0.059355193314,
+]
+_CORRECTED_RACKERS_OVERLAP = [
+    -0.065277474837,
+    0.227372857839,
+    -5.028966274500,
+    0.310104686816,
+    -0.472203538697,
+    0.059355193314,
+]
+
+
+@pytest.mark.parametrize(
+    "include_overlap,expected",
+    [
+        (False, _CORRECTED_RACKERS_NO_OVERLAP),
+        (True, _CORRECTED_RACKERS_OVERLAP),
+    ],
+)
+def test_rackers_thole_induction_corrected_values(
+    overlap_regression_inputs, include_overlap, expected
+):
+    got = _run_rackers(overlap_regression_inputs, include_overlap=include_overlap)
+    torch.testing.assert_close(
+        got,
+        torch.tensor(expected, dtype=torch.float64),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
+
+@pytest.mark.parametrize("include_overlap", [False, True])
+def test_the_corrected_path_is_attractive_on_this_fixture(
+    overlap_regression_inputs, include_overlap
+):
+    """The sign invariant, with and without the overlap term."""
+    corrected = _run_rackers(
+        overlap_regression_inputs, include_overlap=include_overlap
+    ).sum()
+    assert corrected.item() < 0, corrected.item()
+
+
+def test_the_legacy_polarization_alone_was_repulsive_here():
+    """Why the overlap term looked healthier than it was.
+
+    The legacy polarization energy sums to +1.202 on this fixture -- repulsive,
+    which induction cannot be. Adding the overlap term drags the total back to
+    -2.318, so the *total* looked fine while the term underneath it had the
+    wrong sign. That is the same masking seen on S66x8, where `cliff2_ind_ipd`
+    was positive on 421 of 528 geometries but `cliff2_ind` on only 341.
+    """
+    legacy_polarization = sum(_PRE_REFACTOR_RACKERS_NO_OVERLAP)
+    legacy_total = sum(_PRE_REFACTOR_RACKERS_OVERLAP)
+    assert legacy_polarization > 0
+    assert legacy_total < 0
 
 
 @pytest.mark.parametrize(

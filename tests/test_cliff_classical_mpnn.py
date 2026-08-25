@@ -994,16 +994,19 @@ def test_induction_diagnostics_report_the_audit_quantities(
 def test_induction_energy_is_not_the_variational_functional_of_its_solve(
     nested_hfvr_vw_model, synthetic_dimer_batch
 ):
-    """Pins the discrepancy this instrumentation exists to expose.
+    """The two energies now agree, which is the whole point of the fix.
 
-    The dipoles are solved against the full AA+BB+AB permanent field --
-    `_rackers_initial_permanent_fields` accumulates intramolecular terms into
-    `mu_induced_0` -- while the energy contracts over AB edges only. So the
-    trained energy is not `-1/2 mu . E_perm` of its own response, and carries no
-    guarantee of being attractive.
+    This test used to assert they *disagreed*, and told its own successor what
+    to do: "if the response solve and energy expression were made consistent,
+    delete this test and assert the sign invariant instead". That is what
+    happened. The permanent field is now intermolecular, so the dipoles are the
+    response to the partner and the intermolecular edge contraction *is* the
+    variational functional `-1/2 mu . E_perm` of the solve that produced them.
 
-    This test asserts the *current* behaviour so a redesign that makes the two
-    agree fails loudly and gets read, rather than passing silently.
+    That matters more than the numbers: a variational energy of a converged
+    linear response is non-positive by construction, so attractive induction is
+    now a structural property rather than something to be checked geometry by
+    geometry.
     """
     import copy
 
@@ -1018,17 +1021,43 @@ def test_induction_energy_is_not_the_variational_functional_of_its_solve(
     )
     contraction = diagnostics["energy_edge_contraction"]
     variational = diagnostics["energy_variational_total"]
-    assert contraction != pytest.approx(variational, rel=1e-3), (
-        "the two energies now agree -- if the response solve and energy "
-        "expression were made consistent, delete this test and assert the "
-        "sign invariant from ARCHITECTURE_HANDOFF.md instead"
+    assert contraction == pytest.approx(variational, rel=1e-6), (
+        "the edge contraction is no longer the variational functional of its "
+        "own solve -- the permanent field and the energy have gone back to "
+        "covering different edge sets"
     )
-    # The variational energy of a converged linear response is attractive.
+    # Both, not just the variational one: they are the same quantity now.
     assert variational < 0.0
+    assert contraction < 0.0
 
     src = inspect.getsource(mtp_mtp.rackers_thole_induction)
     assert "direct_tensors_AB[3]" in src and "direct_tensors_AB[4]" in src
     assert "e_AA_source" in src and "e_BB_source" in src
+
+
+def test_the_legacy_path_still_shows_the_discrepancy_it_was_written_for(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    """The same diagnostic on the pre-fix construction, as the control.
+
+    Without this, the agreement above could equally mean the diagnostic stopped
+    measuring anything.
+    """
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    _, diagnostics = mtp_mtp.rackers_thole_induction(
+        **_induction_kwargs(head, synthetic_dimer_batch),
+        include_overlap=False,
+        return_diagnostics=True,
+        intramolecular_permanent_field=True,
+    )
+    assert diagnostics["energy_edge_contraction"] != pytest.approx(
+        diagnostics["energy_variational_total"], rel=1e-3
+    )
 
 
 # ---------------------------------------------------------------------------

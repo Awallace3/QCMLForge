@@ -1422,7 +1422,12 @@ def test_rackers_kernel_routes_distinct_parameters_and_overlap(monkeypatch):
             inputs["e_BB_target"],
         ),
     ]
-    assert len(direct_calls) == 3
+    # One direct build, not three: the intramolecular direct tensors exist only
+    # to feed the intramolecular permanent field, which is off by default, so
+    # building them would be two discarded distance-tensor passes per batch.
+    # All three mutual builds stay -- the induced-induced relay still runs
+    # inside each monomer.
+    assert len(direct_calls) == 1
     assert len(mutual_calls) == 3
     for actual, expected in zip(direct_calls, expected_direct):
         assert torch.equal(actual, expected)
@@ -1527,19 +1532,25 @@ def test_rackers_kernel_routes_top_level_direct_monomer_effects(
             **inputs, include_overlap=False, max_iterations=4
         )
         assert len(captured_initial_fields) == 1
-        assert direct_call_index == 3
+        # AB only; see the call-count note in
+        # test_rackers_kernel_routes_distinct_parameters_and_overlap.
+        assert direct_call_index == 1
         return energy.detach().clone(), captured_initial_fields[0]
 
     baseline_energy, (baseline_A, baseline_B) = run_with_perturbation(None)
     aa_energy, (aa_A, aa_B) = run_with_perturbation(1)
     bb_energy, (bb_A, bb_B) = run_with_perturbation(2)
 
-    assert not torch.equal(aa_A, baseline_A)
+    # Perturbing the intramolecular *direct* tensors must now change nothing:
+    # not the permanent field, and not the energy. They are the only route by
+    # which a monomer's own multipoles could reach its induced dipoles, and
+    # that route is closed by default.
+    assert torch.equal(aa_A, baseline_A)
     assert torch.equal(aa_B, baseline_B)
-    assert not torch.allclose(aa_energy, baseline_energy)
+    assert torch.allclose(aa_energy, baseline_energy)
     assert torch.equal(bb_A, baseline_A)
-    assert not torch.equal(bb_B, baseline_B)
-    assert not torch.allclose(bb_energy, baseline_energy)
+    assert torch.equal(bb_B, baseline_B)
+    assert torch.allclose(bb_energy, baseline_energy)
 
 
 def test_rackers_kernel_routes_direct_fields_and_mutual_scf_effect():
@@ -1581,6 +1592,10 @@ def test_rackers_kernel_routes_direct_fields_and_mutual_scf_effect():
         T1_AB,
         T2_AB,
     )
+    # By default the permanent field is intermolecular: the AA and BB direct
+    # tensors must not reach it at all. Feeding a monomer's own field into its
+    # own dipoles, then contracting those dipoles over intermolecular edges
+    # only, is what put induction positive on 421 of 528 S66x8 geometries.
     base_A, base_B = mtp_mtp._rackers_initial_permanent_fields(
         *helper_args, zero_T1, zero_T2, zero_T1, zero_T2
     )
@@ -1590,10 +1605,28 @@ def test_rackers_kernel_routes_direct_fields_and_mutual_scf_effect():
     direct_BB_A, direct_BB_B = mtp_mtp._rackers_initial_permanent_fields(
         *helper_args, zero_T1, zero_T2, T1_AB, T2_AB
     )
-    assert not torch.equal(base_A, direct_AA_A)
+    assert torch.equal(base_A, direct_AA_A)
     assert torch.equal(base_B, direct_AA_B)
     assert torch.equal(base_A, direct_BB_A)
-    assert not torch.equal(base_B, direct_BB_B)
+    assert torch.equal(base_B, direct_BB_B)
+
+    # Under the legacy flag the old routing is still exactly as it was: A's own
+    # field reaches A alone and B's reaches B alone. Kept so a pre-fix
+    # checkpoint can still be reproduced bit for bit.
+    legacy = dict(intramolecular_permanent_field=True)
+    legacy_base_A, legacy_base_B = mtp_mtp._rackers_initial_permanent_fields(
+        *helper_args, zero_T1, zero_T2, zero_T1, zero_T2, **legacy
+    )
+    legacy_AA_A, legacy_AA_B = mtp_mtp._rackers_initial_permanent_fields(
+        *helper_args, T1_AB, T2_AB, zero_T1, zero_T2, **legacy
+    )
+    legacy_BB_A, legacy_BB_B = mtp_mtp._rackers_initial_permanent_fields(
+        *helper_args, zero_T1, zero_T2, T1_AB, T2_AB, **legacy
+    )
+    assert not torch.equal(legacy_base_A, legacy_AA_A)
+    assert torch.equal(legacy_base_B, legacy_AA_B)
+    assert torch.equal(legacy_base_A, legacy_BB_A)
+    assert not torch.equal(legacy_base_B, legacy_BB_B)
 
     initial_A_before_mutual_update = base_A.clone()
     initial_B_before_mutual_update = base_B.clone()
@@ -1874,11 +1907,10 @@ def test_rackers_kernel_routes_charge_oracle_orientation_and_symmetry():
         mutual_BB,
         "mutual",
     )
-    expected_direct = (
-        (expected_T1_AB, expected_direct_T2_AB),
-        (expected_T1_AA, expected_direct_T2_AA),
-        (expected_T1_BB, expected_direct_T2_BB),
-    )
+    # Only the intermolecular direct tensors are built now; the AA/BB direct
+    # oracles below are still computed because the mutual comparison and the
+    # legacy-path check both need the same geometry.
+    expected_direct = ((expected_T1_AB, expected_direct_T2_AB),)
     expected_mutual_T2 = (
         expected_mutual_T2_AB,
         expected_mutual_T2_AA,
@@ -1907,30 +1939,62 @@ def test_rackers_kernel_routes_charge_oracle_orientation_and_symmetry():
         torch.einsum("ai,ai->a", cross_field_B, displacement_AB) > 0
     )
 
+    # The permanent field is the intermolecular contribution and nothing else.
+    # The intramolecular terms the oracle used to add here are exactly the
+    # defect: they made mu carry each monomer's isolated-state polarization
+    # into an energy contracted over intermolecular edges alone.
     expected_initial_A = torch.zeros_like(RA)
     expected_initial_A.index_add_(0, e_AB_source, cross_field_A)
-    expected_initial_A.index_add_(
-        0,
-        e_AA_target,
-        alpha_A.index_select(0, e_AA_target)[:, None]
-        * -expected_T1_AA
-        * qA.index_select(0, e_AA_source)[:, None],
-    )
     expected_initial_B = torch.zeros_like(RB)
     expected_initial_B.index_add_(0, e_AB_target, cross_field_B)
-    expected_initial_B.index_add_(
-        0,
-        e_BB_target,
-        alpha_B.index_select(0, e_BB_target)[:, None]
-        * -expected_T1_BB
-        * qB.index_select(0, e_BB_source)[:, None],
-    )
     assert torch.allclose(
         actual_initial[0], expected_initial_A, atol=1e-12
     )
     assert torch.allclose(
         actual_initial[1], expected_initial_B, atol=1e-12
     )
+
+    # The legacy path still reproduces the old oracle exactly, which is what
+    # makes reproducing a pre-fix checkpoint possible.
+    legacy_A, legacy_B = mtp_mtp._rackers_initial_permanent_fields(
+        alpha_A,
+        alpha_B,
+        qA,
+        torch.zeros_like(RA),
+        qB,
+        torch.zeros_like(RB),
+        e_AB_source,
+        e_AB_target,
+        e_AA_source,
+        e_AA_target,
+        e_BB_source,
+        e_BB_target,
+        expected_T1_AB,
+        expected_direct_T2_AB,
+        expected_T1_AA,
+        expected_direct_T2_AA,
+        expected_T1_BB,
+        expected_direct_T2_BB,
+        intramolecular_permanent_field=True,
+    )
+    legacy_expected_A = expected_initial_A.clone()
+    legacy_expected_A.index_add_(
+        0,
+        e_AA_target,
+        alpha_A.index_select(0, e_AA_target)[:, None]
+        * -expected_T1_AA
+        * qA.index_select(0, e_AA_source)[:, None],
+    )
+    legacy_expected_B = expected_initial_B.clone()
+    legacy_expected_B.index_add_(
+        0,
+        e_BB_target,
+        alpha_B.index_select(0, e_BB_target)[:, None]
+        * -expected_T1_BB
+        * qB.index_select(0, e_BB_source)[:, None],
+    )
+    assert torch.allclose(legacy_A, legacy_expected_A, atol=1e-12)
+    assert torch.allclose(legacy_B, legacy_expected_B, atol=1e-12)
 
     expected_update_A = expected_initial_A.clone()
     expected_update_A.index_add_(

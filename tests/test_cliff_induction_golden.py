@@ -342,42 +342,160 @@ def test_the_intermolecular_field_alone_gives_attractive_induction():
     assert E.item() < 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known defect: mu_induced_0 accumulates the AA/BB permanent fields "
-        "while the energy contracts only AB edges, so the monomers' intrinsic "
-        "polarization enters an energy that has no sign constraint. This is "
-        "the mechanism behind cliff2_ind_ipd being positive on 421 of 528 "
-        "S66x8 geometries. Remove this marker with the fix -- strict=True "
-        "means it fails loudly once induction here becomes attractive."
-    ),
-)
-def test_induction_must_be_attractive_with_intramolecular_fields_too():
-    """Same geometry and parameters; only the AA edges are added.
+def test_intramolecular_edges_can_no_longer_flip_the_sign():
+    """The regression this file was written to catch, now fixed.
 
-    Attractive without them (-0.498 kcal/mol), repulsive with them (+0.346).
-    Nothing about adding a monomer's own internal field to its own dipole solve
-    should be able to turn an interaction induction repulsive.
+    Before the fix, adding the AA edges turned this geometry from -0.498 to
+    +0.346 kcal/mol, because they fed the monomer's own permanent field into
+    `mu_induced_0`. The permanent driving field is now intermolecular by
+    construction, so the AA edges reach only the induced-induced relay.
+
+    That relay is *not* inert and should not be: a dipole induced on atom 0 by
+    B propagates to atom 1 through `T2_AA`, which is real many-body
+    polarization. So the energy still moves -- by 0.9% here, and deeper rather
+    than shallower. What it can no longer do is change sign.
     """
-    E = mtp_mtp.rackers_thole_induction(
-        **_two_atom_monomer_inputs(with_intramolecular=True)
-    ).sum()
-    assert E.item() < 0, f"induction is repulsive: {E.item():+.6f} kcal/mol"
-
-
-def test_the_intramolecular_contribution_is_repulsive_and_this_is_its_size():
-    """Pinned so the fix has something quantitative to move.
-
-    Not a tolerance on a physical quantity -- a record of how large the
-    unconstrained term is on a deliberately unfavourable geometry, so a change
-    to the functional can be checked against it rather than against intuition.
-    """
-    without = mtp_mtp.rackers_thole_induction(
-        **_two_atom_monomer_inputs(with_intramolecular=False)
-    ).sum().item()
     with_intra = mtp_mtp.rackers_thole_induction(
         **_two_atom_monomer_inputs(with_intramolecular=True)
     ).sum().item()
-    assert with_intra - without == pytest.approx(+0.844, abs=0.002)
-    assert with_intra > 0 > without
+    without = mtp_mtp.rackers_thole_induction(
+        **_two_atom_monomer_inputs(with_intramolecular=False)
+    ).sum().item()
+    assert with_intra < 0 and without < 0
+    assert abs(with_intra - without) / abs(without) < 0.02
+    assert with_intra == pytest.approx(-0.493529, rel=1e-5)
+
+
+def test_the_pre_fix_construction_is_still_reachable_and_still_repulsive():
+    """Kept so pre-fix checkpoints can be reproduced, not because it is right.
+
+    Pinning the old number is what makes "the tainted runs used this" a
+    checkable statement rather than a note in a log.
+    """
+    E = mtp_mtp.rackers_thole_induction(
+        **_two_atom_monomer_inputs(with_intramolecular=True),
+        intramolecular_permanent_field=True,
+    ).sum()
+    assert E.item() == pytest.approx(+0.345847, rel=1e-4)
+
+
+def test_the_size_of_the_defect_that_was_removed():
+    """How large the unconstrained term was, on one unfavourable geometry.
+
+    Recorded because it sets the scale of what changes in every pre-fix
+    number: +0.844 kcal/mol on a single three-atom system, against an
+    attractive -0.494 -- enough to reverse the sign on its own.
+    """
+    corrected = mtp_mtp.rackers_thole_induction(
+        **_two_atom_monomer_inputs(with_intramolecular=True)
+    ).sum().item()
+    pre_fix = mtp_mtp.rackers_thole_induction(
+        **_two_atom_monomer_inputs(with_intramolecular=True),
+        intramolecular_permanent_field=True,
+    ).sum().item()
+    assert pre_fix - corrected == pytest.approx(+0.839, abs=0.002)
+    assert pre_fix > 0 > corrected
+
+
+# ---------------------------------------------------------------------------
+# Equivalence with the AP3-D3 path
+#
+# `dimer_induced_dipole_torch` is the induced-point-dipole implementation that
+# is non-positive on all 528 S66x8 geometries. It uses one damping form
+# (`thole_damping_torch`, the mutual `u**3`) for both the permanent and the
+# induced tensors, so CLIFF2 must reproduce it exactly once the direct and
+# mutual columns are equal and the direct exponent is 3 -- which is only a
+# meaningful comparison because the `lambda_5` coefficient now follows the
+# exponent. Anything left over is a difference between the two routes that
+# nobody chose.
+# ---------------------------------------------------------------------------
+
+
+def _matched_dimer():
+    """A water-dimer-like system with full intramolecular edge sets."""
+    n_a, n_b = 3, 2
+    torch.manual_seed(11)
+
+    def intra(n):
+        pairs = [(i, j) for i in range(n) for j in range(n) if i != j]
+        source, target = zip(*pairs)
+        return torch.tensor(source), torch.tensor(target)
+
+    e_aa_source, e_aa_target = intra(n_a)
+    e_bb_source, e_bb_target = intra(n_b)
+    return n_a, n_b, dict(
+        ZA=torch.tensor([8, 1, 1]),
+        RA=torch.tensor(
+            [[0.0, 0.0, 0.0], [0.95, 0.0, 0.0], [-0.3, 0.9, 0.0]], dtype=D
+        ),
+        qA=torch.tensor([-0.8, 0.4, 0.4], dtype=D),
+        muA=torch.randn(n_a, 3, dtype=D) * 0.1,
+        quadA=torch.zeros(n_a, 3, 3, dtype=D),
+        ZB=torch.tensor([8, 1]),
+        RB=torch.tensor([[0.2, 0.4, 3.1], [0.9, 1.2, 3.6]], dtype=D),
+        qB=torch.tensor([-0.5, 0.5], dtype=D),
+        muB=torch.randn(n_b, 3, dtype=D) * 0.1,
+        quadB=torch.zeros(n_b, 3, 3, dtype=D),
+        e_AB_source=torch.arange(n_a).repeat_interleave(n_b),
+        e_AB_target=torch.arange(n_b).repeat(n_a),
+        e_AA_source=e_aa_source,
+        e_BB_source=e_bb_source,
+        e_AA_target=e_aa_target,
+        e_BB_target=e_bb_target,
+        hirshfeld_volume_ratio_A=torch.tensor([0.9, 0.95, 0.95], dtype=D),
+        hirshfeld_volume_ratio_B=torch.tensor([0.92, 0.97], dtype=D),
+        valence_widths_A=torch.full((n_a,), SIGMA, dtype=D),
+        valence_widths_B=torch.full((n_b,), SIGMA, dtype=D),
+    )
+
+
+def _cliff2_on(shared, n_a, n_b, **overrides):
+    return mtp_mtp.rackers_thole_induction(
+        **shared,
+        thole_direct_A=torch.full((n_a,), A_THOLE, dtype=D),
+        thole_direct_B=torch.full((n_b,), A_THOLE, dtype=D),
+        thole_mutual_A=torch.full((n_a,), A_THOLE, dtype=D),
+        thole_mutual_B=torch.full((n_b,), A_THOLE, dtype=D),
+        ind_overlap_A=torch.full((n_a,), K_IND, dtype=D),
+        ind_overlap_B=torch.full((n_b,), K_IND, dtype=D),
+        thole_direct_exponent=3.0,
+        convergence_threshold=1e-13,
+        max_iterations=1000,
+        **overrides,
+    ).sum().item()
+
+
+def _ap3d3_on(shared):
+    import contextlib
+    import io
+
+    from apnet_pt import multipole
+
+    # The function prints its intermediates unconditionally.
+    with contextlib.redirect_stdout(io.StringIO()):
+        return multipole.dimer_induced_dipole_torch(
+            **shared, thole_damping_param=A_THOLE
+        ).sum().item()
+
+
+def test_corrected_cliff2_reproduces_the_ap3d3_induction_path():
+    """Same physics, same numbers -- to the SCF's own convergence."""
+    n_a, n_b, shared = _matched_dimer()
+    assert _cliff2_on(shared, n_a, n_b) == pytest.approx(
+        _ap3d3_on(shared), abs=1e-8
+    )
+
+
+def test_the_pre_fix_construction_disagreed_with_ap3d3_by_a_kcal_per_mol():
+    """The size of the defect on a realistic system, not a toy.
+
+    1.10 kcal/mol on one water-dimer-like pair, against an AP3-D3 answer of
+    -0.117. Every induction number produced before the fix carries an error of
+    this order, which is why they are all tainted rather than merely noisy.
+    """
+    n_a, n_b, shared = _matched_dimer()
+    reference = _ap3d3_on(shared)
+    pre_fix = _cliff2_on(
+        shared, n_a, n_b, intramolecular_permanent_field=True
+    )
+    assert abs(pre_fix - reference) == pytest.approx(1.104, abs=0.01)

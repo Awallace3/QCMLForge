@@ -4165,8 +4165,32 @@ def _rackers_initial_permanent_fields(
     T2_AA: torch.Tensor,
     T1_BB: torch.Tensor,
     T2_BB: torch.Tensor,
+    intramolecular_permanent_field: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build permanent-multipole fields using only direct tensors."""
+    """Build the permanent-multipole field that drives the induced dipoles.
+
+    ``intramolecular_permanent_field`` selects which edges contribute. It must
+    be ``False`` for an *interaction* induction energy, and the default is
+    ``False``.
+
+    With it ``True`` -- what this module did until the S66x8 gate exposed it --
+    each monomer's own multipoles polarize that monomer, so ``mu_induced_0``
+    carries the polarization each monomer already had in isolation. The energy
+    then contracts those dipoles over intermolecular edges only. Contracting a
+    monomer's *intrinsic* dipole with the other monomer's field is not an
+    induction energy at all and carries no sign constraint, and it is why
+    ``cliff2_ind_ipd`` came out positive on 421 of 528 S66x8 geometries.
+
+    With it ``False`` the dipoles are the *change* produced by the partner
+    monomer, which is what the intermolecular energy contraction assumes. This
+    matches :func:`apnet_pt.multipole.dimer_induced_dipole_torch`, the AP3-D3
+    path, which is non-positive on all 528.
+
+    Note the intramolecular *mutual* (induced-induced) relay in
+    :func:`_rackers_scf_update` is untouched and stays on in both cases: a
+    dipole induced by the partner may still propagate through its own monomer's
+    polarizability. Only the permanent driving field is intermolecular.
+    """
     n_atoms_A = alpha_A.shape[0]
     n_atoms_B = alpha_B.shape[0]
     qA = qA.reshape(-1)
@@ -4204,6 +4228,9 @@ def _rackers_initial_permanent_fields(
     mu_induced_0_B += scatter_sum_compile(
         mu_dipole_B, e_AB_target, dim_size=n_atoms_B
     )
+
+    if not intramolecular_permanent_field:
+        return mu_induced_0_A, mu_induced_0_B
 
     alpha_AA_target = alpha_A.index_select(0, e_AA_target)
     qA_AA_source = qA.index_select(0, e_AA_source)
@@ -4312,6 +4339,7 @@ def _rackers_converge_dipoles(
     direct_T1_BB, direct_T2_BB,
     mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
     max_iterations, convergence_threshold, omega,
+    intramolecular_permanent_field=False,
 ):
     """Solve the induced dipoles and report how the solve went.
 
@@ -4328,6 +4356,7 @@ def _rackers_converge_dipoles(
         e_BB_source, e_BB_target,
         direct_T1_AB, direct_T2_AB, direct_T1_AA, direct_T2_AA,
         direct_T1_BB, direct_T2_BB,
+        intramolecular_permanent_field=intramolecular_permanent_field,
     )
     mu_A, mu_B = mu_0_A.clone(), mu_0_B.clone()
     iterations = 0
@@ -4412,6 +4441,7 @@ def rackers_thole_induction(
     variational_energy: bool = False,
     molecule_ind_A: torch.Tensor | None = None,
     molecule_ind_B: torch.Tensor | None = None,
+    intramolecular_permanent_field: bool = False,
 ) -> torch.Tensor:
     """Compute Rackers induction with distinct direct and mutual damping.
 
@@ -4421,13 +4451,17 @@ def rackers_thole_induction(
     energy evaluated two ways on the *same* converged dipoles.
 
     The two energies are expected to disagree, and that is the point. The
-    returned `energy_edge_contraction` sums only over intermolecular (AB) edges,
-    while the dipoles it uses were solved against the full AA+BB+AB permanent
-    field -- see `_rackers_initial_permanent_fields`, which accumulates
-    intramolecular terms into `mu_induced_0`. An energy that is not the
-    variational functional of its own response solve carries no
-    `E = -1/2 mu . E_perm <= 0` guarantee, which is a candidate mechanism for
-    the positive induction energies observed on 16 of 32 S66x8 geometries.
+    returned `energy_edge_contraction` sums only over intermolecular (AB)
+    edges, which is consistent with the default `mu_induced_0` -- built from
+    the intermolecular permanent field alone, so the dipoles are the response
+    to the partner monomer.
+
+    `intramolecular_permanent_field=True` restores the pre-fix construction, in
+    which each monomer's own multipoles also polarized it. That mixed a
+    monomer's intrinsic polarization into an intermolecular energy contraction
+    and put `cliff2_ind_ipd` positive on 421 of 528 S66x8 geometries. It is
+    kept only to reproduce checkpoints trained before the fix; it is not a
+    physically meaningful interaction induction.
 
     Off by default and returning a bare tensor, so the training path is
     unchanged.
@@ -4471,28 +4505,37 @@ def rackers_thole_induction(
         "direct",
         direct_exponent=thole_direct_exponent,
     )
-    direct_tensors_AA = _rackers_distance_tensors(
-        RA,
-        RA,
-        e_AA_source,
-        e_AA_target,
-        alpha_A,
-        alpha_A,
-        direct_AA,
-        "direct",
-        direct_exponent=thole_direct_exponent,
-    )
-    direct_tensors_BB = _rackers_distance_tensors(
-        RB,
-        RB,
-        e_BB_source,
-        e_BB_target,
-        alpha_B,
-        alpha_B,
-        direct_BB,
-        "direct",
-        direct_exponent=thole_direct_exponent,
-    )
+    # The intramolecular *direct* tensors exist only to build the
+    # intramolecular permanent field, which is off by default -- see
+    # `_rackers_initial_permanent_fields`. Building them unconditionally would
+    # be two extra distance-tensor passes per batch whose result is discarded,
+    # so they are `None` unless something is going to read them. Every consumer
+    # is behind the same flag.
+    if intramolecular_permanent_field:
+        direct_tensors_AA = _rackers_distance_tensors(
+            RA,
+            RA,
+            e_AA_source,
+            e_AA_target,
+            alpha_A,
+            alpha_A,
+            direct_AA,
+            "direct",
+            direct_exponent=thole_direct_exponent,
+        )
+        direct_tensors_BB = _rackers_distance_tensors(
+            RB,
+            RB,
+            e_BB_source,
+            e_BB_target,
+            alpha_B,
+            alpha_B,
+            direct_BB,
+            "direct",
+            direct_exponent=thole_direct_exponent,
+        )
+    else:
+        direct_tensors_AA = direct_tensors_BB = (None,) * 5
 
     mutual_AB = geometric_mean_edge_values(
         thole_mutual_A,
@@ -4563,6 +4606,7 @@ def rackers_thole_induction(
             direct_tensors_AA[4],
             direct_tensors_BB[3],
             direct_tensors_BB[4],
+            intramolecular_permanent_field=intramolecular_permanent_field,
         )
     )
     mu_induced_A = mu_induced_0_A.clone()
@@ -4672,6 +4716,7 @@ def rackers_thole_induction(
             mutual_tensors_AB[4][:0], mutual_tensors_AA[4],
             mutual_tensors_BB[4],
             max_iterations, convergence_threshold, omega,
+            intramolecular_permanent_field=intramolecular_permanent_field,
         )
         energy_dimer = _rackers_polarization_energy(
             mu_induced_A, mu_induced_0_A, alpha_A,
