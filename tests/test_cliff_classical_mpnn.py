@@ -332,6 +332,7 @@ def test_config_records_the_architecture(nested_hfvr_vw_model):
     config = head.get_config()
     assert CliffClassicalMPNN.ARCHITECTURE_CONFIG_KEYS == (
         "frozen_parameters",
+        "shared_damping_parameters",
         "param_n_message",
         "param_n_rbf",
         "param_hidden",
@@ -345,10 +346,9 @@ def test_config_records_the_architecture(nested_hfvr_vw_model):
 
 def test_dense_head_declares_only_the_shared_architecture_key():
     """Every positive head can freeze columns; only the MPNN head adds more."""
-    assert CliffClassicalNN.ARCHITECTURE_CONFIG_KEYS == ("frozen_parameters",)
-    assert mtp_mtp._CliffPositiveParamNN.ARCHITECTURE_CONFIG_KEYS == (
-        "frozen_parameters",
-    )
+    shared = ("frozen_parameters", "shared_damping_parameters")
+    assert CliffClassicalNN.ARCHITECTURE_CONFIG_KEYS == shared
+    assert mtp_mtp._CliffPositiveParamNN.ARCHITECTURE_CONFIG_KEYS == shared
 
 
 def test_nested_model_must_be_an_atomtypeparamnn():
@@ -1431,3 +1431,223 @@ def test_help_advertises_frozen_parameters():
     )
     assert result.returncode == 0, result.stderr
     assert "--frozen_parameters" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# CLIFF parity: seeds, damping form, energy prefactor
+#
+# Exchange reached parity with CLIFF (MAE 0.698 vs 0.695 on S66x8, each model
+# against its own fitting reference) while electrostatics sat at 1.41x and
+# induction at 3.05x. Exchange is also the only component with hand-computed
+# golden values, unit-conversion tests, limit tests and per-element Table I
+# seeding. These tests close that gap for the induction side.
+
+
+def test_elst_seed_matches_cliff_table_i_in_its_own_units():
+    """1.8 bohr^-1 is CLIFF's ~3.45 Ang^-1; the seeds agree, the units differ.
+
+    Pinned because reading 1.8 against Table I's 3.04-4.32 invites "fixing" it
+    upward by a factor of the Bohr radius, which would double the damping.
+    """
+    bohr_to_angstrom = 0.529177210903
+    in_angstrom_inverse = (
+        mtp_mtp.CLIFF_ELST_SEED_BOHR_INVERSE / bohr_to_angstrom
+    )
+    assert 3.0371 <= in_angstrom_inverse <= 4.3157
+    assert in_angstrom_inverse == pytest.approx(3.40, abs=0.02)
+    assert (
+        CLIFF_CLASSICAL_INITIAL_VALUES[CLIFF_CLASSICAL_ELST_INDEX]
+        == mtp_mtp.CLIFF_ELST_SEED_BOHR_INVERSE
+    )
+
+
+def test_induction_seeds_start_inside_cliffs_published_range():
+    """K^indu spans 2.1e-05 to 1.7546 in CLIFF Table I.
+
+    The old 1.8 seed sat above the entire range and entered the energy as the
+    product K_i K_j = 3.24 against CLIFF's typical ~0.64, over-polarizing from
+    step one; every run before this pinned the column at its floor.
+    """
+    seed = CLIFF_CLASSICAL_INITIAL_VALUES[CLIFF_CLASSICAL_IND_OVERLAP_INDEX]
+    assert seed == mtp_mtp.CLIFF_IND_OVERLAP_SEED == 0.2
+    assert 2.1e-05 <= seed <= 1.7546
+    assert seed * seed < 0.64  # below CLIFF's typical pair product
+
+
+def test_both_thole_columns_seed_at_cliffs_single_smearing_coefficient():
+    """CLIFF refits one global coefficient, 0.38539, for direct and mutual."""
+    assert mtp_mtp.CLIFF_THOLE_SMEARING == 0.38539
+    direct = CLIFF_CLASSICAL_INITIAL_VALUES[CLIFF_CLASSICAL_THOLE_DIRECT_INDEX]
+    mutual = CLIFF_CLASSICAL_INITIAL_VALUES[CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX]
+    assert direct == mutual == mtp_mtp.CLIFF_THOLE_SMEARING
+    # The Rackers contract keeps its historical seeds: its checkpoints were
+    # trained with them.
+    assert mtp_mtp.RACKERS_INITIAL_VALUES == (1.8, 0.34, 0.39, 1.8)
+
+
+def test_direct_thole_exponent_is_amoeba_plus_and_cliff_is_selectable():
+    """AMOEBA+ damps the permanent field with u**1.5, CLIFF with u**3.
+
+    AMOEBA+ (JCTC 2019) reports better three-body distance dependence for
+    `1 - exp(-a u**1.5)` on the *permanent* field and leaves mutual at u**3.
+    That is the default here. It is a real divergence from CLIFF Eq. (22),
+    which uses u**3 for both, so it must be selectable rather than implicit.
+    """
+    from apnet_pt.multipole import (
+        thole_damping_direct_torch,
+        thole_damping_mutual_torch,
+    )
+
+    assert mtp_mtp.THOLE_DIRECT_EXPONENT_AMOEBA_PLUS == 1.5
+    assert mtp_mtp.THOLE_DIRECT_EXPONENT_CLIFF == 3.0
+    r = torch.tensor([3.0], dtype=torch.float64)
+    alpha = torch.tensor([1.5], dtype=torch.float64)
+    a = torch.tensor([mtp_mtp.CLIFF_THOLE_SMEARING], dtype=torch.float64)
+
+    u = r / (alpha * alpha) ** (1.0 / 6.0)
+    for exponent in (1.5, 3.0):
+        au, lam3, _ = thole_damping_direct_torch(
+            r, alpha, alpha, a, exponent=exponent
+        )
+        expected = a * u ** exponent
+        assert torch.allclose(au, expected), exponent
+        assert torch.allclose(lam3, 1 - torch.exp(-expected)), exponent
+    # Default is AMOEBA+, and mutual is unconditionally u**3.
+    default_au, _, _ = thole_damping_direct_torch(r, alpha, alpha, a)
+    assert torch.allclose(default_au, a * u ** 1.5)
+    mutual_au, _, _ = thole_damping_mutual_torch(r, alpha, alpha, a)
+    assert torch.allclose(mutual_au, a * u ** 3)
+
+
+def test_energy_half_factor_defaults_to_the_historical_prefactor(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    """CLIFF Eq. (19) carries no 1/2; this module always has.
+
+    Keeping the half by default means no trained checkpoint changes meaning,
+    and `energy_half_factor=False` is the Eq. (19) form.
+    """
+    import copy
+    import inspect as _inspect
+
+    signature = _inspect.signature(mtp_mtp.rackers_thole_induction)
+    assert signature.parameters["energy_half_factor"].default is True
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    kwargs = _induction_kwargs(head, synthetic_dimer_batch)
+    halved = mtp_mtp.rackers_thole_induction(**kwargs, include_overlap=False)
+    whole = mtp_mtp.rackers_thole_induction(
+        **kwargs, include_overlap=False, energy_half_factor=False
+    )
+    # Without the overlap term the two differ by exactly a factor of two.
+    assert torch.allclose(whole, 2.0 * halved, atol=1e-6)
+
+
+def test_shared_damping_is_one_scalar_for_both_columns_and_all_atoms(
+    atomic_batch, nested_hfvr_vw_model
+):
+    """CLIFF has one global smearing coefficient, not a per-atom field.
+
+    Per-atom damping is badly conditioned: the physics tolerates a narrow band
+    and degrades sharply outside it, which is how every previous run ended with
+    a Thole column on a bound.
+    """
+    torch.manual_seed(0)
+    head = _head(
+        nested_hfvr_vw_model,
+        shared_damping_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
+    )
+    parameters = head(atomic_batch)[-1].detach()
+    direct = parameters[:, CLIFF_CLASSICAL_THOLE_DIRECT_INDEX]
+    mutual = parameters[:, CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX]
+    assert float(direct.max() - direct.min()) < 1e-7
+    assert torch.allclose(direct, mutual, atol=1e-9)
+    assert float(direct[0]) == pytest.approx(
+        mtp_mtp.CLIFF_THOLE_SMEARING, rel=1e-4
+    )
+    # Still learnable -- one degree of freedom, not zero.
+    head(atomic_batch)[-1].sum().backward()
+    assert head.shared_damping_raw.requires_grad
+    assert head.shared_damping_raw.grad is not None
+    assert float(head.shared_damping_raw.grad.abs()) > 0
+    # And the per-column machinery it replaces is detached.
+    for index in (
+        CLIFF_CLASSICAL_THOLE_DIRECT_INDEX,
+        CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX,
+    ):
+        assert not head.guess_layer[index].weight.requires_grad
+
+
+def test_shared_and_frozen_are_mutually_exclusive(nested_hfvr_vw_model):
+    with pytest.raises(ValueError, match="frozen and shared"):
+        _head(
+            nested_hfvr_vw_model,
+            frozen_parameters=("thole_direct",),
+            shared_damping_parameters=("thole_direct",),
+        )
+
+
+def test_shared_damping_requires_one_seed(nested_hfvr_vw_model):
+    """Two columns cannot share a scalar if they disagree about its value."""
+    with pytest.raises(ValueError, match="share one seed"):
+        _head(
+            nested_hfvr_vw_model,
+            param_start_mean=[1.8, 0.30, 0.45, 0.2, 2.5],
+            shared_damping_parameters=("thole_direct", "thole_mutual"),
+        )
+
+
+def test_induction_overlap_term_carries_a_scale_not_a_unit_conversion():
+    """`K_i S_ij K_j` is dimensionless, so `h2kcalmol` there is a scale factor.
+
+    Exchange has three unit-conversion tests and an explicit assertion that the
+    overlap helper applies none; induction had neither, and the factor of 627.5
+    on a dimensionless product is entirely absorbed into a learned parameter.
+    Pinned so the arbitrariness stays visible rather than looking like physics.
+    """
+    source = inspect.getsource(mtp_mtp.rackers_thole_induction)
+    assert "E_ind -= K_A * S_ij * K_B * constants.h2kcalmol" in source
+
+    # The property that makes the factor a scale and not a conversion: S_ij is
+    # a dimensionless overlap in (0, 1], so `K_i S_ij K_j` carries no energy
+    # unit for `h2kcalmol` to convert. Asserted numerically rather than by
+    # grepping the helper, whose comments mention the constant precisely to say
+    # it is not applied.
+    widths = torch.tensor([0.4, 0.6, 0.5], dtype=torch.float64)
+    source_index = torch.tensor([0, 1, 2])
+    target_index = torch.tensor([1, 2, 0])
+    for distance in (0.5, 2.0, 6.0):
+        overlap = mtp_mtp.atomic_overlap_S_ij(
+            widths,
+            widths,
+            source_index,
+            target_index,
+            torch.full((3,), distance, dtype=torch.float64),
+            width_floor=0.0,
+        )
+        assert torch.all(overlap > 0) and torch.all(overlap <= 1.0), distance
+    # Monotonically decreasing in r, i.e. an overlap and not an energy.
+    close = mtp_mtp.atomic_overlap_S_ij(
+        widths, widths, source_index, target_index,
+        torch.full((3,), 1.0, dtype=torch.float64), width_floor=0.0,
+    )
+    far = mtp_mtp.atomic_overlap_S_ij(
+        widths, widths, source_index, target_index,
+        torch.full((3,), 5.0, dtype=torch.float64), width_floor=0.0,
+    )
+    assert torch.all(far < close)
+
+
+def test_quadrupole_constant_defaults_to_physics_not_cliffs_value():
+    """CLIFF's released code carries a Q_const that over-weights quadrupoles.
+
+    This module defaults to 3.0, the physically correct value, and documents
+    1.0 as the CLIFF-matching setting. A run that wants bit-parity with CLIFF
+    opts in; nobody gets CLIFF's error by default.
+    """
+    source = inspect.getsource(mtp_mtp)
+    assert "Q_const=3.0" in source
+    assert "set to 1.0 to agree with CLIFF" in source

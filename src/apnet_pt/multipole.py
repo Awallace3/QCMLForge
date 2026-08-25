@@ -1381,13 +1381,20 @@ def thole_damping_torch(r_ij, alpha_i, alpha_j, a):
     return au3, l3, l5
 
 
-def thole_damping_direct_torch(r_ij, alpha_i, alpha_j, a):
+def thole_damping_direct_torch(r_ij, alpha_i, alpha_j, a, exponent=1.5):
     """
     Apply Thole damping to interaction tensor for direct (permanent-induced) interactions.
     From AMOEBA+: https://pubs.acs.org/doi/suppl/10.1021/acs.jctc.7b00225/suppl_file/ct7b00225_si_001.pdf
+
+    `exponent` is the power of the polarizability-normalized distance `u`.
+    AMOEBA+ deliberately damps the *permanent* field with `u**1.5` -- it reports
+    better three-body distance dependence than AMOEBA's `u**3`, and leaves the
+    mutual part at 3 -- which is why the default is 1.5 even though the local
+    variable is named `au3`. CLIFF Eq. (22) instead uses `u**3` for both, so
+    matching CLIFF means passing 3.0 here.
     """
     u = r_ij / ((alpha_i * alpha_j) ** (1.0 / 6.0))
-    au3 = a * (u ** (3 / 2))
+    au3 = a * (u ** exponent)
     l3 = 1 - torch.exp(-au3)
     l5 = 1 - (1 + 0.5 * au3) * torch.exp(-au3)
     return au3, l3, l5

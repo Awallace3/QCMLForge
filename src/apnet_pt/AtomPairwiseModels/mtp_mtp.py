@@ -62,6 +62,41 @@ from ..util import scatter_sum_compile
 
 max_Z = 118
 
+# --- CLIFF parity notes for the induction/electrostatics seeds ------------
+#
+# K_elst: our 1.8 is in BOHR^-1, which is 1.8 / 0.529177 = 3.40 ANGSTROM^-1.
+# CLIFF Table I (Schriber 2021) lists K^elst per atom type in Angstrom^-1 over
+# 3.0371-4.3157, mean ~3.45. The seeds already agree; they are quoted in
+# different length units. Do not "correct" 1.8 upward against Table I.
+#
+# K_indu: CLIFF Table I K^indu spans 2.1e-05 (C4) to 1.7546 (N3), so a seed of
+# 1.8 sits above the whole range and enters Eq. (19) as the product K_i K_j =
+# 3.24 against CLIFF's typical ~0.64. That over-polarizes immediately, and the
+# optimizer's cheapest escape is to drive the column to its floor -- which is
+# what every run before 2026-08-25 did.
+CLIFF_ELST_SEED_BOHR_INVERSE = 1.8
+CLIFF_IND_OVERLAP_SEED = 0.2
+
+# CLIFF Eq. (22) refits the Thole smearing coefficient jointly with its K^indu
+# parameters to 0.38539, and uses ONE global value -- not per-atom, and not
+# different between the direct and mutual parts. Seeding both of our columns
+# there removes that difference as a confounder when chasing CLIFF parity.
+CLIFF_THOLE_SMEARING = 0.38539
+
+# Exponent on the polarizability-normalized distance u in the Thole damping.
+#
+# AMOEBA+ (Liu, Piquemal, Ren, JCTC 2019) deliberately damps the PERMANENT
+# (direct) field with `1 - exp(-a u**1.5)`, reporting better three-body
+# distance dependence, and leaves the MUTUAL part at AMOEBA's `u**3`. That is
+# what this module implements and why `thole_damping_direct_torch` uses 1.5
+# despite naming its variable `au3`.
+#
+# CLIFF instead uses `u**3` for both. So matching CLIFF means overriding the
+# direct exponent to 3.0; the AMOEBA+ default is preserved so no existing model
+# changes behaviour.
+THOLE_DIRECT_EXPONENT_AMOEBA_PLUS = 1.5
+THOLE_DIRECT_EXPONENT_CLIFF = 3.0
+
 RACKERS_PARAMETER_NAMES = (
     "elst",
     "thole_direct",
@@ -137,7 +172,18 @@ CLIFF_CLASSICAL_PARAMETER_NAMES = (
     "ind_overlap",
     "exch",
 )
-CLIFF_CLASSICAL_INITIAL_VALUES = (1.8, 0.34, 0.39, 1.8, 2.5)
+# elst stays 1.8 (bohr^-1, == CLIFF's ~3.40 Ang^-1); both Thole columns move to
+# CLIFF's single refit smearing coefficient; ind_overlap drops from 1.8 to 0.2
+# so it starts inside CLIFF's K^indu range instead of above it. See the parity
+# notes at the top of this module. `RACKERS_INITIAL_VALUES` is deliberately not
+# changed: those seeds are what every Rackers checkpoint was trained with.
+CLIFF_CLASSICAL_INITIAL_VALUES = (
+    CLIFF_ELST_SEED_BOHR_INVERSE,
+    CLIFF_THOLE_SMEARING,
+    CLIFF_THOLE_SMEARING,
+    CLIFF_IND_OVERLAP_SEED,
+    2.5,
+)
 CLIFF_CLASSICAL_INITIAL_STDS = (0.01, 0.01, 0.01, 0.01, 0.25)
 
 # Per-element seeds for the combined route.  Only the exchange column has
@@ -2331,7 +2377,10 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
     # that its `get_config` therefore has to record. `AM_DimerParam_Model`
     # forwards exactly these, so a head with its own architecture does not
     # require another branch at either construction site.
-    ARCHITECTURE_CONFIG_KEYS: tuple[str, ...] = ("frozen_parameters",)
+    ARCHITECTURE_CONFIG_KEYS: tuple[str, ...] = (
+        "frozen_parameters",
+        "shared_damping_parameters",
+    )
 
     def __init__(
         self,
@@ -2349,6 +2398,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
+        shared_damping_parameters=(),
     ):
         if type(atom_model) is not AtomTypeParamNN:
             raise ValueError("atom_model must be an AtomTypeParamNN")
@@ -2435,6 +2485,47 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         for p in self._frozen_parameter_indices:
             self.guess_layer[p].requires_grad_(False)
             self.param_readout_layers[p].requires_grad_(False)
+        # One learnable scalar shared by the named columns and by every atom.
+        #
+        # CLIFF has a single global Thole smearing coefficient, not a per-atom
+        # field and not different values for the direct and mutual parts. Per
+        # atom the damping is a badly conditioned thing to fit -- the physics
+        # tolerates a narrow band and degrades sharply outside it -- so this
+        # keeps the parameter learnable while collapsing it to the one degree of
+        # freedom CLIFF actually uses.
+        self.shared_damping_parameters, self._shared_damping_indices = (
+            _validate_frozen_parameters(
+                shared_damping_parameters, list(self.PARAMETER_NAMES)
+            )
+        )
+        if self._shared_damping_indices:
+            overlap = set(self._shared_damping_indices) & set(
+                self._frozen_parameter_indices
+            )
+            if overlap:
+                names = sorted(self.PARAMETER_NAMES[i] for i in overlap)
+                raise ValueError(
+                    "a column cannot be both frozen and shared-learnable: "
+                    + ", ".join(names)
+                )
+            seeds = [
+                positive_means[i] for i in self._shared_damping_indices
+            ]
+            if len(set(seeds)) != 1:
+                raise ValueError(
+                    "shared_damping_parameters must share one seed; got "
+                    f"{seeds} for {self.shared_damping_parameters}"
+                )
+            self.shared_damping_raw = nn.Parameter(
+                torch.tensor(
+                    _inverse_softplus(seeds[0] - positivity_epsilon),
+                    dtype=torch.get_default_dtype(),
+                )
+            )
+            # Their per-column embeddings and readouts are dead in this mode.
+            for p in self._shared_damping_indices:
+                self.guess_layer[p].requires_grad_(False)
+                self.param_readout_layers[p].requires_grad_(False)
 
     def _seed_guess_layer_by_Z(self, param_start_mean_by_Z, positivity_epsilon):
         """Overwrite per-element rows of the seed embeddings.
@@ -2564,6 +2655,17 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         # collapsing head sitting at ``sigmoid(raw) ~ 0`` and unable to
         # recover; see :func:`_ste_clamp` and
         # :data:`CLIFF_PARAM_FLOOR_FRACTION`.
+        shared = getattr(self, "_shared_damping_indices", ())
+        if shared:
+            # Overwrite the shared columns with the one learnable scalar before
+            # bounding, so the clamp and softplus behave exactly as for a
+            # per-atom column.
+            columns = list(torch.unbind(raw_parameters, dim=-1))
+            for index in shared:
+                columns[index] = self.shared_damping_raw.expand_as(
+                    columns[index]
+                )
+            raw_parameters = torch.stack(columns, dim=-1)
         raw_parameters = _ste_clamp(
             raw_parameters,
             self.raw_parameter_floor,
@@ -2621,6 +2723,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
             "positivity_epsilon": self.positivity_epsilon,
             "width_floor": self.width_floor,
             "frozen_parameters": list(self.frozen_parameters),
+            "shared_damping_parameters": list(self.shared_damping_parameters),
             "n_message": self.n_message,
             "n_neuron": self.n_neuron,
             "n_embed": self.n_embed,
@@ -2659,6 +2762,7 @@ class CliffExchangeNN(_CliffPositiveParamNN):
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
+        shared_damping_parameters=(),
     ):
         if param_start_mean_by_Z is None:
             param_start_mean_by_Z = {"exch": CLIFF_EXCH_INITIAL_VALUES_BY_Z}
@@ -2677,6 +2781,7 @@ class CliffExchangeNN(_CliffPositiveParamNN):
             param_ceiling_multiple=param_ceiling_multiple,
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
+            shared_damping_parameters=shared_damping_parameters,
         )
 
 
@@ -2713,6 +2818,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
+        shared_damping_parameters=(),
     ):
         if param_start_mean_by_Z is None:
             param_start_mean_by_Z = CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z
@@ -2731,6 +2837,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
             param_ceiling_multiple=param_ceiling_multiple,
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
+            shared_damping_parameters=shared_damping_parameters,
         )
 
 
@@ -2816,6 +2923,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
     PARAMETER_NAMES = CLIFF_CLASSICAL_PARAMETER_NAMES
     ARCHITECTURE_CONFIG_KEYS = (
         "frozen_parameters",
+        "shared_damping_parameters",
         "param_n_message",
         "param_n_rbf",
         "param_hidden",
@@ -2838,6 +2946,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
+        shared_damping_parameters=(),
         param_n_message: int = CLIFF_MPNN_N_MESSAGE,
         param_n_rbf: int = CLIFF_MPNN_N_RBF,
         param_hidden: int = CLIFF_MPNN_HIDDEN,
@@ -2884,6 +2993,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             param_ceiling_multiple=param_ceiling_multiple,
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
+            shared_damping_parameters=shared_damping_parameters,
         )
         # Built after `super().__init__()`, which is what makes `nn.Module`
         # able to register them.
@@ -3989,6 +4099,7 @@ def _rackers_distance_tensors(
     alpha_j: torch.Tensor,
     thole_edge_values: torch.Tensor,
     damping_type: str,
+    direct_exponent: float = THOLE_DIRECT_EXPONENT_AMOEBA_PLUS,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -4009,6 +4120,7 @@ def _rackers_distance_tensors(
             alpha_source,
             alpha_target,
             thole_edge_values,
+            exponent=direct_exponent,
         )
     elif damping_type == "mutual":
         _, lam_3, lam_5 = thole_damping_mutual_torch(
@@ -4295,6 +4407,8 @@ def rackers_thole_induction(
     omega: float = 0.7,
     polarizability_table: torch.Tensor = constants.polarizability_table,
     return_diagnostics: bool = False,
+    energy_half_factor: bool = True,
+    thole_direct_exponent: float = THOLE_DIRECT_EXPONENT_AMOEBA_PLUS,
     variational_energy: bool = False,
     molecule_ind_A: torch.Tensor | None = None,
     molecule_ind_B: torch.Tensor | None = None,
@@ -4355,6 +4469,7 @@ def rackers_thole_induction(
         alpha_B,
         direct_AB,
         "direct",
+        direct_exponent=thole_direct_exponent,
     )
     direct_tensors_AA = _rackers_distance_tensors(
         RA,
@@ -4365,6 +4480,7 @@ def rackers_thole_induction(
         alpha_A,
         direct_AA,
         "direct",
+        direct_exponent=thole_direct_exponent,
     )
     direct_tensors_BB = _rackers_distance_tensors(
         RB,
@@ -4375,6 +4491,7 @@ def rackers_thole_induction(
         alpha_B,
         direct_BB,
         "direct",
+        direct_exponent=thole_direct_exponent,
     )
 
     mutual_AB = geometric_mean_edge_values(
@@ -4515,7 +4632,11 @@ def rackers_thole_induction(
             direct_tensors_AB[4],
         )
     ) * constants.h2kcalmol
-    E_ind = (E_qu + E_uu) / 2.0
+    # CLIFF Eq. (19) is `sum_{i in A, j in B} mu'_i T_ij M_j + K^indu_ij S_ij`,
+    # with no factor of one half. This module has always applied one, so it
+    # stays the default: dropping it unconditionally would change every trained
+    # checkpoint's induction. `energy_half_factor=False` matches Eq. (19).
+    E_ind = (E_qu + E_uu) / 2.0 if energy_half_factor else (E_qu + E_uu)
     overlap_edge = torch.zeros_like(E_ind)
 
     if variational_energy:

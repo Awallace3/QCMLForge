@@ -1364,13 +1364,16 @@ def test_rackers_kernel_routes_distinct_parameters_and_overlap(monkeypatch):
     original_direct = mtp_mtp.thole_damping_direct_torch
     original_mutual = mtp_mtp.thole_damping_mutual_torch
 
-    def record_direct(r_ij, alpha_i, alpha_j, a):
+    def record_direct(r_ij, alpha_i, alpha_j, a, **kwargs):
+        # `**kwargs` forwards the `exponent` the production caller now passes;
+        # a fixed signature here would fail on a kwarg the spy does not care
+        # about.
         direct_calls.append(a.detach().clone())
-        return original_direct(r_ij, alpha_i, alpha_j, a)
+        return original_direct(r_ij, alpha_i, alpha_j, a, **kwargs)
 
-    def record_mutual(r_ij, alpha_i, alpha_j, a):
+    def record_mutual(r_ij, alpha_i, alpha_j, a, **kwargs):
         mutual_calls.append(a.detach().clone())
-        return original_mutual(r_ij, alpha_i, alpha_j, a)
+        return original_mutual(r_ij, alpha_i, alpha_j, a, **kwargs)
 
     monkeypatch.setattr(mtp_mtp, "thole_damping_direct_torch", record_direct)
     monkeypatch.setattr(mtp_mtp, "thole_damping_mutual_torch", record_mutual)
