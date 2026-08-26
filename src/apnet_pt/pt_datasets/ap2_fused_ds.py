@@ -978,6 +978,13 @@ class ap2_fused_module_dataset(Dataset):
                     self.atom_model.model, dynamic=True
                 )
         print(f"{root=}, {self.spec_type=}, {self.in_memory=}")
+        # PyG assigns self.root inside its own __init__, which has not run
+        # yet, but the shortfall check below needs processed_dir. This is the
+        # same normalisation PyG applies, and it re-assigns the identical
+        # value moments later.
+        self.root = (
+            osp.expanduser(osp.normpath(root)) if isinstance(root, str) else root
+        )
         # An on-disk store that is smaller than max_size asks for has to be
         # grown before PyG is allowed to conclude that nothing needs doing.
         if not self.force_reprocess and not self.in_memory:

@@ -264,3 +264,67 @@ def test_a_complete_store_is_never_asked_about_alignment(tmp_path):
     ds._request_extension_if_store_is_short()
     assert ds.skip_processed is False
     assert ds.force_reprocess is False
+
+
+# The helpers above hand-assign ``root`` onto an instance built with
+# ``object.__new__``, which is exactly what hid a real bug: the shortfall check
+# runs before ``Dataset.__init__``, and PyG is what sets ``self.root``, so on
+# the cluster the very first construction died with ``AttributeError:
+# 'ap2_fused_module_dataset' object has no attribute 'root'``. The two tests
+# below go through the real constructor so that ordering is covered.
+
+
+def _real_store(tmp_path, *, shards):
+    """A root a real construction can be pointed at: raw files present so PyG's
+    download hook returns early, and ``shards`` aligned shards on disk."""
+    (tmp_path / "raw").mkdir(parents=True, exist_ok=True)
+    for name in ("1600K_train_dimers-fixed.pkl", "1600K_test_dimers-fixed.pkl"):
+        (tmp_path / "raw" / name).touch()
+    processed = tmp_path / "processed"
+    processed.mkdir(parents=True, exist_ok=True)
+    for idx in range(shards):
+        start = idx * SHARD_OBJECTS
+        torch.save(
+            [_Stub(i) for i in range(start, start + SHARD_OBJECTS)],
+            processed / f"dimer_ap2_fused_train_spec_2_{idx}.pt",
+        )
+
+
+def _construct(tmp_path, *, max_size, monkeypatch):
+    """Construct for real, recording whether PyG asked for a build."""
+    calls = []
+    monkeypatch.setattr(
+        ap2_fused_module_dataset, "process", lambda self: calls.append(True)
+    )
+    ds = ap2_fused_module_dataset(
+        root=str(tmp_path),
+        spec_type=2,
+        split="train",
+        max_size=max_size,
+        datapoint_storage_n_objects=SHARD_OBJECTS,
+        skip_processed=True,
+        print_level=0,
+    )
+    return ds, calls
+
+
+def test_a_real_construction_over_a_complete_store_builds_nothing(
+    tmp_path, monkeypatch
+):
+    """Covers the ordering: the check must not read root before PyG sets it."""
+    _real_store(tmp_path, shards=4)
+    ds, calls = _construct(tmp_path, max_size=4 * SHARD_OBJECTS, monkeypatch=monkeypatch)
+    assert calls == []
+    assert ds.root == str(tmp_path)
+
+
+def test_a_real_construction_over_a_short_store_asks_for_a_build(
+    tmp_path, monkeypatch
+):
+    _real_store(tmp_path, shards=4)
+    ds, calls = _construct(
+        tmp_path, max_size=64 * SHARD_OBJECTS, monkeypatch=monkeypatch
+    )
+    assert calls == [True]
+    # An aligned prefix is resumed rather than rebuilt from the first dimer.
+    assert ds.skip_processed is True
