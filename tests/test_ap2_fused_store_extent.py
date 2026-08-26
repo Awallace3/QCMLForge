@@ -328,3 +328,32 @@ def test_a_real_construction_over_a_short_store_asks_for_a_build(
     assert calls == [True]
     # An aligned prefix is resumed rather than rebuilt from the first dimer.
     assert ds.skip_processed is True
+
+
+# Recording exhaustion is a claim about the raw source, not about the request.
+# The first 1.5M build got this wrong: load_dimer_dataset truncates the frame
+# with head(max_size), so a pass that asks for everything it gets ends without
+# breaking, which the original conjunct read as "the source is spent". That
+# marker would have capped every later, larger request at 1.5M.
+
+
+def test_a_request_that_binds_teaches_nothing_about_the_source(tmp_path):
+    ds = _store(tmp_path, shards=0, max_size=1_500_000)
+    assert (
+        ds._source_was_exhausted(reached_max_size=False, n_raw=1_500_000) is False
+    )
+
+
+def test_a_source_shorter_than_the_request_is_exhausted(tmp_path):
+    ds = _store(tmp_path, shards=0, max_size=1_500_000)
+    assert ds._source_was_exhausted(reached_max_size=False, n_raw=1_499_999) is True
+
+
+def test_a_pass_that_broke_on_max_size_is_never_exhaustion(tmp_path):
+    ds = _store(tmp_path, shards=0, max_size=1_500_000)
+    assert ds._source_was_exhausted(reached_max_size=True, n_raw=10) is False
+
+
+def test_an_unbounded_request_that_ran_out_is_exhaustion(tmp_path):
+    ds = _store(tmp_path, shards=0, max_size=None)
+    assert ds._source_was_exhausted(reached_max_size=False, n_raw=7) is True

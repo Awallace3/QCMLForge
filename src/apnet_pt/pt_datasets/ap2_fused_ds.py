@@ -1112,6 +1112,22 @@ class ap2_fused_module_dataset(Dataset):
             return None
         return int(shards)
 
+    def _source_was_exhausted(self, *, reached_max_size, n_raw):
+        """Whether the raw source, not the request, is what ended the pass.
+
+        ``load_dimer_dataset`` truncates the frame with ``head(max_size)``, so
+        ``n_raw == MAX_SIZE`` means the request was the binding constraint and
+        the pass learned nothing about what lies beyond it. Only a frame
+        strictly shorter than the request proves the source has no more to
+        give. Recording exhaustion on equality would cap every later, larger
+        request at whatever the first run happened to ask for.
+        """
+        if reached_max_size:
+            return False
+        if self.MAX_SIZE is None:
+            return True
+        return n_raw < self.MAX_SIZE
+
     def _record_store_extent(self, *, source_exhausted):
         """Write the extent sidecar after a processing pass."""
         payload = {
@@ -1500,13 +1516,9 @@ class ap2_fused_module_dataset(Dataset):
                 else:
                     torch.save(data_objects, datapath)
         if not self.in_memory:
-            # A pass that skipped every requested index without breaking has
-            # not learned anything about the source's true extent, so require
-            # the raw source itself to have been the shorter of the two.
             self._record_store_extent(
-                source_exhausted=(
-                    not reached_max_size
-                    and (self.MAX_SIZE is None or len(RAs) <= self.MAX_SIZE)
+                source_exhausted=self._source_was_exhausted(
+                    reached_max_size=reached_max_size, n_raw=len(RAs)
                 )
             )
         return
