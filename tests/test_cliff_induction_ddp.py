@@ -407,6 +407,38 @@ def test_ddp_checkpoint_loads_back(two_rank_run):
     assert not any(key.startswith("module.") for key in state)
 
 
+def test_ddp_checkpoint_keeps_the_atom_model_aliased(two_rank_run):
+    """The checkpoint must not get bigger just because DDP wrote it.
+
+    ``self.atom_model`` *is* ``self.model.atom_model``, so the embedded
+    submodel state_dict shares storages with the top-level one and
+    ``torch.save`` writes each storage once. Copying the two modules with two
+    separate ``deepcopy`` calls breaks that sharing, and the artifact silently
+    grows from 7.3 MB to 13.7 MB with byte-identical contents -- a deliverable
+    whose size depends on the launch topology. Storage identity survives
+    ``torch.save``/``torch.load``, so the loaded checkpoint still shows it.
+    """
+    results, tmpdir = two_rank_run
+    assert results  # the run happened
+    checkpoint = torch.load(
+        os.path.join(str(tmpdir), "cliff_ddp.pt"),
+        map_location="cpu",
+        weights_only=False,
+    )
+    top = checkpoint["model_state_dict"]
+    embedded = checkpoint["submodels"]["atom_model"]["model_state_dict"]
+    shared = 0
+    for key, tensor in embedded.items():
+        outer = top.get(f"atom_model.{key}")
+        if outer is None:
+            continue
+        assert outer.untyped_storage().data_ptr() == (
+            tensor.untyped_storage().data_ptr()
+        ), f"{key} was duplicated instead of shared"
+        shared += 1
+    assert shared > 0, "no embedded atom-model tensor matched a top-level one"
+
+
 def test_ddp_sidecar_records_the_global_epoch(two_rank_run):
     """Resume is the reason the chunk chain works; DDP must not change it."""
     results, tmpdir = two_rank_run

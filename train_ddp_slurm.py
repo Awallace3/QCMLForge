@@ -3,8 +3,11 @@
 QCMLForge Distributed Data Parallel (DDP) Training Script for SLURM
 
 This script is designed to be launched via srun with one process per SLURM
-task. Single-node external DDP is validated; multi-node operation remains
-experimental until a two-node smoke test is completed.
+task. Multi-node operation is validated: the rendezvous is resolved by
+``apnet_pt.ddp_launch``, which is shared with ``train_models.py --ddp_srun``,
+and that path was run on Phoenix across two nodes (four V100 ranks, jobs
+12350159/12350160) with all ranks reporting an identical reduced loss and
+identical parameters.
 
 Environment Variables Required:
     RANK: Global rank of the process (set by SLURM via srun)

@@ -7841,12 +7841,23 @@ units angstrom
                     # would make the replicas diverge outright. Every rank pays
                     # a ~7 MB copy per improvement, which is nothing against an
                     # epoch, and the live model is never touched.
-                    cpu_model = deepcopy(model_io.unwrap_model(self.model)).to(
-                        "cpu"
+                    # Copied as one object, not two. `self.atom_model` is a
+                    # submodule of `self.model`, so their state_dicts share
+                    # tensor storages and `torch.save` writes each storage
+                    # once. Two independent `deepcopy` calls break that
+                    # aliasing and the checkpoint silently grows from 7.3 MB
+                    # to 13.7 MB with byte-identical contents -- a deliverable
+                    # whose size depends on the launch topology. One
+                    # `deepcopy` over the pair shares a memo, so the copy is
+                    # aliased exactly as the original was.
+                    cpu_model, cpu_atom_model = deepcopy(
+                        (
+                            model_io.unwrap_model(self.model),
+                            model_io.unwrap_model(self.atom_model),
+                        )
                     )
-                    cpu_atom_model = deepcopy(
-                        model_io.unwrap_model(self.atom_model)
-                    ).to("cpu")
+                    cpu_model = cpu_model.to("cpu")
+                    cpu_atom_model = cpu_atom_model.to("cpu")
                 else:
                     cpu_model = model_io.unwrap_model(self.model).to("cpu")
                     cpu_atom_model = model_io.unwrap_model(self.atom_model).to(
@@ -7921,12 +7932,16 @@ units angstrom
                 )
             if nan_detected:
                 if world_size > 1:
-                    cpu_model = deepcopy(model_io.unwrap_model(self.model)).to(
-                        "cpu"
+                    # One `deepcopy` over the pair, for the storage-aliasing
+                    # reason spelled out at the best-model save above.
+                    cpu_model, cpu_atom_model = deepcopy(
+                        (
+                            model_io.unwrap_model(self.model),
+                            model_io.unwrap_model(self.atom_model),
+                        )
                     )
-                    cpu_atom_model = deepcopy(
-                        model_io.unwrap_model(self.atom_model)
-                    ).to("cpu")
+                    cpu_model = cpu_model.to("cpu")
+                    cpu_atom_model = cpu_atom_model.to("cpu")
                 else:
                     cpu_model = model_io.unwrap_model(self.model).to("cpu")
                     cpu_atom_model = model_io.unwrap_model(self.atom_model).to(
