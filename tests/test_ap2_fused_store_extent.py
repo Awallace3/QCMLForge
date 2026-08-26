@@ -178,3 +178,89 @@ def test_shards_are_counted_per_split(tmp_path):
     assert len(ds._existing_shard_paths()) == 6250
     ds._request_extension_if_store_is_short()
     assert ds.force_reprocess is True
+
+
+class _Stub:
+    """Stands in for a stored Data object; only ``dimer_ind`` is consulted."""
+
+    def __init__(self, dimer_ind):
+        self.dimer_ind = dimer_ind
+
+
+def _write_shard(ds, split, idx, dimer_inds):
+    torch.save(
+        [_Stub(i) for i in dimer_inds],
+        osp.join(
+            str(ds.root),
+            "processed",
+            f"dimer_ap2_fused_{split}_spec_2_{idx}{ds.file_extension}",
+        ),
+    )
+
+
+def _aligned_store(tmp_path, *, shards, max_size, split="train"):
+    ds = _store(tmp_path, shards=0, max_size=max_size, split=split)
+    for idx in range(shards):
+        _write_shard(
+            ds,
+            split,
+            idx,
+            range(idx * SHARD_OBJECTS, (idx + 1) * SHARD_OBJECTS),
+        )
+    return ds
+
+
+def test_an_aligned_prefix_is_resumed_rather_than_rebuilt(tmp_path, capsys):
+    ds = _aligned_store(tmp_path, shards=6250, max_size=1_500_000)
+    ds.skip_processed = False
+    ds._request_extension_if_store_is_short()
+    assert ds.force_reprocess is True
+    assert ds.skip_processed is True
+    assert "skipped, not rebuilt" in capsys.readouterr().out
+
+
+def test_a_prefix_that_dropped_a_dimer_forces_a_full_rebuild(tmp_path, capsys):
+    """A dropped dimer desynchronises the raw index from the write index."""
+    ds = _aligned_store(tmp_path, shards=10, max_size=1_500_000)
+    _write_shard(ds, "train", 9, range(145, 145 + SHARD_OBJECTS))
+    ds.skip_processed = False
+    ds._request_extension_if_store_is_short()
+    assert ds.force_reprocess is True
+    assert ds.skip_processed is False
+    assert "do not line up" in capsys.readouterr().out
+
+
+def test_a_short_final_shard_forces_a_full_rebuild(tmp_path):
+    ds = _aligned_store(tmp_path, shards=10, max_size=1_500_000)
+    _write_shard(ds, "train", 9, range(144, 144 + 3))
+    assert ds._prefix_is_index_aligned() is False
+
+
+def test_objects_without_a_raw_index_force_a_full_rebuild(tmp_path):
+    ds = _store(tmp_path, shards=4, max_size=1_500_000)
+    assert ds._prefix_is_index_aligned() is False
+
+
+def test_an_unreadable_final_shard_forces_a_full_rebuild(tmp_path):
+    ds = _aligned_store(tmp_path, shards=4, max_size=1_500_000)
+    with open(
+        osp.join(str(tmp_path), "processed", "dimer_ap2_fused_train_spec_2_3.pt"), "wb"
+    ) as fh:
+        fh.write(b"not a torch file")
+    with pytest.warns(UserWarning, match="lines up with the raw order"):
+        assert ds._prefix_is_index_aligned() is False
+
+
+def test_alignment_is_judged_from_the_last_shard_of_this_split(tmp_path):
+    ds = _aligned_store(tmp_path, shards=6250, max_size=1_500_000, split="train")
+    _write_shard(ds, "test", 0, range(9000, 9000 + SHARD_OBJECTS))
+    assert ds._prefix_is_index_aligned() is True
+
+
+def test_a_complete_store_is_never_asked_about_alignment(tmp_path):
+    """Nothing is loaded when there is nothing to extend."""
+    ds = _aligned_store(tmp_path, shards=6250, max_size=100_000)
+    ds.skip_processed = False
+    ds._request_extension_if_store_is_short()
+    assert ds.skip_processed is False
+    assert ds.force_reprocess is False

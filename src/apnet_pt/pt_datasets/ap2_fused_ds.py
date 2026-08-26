@@ -1122,6 +1122,42 @@ class ap2_fused_module_dataset(Dataset):
         except OSError as exc:
             warnings.warn(f"Could not record store extent at {path}: {exc}")
 
+    def _prefix_is_index_aligned(self):
+        """Whether shard k holds exactly dimers [k*n, (k+1)*n) of the raw order.
+
+        ``process()``'s fast-forward advances its write index once per raw
+        dimer, so it only lands on the right resume point if the two indices
+        never diverged -- and they diverge the moment a dimer in the prefix
+        was dropped for being invalid.  Each stored object carries the raw
+        index it came from, so the last shard settles the question outright
+        and cheaply.
+        """
+        if self.storage_type != "pt":
+            # Only the torch store is this cheap to check; leave anything
+            # else to the safe full rebuild.
+            return False
+        shards = self._existing_shard_paths()
+        if not shards:
+            return False
+        expected = len(shards) * self.datapoint_storage_n_objects - 1
+        try:
+            tail = torch.load(shards[-1], weights_only=False)
+        except Exception as exc:
+            warnings.warn(
+                f"Could not read {osp.basename(shards[-1])} to check whether "
+                f"the store lines up with the raw order: {exc}"
+            )
+            return False
+        if len(tail) != self.datapoint_storage_n_objects:
+            return False
+        dimer_ind = getattr(tail[-1], "dimer_ind", None)
+        if dimer_ind is None:
+            return False
+        try:
+            return int(dimer_ind) == expected
+        except (TypeError, ValueError):
+            return False
+
     def _request_extension_if_store_is_short(self):
         """Trigger a build when the store holds fewer dimers than MAX_SIZE asks for.
 
@@ -1156,13 +1192,25 @@ class ap2_fused_module_dataset(Dataset):
                 stacklevel=3,
             )
             return
+        # Without this the extension re-derives the prefix it already has,
+        # and a preempted build restarts from the first dimer every time.
+        aligned = self._prefix_is_index_aligned()
+        if aligned:
+            self.skip_processed = True
         print(
             f"Extending the spec_{self.spec_type} "
             f"{self.split_name or 'all'} store: {have_shards} of "
             f"{wanted_shards} shards present "
             f"({have_shards * self.datapoint_storage_n_objects} of "
-            f"{self.MAX_SIZE} dimers). Processing the remainder; existing "
-            "shards are skipped, not rebuilt.",
+            f"{self.MAX_SIZE} dimers). "
+            + (
+                "Processing the remainder; existing shards are skipped, "
+                "not rebuilt."
+                if aligned
+                else "The shards on disk do not line up with the raw dimer "
+                "order, so the store is rebuilt from the first dimer rather "
+                "than resumed."
+            ),
             flush=True,
         )
         self.force_reprocess = True
