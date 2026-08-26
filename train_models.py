@@ -46,6 +46,13 @@ COMBINED_CLIFF_MODEL_TYPES = {
     "CliffClassicalOverlapModel",
     "CliffClassicalOverlapMPNNModel",
 }
+# Per-component clipping needs disjoint trainable parameter groups. The dense
+# heads have one embedding/readout stack per physical column and a frozen nested
+# atom model; the MPNN head has a shared trainable featurizer and is rejected.
+COMPONENT_CLIP_CLIFF_MODEL_TYPES = {
+    "CliffClassicalModel",
+    "CliffClassicalOverlapModel",
+}
 # `--include_total_mse` predates `--component_gamma` and is filtered out of
 # `AM_DimerParam_Model.train`, which never accepted it.  On a CLIFF route it is
 # reinterpreted as this gamma rather than silently dropped.
@@ -426,6 +433,7 @@ def train_pairwise_model(
     component_gamma=None,
     total_includes_d3=False,
     grad_clip_norm=None,
+    grad_clip_mode="global",
     omp_num_threads=8,
     ddp_world_size=1,
     external_rank=None,
@@ -485,13 +493,33 @@ def train_pairwise_model(
         include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms. On a CLIFF route it is instead shorthand for component_gamma=0.5 and cannot be combined with an explicit component_gamma.
         component_gamma (float or None): CLIFF Eq. (23) component/total loss weight for the combined CLIFF routes. None (the default) keeps the legacy plain multi-column MSE; any float in [0.0, 1.0] selects the Eq. (23) functional. Rejected on CliffExchangeModel and on every pre-existing route.
         total_includes_d3 (bool): If true, the CLIFF Eq. (23) total term includes D3 dispersion and is compared against all four SAPT columns. Requires an explicit component_gamma and one of the combined CLIFF routes.
-        grad_clip_norm (float or None): Global gradient-norm clip applied before each optimizer step. None (the default) leaves every route's update unclipped, as before.
+        grad_clip_norm (float or None): Gradient-norm clip applied before each optimizer step. None leaves the update unclipped.
+        grad_clip_mode (str): `global` clips all parameters together; `component` clips dense CLIFF ELST, EXCH, and IND groups independently.
         omp_num_threads (int): Number of OpenMP threads assigned to each training process.
 
     """
     is_rackers_model = apnet_model_type in RACKERS_MODEL_TYPES
     is_cliff_model = apnet_model_type in CLIFF_MODEL_TYPES
     is_positive_param_model = apnet_model_type in POSITIVE_PARAM_MODEL_TYPES
+    grad_clip_mode = str(grad_clip_mode).strip().lower()
+    if grad_clip_mode not in AtomPairwiseModels.mtp_mtp.CLIFF_GRAD_CLIP_MODES:
+        raise ValueError(
+            "grad_clip_mode must be one of "
+            f"{list(AtomPairwiseModels.mtp_mtp.CLIFF_GRAD_CLIP_MODES)}, "
+            f"got {grad_clip_mode!r}"
+        )
+    if grad_clip_mode == "component":
+        if grad_clip_norm is None:
+            raise ValueError(
+                "grad_clip_mode='component' requires grad_clip_norm"
+            )
+        if apnet_model_type not in COMPONENT_CLIP_CLIFF_MODEL_TYPES:
+            raise ValueError(
+                "component gradient clipping is only supported on the dense "
+                "combined CLIFF routes "
+                f"{sorted(COMPONENT_CLIP_CLIFF_MODEL_TYPES)}, not "
+                f"{apnet_model_type!r}"
+            )
     if split_manifest:
         # Only the atom-model route resolves a manifest into indices. Accepting
         # it here would train on the trainer's own uniform draw while the run
@@ -1092,6 +1120,7 @@ def train_pairwise_model(
         # `grad_clip_norm` parameter do not print a spurious "skipping
         # unsupported kwarg" line on every unclipped run.
         train_kwargs["grad_clip_norm"] = grad_clip_norm
+        train_kwargs["grad_clip_mode"] = grad_clip_mode
     if external_rank is not None:
         # Same reasoning: only the externally launched DDP routes see these, so
         # no other route prints an "unsupported kwarg" line.
@@ -1634,10 +1663,20 @@ def main():
         type=float,
         default=None,
         help=(
-            "Clip the global gradient norm to this value before each optimizer "
-            "step. Unset (the default) leaves the update unclipped. SAPT "
-            "components reach ~240 kcal/mol, so a single close-contact dimer "
-            "can otherwise dominate a step under MSE."
+            "Clip gradient norms to this value before each optimizer step. "
+            "Unset (the default) leaves the update unclipped. SAPT components "
+            "reach ~240 kcal/mol, so a single close-contact dimer can otherwise "
+            "dominate a step under MSE."
+        ),
+    )
+    args.add_argument(
+        "--grad_clip_mode",
+        choices=AtomPairwiseModels.mtp_mtp.CLIFF_GRAD_CLIP_MODES,
+        default="global",
+        help=(
+            "Gradient clipping scope. 'global' clips all trainable parameters "
+            "together. 'component' clips dense CLIFF ELST, EXCH, and IND "
+            "parameter groups independently and requires --grad_clip_norm."
         ),
     )
     args.add_argument(
@@ -1901,6 +1940,7 @@ def main():
             component_gamma=args.component_gamma,
             total_includes_d3=args.total_includes_d3,
             grad_clip_norm=args.grad_clip_norm,
+            grad_clip_mode=args.grad_clip_mode,
             omp_num_threads=(
                 args.omp_num_threads
                 if args.omp_num_threads is not None

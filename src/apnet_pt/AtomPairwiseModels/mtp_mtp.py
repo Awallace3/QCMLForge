@@ -317,6 +317,20 @@ CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX = 2
 CLIFF_CLASSICAL_IND_OVERLAP_INDEX = 3
 CLIFF_CLASSICAL_EXCH_INDEX = 4
 
+# Disjoint trainable columns for component-wise gradient clipping. The nested
+# atom model is frozen on the dense CLIFF routes, so these groups cover every
+# trainable parameter and match the physical dependency graph exactly.
+CLIFF_CLASSICAL_COMPONENT_PARAMETER_INDICES = {
+    "electrostatics": (CLIFF_CLASSICAL_ELST_INDEX,),
+    "exchange": (CLIFF_CLASSICAL_EXCH_INDEX,),
+    "induction": (
+        CLIFF_CLASSICAL_THOLE_DIRECT_INDEX,
+        CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX,
+        CLIFF_CLASSICAL_IND_OVERLAP_INDEX,
+    ),
+}
+CLIFF_GRAD_CLIP_MODES = ("global", "component")
+
 # Lower bound applied to predicted valence widths before they enter the
 # ``rsqrt`` in :func:`atomic_overlap_S_ij`.  ``AtomHirshfeldMPNN`` emits
 # ``relu(...) + 1e-4`` (ap2_hirshfeld_atom_model.py:403), so a predicted width
@@ -7270,6 +7284,92 @@ units angstrom
         total_mse = torch.mean(torch.square(pred_total - ref_total))
         return (1.0 - gamma) * total_mse + gamma * component_mse
 
+    def _component_gradient_parameter_groups(self) -> dict[str, list]:
+        """Return disjoint dense-head parameter groups by physical component.
+
+        The dense ``CliffClassicalNN`` has one embedding/readout stack per
+        parameter column and a frozen nested atom model. Consequently ELST,
+        EXCH, and IND can be clipped independently without assigning a shared
+        trainable tensor arbitrarily. Fail closed if a future architecture adds
+        a shared trainable tensor or if this mode is requested on the MPNN head,
+        whose featurizer is shared across output columns.
+        """
+        head = model_io.unwrap_model(self.model)
+        if type(head) is not CliffClassicalNN:
+            raise ValueError(
+                "component gradient clipping requires the dense "
+                "CliffClassicalNN head; shared-head architectures cannot be "
+                "partitioned unambiguously"
+            )
+
+        groups: dict[str, list] = {
+            name: [] for name in CLIFF_CLASSICAL_COMPONENT_PARAMETER_INDICES
+        }
+        for component, columns in (
+            CLIFF_CLASSICAL_COMPONENT_PARAMETER_INDICES.items()
+        ):
+            for column in columns:
+                groups[component].extend(
+                    parameter
+                    for parameter in head.guess_layer[column].parameters()
+                    if parameter.requires_grad
+                )
+                groups[component].extend(
+                    parameter
+                    for parameter in head.param_readout_layers[
+                        column
+                    ].parameters()
+                    if parameter.requires_grad
+                )
+
+        shared_damping = getattr(head, "shared_damping_raw", None)
+        if shared_damping is not None and shared_damping.requires_grad:
+            groups["induction"].append(shared_damping)
+
+        grouped_ids = [
+            id(parameter)
+            for values in groups.values()
+            for parameter in values
+        ]
+        if len(grouped_ids) != len(set(grouped_ids)):
+            raise RuntimeError("component gradient parameter groups overlap")
+        expected = {
+            id(parameter): name
+            for name, parameter in head.named_parameters()
+            if parameter.requires_grad
+        }
+        missing = sorted(
+            expected[parameter_id]
+            for parameter_id in set(expected) - set(grouped_ids)
+        )
+        extra = set(grouped_ids) - set(expected)
+        if missing or extra:
+            detail = ", ".join(missing) if missing else "unexpected parameters"
+            raise RuntimeError(
+                "component gradient clipping does not cover the trainable "
+                f"head exactly: {detail}"
+            )
+        return groups
+
+    def _clip_gradient_norms(
+        self, grad_clip_norm: float, grad_clip_mode: str
+    ) -> dict[str, torch.Tensor]:
+        """Clip globally or once per independent physical component."""
+        if grad_clip_mode == "global":
+            return {
+                "global": torch.nn.utils.clip_grad_norm_(
+                    self.dimer_model.parameters(), max_norm=grad_clip_norm
+                )
+            }
+        return {
+            component: torch.nn.utils.clip_grad_norm_(
+                parameters, max_norm=grad_clip_norm
+            )
+            for component, parameters in (
+                self._component_gradient_parameter_groups().items()
+            )
+        }
+
     def __train_batches_single_proc(
         self,
         dataloader,
@@ -7279,6 +7379,7 @@ units angstrom
         scheduler,
         y_ind=0,
         grad_clip_norm=None,
+        grad_clip_mode="global",
         world_size=1,
         rank=0,
     ):
@@ -7316,20 +7417,24 @@ units angstrom
             if grad_clip_norm is not None:
                 # SAPT components reach ~240 kcal/mol on close contacts, so a
                 # single such dimer produces a gradient orders of magnitude
-                # larger than a typical batch's under MSE.  Adam rescales by the
+                # larger than a typical batch's under MSE. Adam rescales by the
                 # running second moment rather than clipping, so those spikes
-                # both take a full-size step in an outlier direction and inflate
-                # `v` enough to stall the following steps.  Bounding the global
-                # norm keeps one batch from setting the trajectory.
+                # can set the trajectory.
                 #
-                # `clip_grad_norm_` returns the pre-clip norm and does *not*
-                # sanitize a non-finite one: scaling by `max_norm / nan` leaves
-                # every gradient nan, so the step below would write nan into
-                # every weight and the run is over. Job 12229494 died that way.
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.dimer_model.parameters(), max_norm=grad_clip_norm
+                # In ``global`` mode one large IND gradient also shrinks ELST
+                # and EXCH. ``component`` mode clips their disjoint dense-head
+                # parameter groups separately, preserving the independence of a
+                # gamma=1 component-only loss. ``clip_grad_norm_`` returns the
+                # pre-clip norm and does not sanitize a non-finite one, so any
+                # non-finite group still drops the whole batch before Adam can
+                # write NaNs into parameters.
+                gradient_norms = self._clip_gradient_norms(
+                    grad_clip_norm, grad_clip_mode
                 )
-                skip_batch = not bool(torch.isfinite(total_norm))
+                skip_batch = any(
+                    not bool(torch.isfinite(norm))
+                    for norm in gradient_norms.values()
+                )
                 if world_size > 1:
                     # The decision has to be unanimous. DDP has already averaged
                     # the gradients, so every rank computes the same norm and in
@@ -7469,6 +7574,7 @@ units angstrom
         num_workers,
         skip_compile=False,
         grad_clip_norm=None,
+        grad_clip_mode="global",
         rank=0,
         world_size=1,
         local_rank=None,
@@ -7813,6 +7919,7 @@ units angstrom
                 scheduler=scheduler,
                 y_ind=y_ind,
                 grad_clip_norm=grad_clip_norm,
+                grad_clip_mode=grad_clip_mode,
                 world_size=world_size,
                 rank=rank,
             )
@@ -7998,6 +8105,7 @@ units angstrom
         num_workers,
         skip_compile=False,
         grad_clip_norm=None,
+        grad_clip_mode="global",
         local_rank=None,
     ):
         """Run one DDP rank of :meth:`single_proc_train`.
@@ -8022,6 +8130,7 @@ units angstrom
                 num_workers=num_workers,
                 skip_compile=skip_compile,
                 grad_clip_norm=grad_clip_norm,
+                grad_clip_mode=grad_clip_mode,
                 rank=rank,
                 world_size=world_size,
                 local_rank=local_rank,
@@ -8096,6 +8205,7 @@ units angstrom
         component_gamma=None,
         total_includes_d3=False,
         grad_clip_norm=None,
+        grad_clip_mode="global",
         wandb_config: WandbConfig | None = None,
         _external_rank=None,
         _external_local_rank=None,
@@ -8118,13 +8228,36 @@ units angstrom
         ``component_gamma=None`` (the default) keeps the legacy plain MSE; a
         float in ``[0.0, 1.0]`` selects CLIFF Eq. (23).  Both it and
         ``total_includes_d3`` are declared here as named parameters
-        *deliberately*, as is ``grad_clip_norm`` (``None`` keeps the legacy
-        unclipped update): ``train_models.py`` filters ``train_kwargs`` through
+        *deliberately*, as are ``grad_clip_norm`` and ``grad_clip_mode``
+        (``None`` keeps the legacy unclipped update): ``train_models.py``
+        filters ``train_kwargs`` through
         ``inspect.signature(apnet.train).parameters`` before calling, so
         anything absent from this signature is silently dropped rather than
         raising.  See :meth:`_batch_loss` for the weighting itself.
         """
         grad_clip_norm = _validate_bound_scale(grad_clip_norm, "grad_clip_norm")
+        grad_clip_mode = str(grad_clip_mode).strip().lower()
+        if grad_clip_mode not in CLIFF_GRAD_CLIP_MODES:
+            raise ValueError(
+                "grad_clip_mode must be one of "
+                f"{list(CLIFF_GRAD_CLIP_MODES)}, got {grad_clip_mode!r}"
+            )
+        if grad_clip_mode == "component":
+            if grad_clip_norm is None:
+                raise ValueError(
+                    "grad_clip_mode='component' requires grad_clip_norm"
+                )
+            if self.dimer_eval_type not in COMBINED_CLIFF_DIMER_EVAL_MODES:
+                raise ValueError(
+                    "component gradient clipping is only supported for the "
+                    "combined CLIFF routes"
+                )
+            if type(model_io.unwrap_model(self.model)) is not CliffClassicalNN:
+                raise ValueError(
+                    "component gradient clipping requires the dense "
+                    "CliffClassicalNN head"
+                )
+        self.grad_clip_mode = grad_clip_mode
         # Validated before any dataset work so a misconfigured route fails
         # immediately rather than after a dataset build.
         self.component_gamma, self.total_includes_d3 = (
@@ -8199,6 +8332,7 @@ units angstrom
             "training/random_seed": random_seed,
             "training/skip_compile": skip_compile,
             "training/grad_clip_norm": grad_clip_norm,
+            "training/grad_clip_mode": grad_clip_mode,
             # The CLIFF Eq. (23) total/component weighting changes which
             # physical terms share gradients. It must be visible on W&B so a
             # component-only gamma=1 run cannot be mistaken for the historical
@@ -8249,6 +8383,7 @@ units angstrom
                 dataloader_num_workers,
                 skip_compile,
                 grad_clip_norm,
+                grad_clip_mode,
             )
             if _external_rank is None:
                 configure_distributed_tracking(
@@ -8301,6 +8436,7 @@ units angstrom
                     num_workers=dataloader_num_workers,
                     skip_compile=skip_compile,
                     grad_clip_norm=grad_clip_norm,
+                    grad_clip_mode=grad_clip_mode,
                 ),
                 wandb_config,
                 model_family="parameter",

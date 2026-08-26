@@ -716,12 +716,13 @@ def test_non_finite_gradient_skips_the_step_instead_of_the_run():
     src = inspect.getsource(
         mtp_mtp.AM_DimerParam_Model._AM_DimerParam_Model__train_batches_single_proc
     )
-    assert "total_norm = torch.nn.utils.clip_grad_norm_" in src
+    assert "gradient_norms = self._clip_gradient_norms" in src
     # The decision is named rather than tested inline, because under DDP it has
     # to be all-reduced before it is acted on -- a rank that skipped alone would
     # `continue` past its peers' collectives and hang the job. See
     # `tests/test_cliff_induction_ddp.py::test_grad_norm_skip_is_collective`.
-    assert "skip_batch = not bool(torch.isfinite(total_norm))" in src
+    assert "for norm in gradient_norms.values()" in src
+    assert "not bool(torch.isfinite(norm))" in src
     assert "if skip_batch:" in src
     # The batch is dropped, not stepped, and the count is surfaced.
     assert "n_skipped += 1" in src
@@ -1442,6 +1443,60 @@ def test_nothing_is_frozen_by_default(nested_hfvr_vw_model):
     assert head._frozen_parameter_indices == ()
 
 
+def test_dense_component_gradient_groups_clip_independently(
+    nested_hfvr_vw_model,
+):
+    """Each physical term gets the full clip budget, not a shared scale."""
+    torch.manual_seed(0)
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    groups = harness._component_gradient_parameter_groups()
+    assert tuple(groups) == ("electrostatics", "exchange", "induction")
+
+    before = {}
+    for scale, (component, parameters) in enumerate(groups.items(), start=2):
+        assert parameters
+        for parameter in parameters:
+            parameter.grad = torch.full_like(parameter, float(scale))
+        before[component] = torch.sqrt(
+            sum(torch.sum(parameter.grad.square()) for parameter in parameters)
+        )
+        assert before[component] > 1.0
+
+    reported = harness._clip_gradient_norms(1.0, "component")
+    assert set(reported) == set(groups)
+    for component, parameters in groups.items():
+        assert reported[component] == pytest.approx(before[component])
+        after = torch.sqrt(
+            sum(torch.sum(parameter.grad.square()) for parameter in parameters)
+        )
+        assert after == pytest.approx(1.0, rel=2e-5)
+
+
+def test_component_gradient_groups_reject_the_shared_mpnn_head(
+    nested_hfvr_vw_model,
+):
+    harness = CliffClassicalOverlapMPNNModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        **MPNN_KWARGS,
+    )
+    with pytest.raises(ValueError, match="dense CliffClassicalNN"):
+        harness._component_gradient_parameter_groups()
+
+
 class _FakeCliffHarness:
     """Records constructor kwargs without building anything heavy."""
 
@@ -1453,8 +1508,14 @@ class _FakeCliffHarness:
         self.dataset = object()
         self.model = None
 
-    def train(self, **kwargs):
-        pass
+    def train(
+        self, grad_clip_norm=None, grad_clip_mode="global", **kwargs
+    ):
+        self.train_kwargs = {
+            "grad_clip_norm": grad_clip_norm,
+            "grad_clip_mode": grad_clip_mode,
+            **kwargs,
+        }
 
 
 class _FakeAtomTypeWrapper:
@@ -1494,6 +1555,37 @@ def test_frozen_parameters_rejected_off_the_cliff_routes(tmp_path):
             apnet_model_type="APNet2",
             model_out=str(tmp_path / "out.pt"),
             frozen_parameters=["thole_direct"],
+        )
+
+
+def test_component_clip_mode_reaches_dense_training(tmp_path, cliff_dispatch):
+    train_models.train_pairwise_model(
+        apnet_model_type="CliffClassicalModel",
+        model_out=str(tmp_path / "out.pt"),
+        grad_clip_norm=1.0,
+        grad_clip_mode="component",
+        ds_max_size=100,
+    )
+    assert cliff_dispatch.calls[0].train_kwargs["grad_clip_norm"] == 1.0
+    assert cliff_dispatch.calls[0].train_kwargs["grad_clip_mode"] == "component"
+
+
+def test_component_clip_mode_requires_a_norm(tmp_path):
+    with pytest.raises(ValueError, match="requires grad_clip_norm"):
+        train_models.train_pairwise_model(
+            apnet_model_type="CliffClassicalOverlapModel",
+            model_out=str(tmp_path / "out.pt"),
+            grad_clip_mode="component",
+        )
+
+
+def test_component_clip_mode_rejects_shared_mpnn_head(tmp_path):
+    with pytest.raises(ValueError, match="dense combined CLIFF"):
+        train_models.train_pairwise_model(
+            apnet_model_type="CliffClassicalOverlapMPNNModel",
+            model_out=str(tmp_path / "out.pt"),
+            grad_clip_norm=1.0,
+            grad_clip_mode="component",
         )
 
 

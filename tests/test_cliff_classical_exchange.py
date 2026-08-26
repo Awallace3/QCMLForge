@@ -4147,6 +4147,7 @@ def test_train_models_help_exits_zero_and_advertises_the_cliff_routes():
     assert "--component_gamma" in help_text
     assert "--total_includes_d3" in help_text
     assert "--grad_clip_norm" in help_text
+    assert "--grad_clip_mode" in help_text
 
 
 # ---------------------------------------------------------------------------
@@ -4440,14 +4441,14 @@ def test_cliff_head_per_element_seeds_do_not_leak_across_columns(
 # ---------------------------------------------------------------------------
 
 
-def test_train_declares_grad_clip_norm():
+def test_train_declares_grad_clip_configuration():
     """`train_models.py` drops kwargs missing from the signature silently."""
     signature = inspect.signature(mtp_mtp.AM_DimerParam_Model.train)
-    assert "grad_clip_norm" in signature.parameters
     assert signature.parameters["grad_clip_norm"].default is None
+    assert signature.parameters["grad_clip_mode"].default == "global"
     inner = inspect.signature(mtp_mtp.AM_DimerParam_Model.single_proc_train)
-    assert "grad_clip_norm" in inner.parameters
     assert inner.parameters["grad_clip_norm"].default is None
+    assert inner.parameters["grad_clip_mode"].default == "global"
 
 
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), "x"])
@@ -4954,6 +4955,7 @@ def test_excluded_elements_are_recorded_for_tracking():
     src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.train)
     assert '"data/excluded_elements"' in src
     assert '"training/grad_clip_norm"' in src
+    assert '"training/grad_clip_mode"' in src
     assert '"training/component_gamma"' in src
     assert '"training/total_includes_d3"' in src
     # And the attribute the tracking config reads must be set by __init__ for
