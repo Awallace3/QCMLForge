@@ -746,18 +746,22 @@ class MACEPolarFeaturizer(torch.nn.Module):
     def forward_dimer(self, batch: Any):
         """Run A and B as separate graph batches with shared frozen weights."""
 
+        # Charges and spins are stored as integers by the dimer datasets
+        # (total_charge_A/B are int32), while forward_monomer requires floating
+        # point tensors. Cast here so an integral charge is not reported as a
+        # non-finite value.
         features_a, direct_a = self.forward_monomer(
             batch.RA,
             batch.ZA,
-            batch.total_charge_A,
-            batch.total_spin_A,
+            batch.total_charge_A.float(),
+            batch.total_spin_A.float(),
             batch=batch.molecule_ind_A,
         )
         features_b, direct_b = self.forward_monomer(
             batch.RB,
             batch.ZB,
-            batch.total_charge_B,
-            batch.total_spin_B,
+            batch.total_charge_B.float(),
+            batch.total_spin_B.float(),
             batch=batch.molecule_ind_B,
         )
         return features_a, direct_a, features_b, direct_b

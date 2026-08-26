@@ -526,3 +526,31 @@ def test_real_private_adapter_public_parity_and_direct_contract():
         direct.intrinsic_dipole_eangstrom @ rotation.T,
         atol=1.0e-6,
     )
+
+
+def test_forward_dimer_accepts_integer_total_charge_from_datasets():
+    """Dimer datasets store total_charge as int32; forward_monomer needs floats.
+
+    Without a cast the integral charge trips forward_monomer's floating-point
+    guard, which reports it as a non-finite value even though it is finite.
+    """
+    featurizer = _protocol_featurizer(feature_mode="all-scalars+norms")
+    batch = type("Batch", (), {})()
+    batch.RA = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.8]])
+    batch.ZA = torch.tensor([8, 1])
+    batch.molecule_ind_A = torch.tensor([0, 0])
+    # Matches the on-disk dtype of the AP3 fused dimer LMDB.
+    batch.total_charge_A = torch.tensor([-1], dtype=torch.int32)
+    batch.total_spin_A = torch.tensor([1.0])
+    batch.RB = torch.tensor([[4.0, 0.0, 0.0], [4.0, 0.7, 0.0], [4.0, -0.7, 0.0]])
+    batch.ZB = torch.tensor([6, 1, 1])
+    batch.molecule_ind_B = torch.tensor([0, 0, 0])
+    batch.total_charge_B = torch.tensor([0], dtype=torch.int32)
+    batch.total_spin_B = torch.tensor([2.0])
+
+    features_a, _, features_b, _ = featurizer.forward_dimer(batch)
+
+    assert features_a.total_charge.dtype.is_floating_point
+    assert features_b.total_charge.dtype.is_floating_point
+    assert features_a.total_charge.reshape(-1).tolist() == [-1.0]
+    assert features_b.total_charge.reshape(-1).tolist() == [0.0]
