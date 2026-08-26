@@ -1,4 +1,6 @@
 import os
+import json
+import warnings
 import qcelemental as qcel
 from typing import List, Optional, Sequence, Union
 from torch_geometric.data.data import BaseData
@@ -976,12 +978,18 @@ class ap2_fused_module_dataset(Dataset):
                     self.atom_model.model, dynamic=True
                 )
         print(f"{root=}, {self.spec_type=}, {self.in_memory=}")
+        # An on-disk store that is smaller than max_size asks for has to be
+        # grown before PyG is allowed to conclude that nothing needs doing.
+        if not self.force_reprocess and not self.in_memory:
+            self._request_extension_if_store_is_short()
         super(ap2_fused_module_dataset, self).__init__(root, transform, pre_transform)
         if self.force_reprocess:
             self.force_reprocess = False
             super(ap2_fused_module_dataset, self).__init__(
                 root, transform, pre_transform
             )
+        if not self.in_memory:
+            self._warn_if_store_is_smaller_than_requested()
         if self.in_memory:
             self.get = self.get_in_memory
         self.batch_size = batch_size
@@ -1042,6 +1050,142 @@ class ap2_fused_module_dataset(Dataset):
             return [
                 "splinter_spec1.pkl",
             ]
+
+    def _store_extent_path(self):
+        """Sidecar recording how far the raw source could actually fill this store.
+
+        Only the "the source ran out" case is load-bearing.  Without a record
+        of it, asking for more dimers than the raw source can supply would
+        re-trigger a full raw rescan on every instantiation: the shard list
+        would stay permanently short of what ``MAX_SIZE`` implies, and nothing
+        else on disk says "this is as big as it gets".
+        """
+        return osp.join(
+            self.processed_dir,
+            f"dimer_ap2_fused{self.split_name}_spec_{
+                self.spec_type
+            }.store_extent.json",
+        )
+
+    def _existing_shard_paths(self):
+        """Shard files for this split that are on disk right now, in index order.
+
+        Deliberately the same glob shape ``reprocess_file_names`` uses, so the
+        two can never disagree about what "present" means.
+        """
+        pattern = osp.join(
+            self.processed_dir,
+            f"dimer_ap2_fused{self.split_name}_spec_{self.spec_type}_*{
+                self.file_extension
+            }",
+        )
+        return sorted(glob(pattern), key=natural_key)
+
+    def _shards_implied_by_max_size(self):
+        """Shard count ``MAX_SIZE`` asks for, matching reprocess_file_names' floor."""
+        if self.MAX_SIZE is None:
+            return None
+        return int(self.MAX_SIZE / self.datapoint_storage_n_objects)
+
+    def _recorded_source_extent(self):
+        """Shard count at which the raw source was observed to run out, or None."""
+        path = self._store_extent_path()
+        if not osp.exists(path):
+            return None
+        try:
+            with open(path) as fh:
+                recorded = json.load(fh)
+        except Exception as exc:
+            warnings.warn(f"Ignoring unreadable store extent {path}: {exc}")
+            return None
+        if not recorded.get("source_exhausted"):
+            return None
+        shards = recorded.get("shards")
+        if not isinstance(shards, (int, float)) or isinstance(shards, bool):
+            return None
+        return int(shards)
+
+    def _record_store_extent(self, *, source_exhausted):
+        """Write the extent sidecar after a processing pass."""
+        payload = {
+            "shards": len(self._existing_shard_paths()),
+            "datapoint_storage_n_objects": self.datapoint_storage_n_objects,
+            "requested_max_size": self.MAX_SIZE,
+            "source_exhausted": bool(source_exhausted),
+        }
+        path = self._store_extent_path()
+        tmp = f"{path}.tmp"
+        try:
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError as exc:
+            warnings.warn(f"Could not record store extent at {path}: {exc}")
+
+    def _request_extension_if_store_is_short(self):
+        """Trigger a build when the store holds fewer dimers than MAX_SIZE asks for.
+
+        ``processed_file_names`` is built by globbing the shards that already
+        exist and then only ever truncating that list down, so PyG's "is
+        processing needed?" check is satisfied by construction and
+        ``process()`` never runs once any shard is present.  The store could
+        therefore never grow: a run asking for 1.5M dimers silently trained on
+        whatever happened to be on disk.  Routing through ``force_reprocess``
+        reuses the incremental path ``process()`` already implements -- with
+        ``skip_processed`` the existing shards are skipped, not rebuilt.
+        """
+        wanted_shards = self._shards_implied_by_max_size()
+        if not wanted_shards or wanted_shards <= 0:
+            return
+        have_shards = len(self._existing_shard_paths())
+        if have_shards == 0 or have_shards >= wanted_shards:
+            # Nothing on disk yet, in which case the pre-existing
+            # "dimer_missing" marker already forces a build, or the store
+            # already covers the request.
+            return
+        exhausted_at = self._recorded_source_extent()
+        if exhausted_at is not None and have_shards >= exhausted_at:
+            warnings.warn(
+                f"spec_{self.spec_type} {self.split_name or 'all'} store: "
+                f"max_size asked for {self.MAX_SIZE} dimers "
+                f"({wanted_shards} shards) but the raw source only ever "
+                f"yielded {exhausted_at} shards, as recorded in "
+                f"{osp.basename(self._store_extent_path())}. Using the "
+                f"{have_shards} shards on disk rather than rescanning a "
+                "source that cannot produce more.",
+                stacklevel=3,
+            )
+            return
+        print(
+            f"Extending the spec_{self.spec_type} "
+            f"{self.split_name or 'all'} store: {have_shards} of "
+            f"{wanted_shards} shards present "
+            f"({have_shards * self.datapoint_storage_n_objects} of "
+            f"{self.MAX_SIZE} dimers). Processing the remainder; existing "
+            "shards are skipped, not rebuilt.",
+            flush=True,
+        )
+        self.force_reprocess = True
+
+    def _warn_if_store_is_smaller_than_requested(self):
+        """Say so out loud when the store cannot satisfy ``MAX_SIZE``.
+
+        The silent version of this is how a "1.5M dimer" training run spent
+        GPU-hours on 100k dimers without a single line of output saying so.
+        """
+        wanted_shards = self._shards_implied_by_max_size()
+        if not wanted_shards or wanted_shards <= 0:
+            return
+        have_shards = len(self._existing_shard_paths())
+        if have_shards >= wanted_shards:
+            return
+        warnings.warn(
+            f"spec_{self.spec_type} {self.split_name or 'all'} store holds "
+            f"{have_shards * self.datapoint_storage_n_objects} dimers but "
+            f"max_size asked for {self.MAX_SIZE}. Proceeding with the "
+            "smaller store.",
+            stacklevel=3,
+        )
 
     def reprocess_file_names(self):
         """
@@ -1212,6 +1356,10 @@ class ap2_fused_module_dataset(Dataset):
         t1 = time()
         t2 = time()
         print(f"{len(RAs)=}, {self.atomic_batch_size=}, {self.batch_size=}")
+        # Distinguishes "stopped because max_size was satisfied" from
+        # "stopped because the raw source ran out"; only the latter is worth
+        # recording, and only it must never be inferred by accident.
+        reached_max_size = False
         for i in range(len(RAs)):
             if self.skip_processed:
                 datapath = osp.join(
@@ -1269,6 +1417,7 @@ class ap2_fused_module_dataset(Dataset):
                         torch.save(data_objects, datapath)
                 data_objects = []
                 if self.MAX_SIZE is not None and idx > self.MAX_SIZE:
+                    reached_max_size = True
                     break
             idx += 1
         if self.print_level >= 2:
@@ -1295,6 +1444,16 @@ class ap2_fused_module_dataset(Dataset):
                     save_hdf5_data_objects(data_objects, datapath)
                 else:
                     torch.save(data_objects, datapath)
+        if not self.in_memory:
+            # A pass that skipped every requested index without breaking has
+            # not learned anything about the source's true extent, so require
+            # the raw source itself to have been the shorter of the two.
+            self._record_store_extent(
+                source_exhausted=(
+                    not reached_max_size
+                    and (self.MAX_SIZE is None or len(RAs) <= self.MAX_SIZE)
+                )
+            )
         return
 
     def len(self):
