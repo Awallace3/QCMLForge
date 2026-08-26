@@ -4954,6 +4954,8 @@ def test_excluded_elements_are_recorded_for_tracking():
     src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.train)
     assert '"data/excluded_elements"' in src
     assert '"training/grad_clip_norm"' in src
+    assert '"training/component_gamma"' in src
+    assert '"training/total_includes_d3"' in src
     # And the attribute the tracking config reads must be set by __init__ for
     # every route, not only when something is excluded.
     init_src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.__init__)

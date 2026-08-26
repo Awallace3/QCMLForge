@@ -8199,6 +8199,12 @@ units angstrom
             "training/random_seed": random_seed,
             "training/skip_compile": skip_compile,
             "training/grad_clip_norm": grad_clip_norm,
+            # The CLIFF Eq. (23) total/component weighting changes which
+            # physical terms share gradients. It must be visible on W&B so a
+            # component-only gamma=1 run cannot be mistaken for the historical
+            # jointly compensated gamma=0.4 objective.
+            "training/component_gamma": self.component_gamma,
+            "training/total_includes_d3": self.total_includes_d3,
             # Always logged, even when empty: an absent key would have to be
             # read as "unknown", while [] is a positive statement that nothing
             # was filtered.
