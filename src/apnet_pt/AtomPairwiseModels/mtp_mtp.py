@@ -14,6 +14,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.data import Data
 
 from apnet_pt.torch_util import set_weights_to_value
@@ -21,11 +22,13 @@ from apnet_pt.util import resolve_split_indices
 from qcml_dftd3.d3 import d3, resolve_d3_damping_parameters
 
 from .. import constants
+from .. import ddp_launch
 from .. import model_io
 from ..training_tracking import (
     TrackerBackend,
     WandbConfig,
     configure_distributed_tracking,
+    run_tracked_distributed,
     run_tracked_single_process,
     stage_final_weights,
     track_epoch_from_locals,
@@ -7117,10 +7120,33 @@ units angstrom
     # TRAINING/VALIDATION HELPERS
     ########################################################################
 
-    def __setup(self, rank, world_size):
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
+    def __setup(self, rank, world_size, local_rank=None):
+        """Join the process group, whichever launcher produced this rank.
+
+        The endpoint is resolved by :mod:`apnet_pt.ddp_launch` instead of being
+        hard-coded to ``localhost:12355``, because a hard-coded ``localhost`` is
+        exactly what makes a job work on one node and hang on two: every rank
+        off node 0 would rendezvous with itself and the job would sit until its
+        wall clock expired with no error message. An externally launched rank
+        (``srun``) has already joined the group before reaching this method, so
+        the initialization is skipped rather than repeated.
+        """
+        if dist.is_initialized():
+            if torch.cuda.is_available() and local_rank is not None:
+                torch.cuda.set_device(int(local_rank))
+            torch.manual_seed(43)
+            return
+        rendezvous = ddp_launch.export_rendezvous(
+            ddp_launch.resolve_rendezvous(
+                rank=rank, local_rank=local_rank, world_size=world_size
+            )
+        )
+        print(ddp_launch.describe_rendezvous(rendezvous), flush=True)
         if torch.cuda.is_available():
+            # Set before `init_process_group`: nccl binds a communicator to the
+            # current device, and every rank of a node defaulting to `cuda:0`
+            # deadlocks inside the first collective.
+            torch.cuda.set_device(rendezvous.local_rank)
             dist.init_process_group("nccl", rank=rank, world_size=world_size)
         else:
             dist.init_process_group("gloo", rank=rank, world_size=world_size)
@@ -7128,6 +7154,48 @@ units angstrom
 
     def __cleanup(self):
         dist.destroy_process_group()
+
+    @staticmethod
+    def _ddp_all_reduce(tensor, op="sum"):
+        """All-reduce ``tensor`` on a device the active backend accepts.
+
+        nccl refuses CPU tensors and gloo cannot reduce CUDA ones on a CPU-only
+        build, so the payload is staged to the backend's device and the result
+        is returned on the caller's. Small by construction -- a handful of
+        scalars -- so the staging copy is irrelevant next to the collective.
+        """
+        reduce_op = (
+            dist.ReduceOp.MAX if str(op).lower() == "max" else dist.ReduceOp.SUM
+        )
+        if dist.get_backend() == "nccl":
+            target = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            target = torch.device("cpu")
+        staged = tensor.detach().to(target)
+        dist.all_reduce(staged, op=reduce_op)
+        return staged.to(tensor.device)
+
+    def _ddp_reduce_epoch_metrics(self, total_loss, comp_errors_t, world_size):
+        """Global ``(total_loss, MAE)`` from this rank's shard.
+
+        SUM, not MEAN, for both: ``training_tracking._loader_batch_count``
+        multiplies the per-rank batch count by the world size, so tracking
+        divides a summed loss by the global batch count. The MAE is reduced as
+        a sum of absolute errors plus a count of dimers, so the quotient is the
+        true global MAE rather than a mean of per-rank means -- the shards are
+        not exactly equal (``DistributedSampler`` pads the last one), and a
+        mean of means would weight the padded rank slightly wrong.
+        """
+        error_sum = torch.sum(torch.abs(comp_errors_t), dim=0)
+        counts = torch.full_like(error_sum, float(comp_errors_t.shape[0]))
+        packed = self._ddp_all_reduce(torch.stack((error_sum, counts)))
+        total_MAE = packed[0] / packed[1]
+        total_loss = float(
+            self._ddp_all_reduce(
+                torch.tensor(float(total_loss), dtype=torch.float64)
+            ).item()
+        )
+        return total_loss, total_MAE
 
     def _component_loss_weighting(self) -> tuple[float | None, bool]:
         """Resolved ``(component_gamma, total_includes_d3)`` for this harness.
@@ -7211,9 +7279,17 @@ units angstrom
         scheduler,
         y_ind=0,
         grad_clip_norm=None,
+        world_size=1,
+        rank=0,
     ):
         """
-        Single-process training loop body.
+        One epoch of training over this rank's shard of ``dataloader``.
+
+        ``world_size == 1`` is the historical single-process body, unchanged and
+        bitwise identical. Above 1 the returned loss and MAE are global: see
+        :meth:`_ddp_reduce_epoch_metrics`. Every rank runs the same number of
+        batches (``DistributedSampler`` pads the shards to equal length), which
+        is what allows the per-batch collective below to be deadlock-free.
         """
         self.model.train()
         comp_errors_t = []
@@ -7253,7 +7329,21 @@ units angstrom
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     self.dimer_model.parameters(), max_norm=grad_clip_norm
                 )
-                if not torch.isfinite(total_norm):
+                skip_batch = not bool(torch.isfinite(total_norm))
+                if world_size > 1:
+                    # The decision has to be unanimous. DDP has already averaged
+                    # the gradients, so every rank computes the same norm and in
+                    # practice agrees -- but "in practice" is not a guarantee
+                    # worth a silent divergence between replicas, and a rank that
+                    # skipped alone would `continue` past its peers' collectives.
+                    # One 1-element all-reduce per batch is ~0.1 ms against ~0.7 s
+                    # of compute for this model.
+                    skip_batch = bool(
+                        self._ddp_all_reduce(
+                            torch.tensor(float(skip_batch)), op="max"
+                        ).item()
+                    )
+                if skip_batch:
                     # Drop the batch rather than the run. One diverged dimer is
                     # not worth four GPU-hours, and the parameters that produced
                     # it are still bounded, so the next batch can recover.
@@ -7265,9 +7355,10 @@ units angstrom
             comp_errors_t.append(comp_errors.detach().cpu())
         if scheduler is not None:
             scheduler.step()
-        if n_skipped:
+        if n_skipped and rank == 0:
             # Printed, not swallowed: a run that quietly dropped a third of its
-            # batches is not the run the record claims.
+            # batches is not the run the record claims. The skip decision is
+            # collective, so rank 0's count is every rank's count.
             print(
                 f"  WARNING: skipped {n_skipped} batch(es) this epoch on a "
                 "non-finite gradient norm",
@@ -7275,11 +7366,24 @@ units angstrom
             )
         self.last_epoch_skipped_batches = n_skipped
         comp_errors_t = torch.cat(comp_errors_t, dim=0)
+        if world_size > 1:
+            return self._ddp_reduce_epoch_metrics(
+                total_loss, comp_errors_t, world_size
+            )
         total_MAE_t = torch.mean(torch.abs(comp_errors_t), dim=0)
         return total_loss, total_MAE_t
 
     # @torch.inference_mode()
-    def __evaluate_batches_single_proc(self, dataloader, loss_fn, rank_device, y_ind=0):
+    def __evaluate_batches_single_proc(
+        self, dataloader, loss_fn, rank_device, y_ind=0, world_size=1
+    ):
+        """Evaluate this rank's shard; ``world_size > 1`` returns global values.
+
+        The validation loss is all-reduced *before* the caller compares it with
+        ``lowest_test_loss``. Comparing a per-rank loss would let the ranks
+        disagree about which epoch was the best one, and they would then write
+        different checkpoints and restore different weights at the end.
+        """
         self.model.eval()
         comp_errors_t = []
         total_loss = 0.0
@@ -7312,6 +7416,10 @@ units angstrom
                 total_loss += batch_loss.item()
                 comp_errors_t.append(comp_errors.detach().cpu())
         comp_errors_t = torch.cat(comp_errors_t, dim=0)
+        if world_size > 1:
+            return self._ddp_reduce_epoch_metrics(
+                total_loss, comp_errors_t, world_size
+            )
         total_MAE_t = torch.mean(torch.abs(comp_errors_t), dim=0)
         return total_loss, total_MAE_t
 
@@ -7361,6 +7469,9 @@ units angstrom
         num_workers,
         skip_compile=False,
         grad_clip_norm=None,
+        rank=0,
+        world_size=1,
+        local_rank=None,
     ):
         # (1) Compile Model
         """
@@ -7385,7 +7496,41 @@ units angstrom
                 Number of worker processes for data loading.
             skip_compile (bool):
                 If True, skip torch compilation step before training.
+            rank (int):
+                Global rank of this process. ``0`` for a single-process run.
+            world_size (int):
+                Number of participating processes. ``1`` keeps the historical
+                single-process behaviour bitwise identical; above 1 this is the
+                DDP loop and the process group must already be initialized.
+            local_rank (int | None):
+                Rank within this node, used to pick the CUDA device. Defaults to
+                ``rank % device_count`` when not supplied.
+
+        One loop serves both cases deliberately. A separate ``ddp_train`` body
+        would drift from this one -- the induction functional, the CLIFF Eq. (23)
+        loss, the bound-occupancy logging and the resume sidecar would all have
+        to be duplicated -- and the source-introspection contract tests that
+        guard the resume behaviour only ever look at this function.
+
+        Batch-size convention: ``batch_size`` is *per rank*. The effective
+        global batch is ``batch_size * world_size`` and is printed and recorded
+        in the tracker config, because it changes the optimization, not just the
+        throughput.
         """
+        is_primary = rank == 0
+        # (0) Per-rank device. `__init__` pins `cuda:0` for every process, which
+        # would put both ranks of a 2-GPU node on the same GPU: one of them out
+        # of memory, both of them slow, and nothing in the logs saying why.
+        if world_size > 1 and torch.cuda.is_available():
+            if local_rank is None:
+                local_rank = rank % max(torch.cuda.device_count(), 1)
+            torch.cuda.set_device(int(local_rank))
+            self.device = torch.device(f"cuda:{int(local_rank)}")
+            self.model.to(self.device)
+            if self.dimer_model is not None:
+                self.dimer_model.to(self.device)
+            if self.dimer_model_elst is not None:
+                self.dimer_model_elst.to(self.device)
         rank_device = self.device
         # self.model.to(rank_device)
         batch = self.example_input()
@@ -7399,14 +7544,37 @@ units angstrom
         # (2) Dataloaders
         # if self.ds_spec_type in [1, 5, 6]:
         collate_fn = ap2_fused_collate_update
+        train_sampler = None
+        test_sampler = None
+        if world_size > 1:
+            # `drop_last=False` (the default) pads the last shard by repeating
+            # samples so every rank draws the same number of batches. That
+            # equality is load-bearing: unequal batch counts would leave the
+            # short rank waiting in the next epoch's collective forever. The
+            # cost is at most `world_size - 1` duplicated dimers per epoch --
+            # 3 in 100,000 at four ranks, a 0.003% reweighting of the loss.
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=43,
+            )
+            test_sampler = DistributedSampler(
+                test_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+            )
         train_loader = APNet2_fused_DataLoader(
             dataset=train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
             # shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=collate_fn,
+            sampler=train_sampler,
         )
         test_loader = APNet2_fused_DataLoader(
             dataset=test_dataset,
@@ -7415,7 +7583,19 @@ units angstrom
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=collate_fn,
+            sampler=test_sampler,
         )
+        if world_size > 1:
+            padded = len(train_sampler) * world_size - len(train_dataset)
+            print(
+                f"  DDP rank {rank}/{world_size} device={rank_device} "
+                f"per-rank batch_size={batch_size} "
+                f"EFFECTIVE GLOBAL BATCH SIZE={batch_size * world_size} "
+                f"train batches/rank={len(train_loader)} "
+                f"val batches/rank={len(test_loader)} "
+                f"sampler padding={padded} dimer(s)",
+                flush=True,
+            )
 
         # (3) Optim/Scheduler
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
@@ -7493,6 +7673,45 @@ units angstrom
             f"                                       {term}",
             flush=True,
         )
+
+        # (4b) Wrap the parameter head for gradient synchronization.
+        #
+        # Done here, after the device placement above, because that block reads
+        # `self.model.atom_model` and DDP does not proxy attribute access.
+        #
+        # The forward this loop runs is `self.dimer_model(batch)`, *not*
+        # `self.model(batch)`: `DimerProp` holds the parameter head as
+        # `.AtomTypeParam` and calls it itself. Wrapping `self.model` and
+        # stopping there would leave DDP's forward pre-hook unfired, the reducer
+        # unprepared, and no gradient ever synchronized -- silently, with a
+        # healthy-looking loss curve and a four-GPU job that is four independent
+        # one-GPU jobs. So the wrapper is rebound into every `DimerProp` that
+        # references the head.
+        if world_size > 1:
+            ddp_model = DDP(
+                self.model,
+                # `device_ids` deliberately unset. With it, DDP scatters the
+                # forward inputs across devices, and the fused dimer batch is a
+                # custom object `scatter` cannot split. The batch is moved to
+                # this rank's device by the epoch loop, so there is nothing to
+                # scatter.
+                device_ids=None,
+                # Every trainable parameter of the head takes part in every
+                # forward: the frozen columns and the shared-damping columns
+                # have `requires_grad=False` (the reducer ignores those) and the
+                # atom model is frozen wholesale. `find_unused_parameters=True`
+                # would add a graph traversal per iteration to discover nothing.
+                find_unused_parameters=False,
+                # The head's only buffers are the constant raw-parameter floor
+                # and ceiling, identical on every rank by construction, and the
+                # normalization layers are `LayerNorm` (no running statistics).
+                # Broadcasting them every iteration would be pure overhead.
+                broadcast_buffers=False,
+            )
+            self.model = ddp_model
+            for _holder in (self.dimer_model, self.dimer_model_elst):
+                if _holder is not None and hasattr(_holder, "AtomTypeParam"):
+                    _holder.AtomTypeParam = ddp_model
 
         # (5) Evaluate once pre-training
         if self.dimer_model_elst is not None:
@@ -7580,6 +7799,12 @@ units angstrom
 
         for epoch in range(epochs_completed, epochs_completed + n_epochs):
             t1 = time.time()
+            if train_sampler is not None:
+                # The resumed *global* epoch, not a chunk-local counter. Two
+                # chunks that both started at 0 would replay the identical
+                # shuffle, so the chain would see one epoch's worth of ordering
+                # over and over and nothing would say so.
+                train_sampler.set_epoch(epoch)
             t_out = self.__train_batches_single_proc(
                 train_loader,
                 loss_fn=criterion,
@@ -7588,36 +7813,66 @@ units angstrom
                 scheduler=scheduler,
                 y_ind=y_ind,
                 grad_clip_norm=grad_clip_norm,
+                world_size=world_size,
+                rank=rank,
             )
             v_out = self.__evaluate_batches_single_proc(
-                test_loader, loss_fn=criterion, rank_device=rank_device, y_ind=y_ind
+                test_loader,
+                loss_fn=criterion,
+                rank_device=rank_device,
+                y_ind=y_ind,
+                world_size=world_size,
             )
             train_loss, total_MAE_t = t_out
             test_loss, total_MAE_v = v_out
 
             # Track best model
             star_marker = " "
+            # `test_loss` is already global under DDP (summed over every rank by
+            # the evaluation loop), so every rank takes this branch or none
+            # does, and they all agree on which epoch was the best one.
             if test_loss < lowest_test_loss:
                 lowest_test_loss = test_loss
                 star_marker = "*"
-                cpu_model = model_io.unwrap_model(self.model).to("cpu")
-                cpu_atom_model = model_io.unwrap_model(self.atom_model).to("cpu")
+                if world_size > 1:
+                    # Copied, not moved. `unwrap_model(self.model).to("cpu")`
+                    # relocates the live parameter storages that DDP's reducer
+                    # holds bucket views into, and moving them on rank 0 only
+                    # would make the replicas diverge outright. Every rank pays
+                    # a ~7 MB copy per improvement, which is nothing against an
+                    # epoch, and the live model is never touched.
+                    cpu_model = deepcopy(model_io.unwrap_model(self.model)).to(
+                        "cpu"
+                    )
+                    cpu_atom_model = deepcopy(
+                        model_io.unwrap_model(self.atom_model)
+                    ).to("cpu")
+                else:
+                    cpu_model = model_io.unwrap_model(self.model).to("cpu")
+                    cpu_atom_model = model_io.unwrap_model(self.atom_model).to(
+                        "cpu"
+                    )
                 best_model = deepcopy(cpu_model)
-                if self.model_save_path:
+                # Written by rank 0 alone: every rank holds identical weights,
+                # so the other ranks would be writing the same bytes over the
+                # same path at the same time, which is how a checkpoint ends up
+                # truncated.
+                if self.model_save_path and is_primary:
                     checkpoint = self._create_checkpoint(
                         model=cpu_model,
                         atom_model=cpu_atom_model,
                         embed_atom_model=True,
                     )
                     model_io.save_checkpoint(checkpoint, self.model_save_path)
-                self.model.to(rank_device)
+                if world_size == 1:
+                    self.model.to(rank_device)
 
             # Written every epoch, improvement or not, and atomically: this is
             # the only thing standing between a preemption and re-running every
             # epoch since the last improvement. At full-dataset scale one epoch
             # is ~2 h, so "up to one epoch" and "up to one chunk" are very
             # different costs.
-            if train_state_file:
+            if train_state_file and is_primary:
                 model_io.save_train_state(
                     train_state_file,
                     model=self.model,
@@ -7626,6 +7881,12 @@ units angstrom
                     lowest_test_loss=lowest_test_loss,
                     identity=train_state_identity,
                 )
+            if world_size > 1:
+                # Rank 0's sidecar for epoch N is on disk before any rank starts
+                # epoch N+1, so a preemption can never leave a chunk whose next
+                # start reads a sidecar older than the weights the other ranks
+                # already advanced past. One barrier per epoch, microseconds.
+                dist.barrier()
 
             dt = time.time() - t1
             track_epoch_from_locals(self, locals(), metric_labels=metric_labels)
@@ -7645,17 +7906,41 @@ units angstrom
             )
             if not self.device == "CPU":
                 torch.cuda.empty_cache()
-            if torch.any(total_MAE_t.isnan()) or torch.any(total_MAE_v.isnan()):
-                cpu_model = model_io.unwrap_model(self.model).to("cpu")
-                cpu_atom_model = model_io.unwrap_model(self.atom_model).to("cpu")
-                print("NaN detected, stopping training")
-                checkpoint = self._create_checkpoint(
-                    model=cpu_model,
-                    atom_model=cpu_atom_model,
-                    embed_atom_model=True,
-                    metadata={"nan_crash": True},
+            nan_detected = bool(
+                torch.any(total_MAE_t.isnan()) or torch.any(total_MAE_v.isnan())
+            )
+            if world_size > 1:
+                # The stop is itself a collective. A rank that broke out alone
+                # would leave every other rank blocked in the next epoch's first
+                # all-reduce until the job's wall clock ran out -- the classic
+                # DDP hang, which looks like a job that is still running.
+                nan_detected = bool(
+                    self._ddp_all_reduce(
+                        torch.tensor(float(nan_detected)), op="max"
+                    ).item()
                 )
-                model_io.save_checkpoint(checkpoint, "nan_crash_model.pt")
+            if nan_detected:
+                if world_size > 1:
+                    cpu_model = deepcopy(model_io.unwrap_model(self.model)).to(
+                        "cpu"
+                    )
+                    cpu_atom_model = deepcopy(
+                        model_io.unwrap_model(self.atom_model)
+                    ).to("cpu")
+                else:
+                    cpu_model = model_io.unwrap_model(self.model).to("cpu")
+                    cpu_atom_model = model_io.unwrap_model(self.atom_model).to(
+                        "cpu"
+                    )
+                print("NaN detected, stopping training")
+                if is_primary:
+                    checkpoint = self._create_checkpoint(
+                        model=cpu_model,
+                        atom_model=cpu_atom_model,
+                        embed_atom_model=True,
+                        metadata={"nan_crash": True},
+                    )
+                    model_io.save_checkpoint(checkpoint, "nan_crash_model.pt")
                 break
         # Publish the real final-epoch weights before restoring the best ones.
         stage_final_weights(self)
@@ -7673,7 +7958,65 @@ units angstrom
             and self.dimer_model_elst.AtomTypeParam is not underlying_model
         ):
             self.dimer_model_elst.AtomTypeParam = underlying_model
+        if world_size > 1:
+            # Leave the harness in the shape a single-process run leaves it: the
+            # DDP wrapper is a training-time artifact, and every rank restored
+            # the same `best_model`, so all replicas end identical. Anything
+            # downstream (checkpoint staging, inference, a second `train` call)
+            # then does not have to know DDP happened.
+            self.model = underlying_model
         return
+
+    ########################################################################
+    # DISTRIBUTED TRAINING
+    ########################################################################
+    def ddp_train(
+        self,
+        rank,
+        world_size,
+        train_dataset,
+        test_dataset,
+        n_epochs,
+        batch_size,
+        lr,
+        pin_memory,
+        num_workers,
+        skip_compile=False,
+        grad_clip_norm=None,
+        local_rank=None,
+    ):
+        """Run one DDP rank of :meth:`single_proc_train`.
+
+        Thin on purpose. The loop itself is shared with the single-process path,
+        so this method only owns the process group: joining it (or noticing that
+        an external launcher already did) and leaving it. The argument order is
+        fixed by ``training_tracking.tracked_ddp_worker``, which binds
+        ``world_size``/``train_dataset``/``test_dataset``/``batch_size`` by name
+        out of this signature when the ranks come from ``mp.spawn``.
+        """
+        owns_process_group = not dist.is_initialized()
+        self.__setup(rank, world_size, local_rank)
+        try:
+            return self.single_proc_train(
+                train_dataset=train_dataset,
+                test_dataset=test_dataset,
+                n_epochs=n_epochs,
+                batch_size=batch_size,
+                lr=lr,
+                pin_memory=pin_memory,
+                num_workers=num_workers,
+                skip_compile=skip_compile,
+                grad_clip_norm=grad_clip_norm,
+                rank=rank,
+                world_size=world_size,
+                local_rank=local_rank,
+            )
+        finally:
+            # Only the process group this call created. An externally launched
+            # rank leaves teardown to `run_tracked_distributed`, which does it
+            # in its own `finally` after the tracker has published.
+            if owns_process_group and dist.is_initialized():
+                self.__cleanup()
 
     def _validate_component_loss_weighting(
         self,
@@ -7739,10 +8082,23 @@ units angstrom
         total_includes_d3=False,
         grad_clip_norm=None,
         wandb_config: WandbConfig | None = None,
+        _external_rank=None,
+        _external_local_rank=None,
         _tracker_backend=TrackerBackend.WANDB,
         _tracker_event_directory=None,
     ):
         """Fit the parameter head.
+
+        ``world_size > 1`` runs DistributedDataParallel. Two launch styles are
+        supported and take the same loop:
+
+        * internal -- ``mp.spawn`` starts ``world_size`` ranks on this node,
+          which is the convenient path for a single machine;
+        * external -- ``srun``/``torchrun`` has already started one process per
+          GPU and passes this process's ``_external_rank`` and
+          ``_external_local_rank``. This is the only path that works across
+          nodes, and it is entered even for a one-task job so that a two-node
+          run and a one-node run differ in nothing but the numbers.
 
         ``component_gamma=None`` (the default) keeps the legacy plain MSE; a
         float in ``[0.0, 1.0]`` selects CLIFF Eq. (23).  Both it and
@@ -7840,12 +8196,75 @@ units angstrom
             "data/train_cap": getattr(self, "ds_max_size", None),
             "data/validation_cap": getattr(self, "ds_max_size_val", None),
             "data/batch_size": batch_size,
+            # Stated rather than implied: `batch_size` is per rank, so the
+            # optimization actually sees `batch_size * world_size` samples per
+            # step. A dashboard that recorded only the per-rank number would
+            # make a 4-GPU run look like the same experiment as a 1-GPU one.
+            "data/effective_global_batch_size": batch_size * max(world_size, 1),
+            "training/world_size": world_size,
         }
-        if world_size > 1:
+        if world_size > 1 or _external_rank is not None:
+            # An external launcher enters the worker path even for one task, so
+            # a `--nodes=1 --ntasks-per-node=1` sanity run exercises exactly the
+            # code a two-node run uses.
             print("Running multi-process training", flush=True)
-            raise NotImplementedError(
-                "Multi-process training is not implemented for MTP-MTP models."
+            print(
+                f"  world_size={world_size} per-rank batch_size={batch_size} "
+                f"EFFECTIVE GLOBAL BATCH SIZE="
+                f"{batch_size * max(world_size, 1)}",
+                flush=True,
             )
+            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_config = dict(tracking_config)
+            ddp_config["training/external_ddp"] = _external_rank is not None
+            ddp_args = (
+                world_size,
+                train_dataset,
+                test_dataset,
+                n_epochs,
+                batch_size,
+                lr,
+                pin_memory,
+                dataloader_num_workers,
+                skip_compile,
+                grad_clip_norm,
+            )
+            if _external_rank is None:
+                configure_distributed_tracking(
+                    self,
+                    wandb_config,
+                    model_family="parameter",
+                    initial_config=ddp_config,
+                    backend=_tracker_backend,
+                    event_directory=_tracker_event_directory,
+                )
+                mp.spawn(
+                    tracked_ddp_worker,
+                    args=(self.ddp_train, *ddp_args),
+                    nprocs=world_size,
+                    join=True,
+                )
+            else:
+                run_tracked_distributed(
+                    self,
+                    lambda: self.ddp_train(
+                        _external_rank,
+                        *ddp_args,
+                        local_rank=_external_local_rank,
+                    ),
+                    wandb_config,
+                    rank=_external_rank,
+                    local_rank=_external_local_rank,
+                    model_family="parameter",
+                    train_dataset=train_dataset,
+                    validation_dataset=test_dataset,
+                    effective_batch_size=batch_size * max(world_size, 1),
+                    world_size=world_size,
+                    initial_config=ddp_config,
+                    backend=_tracker_backend,
+                    event_directory=_tracker_event_directory,
+                    variant="external-ddp",
+                )
         else:
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)

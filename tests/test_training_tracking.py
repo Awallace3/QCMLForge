@@ -706,12 +706,19 @@ def test_every_public_train_harness_has_universal_tracking_api(
     assert parameters["_tracker_event_directory"].default is None
     assert "run_tracked_single_process" in inspect.getsource(harness_class.train)
 
-    # Every epoch loop must report itself; nothing wraps the harness on its behalf.
+    # Every epoch loop must report itself; nothing wraps the harness on its
+    # behalf. A `ddp_train` that owns no loop of its own satisfies this by
+    # delegating to `single_proc_train`, which is checked in its own right --
+    # AM_DimerParam_Model does exactly that so the single-process and
+    # distributed paths cannot drift apart.
     for loop_name in ("single_proc_train", "ddp_train"):
         loop = getattr(harness_class, loop_name, None)
         if loop is None:
             continue
-        assert "track_epoch_from_locals(" in inspect.getsource(loop), loop_name
+        source = inspect.getsource(loop)
+        if loop_name == "ddp_train" and "self.single_proc_train(" in source:
+            continue
+        assert "track_epoch_from_locals(" in source, loop_name
 
 
 class _ToyTrackedModel(torch.nn.Module):

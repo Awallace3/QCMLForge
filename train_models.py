@@ -1,5 +1,6 @@
 from apnet_pt import AtomModels
 from apnet_pt import AtomPairwiseModels
+from apnet_pt import ddp_launch
 from apnet_pt.training_tracking import WandbConfig
 from apnet_pt.util import load_split_manifest
 import argparse
@@ -426,6 +427,10 @@ def train_pairwise_model(
     total_includes_d3=False,
     grad_clip_norm=None,
     omp_num_threads=8,
+    ddp_world_size=1,
+    external_rank=None,
+    external_local_rank=None,
+    dataloader_num_workers=None,
     wandb_config=None,
 ):
     # Ensure param_start_mean and param_start_std are lists
@@ -721,9 +726,19 @@ def train_pairwise_model(
         raise ValueError("end_lr is currently only supported for APNetD3 training")
     print("Training {}...".format(apnet_model_type))
     if is_positive_param_model:
-        # No DDP path exists for the positive-parameter heads;
-        # `AM_DimerParam_Model.train` raises NotImplementedError above 1.
-        world_size = 1
+        # These heads (Rackers, CLIFF) do have a DDP path now, but it is opt-in:
+        # `--world_size_ddp`, or an external launcher that reports its own world
+        # size. Deliberately *not* `torch.cuda.device_count()` -- a single-GPU
+        # chunk that landed on a 2-GPU node must stay a single-GPU chunk, since
+        # the chunk chain's epoch budget and its learning rate were measured
+        # that way and the effective batch size would silently double.
+        world_size = max(int(ddp_world_size or 1), 1)
+        if external_rank is not None:
+            print(
+                f"External DDP rank {external_rank} "
+                f"(local {external_local_rank}) of {world_size}",
+                flush=True,
+            )
     elif torch.cuda.is_available():
         world_size = torch.cuda.device_count()
     else:
@@ -1061,7 +1076,13 @@ def train_pairwise_model(
         world_size=world_size,
         omp_num_threads_per_process=omp_num_threads_per_process,
         lr=lr,
-        dataloader_num_workers=4,
+        # 4 remains the default so every existing route's behaviour is
+        # unchanged; a DDP launcher passes its own, because `--cpus-per-task`
+        # divided by the tasks per node is the real budget and 4 workers per
+        # rank on an 8-core allocation oversubscribes it.
+        dataloader_num_workers=(
+            4 if dataloader_num_workers is None else int(dataloader_num_workers)
+        ),
         random_seed=random_seed,
         include_total_mse=include_total_mse,
         wandb_config=wandb_config,
@@ -1071,6 +1092,11 @@ def train_pairwise_model(
         # `grad_clip_norm` parameter do not print a spurious "skipping
         # unsupported kwarg" line on every unclipped run.
         train_kwargs["grad_clip_norm"] = grad_clip_norm
+    if external_rank is not None:
+        # Same reasoning: only the externally launched DDP routes see these, so
+        # no other route prints an "unsupported kwarg" line.
+        train_kwargs["_external_rank"] = external_rank
+        train_kwargs["_external_local_rank"] = external_local_rank
     if is_cliff_model:
         # Added only for the CLIFF routes so every other route's train_kwargs
         # stay exactly as they were.  `component_gamma` is forwarded as-is,
@@ -1505,7 +1531,33 @@ def main():
         "--world_size_ddp",
         type=int,
         default=1,
-        help="specify world_size for DDP only for AtomModels currently (default: 1)",
+        help=(
+            "world_size for DDP: AtomModels, and the positive-parameter "
+            "pairwise routes (Rackers/CLIFF). Ignored when --ddp_srun is "
+            "given, which reads the real world size from the launcher "
+            "(default: 1)"
+        ),
+    )
+    args.add_argument(
+        "--ddp_srun",
+        action="store_true",
+        help=(
+            "This process is one rank of an externally launched job (srun or "
+            "torchrun). Rank, local rank, world size and the rendezvous "
+            "endpoint are read from the environment; this is the only launch "
+            "mode that works across nodes. Opt-in rather than auto-detected so "
+            "an ordinary one-task srun job keeps running single-process."
+        ),
+    )
+    args.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=None,
+        help=(
+            "DataLoader workers per process (default: 4). Under DDP this is "
+            "per rank, so the sum across ranks on a node must fit "
+            "--cpus-per-task."
+        ),
     )
     args.add_argument(
         "--omp_num_threads",
@@ -1777,6 +1829,27 @@ def main():
                 param_start_mean = 2.0
             if param_start_std is None:
                 param_start_std = 0.1
+        # Resolve the launch topology once, here, so the rest of the call is
+        # identical whether this is a plain single-process run, an in-process
+        # `mp.spawn` run (--world_size_ddp on one node) or one rank of an
+        # `srun`/`torchrun` job (--ddp_srun, the only mode that spans nodes).
+        pairwise_external_rank = None
+        pairwise_external_local_rank = None
+        pairwise_world_size = args.world_size_ddp
+        if args.ddp_srun:
+            rendezvous = ddp_launch.export_rendezvous(
+                ddp_launch.resolve_rendezvous(),
+                omp_num_threads=args.omp_num_threads,
+            )
+            pairwise_external_rank = rendezvous.rank
+            pairwise_external_local_rank = rendezvous.local_rank
+            # The launcher is authoritative: `--world_size_ddp` is whatever the
+            # sbatch template happened to say, while WORLD_SIZE/SLURM_NTASKS is
+            # the number of processes that will actually reach the collectives.
+            # Disagreeing with it is the difference between a run and a hang.
+            pairwise_world_size = rendezvous.world_size
+            if rendezvous.rank == 0:
+                print(ddp_launch.describe_rendezvous(rendezvous), flush=True)
         train_pairwise_model(
             apnet_model_type=args.train_apnet,
             model_out=args.ap_model_path,
@@ -1833,6 +1906,10 @@ def main():
                 if args.omp_num_threads is not None
                 else 8
             ),
+            ddp_world_size=pairwise_world_size,
+            external_rank=pairwise_external_rank,
+            external_local_rank=pairwise_external_local_rank,
+            dataloader_num_workers=args.dataloader_num_workers,
             wandb_config=pairwise_wandb_config,
         )
     return

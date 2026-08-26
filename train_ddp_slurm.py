@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from apnet_pt import AtomModels
 from apnet_pt import atomic_datasets
+from apnet_pt import ddp_launch
 from apnet_pt.training_tracking import WandbConfig
 
 
@@ -157,8 +158,11 @@ def parse_args():
     parser.add_argument(
         "--master_port",
         type=str,
-        default="29500",
-        help="Master port",
+        default=None,
+        help=(
+            "Master port (default: MASTER_PORT, else derived from "
+            "SLURM_JOB_ID, else 29500)"
+        ),
     )
     wandb_mode_default = os.getenv("WANDB_MODE", "disabled")
     if wandb_mode_default not in {"disabled", "online", "offline"}:
@@ -182,41 +186,60 @@ def parse_args():
 
 def setup_distributed(args):
     """
-    Configure PyTorch distributed environment variables from provided args or SLURM environment.
-    
-    If `args` is missing rank, local_rank, world_size, or master_addr, those values are read from the SLURM environment variables SLURM_PROCID, SLURM_LOCALID, SLURM_NTASKS, and MASTER_ADDR (respectively). The function sets the environment variables RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, and MASTER_PORT to values derived from `args`. If `args.omp_num_threads` is provided, OMP_NUM_THREADS is set. A brief summary of the resolved distributed configuration is printed when the global rank is 0.
-    
+    Configure PyTorch distributed environment variables from the given args or
+    the launcher's environment.
+
+    Resolution is delegated to `apnet_pt.ddp_launch.resolve_rendezvous`, which
+    is shared with `train_models.py --ddp_srun` so both entry points rendezvous
+    identically. For each field the first source that yields a value wins:
+
+    - rank: `--rank`, then `RANK`, then `SLURM_PROCID`, else 0
+    - local_rank: `--local_rank`, then `LOCAL_RANK`, then `SLURM_LOCALID`, else
+      rank % visible GPUs
+    - world_size: `--world_size`, then `WORLD_SIZE`, then `SLURM_NTASKS`, else 1
+    - master_addr: `--master_addr`, then `MASTER_ADDR`, then the first host of
+      `SLURM_JOB_NODELIST` (via `scontrol show hostnames`), else "localhost"
+    - master_port: `--master_port`, then `MASTER_PORT`, then
+      `20000 + SLURM_JOB_ID % 20000`, else 29500
+
+    RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR and MASTER_PORT are exported so
+    that any `init_process_group` further down the stack -- including one inside
+    a model's own `train()` -- sees the same env:// rendezvous. OMP_NUM_THREADS
+    is exported when `args.omp_num_threads` is set.
+
     Parameters:
-        args (argparse.Namespace): Namespace with optional attributes `rank`, `local_rank`, `world_size`, `master_addr`, `master_port`, and `omp_num_threads`. The namespace is mutated in-place.
-    
+        args (argparse.Namespace): Namespace with optional attributes `rank`,
+            `local_rank`, `world_size`, `master_addr`, `master_port` and
+            `omp_num_threads`. The namespace is mutated in-place.
+
     Returns:
-        argparse.Namespace: The same `args` namespace with any missing distributed attributes filled in.
+        argparse.Namespace: The same `args`, with the resolved values filled in.
     """
-    # Get DDP parameters from environment if not provided
-    if args.rank is None:
-        args.rank = int(os.environ.get("SLURM_PROCID", 0))
-    if args.local_rank is None:
-        args.local_rank = int(os.environ.get("SLURM_LOCALID", 0))
-    if args.world_size is None:
-        args.world_size = int(os.environ.get("SLURM_NTASKS", 1))
-    if args.master_addr is None:
-        args.master_addr = os.environ.get("MASTER_ADDR", "localhost")
-
-    # Set environment variables for PyTorch DDP
-    os.environ["RANK"] = str(args.rank)
-    os.environ["LOCAL_RANK"] = str(args.local_rank)
-    os.environ["WORLD_SIZE"] = str(args.world_size)
-    os.environ["MASTER_ADDR"] = args.master_addr
-    os.environ["MASTER_PORT"] = args.master_port
-
-    # Set OMP_NUM_THREADS if provided
-    if args.omp_num_threads is not None:
-        os.environ["OMP_NUM_THREADS"] = str(args.omp_num_threads)
+    # One resolver for every launcher, so a two-node `srun` job and a
+    # single-node one differ only in the values it returns.  Previously
+    # `master_addr` fell back to "localhost", which cannot work across nodes:
+    # every rank off node 0 would try to rendezvous with itself.
+    rendezvous = ddp_launch.export_rendezvous(
+        ddp_launch.resolve_rendezvous(
+            rank=args.rank,
+            local_rank=args.local_rank,
+            world_size=args.world_size,
+            master_addr=args.master_addr,
+            master_port=args.master_port,
+        ),
+        omp_num_threads=args.omp_num_threads,
+    )
+    args.rank = rendezvous.rank
+    args.local_rank = rendezvous.local_rank
+    args.world_size = rendezvous.world_size
+    args.master_addr = rendezvous.master_addr
+    args.master_port = str(rendezvous.master_port)
 
     # Print info only from rank 0
     if args.rank == 0:
         print("=" * 60)
         print("Distributed Training Setup")
+        print(ddp_launch.describe_rendezvous(rendezvous))
         print("=" * 60)
         print(f"Rank: {args.rank}")
         print(f"Local Rank: {args.local_rank}")

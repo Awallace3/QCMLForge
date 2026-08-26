@@ -717,7 +717,12 @@ def test_non_finite_gradient_skips_the_step_instead_of_the_run():
         mtp_mtp.AM_DimerParam_Model._AM_DimerParam_Model__train_batches_single_proc
     )
     assert "total_norm = torch.nn.utils.clip_grad_norm_" in src
-    assert "if not torch.isfinite(total_norm):" in src
+    # The decision is named rather than tested inline, because under DDP it has
+    # to be all-reduced before it is acted on -- a rank that skipped alone would
+    # `continue` past its peers' collectives and hang the job. See
+    # `tests/test_cliff_induction_ddp.py::test_grad_norm_skip_is_collective`.
+    assert "skip_batch = not bool(torch.isfinite(total_norm))" in src
+    assert "if skip_batch:" in src
     # The batch is dropped, not stepped, and the count is surfaced.
     assert "n_skipped += 1" in src
     assert "continue" in src

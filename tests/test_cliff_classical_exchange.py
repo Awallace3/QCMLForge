@@ -3011,16 +3011,25 @@ def test_total_includes_d3_requires_an_explicit_gamma(nested_hfvr_vw_model):
             harness.train(component_gamma=gamma, total_includes_d3=True)
 
 
-def test_multi_process_training_is_still_rejected(nested_hfvr_vw_model):
-    """No DDP path is added for the CLIFF routes."""
-    harness = _build_cliff_harness(CliffClassicalModel, nested_hfvr_vw_model)
-    with pytest.raises(NotImplementedError, match="Multi-process training"):
-        harness.train(
-            dataset=_StubTrainDataset(),
-            world_size=2,
-            model_path=None,
-            shuffle=False,
-        )
+def test_multi_process_training_is_no_longer_rejected():
+    """The CLIFF routes now have a DDP path, and it is one loop, not two.
+
+    This test used to assert the opposite -- that ``train(world_size=2)``
+    raised ``NotImplementedError("Multi-process training ...")``. It does not
+    any more. What is worth pinning instead is that the distributed path did
+    not arrive as a *second* epoch loop: ``ddp_train`` delegates to
+    ``single_proc_train``, so the golden source-introspection contracts in
+    ``tests/test_cliff_induction_golden.py`` still cover the loop that
+    actually runs under DDP. A real two-rank gloo run lives in
+    ``tests/test_cliff_induction_ddp.py``.
+    """
+    train_source = inspect.getsource(AM_DimerParam_Model.train)
+    assert "NotImplementedError" not in train_source
+    assert "mp.spawn(" in train_source
+
+    ddp_source = inspect.getsource(AM_DimerParam_Model.ddp_train)
+    assert "self.single_proc_train(" in ddp_source
+    assert "for epoch in range(" not in ddp_source
 
 
 def test_component_gamma_survives_the_train_models_signature_filter():
