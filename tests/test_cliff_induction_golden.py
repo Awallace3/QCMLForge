@@ -600,3 +600,114 @@ def test_a_pre_fix_checkpoint_can_still_be_loaded_deliberately(
         allow_stale_induction_functional=True,
     )
     assert reloaded.model is not None
+
+
+# ---------------------------------------------------------------------------
+# Chunked training on a preemptible queue
+#
+# The full-dataset fit does not fit in one 8-hour `embers` allocation, so it
+# runs as a chain of chunks that warm-start from the previous chunk's
+# checkpoint. That makes the resume path part of the physics story: a chunk
+# that resumed state written under the pre-fix induction functional would
+# reinstate pre-fix weights on top of a corrected checkpoint, and -- as with
+# the defect itself -- nothing in the logs would say so.
+# ---------------------------------------------------------------------------
+
+
+def _training_loop_source():
+    import inspect
+
+    return inspect.getsource(mtp_mtp.AM_DimerParam_Model.single_proc_train)
+
+
+def test_the_training_loop_continues_the_epoch_counter_across_chunks():
+    """A chunk that restarted at epoch 0 would relabel every logged metric."""
+    source = _training_loop_source()
+    assert "for epoch in range(epochs_completed, epochs_completed + n_epochs):" in (
+        source
+    )
+    assert "epochs_completed, lowest_test_loss = resumed" in source
+
+
+def test_the_training_loop_writes_its_resume_state_every_epoch():
+    """Not only on improvement: preemption is uncorrelated with the val curve.
+
+    At roughly two hours an epoch on the full dataset, writing only when the
+    validation loss improves would discard every epoch since the last
+    improvement -- most of a chunk, in the flat part of the curve.
+    """
+    source = _training_loop_source()
+    body = source.split(
+        "for epoch in range(epochs_completed, epochs_completed + n_epochs):"
+    )[1]
+    assert "model_io.save_train_state(" in body
+    # Inside the epoch loop, not gated on the best-checkpoint branch.
+    save = body.index("model_io.save_train_state(")
+    improvement_gate = body.index("lowest_test_loss")
+    assert save > improvement_gate
+    assert "epochs_completed=epoch + 1" in body
+
+
+def test_the_resume_state_is_stamped_with_the_induction_functional():
+    source = _training_loop_source()
+    assert '"induction_functional_version"' in source
+    assert "INDUCTION_FUNCTIONAL_VERSION" in source
+    assert '"dimer_eval_type": self.dimer_eval_type' in source
+
+
+def test_resume_state_from_the_pre_fix_functional_is_refused(
+    tmp_path, nested_hfvr_vw_model
+):
+    """The sidecar equivalent of refusing a pre-fix checkpoint."""
+    from apnet_pt import model_io
+
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    assert harness.dimer_eval_type in mtp_mtp.INDUCTION_DIMER_EVAL_MODES
+    path = model_io.train_state_path(str(tmp_path / "cliff2.pt"))
+    optimizer = torch.optim.Adam(harness.model.parameters(), lr=1e-3)
+    model_io.save_train_state(
+        path,
+        model=harness.model,
+        optimizer=optimizer,
+        epochs_completed=3,
+        lowest_test_loss=0.5,
+        identity={
+            "dimer_eval_type": harness.dimer_eval_type,
+            "induction_functional_version": 1,
+        },
+    )
+
+    current = {
+        "dimer_eval_type": harness.dimer_eval_type,
+        "induction_functional_version": mtp_mtp.INDUCTION_FUNCTIONAL_VERSION,
+    }
+    with pytest.warns(UserWarning, match="identity mismatch"):
+        assert (
+            model_io.load_train_state(
+                path,
+                model=harness.model,
+                optimizer=optimizer,
+                identity=current,
+            )
+            is None
+        )
+    # Written by this build, it round-trips through the real parameter head.
+    model_io.save_train_state(
+        path,
+        model=harness.model,
+        optimizer=optimizer,
+        epochs_completed=3,
+        lowest_test_loss=0.5,
+        identity=current,
+    )
+    assert model_io.load_train_state(
+        path, model=harness.model, optimizer=optimizer, identity=current
+    ) == (3, 0.5)

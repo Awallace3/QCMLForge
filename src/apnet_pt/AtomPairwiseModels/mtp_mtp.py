@@ -7526,7 +7526,59 @@ units angstrom
         lowest_test_loss = float("inf")
         # cpu_model = self.model.to("cpu")
         # self.model.to(rank_device)
-        for epoch in range(n_epochs):
+
+        # (6) Resume, if a previous chunk of this same run left training state.
+        #
+        # `self.model` at this point holds the *best* weights of the previous
+        # chunk (that is what `--ap_model_path` warm-started from). The sidecar
+        # holds its *last-epoch* weights plus the Adam moments and the best loss
+        # actually achieved. Restoring those three is what makes an 8-hour
+        # chunked chain equivalent to one long run: without the loss, this
+        # chunk's first epoch would overwrite the deliverable unconditionally;
+        # without the last-epoch weights, every epoch after the last improvement
+        # is discarded and re-run; without the moments, Adam re-warms at every
+        # chunk boundary and every preemption.
+        train_state_file = (
+            model_io.train_state_path(self.model_save_path)
+            if self.model_save_path
+            else None
+        )
+        # Only the fields that would make a resume *wrong* rather than merely
+        # different. The induction version is here because a sidecar written by
+        # the pre-fix functional must not reinstate its weights over a corrected
+        # checkpoint.
+        train_state_identity = {
+            "dimer_eval_type": self.dimer_eval_type,
+            "induction_functional_version": (
+                INDUCTION_FUNCTIONAL_VERSION
+                if self.dimer_eval_type in INDUCTION_DIMER_EVAL_MODES
+                else None
+            ),
+        }
+        epochs_completed = 0
+        if train_state_file:
+            resumed = model_io.load_train_state(
+                train_state_file,
+                model=self.model,
+                optimizer=optimizer,
+                identity=train_state_identity,
+            )
+            if resumed is not None:
+                epochs_completed, lowest_test_loss = resumed
+                self.model.to(rank_device)
+                # `best_model` was deep-copied from the warm-started (best)
+                # weights before the resume overwrote them with the last
+                # epoch's, so it still holds the best ones. That is what the
+                # loop's own bookkeeping assumes and what gets restored at the
+                # end if this chunk never improves.
+                print(
+                    f"Resuming from {train_state_file}: "
+                    f"{epochs_completed} epochs completed, "
+                    f"best validation loss {lowest_test_loss:.6f}",
+                    flush=True,
+                )
+
+        for epoch in range(epochs_completed, epochs_completed + n_epochs):
             t1 = time.time()
             t_out = self.__train_batches_single_proc(
                 train_loader,
@@ -7559,6 +7611,21 @@ units angstrom
                     )
                     model_io.save_checkpoint(checkpoint, self.model_save_path)
                 self.model.to(rank_device)
+
+            # Written every epoch, improvement or not, and atomically: this is
+            # the only thing standing between a preemption and re-running every
+            # epoch since the last improvement. At full-dataset scale one epoch
+            # is ~2 h, so "up to one epoch" and "up to one chunk" are very
+            # different costs.
+            if train_state_file:
+                model_io.save_train_state(
+                    train_state_file,
+                    model=self.model,
+                    optimizer=optimizer,
+                    epochs_completed=epoch + 1,
+                    lowest_test_loss=lowest_test_loss,
+                    identity=train_state_identity,
+                )
 
             dt = time.time() - t1
             track_epoch_from_locals(self, locals(), metric_labels=metric_labels)

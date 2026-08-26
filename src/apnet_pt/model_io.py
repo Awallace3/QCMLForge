@@ -28,6 +28,7 @@ checkpoint = {
 }
 """
 
+import os
 import warnings
 from datetime import datetime
 from typing import Any
@@ -471,3 +472,170 @@ def upgrade_v1_checkpoint(
             "upgraded_from_v1": True,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Resumable training state
+#
+# The model checkpoint is the *deliverable*: it holds the best-validation
+# weights, and every downstream consumer (the S66x8 profiler, the classical
+# merge, `AM_DimerParam_Model.__init__`) reads it. Training state is a
+# different object with a different lifetime -- last-epoch weights, the Adam
+# moments, the epoch counter, and the best loss seen so far -- so it lives in a
+# sidecar beside the checkpoint rather than inside it. Keeping them apart means
+# the ~21 MB of optimizer moments never reaches a consumer that only wants
+# weights, and an absent sidecar is simply "no resume information", which is
+# what every checkpoint written before this existed says.
+#
+# Why this is needed at all: an 8-hour QoS cap forces long training into
+# chunks that warm-start from the previous chunk's file. Without the sidecar
+# each chunk restarts its best-loss tracking at +inf, so its first epoch
+# overwrites the deliverable unconditionally -- and since a chunk's first epoch
+# runs on a freshly zeroed Adam state, it is usually slightly *worse* than the
+# weights it just loaded. Repeated preemption on a preemptible queue turns that
+# into a ratchet that walks the model backwards.
+TRAIN_STATE_VERSION = 1
+TRAIN_STATE_SUFFIX = ".trainstate.pt"
+
+
+def train_state_path(model_save_path: str) -> str:
+    """Sidecar path for ``model_save_path``'s resumable training state."""
+    return f"{model_save_path}{TRAIN_STATE_SUFFIX}"
+
+
+def save_train_state(
+    path: str,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epochs_completed: int,
+    lowest_test_loss: float,
+    identity: dict[str, Any] | None = None,
+) -> None:
+    """Write resumable training state to ``path``, atomically.
+
+    Written once per epoch, so the write has to be crash-safe: a job killed
+    mid-``torch.save`` would otherwise leave a truncated sidecar that the next
+    chunk cannot read, and the chunk would silently fall back to restarting.
+    Saving to a temporary file and ``os.replace``-ing it means the sidecar on
+    disk is always either the previous epoch's or this one's, never a fragment.
+
+    ``identity`` is recorded verbatim and checked on load; see
+    :func:`load_train_state`.
+    """
+    state_dict = strip_prefix_from_state_dict(unwrap_model(model).state_dict())
+    payload = {
+        "train_state_version": TRAIN_STATE_VERSION,
+        "apnet_version": __version__,
+        "save_date": datetime.now().isoformat(),
+        "epochs_completed": int(epochs_completed),
+        "lowest_test_loss": float(lowest_test_loss),
+        # CPU tensors so the sidecar is portable between a V100 chunk and a
+        # CPU-only inspection, and so `torch.save` does not pin GPU memory.
+        "model_state_dict": {k: v.detach().cpu() for k, v in state_dict.items()},
+        "optimizer_state_dict": optimizer.state_dict(),
+        "identity": dict(identity or {}),
+    }
+    tmp = f"{path}.tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def load_train_state(
+    path: str,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    identity: dict[str, Any] | None = None,
+) -> tuple[int, float] | None:
+    """Restore training state from ``path`` into ``model`` and ``optimizer``.
+
+    Returns ``(epochs_completed, lowest_test_loss)`` on success and ``None``
+    when there is nothing usable to resume from -- no sidecar, a version this
+    build does not understand, an ``identity`` that disagrees with the caller's,
+    or a state dict that does not fit the model.
+
+    Every one of those is a *warning*, not an error. A resume that cannot
+    proceed should cost the run its Adam moments and its epoch counter, not the
+    whole job; the weights it would have loaded are still on disk in the
+    checkpoint the harness warm-started from. The one thing that must never
+    happen is resuming from state that belongs to different physics, which is
+    what the ``identity`` check is for: a sidecar written by the pre-fix
+    induction functional would otherwise reinstate its weights on top of a
+    corrected checkpoint.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:  # truncated, or written by an incompatible torch
+        warnings.warn(f"Ignoring unreadable training state {path}: {exc}")
+        return None
+
+    version = payload.get("train_state_version")
+    if version != TRAIN_STATE_VERSION:
+        warnings.warn(
+            f"Ignoring training state {path}: version {version!r}, "
+            f"this build writes {TRAIN_STATE_VERSION}"
+        )
+        return None
+
+    want = dict(identity or {})
+    got = payload.get("identity") or {}
+    mismatched = {k: (v, got.get(k)) for k, v in want.items() if got.get(k) != v}
+    if mismatched:
+        warnings.warn(
+            f"Ignoring training state {path}: identity mismatch {mismatched!r} "
+            "(expected, found). Not resuming rather than mixing runs."
+        )
+        return None
+
+    # Check the state dict fits *before* copying anything into the model.
+    # `load_state_dict` reports every key and shape problem it found, but it
+    # raises only after having already copied the parameters that did fit, so
+    # letting it fail would leave the warm-started weights half-overwritten by
+    # the very state we decided not to trust.
+    target = unwrap_model(model)
+    current = target.state_dict()
+    saved = payload.get("model_state_dict") or {}
+    problems = []
+    if set(saved) != set(current):
+        missing = sorted(set(current) - set(saved))
+        unexpected = sorted(set(saved) - set(current))
+        if missing:
+            problems.append(f"missing keys {missing[:5]}")
+        if unexpected:
+            problems.append(f"unexpected keys {unexpected[:5]}")
+    shape_mismatch = [
+        key
+        for key, value in saved.items()
+        if key in current
+        and getattr(value, "shape", None) != getattr(current[key], "shape", None)
+    ]
+    if shape_mismatch:
+        problems.append(f"shape mismatch for {sorted(shape_mismatch)[:5]}")
+    if problems:
+        warnings.warn(
+            f"Ignoring training state {path}: does not fit this model "
+            f"({'; '.join(problems)}). Model left untouched."
+        )
+        return None
+
+    try:
+        target.load_state_dict(saved, strict=True)
+    except Exception as exc:
+        warnings.warn(f"Ignoring training state {path}: {exc}")
+        return None
+
+    try:
+        optimizer.load_state_dict(payload["optimizer_state_dict"])
+    except Exception as exc:
+        # The weights are already restored at this point, and they are the
+        # valuable half. Losing the moments costs a short re-warm, so this is
+        # reported and continued rather than unwound.
+        warnings.warn(
+            f"Training state {path}: restored weights but not optimizer "
+            f"state ({exc}); Adam moments restart from zero."
+        )
+
+    return int(payload["epochs_completed"]), float(payload["lowest_test_loss"])
