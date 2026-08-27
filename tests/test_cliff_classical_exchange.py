@@ -2118,6 +2118,29 @@ def test_intermolecular_distances_are_computed_once_per_forward(
         )
 
 
+def test_dimer_prop_forwards_configured_scf_controls(
+    synthetic_dimer_batch, monkeypatch
+):
+    calls = []
+    original = mtp_mtp.rackers_thole_induction
+
+    def record_induction(*args, **kwargs):
+        calls.append(kwargs.copy())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mtp_mtp, "rackers_thole_induction", record_induction)
+    dimer = mtp_mtp.DimerProp(
+        ATParam=_ControlledCliffClassicalAtomParam(),
+        dimer_eval="cliff_classical_overlap",
+        induction_convergence_threshold=1e-6,
+        induction_max_iterations=50,
+    )
+    dimer(synthetic_dimer_batch)
+    assert len(calls) == 1
+    assert calls[0]["convergence_threshold"] == 1e-6
+    assert calls[0]["max_iterations"] == 50
+
+
 def test_shared_distances_are_converted_to_bohr_for_exchange(
     synthetic_dimer_batch, monkeypatch
 ):
@@ -3111,6 +3134,9 @@ def test_cliff_checkpoint_round_trip(
         assert config["total_includes_d3"] is False
     else:
         assert "component_gamma" not in config
+    if expected_mode in mtp_mtp.INDUCTION_DIMER_EVAL_MODES:
+        assert config["induction_convergence_threshold"] == 1e-8
+        assert config["induction_max_iterations"] == 200
 
     # Nested state is restored from the checkpoint alone.
     loaded = harness_type(
@@ -3225,6 +3251,54 @@ def test_cliff_checkpoint_error_messages_name_their_own_contract(
         "CliffClassicalNN checkpoint parameter_names must exactly match "
         f"{list(CLIFF_CLASSICAL_PARAMETER_NAMES)}"
     )
+
+
+def test_cliff_checkpoint_preserves_nondefault_scf_controls(
+    tmp_path, nested_hfvr_vw_model
+):
+    harness = _build_cliff_harness(
+        CliffClassicalOverlapModel,
+        nested_hfvr_vw_model,
+        induction_convergence_threshold=1e-6,
+        induction_max_iterations=50,
+    )
+    path = tmp_path / "scf50.pt"
+    harness.save_model(path)
+    config = model_io.load_checkpoint(path)["config"]
+    assert config["induction_convergence_threshold"] == 1e-6
+    assert config["induction_max_iterations"] == 50
+
+    loaded = CliffClassicalOverlapModel(
+        pre_trained_model_path=path,
+        atom_model=None,
+        dataset=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    assert loaded.dimer_model.induction_convergence_threshold == 1e-6
+    assert loaded.dimer_model.induction_max_iterations == 50
+
+
+def test_legacy_cliff_checkpoint_uses_historical_scf_defaults(
+    tmp_path, nested_hfvr_vw_model
+):
+    harness = _build_cliff_harness(
+        CliffClassicalOverlapModel, nested_hfvr_vw_model
+    )
+    checkpoint = harness._create_checkpoint()
+    checkpoint["config"].pop("induction_convergence_threshold")
+    checkpoint["config"].pop("induction_max_iterations")
+    path = tmp_path / "legacy-scf.pt"
+    model_io.save_checkpoint(checkpoint, path)
+    loaded = CliffClassicalOverlapModel(
+        pre_trained_model_path=path,
+        atom_model=None,
+        dataset=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    assert loaded.dimer_model.induction_convergence_threshold == 1e-8
+    assert loaded.dimer_model.induction_max_iterations == 200
 
 
 def test_cliff_checkpoint_rejects_the_wrong_harness_mode(
@@ -4150,6 +4224,8 @@ def test_train_models_help_exits_zero_and_advertises_the_cliff_routes():
     assert "--grad_clip_mode" in help_text
     assert "--thole_lr" in help_text
     assert "--induction_diagnostics" in help_text
+    assert "--induction_convergence_threshold" in help_text
+    assert "--induction_max_iterations" in help_text
 
 
 # ---------------------------------------------------------------------------
@@ -4450,11 +4526,45 @@ def test_train_declares_grad_clip_configuration():
     assert signature.parameters["grad_clip_mode"].default == "global"
     assert signature.parameters["thole_lr"].default is None
     assert signature.parameters["induction_diagnostics"].default is False
+    assert signature.parameters["induction_convergence_threshold"].default is None
+    assert signature.parameters["induction_max_iterations"].default is None
     inner = inspect.signature(mtp_mtp.AM_DimerParam_Model.single_proc_train)
     assert inner.parameters["grad_clip_norm"].default is None
     assert inner.parameters["grad_clip_mode"].default == "global"
     assert inner.parameters["thole_lr"].default is None
     assert inner.parameters["induction_diagnostics"].default is False
+
+
+@pytest.mark.parametrize(
+    "threshold,max_iterations",
+    [(0.0, 50), (-1e-6, 50), (float("nan"), 50), (1e-6, 0),
+     (1e-6, -1), (1e-6, 2.5), (1e-6, True)],
+)
+def test_validate_induction_solver_controls_rejects_invalid(
+    threshold, max_iterations
+):
+    with pytest.raises(ValueError, match="induction_"):
+        mtp_mtp._validate_induction_solver_controls(
+            threshold, max_iterations
+        )
+
+
+def test_exchange_train_rejects_induction_solver_controls(
+    nested_hfvr_vw_model
+):
+    harness = _build_cliff_harness(CliffExchangeModel, nested_hfvr_vw_model)
+    with pytest.raises(ValueError, match="induction solver controls"):
+        harness.train(
+            induction_convergence_threshold=1e-6,
+            induction_max_iterations=50,
+        )
+
+
+def test_validate_induction_solver_controls_accepts_profiled_values():
+    assert mtp_mtp._validate_induction_solver_controls(1e-6, 50) == (
+        1e-6,
+        50,
+    )
 
 
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), "x"])

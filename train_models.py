@@ -436,6 +436,8 @@ def train_pairwise_model(
     grad_clip_mode="global",
     thole_lr=None,
     induction_diagnostics=False,
+    induction_convergence_threshold=None,
+    induction_max_iterations=None,
     omp_num_threads=8,
     ddp_world_size=1,
     external_rank=None,
@@ -499,6 +501,8 @@ def train_pairwise_model(
         grad_clip_mode (str): `global` clips all parameters together; `component` clips dense CLIFF ELST, EXCH, and IND groups independently.
         thole_lr (float or None): Optional Adam learning rate for only the trainable direct/mutual Thole columns; all other columns retain `lr`.
         induction_diagnostics (bool): Collect and log per-epoch SCF convergence, residual, induced-dipole, and induction-energy health metrics.
+        induction_convergence_threshold (float or None): Optional Rackers/Thole SCF residual threshold. None preserves the checkpoint/default value (historically 1e-8).
+        induction_max_iterations (int or None): Optional Rackers/Thole SCF iteration cap. None preserves the checkpoint/default value (historically 200).
         omp_num_threads (int): Number of OpenMP threads assigned to each training process.
 
     """
@@ -539,6 +543,31 @@ def train_pairwise_model(
             "induction_diagnostics is only supported on the combined CLIFF "
             f"routes {sorted(COMBINED_CLIFF_MODEL_TYPES)}, not "
             f"{apnet_model_type!r}"
+        )
+    if (
+        induction_convergence_threshold is not None
+        or induction_max_iterations is not None
+    ):
+        if apnet_model_type not in COMBINED_CLIFF_MODEL_TYPES:
+            raise ValueError(
+                "induction solver controls are only supported on the combined "
+                f"CLIFF routes {sorted(COMBINED_CLIFF_MODEL_TYPES)}, not "
+                f"{apnet_model_type!r}"
+            )
+        (
+            induction_convergence_threshold,
+            induction_max_iterations,
+        ) = AtomPairwiseModels.mtp_mtp._validate_induction_solver_controls(
+            (
+                AtomPairwiseModels.mtp_mtp.DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD
+                if induction_convergence_threshold is None
+                else induction_convergence_threshold
+            ),
+            (
+                AtomPairwiseModels.mtp_mtp.DEFAULT_INDUCTION_MAX_ITERATIONS
+                if induction_max_iterations is None
+                else induction_max_iterations
+            ),
         )
     if split_manifest:
         # Only the atom-model route resolves a manifest into indices. Accepting
@@ -1156,6 +1185,12 @@ def train_pairwise_model(
         train_kwargs["total_includes_d3"] = total_includes_d3
         train_kwargs["thole_lr"] = thole_lr
         train_kwargs["induction_diagnostics"] = induction_diagnostics
+        if induction_convergence_threshold is not None:
+            train_kwargs["induction_convergence_threshold"] = (
+                induction_convergence_threshold
+            )
+        if induction_max_iterations is not None:
+            train_kwargs["induction_max_iterations"] = induction_max_iterations
     if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
         train_kwargs["end_lr"] = end_lr
     else:
@@ -1721,6 +1756,24 @@ def main():
         ),
     )
     args.add_argument(
+        "--induction_convergence_threshold",
+        type=float,
+        default=None,
+        help=(
+            "Combined CLIFF routes only: Rackers/Thole SCF residual stopping "
+            "threshold. Unset preserves the checkpoint or historical 1e-8 default."
+        ),
+    )
+    args.add_argument(
+        "--induction_max_iterations",
+        type=int,
+        default=None,
+        help=(
+            "Combined CLIFF routes only: Rackers/Thole SCF iteration cap. "
+            "Unset preserves the checkpoint or historical 200 default."
+        ),
+    )
+    args.add_argument(
         "--total_includes_d3",
         action="store_true",
         default=False,
@@ -1984,6 +2037,10 @@ def main():
             grad_clip_mode=args.grad_clip_mode,
             thole_lr=args.thole_lr,
             induction_diagnostics=args.induction_diagnostics,
+            induction_convergence_threshold=(
+                args.induction_convergence_threshold
+            ),
+            induction_max_iterations=args.induction_max_iterations,
             omp_num_threads=(
                 args.omp_num_threads
                 if args.omp_num_threads is not None

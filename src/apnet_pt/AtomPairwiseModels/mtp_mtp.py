@@ -292,6 +292,11 @@ CLIFF_INDUCTION_DAMPING_PARAMETERS = ("thole_direct", "thole_mutual")
 # resuming from one silently contaminates every component.
 INDUCTION_FUNCTIONAL_VERSION = 2
 
+# Historical Rackers/Thole SCF controls. They remain the defaults for every
+# existing checkpoint and inference call; experiments must opt into alternatives.
+DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD = 1.0e-8
+DEFAULT_INDUCTION_MAX_ITERATIONS = 200
+
 # The `dimer_eval` modes whose forward calls `rackers_thole_induction`, and so
 # the ones a stale functional version applies to. The `*induced_dipole*` modes
 # are deliberately absent: they go through `induced_dipole_induction` /
@@ -487,6 +492,8 @@ class DimerProp(nn.Module):
         d3_damping_parameters=None,
         freeze_atom_model=True,
         variational_induction=False,
+        induction_convergence_threshold=DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD,
+        induction_max_iterations=DEFAULT_INDUCTION_MAX_ITERATIONS,
     ):
         """
         Create a DimerProp configured with an AtomTypeParam and selected evaluation and damping modes.
@@ -508,6 +515,13 @@ class DimerProp(nn.Module):
         # physically impossible -- on 16 of 32 S66x8 geometries. See
         # `rackers_thole_induction` and ARCHITECTURE_HANDOFF.md.
         self.variational_induction = variational_induction
+        (
+            self.induction_convergence_threshold,
+            self.induction_max_iterations,
+        ) = _validate_induction_solver_controls(
+            induction_convergence_threshold,
+            induction_max_iterations,
+        )
         # Opt-in training diagnostics. The default remains false so checkpoint
         # inference and historical training take the exact pre-diagnostic path.
         self.collect_induction_diagnostics = False
@@ -743,6 +757,8 @@ class DimerProp(nn.Module):
             ind_overlap_A=parameters_A[:, RACKERS_IND_OVERLAP_INDEX],
             ind_overlap_B=parameters_B[:, RACKERS_IND_OVERLAP_INDEX],
             include_overlap=include_overlap,
+            max_iterations=self.induction_max_iterations,
+            convergence_threshold=self.induction_convergence_threshold,
             polarizability_table=self.polarizability_table,
         )
         return torch.vstack((Elst, Indu)).T, output_A, output_B
@@ -931,6 +947,8 @@ class DimerProp(nn.Module):
                 batch.molecule_ind_B if self.variational_induction else None
             ),
             return_diagnostics=self.collect_induction_diagnostics,
+            max_iterations=self.induction_max_iterations,
+            convergence_threshold=self.induction_convergence_threshold,
         )
         if self.collect_induction_diagnostics:
             Indu, induction_diagnostics = induction_result
@@ -982,6 +1000,10 @@ class DimerProp(nn.Module):
             "dimer_eval": getattr(getattr(self, "forward", None), "__name__", None),
             "elst_damping_type": self.elst_damping_type,
             "d3_damping_parameters": deepcopy(self.d3_damping_parameters),
+            "induction_convergence_threshold": (
+                self.induction_convergence_threshold
+            ),
+            "induction_max_iterations": self.induction_max_iterations,
             "atom_type_param_type": atom_type_param_type,
             "atom_type_param_config": atom_type_param_config,
             "atom_model_type": atom_model_type,
@@ -2254,6 +2276,29 @@ def _validate_bound_scale(value, name: str, *, allow_none: bool = True):
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"{name} must be finite and strictly greater than zero")
     return scale
+
+
+def _validate_induction_solver_controls(
+    convergence_threshold,
+    max_iterations,
+) -> tuple[float, int]:
+    """Validate the Rackers/Thole SCF stopping rule."""
+    threshold = _validate_bound_scale(
+        convergence_threshold,
+        "induction_convergence_threshold",
+        allow_none=False,
+    )
+    if isinstance(max_iterations, bool):
+        raise ValueError("induction_max_iterations must be a positive integer")
+    try:
+        iterations = int(max_iterations)
+        exact = float(max_iterations) == iterations
+    except (TypeError, ValueError, OverflowError):
+        exact = False
+        iterations = 0
+    if not exact or iterations <= 0:
+        raise ValueError("induction_max_iterations must be a positive integer")
+    return threshold, iterations
 
 
 def _validate_bound_scales(value, name: str, n_params: int):
@@ -6078,6 +6123,8 @@ class AM_DimerParam_Model:
         frozen_parameters=_CLIFF_HEAD_DEFAULT,
         shared_damping_parameters=_CLIFF_HEAD_DEFAULT,
         allow_stale_induction_functional=False,
+        induction_convergence_threshold=DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD,
+        induction_max_iterations=DEFAULT_INDUCTION_MAX_ITERATIONS,
         param_n_message=_CLIFF_HEAD_DEFAULT,
         param_n_rbf=_CLIFF_HEAD_DEFAULT,
         param_hidden=_CLIFF_HEAD_DEFAULT,
@@ -6454,7 +6501,16 @@ class AM_DimerParam_Model:
         # whatever was last used so a resumed run reproduces it -- including a
         # recorded `None`, which must not silently become a float.
         loaded_config = param_config if pre_trained_model_path else None
-        loaded_gamma = (loaded_config or {}).get("component_gamma")
+        solver_config = loaded_config or {}
+        induction_convergence_threshold = solver_config.get(
+            "induction_convergence_threshold",
+            induction_convergence_threshold,
+        )
+        induction_max_iterations = solver_config.get(
+            "induction_max_iterations",
+            induction_max_iterations,
+        )
+        loaded_gamma = solver_config.get("component_gamma")
         self.component_gamma = (
             None if loaded_gamma is None else float(loaded_gamma)
         )
@@ -6466,6 +6522,10 @@ class AM_DimerParam_Model:
             dimer_eval=dimer_eval_type,
             elst_damping_type=elst_damping_type,
             freeze_atom_model=freeze_atom_model,
+            induction_convergence_threshold=(
+                induction_convergence_threshold
+            ),
+            induction_max_iterations=induction_max_iterations,
         )
         if self.dimer_eval_type in ["elst", "elst_damping"]:
             self.dimer_model_elst = DimerProp(
@@ -6473,6 +6533,10 @@ class AM_DimerParam_Model:
                 dimer_eval="elst",
                 elst_damping_type=elst_damping_type,
                 freeze_atom_model=freeze_atom_model,
+                induction_convergence_threshold=(
+                    induction_convergence_threshold
+                ),
+                induction_max_iterations=induction_max_iterations,
             )
         else:
             self.dimer_model_elst = None
@@ -6809,6 +6873,12 @@ class AM_DimerParam_Model:
             # used.
             model_config["induction_functional_version"] = (
                 INDUCTION_FUNCTIONAL_VERSION
+            )
+            model_config["induction_convergence_threshold"] = (
+                self.dimer_model.induction_convergence_threshold
+            )
+            model_config["induction_max_iterations"] = (
+                self.dimer_model.induction_max_iterations
             )
         if type(model).__name__ in _CLIFF_PARAMETER_HEADS:
             model_config["d3_damping_parameters"] = deepcopy(
@@ -8074,6 +8144,21 @@ units angstrom
             train_state_identity.update(
                 {"base_lr": float(lr), "thole_lr": float(thole_lr)}
             )
+        solver_threshold = self.dimer_model.induction_convergence_threshold
+        solver_max_iterations = self.dimer_model.induction_max_iterations
+        if (
+            solver_threshold != DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD
+            or solver_max_iterations != DEFAULT_INDUCTION_MAX_ITERATIONS
+        ):
+            # Keep default controls absent so historical sidecars still resume,
+            # while preventing Adam state fitted under one stopping rule from
+            # being restored under another.
+            train_state_identity.update(
+                {
+                    "induction_convergence_threshold": solver_threshold,
+                    "induction_max_iterations": solver_max_iterations,
+                }
+            )
         epochs_completed = 0
         if train_state_file:
             resumed = model_io.load_train_state(
@@ -8429,6 +8514,8 @@ units angstrom
         grad_clip_mode="global",
         thole_lr=None,
         induction_diagnostics=False,
+        induction_convergence_threshold=None,
+        induction_max_iterations=None,
         wandb_config: WandbConfig | None = None,
         _external_rank=None,
         _external_local_rank=None,
@@ -8461,6 +8548,33 @@ units angstrom
         grad_clip_norm = _validate_bound_scale(grad_clip_norm, "grad_clip_norm")
         thole_lr = _validate_bound_scale(thole_lr, "thole_lr")
         induction_diagnostics = bool(induction_diagnostics)
+        if (
+            induction_convergence_threshold is not None
+            or induction_max_iterations is not None
+        ) and self.dimer_eval_type not in INDUCTION_DIMER_EVAL_MODES:
+            raise ValueError(
+                "induction solver controls require a Rackers/Thole induction "
+                f"route, not {self.dimer_eval_type!r}"
+            )
+        effective_threshold = (
+            self.dimer_model.induction_convergence_threshold
+            if induction_convergence_threshold is None
+            else induction_convergence_threshold
+        )
+        effective_max_iterations = (
+            self.dimer_model.induction_max_iterations
+            if induction_max_iterations is None
+            else induction_max_iterations
+        )
+        (
+            effective_threshold,
+            effective_max_iterations,
+        ) = _validate_induction_solver_controls(
+            effective_threshold,
+            effective_max_iterations,
+        )
+        self.dimer_model.induction_convergence_threshold = effective_threshold
+        self.dimer_model.induction_max_iterations = effective_max_iterations
         grad_clip_mode = str(grad_clip_mode).strip().lower()
         if grad_clip_mode not in CLIFF_GRAD_CLIP_MODES:
             raise ValueError(
@@ -8546,7 +8660,9 @@ units angstrom
         print(f"  {n_epochs=}", flush=True)
         print(f"  {lr=}", flush=True)
         print(f"  {thole_lr=}", flush=True)
-        print(f"  {induction_diagnostics=}\n", flush=True)
+        print(f"  {induction_diagnostics=}", flush=True)
+        print(f"  induction_convergence_threshold={effective_threshold}", flush=True)
+        print(f"  induction_max_iterations={effective_max_iterations}\n", flush=True)
         print(f"  {batch_size=}", flush=True)
 
         if self.device.type == "cuda":
@@ -8565,6 +8681,8 @@ units angstrom
             "training/grad_clip_mode": grad_clip_mode,
             "training/thole_learning_rate": thole_lr,
             "training/induction_diagnostics": induction_diagnostics,
+            "training/induction_convergence_threshold": effective_threshold,
+            "training/induction_max_iterations": effective_max_iterations,
             # The CLIFF Eq. (23) total/component weighting changes which
             # physical terms share gradients. It must be visible on W&B so a
             # component-only gamma=1 run cannot be mistaken for the historical

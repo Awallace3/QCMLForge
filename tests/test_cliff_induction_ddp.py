@@ -457,6 +457,17 @@ def test_ddp_sidecar_records_the_global_epoch(two_rank_run):
         key.startswith("module.") for key in payload["model_state_dict"]
     )
     assert payload["identity"]["dimer_eval_type"] == "cliff_classical_overlap"
+    # Historical defaults stay absent so old sidecars remain compatible.
+    assert "induction_convergence_threshold" not in payload["identity"]
+    assert "induction_max_iterations" not in payload["identity"]
+
+
+def test_nondefault_scf_controls_are_resume_identity():
+    source = inspect.getsource(AM_DimerParam_Model.single_proc_train)
+    assert '"induction_convergence_threshold": solver_threshold' in source
+    assert '"induction_max_iterations": solver_max_iterations' in source
+    assert "DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD" in source
+    assert "DEFAULT_INDUCTION_MAX_ITERATIONS" in source
 
 
 def test_ddp_resume_continues_the_epoch_sequence(two_rank_resumed_run):
