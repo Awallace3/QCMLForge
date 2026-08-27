@@ -4148,6 +4148,8 @@ def test_train_models_help_exits_zero_and_advertises_the_cliff_routes():
     assert "--total_includes_d3" in help_text
     assert "--grad_clip_norm" in help_text
     assert "--grad_clip_mode" in help_text
+    assert "--thole_lr" in help_text
+    assert "--induction_diagnostics" in help_text
 
 
 # ---------------------------------------------------------------------------
@@ -4446,9 +4448,13 @@ def test_train_declares_grad_clip_configuration():
     signature = inspect.signature(mtp_mtp.AM_DimerParam_Model.train)
     assert signature.parameters["grad_clip_norm"].default is None
     assert signature.parameters["grad_clip_mode"].default == "global"
+    assert signature.parameters["thole_lr"].default is None
+    assert signature.parameters["induction_diagnostics"].default is False
     inner = inspect.signature(mtp_mtp.AM_DimerParam_Model.single_proc_train)
     assert inner.parameters["grad_clip_norm"].default is None
     assert inner.parameters["grad_clip_mode"].default == "global"
+    assert inner.parameters["thole_lr"].default is None
+    assert inner.parameters["induction_diagnostics"].default is False
 
 
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), "x"])
@@ -4956,6 +4962,8 @@ def test_excluded_elements_are_recorded_for_tracking():
     assert '"data/excluded_elements"' in src
     assert '"training/grad_clip_norm"' in src
     assert '"training/grad_clip_mode"' in src
+    assert '"training/thole_learning_rate"' in src
+    assert '"training/induction_diagnostics"' in src
     assert '"training/component_gamma"' in src
     assert '"training/total_includes_d3"' in src
     # And the attribute the tracking config reads must be set by __init__ for

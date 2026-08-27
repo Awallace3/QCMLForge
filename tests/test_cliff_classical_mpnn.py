@@ -979,6 +979,9 @@ def test_induction_diagnostics_report_the_audit_quantities(
         "scf_iterations",
         "scf_residual",
         "scf_converged",
+        "all_finite",
+        "max_induced_dipole",
+        "max_abs_energy_edge",
         "energy_edge_contraction",
         "energy_qu",
         "energy_uu",
@@ -994,7 +997,72 @@ def test_induction_diagnostics_report_the_audit_quantities(
     if diagnostics["scf_converged"]:
         assert diagnostics["scf_residual"] < 1e-8
     assert 1 <= diagnostics["scf_iterations"] <= 200
+    assert diagnostics["all_finite"]
+    assert diagnostics["max_induced_dipole"] >= 0.0
+    assert diagnostics["max_abs_energy_edge"] >= 0.0
     assert diagnostics["n_edges"] == synthetic_dimer_batch.e_ABfull_source.numel()
+
+
+def test_dimer_prop_accumulates_opt_in_induction_health(
+    nested_hfvr_vw_model, synthetic_dimer_batch
+):
+    import copy
+
+    torch.manual_seed(0)
+    head = CliffClassicalNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
+    )
+    dimer = mtp_mtp.DimerProp(
+        ATParam=head,
+        dimer_eval="cliff_classical_overlap",
+        freeze_atom_model=True,
+    )
+    assert dimer.induction_diagnostic_totals()["calls"] == 0.0
+    dimer(synthetic_dimer_batch)
+    assert dimer.induction_diagnostic_totals()["calls"] == 0.0
+
+    dimer.collect_induction_diagnostics = True
+    energy, _, _ = dimer(synthetic_dimer_batch)
+    totals = dimer.induction_diagnostic_totals()
+    assert torch.isfinite(energy).all()
+    assert totals["calls"] == 1.0
+    assert totals["finite"] == 1.0
+    assert 1.0 <= totals["iterations_sum"] <= 200.0
+    assert totals["iterations_max"] == totals["iterations_sum"]
+    assert totals["max_induced_dipole"] >= 0.0
+    assert totals["max_abs_energy_edge"] >= 0.0
+    assert totals["edges"] == synthetic_dimer_batch.e_ABfull_source.numel()
+
+    dimer.reset_induction_diagnostics()
+    assert dimer.induction_diagnostic_totals()["calls"] == 0.0
+
+
+def test_induction_diagnostic_maxima_preserve_nonfinite_failures(
+    nested_hfvr_vw_model,
+):
+    dimer = mtp_mtp.DimerProp(
+        ATParam=_head(nested_hfvr_vw_model),
+        dimer_eval="cliff_classical_overlap",
+        freeze_atom_model=True,
+    )
+    dimer._record_induction_diagnostics(
+        {
+            "scf_converged": False,
+            "all_finite": False,
+            "scf_iterations": 200,
+            "scf_residual": float("nan"),
+            "max_induced_dipole": float("nan"),
+            "max_abs_energy_edge": float("nan"),
+            "n_edges_positive": 0,
+            "n_edges": 1,
+        }
+    )
+    totals = dimer.induction_diagnostic_totals()
+    assert totals["finite"] == 0.0
+    assert totals["converged"] == 0.0
+    assert totals["residual_max"] == float("inf")
+    assert totals["max_induced_dipole"] == float("inf")
+    assert totals["max_abs_energy_edge"] == float("inf")
 
 
 def test_induction_energy_is_not_the_variational_functional_of_its_solve(
@@ -1480,6 +1548,156 @@ def test_dense_component_gradient_groups_clip_independently(
         assert after == pytest.approx(1.0, rel=2e-5)
 
 
+def test_thole_optimizer_lr_partitions_independent_dense_head(
+    nested_hfvr_vw_model,
+):
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    groups = harness._optimizer_parameter_groups(5e-4, 2.5e-5)
+    assert [group["group_name"] for group in groups] == ["base", "thole"]
+    assert [group["lr"] for group in groups] == [5e-4, 2.5e-5]
+    thole_ids = {id(parameter) for parameter in groups[1]["params"]}
+    expected = {
+        id(parameter)
+        for column in (
+            mtp_mtp.CLIFF_CLASSICAL_THOLE_DIRECT_INDEX,
+            mtp_mtp.CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX,
+        )
+        for module in (
+            harness.model.guess_layer[column],
+            harness.model.param_readout_layers[column],
+        )
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    }
+    assert thole_ids == expected
+    all_grouped = [
+        parameter for group in groups for parameter in group["params"]
+    ]
+    assert len(all_grouped) == len({id(parameter) for parameter in all_grouped})
+    assert {id(parameter) for parameter in all_grouped} == {
+        id(parameter)
+        for parameter in harness.model.parameters()
+        if parameter.requires_grad
+    }
+
+
+def test_low_thole_trainstate_identity_guards_both_learning_rates(
+    tmp_path, nested_hfvr_vw_model
+):
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    optimizer = torch.optim.Adam(
+        harness._optimizer_parameter_groups(5e-4, 2.5e-5), lr=5e-4
+    )
+    path = tmp_path / "low-thole.trainstate.pt"
+    identity = {"base_lr": 5e-4, "thole_lr": 2.5e-5}
+    model_io.save_train_state(
+        str(path),
+        model=harness.model,
+        optimizer=optimizer,
+        epochs_completed=3,
+        lowest_test_loss=1.25,
+        identity=identity,
+    )
+
+    restored = torch.optim.Adam(
+        harness._optimizer_parameter_groups(5e-4, 2.5e-5), lr=5e-4
+    )
+    assert model_io.load_train_state(
+        str(path),
+        model=harness.model,
+        optimizer=restored,
+        identity=identity,
+    ) == (3, 1.25)
+    assert [group["lr"] for group in restored.param_groups] == [5e-4, 2.5e-5]
+
+    mismatched = torch.optim.Adam(
+        harness._optimizer_parameter_groups(1e-4, 2.5e-5), lr=1e-4
+    )
+    with pytest.warns(UserWarning, match="identity mismatch"):
+        assert (
+            model_io.load_train_state(
+                str(path),
+                model=harness.model,
+                optimizer=mismatched,
+                identity={"base_lr": 1e-4, "thole_lr": 2.5e-5},
+            )
+            is None
+        )
+
+
+def test_thole_optimizer_lr_supports_one_shared_damping_scalar(
+    nested_hfvr_vw_model,
+):
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        shared_damping_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
+    )
+    groups = harness._optimizer_parameter_groups(5e-4, 2.5e-5)
+    assert groups[1]["params"] == [harness.model.shared_damping_raw]
+
+
+def test_thole_optimizer_lr_rejects_frozen_damping(
+    nested_hfvr_vw_model,
+):
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        frozen_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
+    )
+    with pytest.raises(ValueError, match="no trainable direct or mutual"):
+        harness._optimizer_parameter_groups(5e-4, 2.5e-5)
+
+
+def test_zero_call_ddp_diagnostics_still_enter_collectives(
+    nested_hfvr_vw_model, monkeypatch
+):
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    operations = []
+
+    def fake_all_reduce(tensor, op="sum"):
+        operations.append(op)
+        return tensor
+
+    monkeypatch.setattr(harness, "_ddp_all_reduce", fake_all_reduce)
+    assert harness._reduced_induction_diagnostics("train", world_size=2) == {}
+    assert operations == ["sum", "max"]
+
+
 def test_component_gradient_groups_reject_the_shared_mpnn_head(
     nested_hfvr_vw_model,
 ):
@@ -1509,11 +1727,18 @@ class _FakeCliffHarness:
         self.model = None
 
     def train(
-        self, grad_clip_norm=None, grad_clip_mode="global", **kwargs
+        self,
+        grad_clip_norm=None,
+        grad_clip_mode="global",
+        thole_lr=None,
+        induction_diagnostics=False,
+        **kwargs,
     ):
         self.train_kwargs = {
             "grad_clip_norm": grad_clip_norm,
             "grad_clip_mode": grad_clip_mode,
+            "thole_lr": thole_lr,
+            "induction_diagnostics": induction_diagnostics,
             **kwargs,
         }
 
@@ -1568,6 +1793,34 @@ def test_component_clip_mode_reaches_dense_training(tmp_path, cliff_dispatch):
     )
     assert cliff_dispatch.calls[0].train_kwargs["grad_clip_norm"] == 1.0
     assert cliff_dispatch.calls[0].train_kwargs["grad_clip_mode"] == "component"
+
+
+def test_stability_controls_reach_dense_training(tmp_path, cliff_dispatch):
+    train_models.train_pairwise_model(
+        apnet_model_type="CliffClassicalModel",
+        model_out=str(tmp_path / "out.pt"),
+        thole_lr=2.5e-5,
+        induction_diagnostics=True,
+        ds_max_size=100,
+    )
+    training = cliff_dispatch.calls[0].train_kwargs
+    assert training["thole_lr"] == 2.5e-5
+    assert training["induction_diagnostics"] is True
+
+
+def test_stability_controls_reject_non_cliff_route(tmp_path):
+    with pytest.raises(ValueError, match="thole_lr"):
+        train_models.train_pairwise_model(
+            apnet_model_type="APNet2",
+            model_out=str(tmp_path / "out.pt"),
+            thole_lr=2.5e-5,
+        )
+    with pytest.raises(ValueError, match="induction_diagnostics"):
+        train_models.train_pairwise_model(
+            apnet_model_type="APNet2",
+            model_out=str(tmp_path / "out.pt"),
+            induction_diagnostics=True,
+        )
 
 
 def test_component_clip_mode_requires_a_norm(tmp_path):

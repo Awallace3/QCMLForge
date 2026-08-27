@@ -434,6 +434,8 @@ def train_pairwise_model(
     total_includes_d3=False,
     grad_clip_norm=None,
     grad_clip_mode="global",
+    thole_lr=None,
+    induction_diagnostics=False,
     omp_num_threads=8,
     ddp_world_size=1,
     external_rank=None,
@@ -495,6 +497,8 @@ def train_pairwise_model(
         total_includes_d3 (bool): If true, the CLIFF Eq. (23) total term includes D3 dispersion and is compared against all four SAPT columns. Requires an explicit component_gamma and one of the combined CLIFF routes.
         grad_clip_norm (float or None): Gradient-norm clip applied before each optimizer step. None leaves the update unclipped.
         grad_clip_mode (str): `global` clips all parameters together; `component` clips dense CLIFF ELST, EXCH, and IND groups independently.
+        thole_lr (float or None): Optional Adam learning rate for only the trainable direct/mutual Thole columns; all other columns retain `lr`.
+        induction_diagnostics (bool): Collect and log per-epoch SCF convergence, residual, induced-dipole, and induction-energy health metrics.
         omp_num_threads (int): Number of OpenMP threads assigned to each training process.
 
     """
@@ -520,6 +524,22 @@ def train_pairwise_model(
                 f"{sorted(COMPONENT_CLIP_CLIFF_MODEL_TYPES)}, not "
                 f"{apnet_model_type!r}"
             )
+    if thole_lr is not None:
+        thole_lr = AtomPairwiseModels.mtp_mtp._validate_bound_scale(
+            thole_lr, "thole_lr"
+        )
+        if apnet_model_type not in COMPONENT_CLIP_CLIFF_MODEL_TYPES:
+            raise ValueError(
+                "thole_lr is only supported on the dense combined CLIFF "
+                f"routes {sorted(COMPONENT_CLIP_CLIFF_MODEL_TYPES)}, not "
+                f"{apnet_model_type!r}"
+            )
+    if induction_diagnostics and apnet_model_type not in COMBINED_CLIFF_MODEL_TYPES:
+        raise ValueError(
+            "induction_diagnostics is only supported on the combined CLIFF "
+            f"routes {sorted(COMBINED_CLIFF_MODEL_TYPES)}, not "
+            f"{apnet_model_type!r}"
+        )
     if split_manifest:
         # Only the atom-model route resolves a manifest into indices. Accepting
         # it here would train on the trainer's own uniform draw while the run
@@ -1134,6 +1154,8 @@ def train_pairwise_model(
         # silently switch the run onto the Eq. (23) functional.
         train_kwargs["component_gamma"] = component_gamma
         train_kwargs["total_includes_d3"] = total_includes_d3
+        train_kwargs["thole_lr"] = thole_lr
+        train_kwargs["induction_diagnostics"] = induction_diagnostics
     if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
         train_kwargs["end_lr"] = end_lr
     else:
@@ -1680,6 +1702,25 @@ def main():
         ),
     )
     args.add_argument(
+        "--thole_lr",
+        type=float,
+        default=None,
+        help=(
+            "Dense combined CLIFF routes only: use this Adam learning rate for "
+            "trainable thole_direct/thole_mutual parameters while every other "
+            "parameter uses --lr."
+        ),
+    )
+    args.add_argument(
+        "--induction_diagnostics",
+        action="store_true",
+        default=False,
+        help=(
+            "Combined CLIFF routes only: log SCF convergence/residual, maximum "
+            "induced dipole, and maximum absolute induction edge energy."
+        ),
+    )
+    args.add_argument(
         "--total_includes_d3",
         action="store_true",
         default=False,
@@ -1941,6 +1982,8 @@ def main():
             total_includes_d3=args.total_includes_d3,
             grad_clip_norm=args.grad_clip_norm,
             grad_clip_mode=args.grad_clip_mode,
+            thole_lr=args.thole_lr,
+            induction_diagnostics=args.induction_diagnostics,
             omp_num_threads=(
                 args.omp_num_threads
                 if args.omp_num_threads is not None

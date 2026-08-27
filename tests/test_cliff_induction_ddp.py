@@ -653,6 +653,12 @@ def test_ddp_train_signature_matches_the_tracked_worker_binding():
         "n_epochs",
     ]
     assert "batch_size" in parameters
+    assert "thole_lr" in parameters
+    assert "induction_diagnostics" in parameters
+    assert parameters.index("thole_lr") < parameters.index("local_rank")
+    assert parameters.index("induction_diagnostics") < parameters.index(
+        "local_rank"
+    )
     assert "local_rank" in parameters
 
 

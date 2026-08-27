@@ -508,6 +508,10 @@ class DimerProp(nn.Module):
         # physically impossible -- on 16 of 32 S66x8 geometries. See
         # `rackers_thole_induction` and ARCHITECTURE_HANDOFF.md.
         self.variational_induction = variational_induction
+        # Opt-in training diagnostics. The default remains false so checkpoint
+        # inference and historical training take the exact pre-diagnostic path.
+        self.collect_induction_diagnostics = False
+        self.reset_induction_diagnostics()
         self.set_d3_damping_parameters(d3_damping_parameters)
         self.set_forward(dimer_eval)
         return
@@ -517,6 +521,51 @@ class DimerProp(nn.Module):
             d3_damping_parameters
         )
         return
+
+    def reset_induction_diagnostics(self):
+        """Reset cheap aggregate diagnostics collected by induction forwards."""
+        self._induction_diagnostic_totals = {
+            "calls": 0.0,
+            "converged": 0.0,
+            "finite": 0.0,
+            "iterations_sum": 0.0,
+            "iterations_max": 0.0,
+            "residual_max": 0.0,
+            "max_induced_dipole": 0.0,
+            "max_abs_energy_edge": 0.0,
+            "positive_edges": 0.0,
+            "edges": 0.0,
+        }
+
+    def induction_diagnostic_totals(self) -> dict[str, float]:
+        """Return a copy suitable for rank-wise epoch reduction."""
+        return dict(self._induction_diagnostic_totals)
+
+    def _record_induction_diagnostics(self, diagnostics: dict) -> None:
+        totals = self._induction_diagnostic_totals
+        totals["calls"] += 1.0
+        totals["converged"] += float(diagnostics["scf_converged"])
+        totals["finite"] += float(diagnostics["all_finite"])
+        totals["iterations_sum"] += float(diagnostics["scf_iterations"])
+        totals["iterations_max"] = max(
+            totals["iterations_max"], float(diagnostics["scf_iterations"])
+        )
+        # A NaN is evidence, not an identity element. Map it to +inf so MAX
+        # reduction and the stability gate preserve the failure instead of
+        # Python's max(0.0, nan) silently reporting zero.
+        for total_key, diagnostic_key in (
+            ("residual_max", "scf_residual"),
+            ("max_induced_dipole", "max_induced_dipole"),
+            ("max_abs_energy_edge", "max_abs_energy_edge"),
+        ):
+            value = float(diagnostics[diagnostic_key])
+            totals[total_key] = (
+                float("inf")
+                if not math.isfinite(value)
+                else max(totals[total_key], value)
+            )
+        totals["positive_edges"] += float(diagnostics["n_edges_positive"])
+        totals["edges"] += float(diagnostics["n_edges"])
 
     def info(self):
         """Print a Unicode model tree for this model."""
@@ -833,7 +882,7 @@ class DimerProp(nn.Module):
             dR_AB=dR_AB,
             width_floor=self._overlap_width_floor(),
         )
-        Indu = rackers_thole_induction(
+        induction_result = rackers_thole_induction(
             ZA=batch.ZA,
             RA=batch.RA,
             qA=output_A[0],
@@ -881,7 +930,13 @@ class DimerProp(nn.Module):
             molecule_ind_B=(
                 batch.molecule_ind_B if self.variational_induction else None
             ),
+            return_diagnostics=self.collect_induction_diagnostics,
         )
+        if self.collect_induction_diagnostics:
+            Indu, induction_diagnostics = induction_result
+            self._record_induction_diagnostics(induction_diagnostics)
+        else:
+            Indu = induction_result
         if include_d3:
             Disp = d3(batch, params=self.d3_damping_parameters)
             return (
@@ -4856,10 +4911,22 @@ def rackers_thole_induction(
             torch.sum(mu_induced_A * field_A)
             + torch.sum(mu_induced_B * field_B)
         ) * constants.h2kcalmol
+    max_induced_dipole = torch.maximum(
+        torch.linalg.vector_norm(mu_induced_A, dim=-1).max(),
+        torch.linalg.vector_norm(mu_induced_B, dim=-1).max(),
+    )
+    all_finite = bool(
+        torch.isfinite(E_ind).all()
+        and torch.isfinite(mu_induced_A).all()
+        and torch.isfinite(mu_induced_B).all()
+    )
     diagnostics = {
         "scf_iterations": scf_iterations,
         "scf_residual": float(scf_residual.detach()),
         "scf_converged": bool(scf_converged),
+        "all_finite": all_finite,
+        "max_induced_dipole": float(max_induced_dipole.detach()),
+        "max_abs_energy_edge": float(E_ind.detach().abs().max()),
         # Summed over AB edges: what the model trains on.
         "energy_edge_contraction": float(E_ind.detach().sum()),
         "energy_qu": float(E_qu.detach().sum()),
@@ -7284,6 +7351,119 @@ units angstrom
         total_mse = torch.mean(torch.square(pred_total - ref_total))
         return (1.0 - gamma) * total_mse + gamma * component_mse
 
+    def _optimizer_parameter_groups(self, lr: float, thole_lr: float | None):
+        """Return the legacy iterator or disjoint base/Thole Adam groups."""
+        if thole_lr is None:
+            # Preserve the historical optimizer construction exactly when the
+            # new control is not requested.
+            return self.model.parameters()
+        thole_lr = _validate_bound_scale(thole_lr, "thole_lr")
+        head = model_io.unwrap_model(self.model)
+        if type(head) is not CliffClassicalNN:
+            raise ValueError(
+                "thole_lr requires the dense CliffClassicalNN head"
+            )
+        thole_columns = {
+            CLIFF_CLASSICAL_THOLE_DIRECT_INDEX,
+            CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX,
+        }
+        thole_parameters = []
+        for column in sorted(thole_columns):
+            thole_parameters.extend(
+                parameter
+                for parameter in head.guess_layer[column].parameters()
+                if parameter.requires_grad
+            )
+            thole_parameters.extend(
+                parameter
+                for parameter in head.param_readout_layers[column].parameters()
+                if parameter.requires_grad
+            )
+        shared_damping = getattr(head, "shared_damping_raw", None)
+        shared_indices = set(getattr(head, "_shared_damping_indices", ()))
+        if (
+            shared_damping is not None
+            and shared_damping.requires_grad
+            and shared_indices & thole_columns
+        ):
+            thole_parameters.append(shared_damping)
+        if not thole_parameters:
+            raise ValueError(
+                "thole_lr was requested but no trainable direct or mutual "
+                "Thole parameters exist"
+            )
+        thole_ids = [id(parameter) for parameter in thole_parameters]
+        if len(thole_ids) != len(set(thole_ids)):
+            raise RuntimeError("Thole optimizer parameter group overlaps itself")
+        trainable = [
+            parameter for parameter in head.parameters() if parameter.requires_grad
+        ]
+        base_parameters = [
+            parameter for parameter in trainable if id(parameter) not in thole_ids
+        ]
+        if {id(parameter) for parameter in trainable} != {
+            id(parameter) for parameter in (*base_parameters, *thole_parameters)
+        }:
+            raise RuntimeError("base/Thole optimizer groups do not cover the head")
+        return [
+            {"params": base_parameters, "lr": float(lr), "group_name": "base"},
+            {
+                "params": thole_parameters,
+                "lr": float(thole_lr),
+                "group_name": "thole",
+            },
+        ]
+
+    def _reduced_induction_diagnostics(
+        self, prefix: str, world_size: int
+    ) -> dict[str, float]:
+        """Reduce one split's induction-health counters across DDP ranks."""
+        totals = self.dimer_model.induction_diagnostic_totals()
+        sum_keys = (
+            "calls",
+            "converged",
+            "finite",
+            "iterations_sum",
+            "positive_edges",
+            "edges",
+        )
+        max_keys = (
+            "iterations_max",
+            "residual_max",
+            "max_induced_dipole",
+            "max_abs_energy_edge",
+        )
+        sums = torch.tensor(
+            [totals[key] for key in sum_keys], dtype=torch.float64
+        )
+        maxima = torch.tensor(
+            [totals[key] for key in max_keys], dtype=torch.float64
+        )
+        if world_size > 1:
+            # Collective even when this rank observed zero calls. Returning on a
+            # rank-local condition would leave peers blocked in all_reduce.
+            sums = self._ddp_all_reduce(sums, op="sum")
+            maxima = self._ddp_all_reduce(maxima, op="max")
+        if float(sums[0]) == 0.0:
+            return {}
+        reduced = {
+            **{key: float(value) for key, value in zip(sum_keys, sums)},
+            **{key: float(value) for key, value in zip(max_keys, maxima)},
+        }
+        calls = max(reduced["calls"], 1.0)
+        edges = max(reduced["edges"], 1.0)
+        root = f"{prefix}/induction"
+        return {
+            f"{root}/scf_converged_fraction": reduced["converged"] / calls,
+            f"{root}/finite_fraction": reduced["finite"] / calls,
+            f"{root}/scf_iterations_mean": reduced["iterations_sum"] / calls,
+            f"{root}/scf_iterations_max": reduced["iterations_max"],
+            f"{root}/scf_residual_max": reduced["residual_max"],
+            f"{root}/max_induced_dipole": reduced["max_induced_dipole"],
+            f"{root}/max_abs_energy_edge": reduced["max_abs_energy_edge"],
+            f"{root}/positive_edge_fraction": reduced["positive_edges"] / edges,
+        }
+
     def _component_gradient_parameter_groups(self) -> dict[str, list]:
         """Return disjoint dense-head parameter groups by physical component.
 
@@ -7575,6 +7755,8 @@ units angstrom
         skip_compile=False,
         grad_clip_norm=None,
         grad_clip_mode="global",
+        thole_lr=None,
+        induction_diagnostics=False,
         rank=0,
         world_size=1,
         local_rank=None,
@@ -7624,6 +7806,9 @@ units angstrom
         throughput.
         """
         is_primary = rank == 0
+        self.dimer_model.collect_induction_diagnostics = bool(
+            induction_diagnostics
+        )
         # (0) Per-rank device. `__init__` pins `cuda:0` for every process, which
         # would put both ranks of a 2-GPU node on the same GPU: one of them out
         # of memory, both of them slow, and nothing in the logs saying why.
@@ -7704,7 +7889,9 @@ units angstrom
             )
 
         # (3) Optim/Scheduler
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(
+            self._optimizer_parameter_groups(lr, thole_lr), lr=lr
+        )
         scheduler = None
         # criterion = None  # defaults to MSE
         criterion = torch.nn.MSELoss()
@@ -7880,6 +8067,13 @@ units angstrom
                 else None
             ),
         }
+        if thole_lr is not None:
+            # Optimizer group structure and both restored rates are part of
+            # resume correctness. Keep these keys absent on the legacy one-group
+            # path so pre-existing sidecars remain compatible.
+            train_state_identity.update(
+                {"base_lr": float(lr), "thole_lr": float(thole_lr)}
+            )
         epochs_completed = 0
         if train_state_file:
             resumed = model_io.load_train_state(
@@ -7911,6 +8105,7 @@ units angstrom
                 # shuffle, so the chain would see one epoch's worth of ordering
                 # over and over and nothing would say so.
                 train_sampler.set_epoch(epoch)
+            self.dimer_model.reset_induction_diagnostics()
             t_out = self.__train_batches_single_proc(
                 train_loader,
                 loss_fn=criterion,
@@ -7923,6 +8118,10 @@ units angstrom
                 world_size=world_size,
                 rank=rank,
             )
+            train_induction_metrics = self._reduced_induction_diagnostics(
+                "train", world_size
+            )
+            self.dimer_model.reset_induction_diagnostics()
             v_out = self.__evaluate_batches_single_proc(
                 test_loader,
                 loss_fn=criterion,
@@ -7930,6 +8129,11 @@ units angstrom
                 y_ind=y_ind,
                 world_size=world_size,
             )
+            validation_induction_metrics = self._reduced_induction_diagnostics(
+                "val", world_size
+            )
+            self.last_bound_occupancy.update(train_induction_metrics)
+            self.last_bound_occupancy.update(validation_induction_metrics)
             train_loss, total_MAE_t = t_out
             test_loss, total_MAE_v = v_out
 
@@ -8007,6 +8211,19 @@ units angstrom
                 dist.barrier()
 
             dt = time.time() - t1
+            if induction_diagnostics and is_primary:
+                induction_health = {
+                    **train_induction_metrics,
+                    **validation_induction_metrics,
+                }
+                print(
+                    "  INDUCTION HEALTH: "
+                    + " ".join(
+                        f"{key}={value:.8g}"
+                        for key, value in sorted(induction_health.items())
+                    ),
+                    flush=True,
+                )
             track_epoch_from_locals(self, locals(), metric_labels=metric_labels)
             if isinstance(y_ind, torch.Tensor):
                 mae_string = " ".join(
@@ -8106,6 +8323,8 @@ units angstrom
         skip_compile=False,
         grad_clip_norm=None,
         grad_clip_mode="global",
+        thole_lr=None,
+        induction_diagnostics=False,
         local_rank=None,
     ):
         """Run one DDP rank of :meth:`single_proc_train`.
@@ -8131,6 +8350,8 @@ units angstrom
                 skip_compile=skip_compile,
                 grad_clip_norm=grad_clip_norm,
                 grad_clip_mode=grad_clip_mode,
+                thole_lr=thole_lr,
+                induction_diagnostics=induction_diagnostics,
                 rank=rank,
                 world_size=world_size,
                 local_rank=local_rank,
@@ -8206,6 +8427,8 @@ units angstrom
         total_includes_d3=False,
         grad_clip_norm=None,
         grad_clip_mode="global",
+        thole_lr=None,
+        induction_diagnostics=False,
         wandb_config: WandbConfig | None = None,
         _external_rank=None,
         _external_local_rank=None,
@@ -8236,6 +8459,8 @@ units angstrom
         raising.  See :meth:`_batch_loss` for the weighting itself.
         """
         grad_clip_norm = _validate_bound_scale(grad_clip_norm, "grad_clip_norm")
+        thole_lr = _validate_bound_scale(thole_lr, "thole_lr")
+        induction_diagnostics = bool(induction_diagnostics)
         grad_clip_mode = str(grad_clip_mode).strip().lower()
         if grad_clip_mode not in CLIFF_GRAD_CLIP_MODES:
             raise ValueError(
@@ -8257,6 +8482,9 @@ units angstrom
                     "component gradient clipping requires the dense "
                     "CliffClassicalNN head"
                 )
+        if thole_lr is not None:
+            # Validate the requested optimizer split before any dataset I/O.
+            self._optimizer_parameter_groups(lr, thole_lr)
         self.grad_clip_mode = grad_clip_mode
         # Validated before any dataset work so a misconfigured route fails
         # immediately rather than after a dataset build.
@@ -8316,7 +8544,9 @@ units angstrom
         print(f"  {self.model.param_start_std=}", flush=True)
         print("\nTraining Hyperparameters:", flush=True)
         print(f"  {n_epochs=}", flush=True)
-        print(f"  {lr=}\n", flush=True)
+        print(f"  {lr=}", flush=True)
+        print(f"  {thole_lr=}", flush=True)
+        print(f"  {induction_diagnostics=}\n", flush=True)
         print(f"  {batch_size=}", flush=True)
 
         if self.device.type == "cuda":
@@ -8333,6 +8563,8 @@ units angstrom
             "training/skip_compile": skip_compile,
             "training/grad_clip_norm": grad_clip_norm,
             "training/grad_clip_mode": grad_clip_mode,
+            "training/thole_learning_rate": thole_lr,
+            "training/induction_diagnostics": induction_diagnostics,
             # The CLIFF Eq. (23) total/component weighting changes which
             # physical terms share gradients. It must be visible on W&B so a
             # component-only gamma=1 run cannot be mistaken for the historical
@@ -8384,6 +8616,8 @@ units angstrom
                 skip_compile,
                 grad_clip_norm,
                 grad_clip_mode,
+                thole_lr,
+                induction_diagnostics,
             )
             if _external_rank is None:
                 configure_distributed_tracking(
@@ -8437,6 +8671,8 @@ units angstrom
                     skip_compile=skip_compile,
                     grad_clip_norm=grad_clip_norm,
                     grad_clip_mode=grad_clip_mode,
+                    thole_lr=thole_lr,
+                    induction_diagnostics=induction_diagnostics,
                 ),
                 wandb_config,
                 model_family="parameter",
