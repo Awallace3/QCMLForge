@@ -5,6 +5,7 @@ import torch
 import apnet_pt
 import qcelemental as qcel
 import numpy as np
+import pytest
 
 current_file_path = os.path.dirname(os.path.realpath(__file__))
 
@@ -28,6 +29,7 @@ def set_weights_to_value(model, value=0.9):
             param.fill_(value)  # Set all elements to the given value
 
 
+@pytest.mark.pretrained_models("am")
 def test_am():
     # Test Values
     qA_ref = torch.load(
@@ -234,6 +236,7 @@ def test_am_architecture():
         hlist - hidden_list_v=}"
 
 
+@pytest.mark.pretrained_models("am")
 def test_am_element():
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,

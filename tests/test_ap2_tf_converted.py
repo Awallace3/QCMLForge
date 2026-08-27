@@ -15,6 +15,10 @@ from pprint import pprint as pp
 
 current_file_path = os.path.dirname(os.path.realpath(__file__))
 project_root = os.path.dirname(current_file_path)
+TF_ATOM_MODELS = [f"models/ap2_tf/atom_models/atom{i}.pt" for i in range(5)]
+TF_PAIR_MODELS = [f"models/ap2_tf/pair_models/pair{i}.pt" for i in range(5)]
+TF_MODEL_ENSEMBLE = TF_ATOM_MODELS + TF_PAIR_MODELS
+TF_MODEL_ZERO = [TF_ATOM_MODELS[0], TF_PAIR_MODELS[0]]
 
 # Water dimer - equilibrium geometry
 mol_water_dimer = qcel.models.Molecule.from_data("""
@@ -56,6 +60,7 @@ H  5.260455  0.000000 -0.872893
 """)
 
 
+@pytest.mark.pretrained_models("am", local=TF_ATOM_MODELS)
 def test_tf_converted_atom_model_loads():
     """Test that converted TF atom models can be loaded."""
     am_pt = AtomModel(
@@ -99,6 +104,7 @@ def test_tf_converted_atom_model_loads():
         assert np.allclose(np.array(v_pt[0]), np.array(v[0]), atol=1e-1), f"Should be close to pt model\n{v_pt[0] = }\n{v[0] = }"
 
 
+@pytest.mark.pretrained_models(local=TF_MODEL_ENSEMBLE)
 def test_tf_converted_pair_model_loads():
     """Test that converted TF pair models can be loaded."""
     atom_model_path = os.path.join(
@@ -162,6 +168,7 @@ def test_tf_converted_pair_model_loads():
         print(f"✓ Successfully loaded pair model {i}")
 
 
+@pytest.mark.pretrained_models(local=TF_MODEL_ZERO)
 def test_tf_converted_predict_water_dimer_single():
     """Test prediction on a single water dimer using converted TF models."""
     atom_model_path = os.path.join(
@@ -225,6 +232,7 @@ def test_tf_converted_predict_water_dimer_single():
     print("✓ All sanity checks passed for water dimer prediction")
 
 
+@pytest.mark.pretrained_models(local=TF_MODEL_ZERO)
 def test_tf_converted_predict_water_dimer_batch():
     """Test batch prediction on multiple water dimers."""
     atom_model_path = os.path.join(
@@ -292,6 +300,7 @@ def test_tf_converted_predict_water_dimer_batch():
     print("\n✓ Distance-dependent behavior verified")
 
 
+@pytest.mark.pretrained_models(local=TF_MODEL_ENSEMBLE)
 def test_tf_converted_ensemble_prediction():
     """Test ensemble prediction using all 5 converted models."""
     atom_models = []
@@ -358,6 +367,7 @@ def test_tf_converted_ensemble_prediction():
     print("\n✓ Ensemble prediction completed successfully")
 
 
+@pytest.mark.pretrained_models(local=TF_MODEL_ZERO)
 def test_tf_converted_with_elst_breakdown():
     """Test prediction with electrostatic breakdown (multipole vs NN)."""
     atom_model_path = os.path.join(

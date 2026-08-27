@@ -1,6 +1,6 @@
 ---
 name: run-ies
-description: Use this skill when the user asks to run interaction-energy many-body jobs with run-IEs, queue or check QCArchive/QCFractal manybody records, or report completed IE results from a prepared dataframe. This skill handles submit, progress checks, safe polling behavior, and result summarization using the bundled example_manybody.py script.
+description: Use this skill when the user asks to run interaction-energy many-body jobs with run-IEs, queue or check QCArchive/QCFractal manybody records, or report completed IE results from a prepared dataframe. This skill handles submit, progress checks, safe polling behavior, and result summarization using the bundled scripts/example_manybody.py helper.
 ---
 
 # run-IEs
@@ -18,7 +18,7 @@ If the user explicitly asks for `run-IEs`, prefer this skill.
 
 ## Required input
 
-- A correctly formatted pandas dataframe expected by the bundled `example_manybody.py`.
+- A correctly formatted pandas dataframe expected by the bundled `scripts/example_manybody.py`.
 - The dataframe must include the columns needed for queueing, including:
   - `Level of Theory`
   - `qcel_dimer`
@@ -29,7 +29,7 @@ If the input is not in this format, stop and ask for a corrected dataframe.
 
 Always use functions from:
 
-`<resolved_skill_dir>/example_manybody.py`, where `<resolved_skill_dir>` is the skill resource directory reported by the loader.
+`<resolved_skill_dir>/scripts/example_manybody.py`, where `<resolved_skill_dir>` is the run-ies skill resource directory reported by the loader.
 
 Primary functions:
 - `queue_manybodys(df)`

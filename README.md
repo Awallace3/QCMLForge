@@ -18,6 +18,21 @@ conda env create -f environment.yml
 conda activate qcml
 pip install -e .
 ```
+
+### Running tests
+
+Some tests require pretrained model artifacts from the QCMLForge Hugging Face
+repository. Enable downloads before running pytest:
+
+```bash
+export QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED=1
+python -m pytest tests/
+```
+
+Pretrained-model tests are skipped when this environment variable is not
+enabled or when their required artifacts cannot be resolved. Tests that do not
+need pretrained models still run normally.
+
 ### Common Issues
 If you get an OS.Error when running qcml related to torch-geometric, you likely need
 to install a specific version through the following example:

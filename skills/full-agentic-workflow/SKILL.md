@@ -238,7 +238,7 @@ Only queue fresh manybody computations for rows where no matching record exists 
 import importlib.util
 from pathlib import Path
 
-mod_path = Path(<resolved_skill_dir>) / "example_manybody.py"
+mod_path = Path(<resolved_run_ies_skill_dir>) / "scripts" / "example_manybody.py"
 spec = importlib.util.spec_from_file_location("run_ies_example_manybody", mod_path)
 run_ies = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run_ies)
@@ -294,7 +294,7 @@ Normalize the reference into a Series or DataFrame keyed by system `id`.
 
 ### Step 2: Extract the interaction energy
 
-The `retrieve_manybodies()` function in `example_manybody.py` may return `NaN` for current `qcmanybody` schemas. Prefer the explicit result key matching the LoT correction type:
+The `retrieve_manybodies()` function in `scripts/example_manybody.py` may return `NaN` for current `qcmanybody` schemas. Prefer the explicit result key matching the LoT correction type:
 
 - CP LoTs: `rec.properties["results"]["cp_corrected_interaction_energy"]`
 - unCP/noCP LoTs: `rec.properties["results"]["nocp_corrected_interaction_energy"]`
@@ -416,6 +416,6 @@ If manybody jobs error out:
 ## Skill interaction notes
 
 - This skill does NOT modify or replace the three sub-skills. It orchestrates them.
-- Import select-LoT code from `qcml_mcp.ie_time_esimator_script`; load the bundled `example_manybody.py` resource by its resolved skill-resource path.
+- Import select-LoT code from `qcml_mcp.ie_time_esimator_script`; load `scripts/example_manybody.py` from the resolved run-ies skill directory.
   - `qcmlforge.qca` (for QCFractal setup)
 - If source edits become necessary, limit them to workflow/helper code the user asked you to modify. Do not patch unrelated model package files as part of running this workflow.

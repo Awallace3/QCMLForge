@@ -66,6 +66,7 @@ no_com
 """)
 
 
+@pytest.mark.pretrained_models("am_ensemble")
 def test_am_ensemble():
     print("Testing AM ensemble...")
     ref = torch.load(
@@ -111,6 +112,7 @@ def test_ap2_ensemble():
     assert np.allclose(interaction_energies, ref, atol=1e-3)
 
 
+@pytest.mark.pretrained_models("am_ensemble")
 def test_am_ensemble_compile():
     print("Testing AM ensemble...")
     ref = torch.load(
@@ -194,6 +196,7 @@ def test_ap2_ensemble_predict_pairs():
     return
 
 
+@pytest.mark.pretrained_models("ap2_fused_ensemble")
 def test_ap2_fused_ensemble():
     print("Testing AP2 ensemble...")
     ref = torch.load(
@@ -213,6 +216,7 @@ def test_ap2_fused_ensemble():
     assert np.allclose(interaction_energies, ref, atol=1e-5), f"{ref=}\n{interaction_energies = }"
 
 
+@pytest.mark.pretrained_models("ap2_fused_ensemble")
 def test_ap2_fused_ensemble_predict_pairs():
     _, pairs, df = apnet_pt.pretrained_models.apnet2_model_predict_pairs(
         [mol_fsapt],

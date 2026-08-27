@@ -110,6 +110,7 @@ def test_dapnet2_architecture():
         ("B3LYP-D3/aug-cc-pVTZ/CP", np.array([4.76954738e-05, 4.76958230e-05])),
     ],
 )
+@pytest.mark.pretrained_models("dapnet2")
 def test_dapnet2_pretrained_error_estimators(m1, ref):
     qcel_mols = [mol3, mol3]
     v = apnet_pt.pretrained_models.dapnet2_model_predict(
