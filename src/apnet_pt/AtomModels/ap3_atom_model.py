@@ -1339,7 +1339,16 @@ class AtomInducedDipoleModel:
                     )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
         elif (
             not ignore_database_null
             and self.dataset is None
@@ -1370,7 +1379,16 @@ class AtomInducedDipoleModel:
                 ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
         print(f"{self.dataset = }")
         self.rank = None
         self.world_size = None

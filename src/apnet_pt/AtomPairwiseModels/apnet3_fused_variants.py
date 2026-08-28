@@ -1089,7 +1089,16 @@ class APNet3_AtomType_Model:
                     )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
         elif not ignore_database_null and self.dataset is None and ds_split_db:
@@ -1202,7 +1211,16 @@ class APNet3_AtomType_Model:
                     ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset[0] = self.dataset[0][:ds_max_size]
                 self.dataset[1] = self.dataset[1][:ds_max_size]
