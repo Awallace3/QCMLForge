@@ -565,7 +565,10 @@ def test_validation_loss_is_reduced_before_it_is_compared():
     save different checkpoints and resume from different sidecars.
     """
     eval_source = _evaluate_batches_source()
-    assert "_ddp_reduce_epoch_metrics" in eval_source
+    # Prefix, not the full name: the loop reduces running sums
+    # (``_ddp_reduce_epoch_sums``) rather than a materialised per-dimer error
+    # tensor, and either helper satisfies what this test is about.
+    assert "_ddp_reduce_epoch" in eval_source
     loop = _loop_source()
     eval_call = loop.index("__evaluate_batches_single_proc(")
     compare = loop.index("lowest_test_loss", eval_call)
@@ -643,7 +646,7 @@ def test_single_process_path_is_untouched():
     for index in [
         i
         for i in range(len(loop))
-        if loop.startswith("_ddp_reduce_epoch_metrics", i)
+        if loop.startswith("_ddp_reduce_epoch", i)
     ]:
         preceding = loop[:index]
         assert "if world_size > 1:" in preceding

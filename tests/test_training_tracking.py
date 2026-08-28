@@ -1548,14 +1548,28 @@ def test_the_summed_loss_really_is_a_sum_of_batch_means():
 
     If a loop ever starts dividing by its own batch count, `loss_mean` would
     divide twice. Pinned on the CLIFF/parameter loop that is in production use.
+
+    The accumulator moved from a Python float to a 0-dim device tensor when the
+    per-batch `.item()` was removed -- that call forced a device->host sync on
+    every optimizer step, serialising the step against the copy. The invariant
+    is unchanged and so is the arithmetic: still a running sum of per-batch
+    means, still undivided, just accumulated on-device in float64 and read once
+    at the end of the epoch.
     """
     from apnet_pt.AtomPairwiseModels import mtp_mtp
 
-    src = inspect.getsource(
-        mtp_mtp.AM_DimerParam_Model._AM_DimerParam_Model__train_batches_single_proc
-    )
-    assert "total_loss += batch_loss.item()" in src
-    assert "return total_loss, total_MAE_t" in src
-    # No division of the accumulator anywhere in the function.
-    assert "total_loss /" not in src
-    assert "total_loss/" not in src
+    for name in (
+        "_AM_DimerParam_Model__train_batches_single_proc",
+        "_AM_DimerParam_Model__evaluate_batches_single_proc",
+    ):
+        member = getattr(mtp_mtp.AM_DimerParam_Model, name, None)
+        if member is None:
+            continue
+        src = inspect.getsource(member)
+        assert "total_loss_t += batch_loss.detach().double()" in src, name
+        # Read back exactly once, at the end, rather than per step.
+        assert src.count("total_loss_t.item()") == 1, name
+        assert "float(total_loss_t.item())" in src, name
+        # No division of the accumulator anywhere in the function.
+        assert "total_loss_t /" not in src, name
+        assert "total_loss_t/" not in src, name

@@ -8,6 +8,7 @@ from torch_geometric.data.datapipes import DatasetAdapter
 from torch_geometric.data.on_disk_dataset import OnDiskDataset
 from torch_geometric.data import Data
 from torch_geometric.data import Dataset
+from collections import OrderedDict
 import os.path as osp
 import torch
 from torch_geometric.data import download_url
@@ -889,6 +890,7 @@ class ap2_fused_module_dataset(Dataset):
         random_seed=42,
         check_monomer_validity=True,
         storage_type="pt",  # "pt" or "h5" for storage format
+        shard_cache_size=1,
     ):
         """
         spec_type definitions:
@@ -1002,6 +1004,18 @@ class ap2_fused_module_dataset(Dataset):
         self.batch_size = batch_size
         self.active_idx_data = None
         self.active_data = None
+        # Multi-shard LRU, off by default.  `active_data` above already caches
+        # the most recent shard, which is all a sequential pass needs; a
+        # shuffled pass touches a different shard on nearly every sample and
+        # re-reads it -- 16x read amplification on a 16-dimer shard.  With
+        # `shard_cache_size > 1` and a shard-locality sampler feeding the
+        # loader, a worker reads each shard of its block once and serves the
+        # rest of the block from here.  Size 1 leaves the cache unallocated so
+        # the default path is exactly the one that was here before.
+        self.shard_cache_size = max(1, int(shard_cache_size))
+        self._shard_cache = (
+            OrderedDict() if self.shard_cache_size > 1 else None
+        )
 
     @property
     def file_extension(self):
@@ -1302,9 +1316,37 @@ class ap2_fused_module_dataset(Dataset):
                 # Forces a re-processing of the dataset
                 return [f"dimer_missing{self.file_extension}"]
 
+    def _invalidate_store_listing(self):
+        """Drop the cached shard listing and length.
+
+        Called wherever the set of shards on disk can have changed under us --
+        i.e. after ``process()`` writes one.
+        """
+        self.__dict__.pop("_store_listing_cache", None)
+
+    def _store_listing_key(self):
+        return (bool(self.force_reprocess), self.MAX_SIZE, self.split_name)
+
     @property
     def processed_file_names(self):
-        return self.reprocess_file_names()
+        """The shard listing, globbed once per (force_reprocess, MAX_SIZE).
+
+        ``reprocess_file_names`` globs a directory holding 206k entries and
+        natural-sorts the 93,750 that match: 4.7 s per call against the
+        project NFS mount.  PyG reads this property on every
+        ``processed_paths`` access and ``len()`` read it twice, which put ~14 s
+        into a single length query and ran once per dataset construction --
+        and the model constructs each split twice.  The listing only changes
+        when ``process()`` writes a shard or ``force_reprocess`` flips; the
+        first invalidates the cache explicitly and the second is in the key.
+        """
+        key = self._store_listing_key()
+        cached = self.__dict__.get("_store_listing_cache")
+        if cached is not None and cached["key"] == key:
+            return cached["names"]
+        names = self.reprocess_file_names()
+        self.__dict__["_store_listing_cache"] = {"key": key, "names": names}
+        return names
 
     def download(self):
         if self.energy_labels and self.qcel_molecules:
@@ -1338,6 +1380,18 @@ class ap2_fused_module_dataset(Dataset):
         return
 
     def process(self):
+        """Build the store, then drop anything memoised about its shape.
+
+        ``processed_file_names``/``len`` cache the shard listing; writing a
+        shard is the one thing that invalidates it. try/finally so a partial
+        or failed process leaves no stale listing behind either.
+        """
+        try:
+            return self._process_shards()
+        finally:
+            self._invalidate_store_listing()
+
+    def _process_shards(self):
         """
         Builds fused PyG Data objects from raw dimers or provided QCElemental molecules and writes them to disk or stores them in memory.
 
@@ -1524,27 +1578,67 @@ class ap2_fused_module_dataset(Dataset):
         return
 
     def len(self):
+        """Dimer count, memoised alongside the shard listing.
+
+        Every call used to re-glob the store and deserialise the tail shard to
+        find out how short it was -- 9.2 s on the 93,750-shard store.  The
+        answer cannot change unless the listing does, so it is cached in the
+        same slot and dropped by the same invalidation.
+        """
         if self.in_memory:
             return len(self.data)
 
+        key = self._store_listing_key()
+        cached = self.__dict__.get("_store_listing_cache")
+        if cached is not None and cached["key"] == key and "length" in cached:
+            return cached["length"]
+
+        names = self.processed_file_names
         if self.storage_type == "h5":
-            d = load_hdf5_data_objects(
-                osp.join(self.processed_dir, self.processed_file_names[-1])
-            )
+            d = load_hdf5_data_objects(osp.join(self.processed_dir, names[-1]))
         else:
             d = torch.load(
-                osp.join(self.processed_dir, self.processed_file_names[-1]),
-                weights_only=False,
+                osp.join(self.processed_dir, names[-1]), weights_only=False
             )
-        return (
-            len(self.processed_file_names) - 1
-        ) * self.datapoint_storage_n_objects + len(d)
+        length = (len(names) - 1) * self.datapoint_storage_n_objects + len(d)
+        cached = self.__dict__.get("_store_listing_cache")
+        if cached is not None and cached["key"] == key:
+            cached["length"] = length
+        return length
+
+    def set_shard_cache_size(self, n):
+        """Resize the multi-shard LRU in place.
+
+        The cache is sized where the loader is built rather than where the
+        dataset is constructed, because the size that makes sense is the
+        sampler's block size and only the loader knows that.  Attributes set
+        here are inherited by the fork that starts each loader worker, which is
+        where the cache actually earns anything.
+        """
+        n = max(1, int(n))
+        self.shard_cache_size = n
+        if n > 1:
+            if self._shard_cache is None:
+                self._shard_cache = OrderedDict()
+            while len(self._shard_cache) > n:
+                self._shard_cache.popitem(last=False)
+        else:
+            self._shard_cache = None
+        return self
 
     def get(self, idx):
         idx_datapath = idx // self.datapoint_storage_n_objects
         obj_ind = idx % self.datapoint_storage_n_objects
         if self.active_idx_data == idx_datapath:
             return self.active_data[obj_ind]
+        cache = self._shard_cache
+        if cache is not None:
+            hit = cache.get(idx_datapath)
+            if hit is not None:
+                cache.move_to_end(idx_datapath)
+                self.active_data = hit
+                self.active_idx_data = idx_datapath
+                return hit[obj_ind]
         split_name = ""
         if self.split_db:
             split_name = self.split_name
@@ -1556,6 +1650,17 @@ class ap2_fused_module_dataset(Dataset):
             self.active_data = load_hdf5_data_objects(datapath)
         else:
             self.active_data = torch.load(datapath, weights_only=False)
+        # Arming the guard above. Without this assignment `active_idx_data`
+        # stayed at its `__init__` value of None for the life of the dataset,
+        # the `==` check could never be true, and every sample deserialised a
+        # whole 16-dimer shard to return one dimer -- 16x read amplification on
+        # a sequential pass. The read that just happened is the one the guard
+        # is meant to skip next time.
+        self.active_idx_data = idx_datapath
+        if cache is not None:
+            cache[idx_datapath] = self.active_data
+            while len(cache) > self.shard_cache_size:
+                cache.popitem(last=False)
         try:
             self.active_data[obj_ind]
         except Exception:

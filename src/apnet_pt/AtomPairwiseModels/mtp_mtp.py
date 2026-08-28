@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from ..pt_datasets.shard_locality import ShardBlockSampler
 from torch_geometric.data import Data
 
 from apnet_pt.torch_util import set_weights_to_value
@@ -297,6 +298,27 @@ INDUCTION_FUNCTIONAL_VERSION = 2
 DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD = 1.0e-8
 DEFAULT_INDUCTION_MAX_ITERATIONS = 200
 
+# How the induced-dipole change is reduced to the scalar compared against
+# `induction_convergence_threshold`.
+#
+#   l2   ||dmu_A||_2 vs ||dmu_B||_2, unnormalised over every atom in the batch.
+#        The historical rule, and the default, so existing checkpoints and
+#        trajectories are unchanged.  It is *extensive*: the same per-atom
+#        convergence gives a residual that grows as sqrt(n_atoms), so the
+#        effective tolerance tightens as the batch grows.  At batch 128 (~5,000
+#        atoms, ~15,000 components) the smallest residual float32 can represent
+#        for these magnitudes is already above 1e-8, which is why the solve runs
+#        its full iteration cap on every batch -- see docs/profiling.html s12.
+#   rms  the same norms divided by sqrt(numel): batch-size independent, reads as
+#        a typical per-component change.
+#   max  the largest absolute per-component change: batch-size independent and
+#        the strictest of the three, so no atom hides behind an average.
+#
+# rms and max are opt-in.  They change the stopping point, and therefore the
+# optimizer trajectory, of any run that enables them.
+DEFAULT_INDUCTION_CONVERGENCE_NORM = "l2"
+INDUCTION_CONVERGENCE_NORMS = ("l2", "rms", "max")
+
 # The `dimer_eval` modes whose forward calls `rackers_thole_induction`, and so
 # the ones a stale functional version applies to. The `*induced_dipole*` modes
 # are deliberately absent: they go through `induced_dipole_induction` /
@@ -494,6 +516,7 @@ class DimerProp(nn.Module):
         variational_induction=False,
         induction_convergence_threshold=DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD,
         induction_max_iterations=DEFAULT_INDUCTION_MAX_ITERATIONS,
+        induction_convergence_norm=DEFAULT_INDUCTION_CONVERGENCE_NORM,
     ):
         """
         Create a DimerProp configured with an AtomTypeParam and selected evaluation and damping modes.
@@ -521,6 +544,9 @@ class DimerProp(nn.Module):
         ) = _validate_induction_solver_controls(
             induction_convergence_threshold,
             induction_max_iterations,
+        )
+        self.induction_convergence_norm = _validate_induction_convergence_norm(
+            induction_convergence_norm
         )
         # Opt-in training diagnostics. The default remains false so checkpoint
         # inference and historical training take the exact pre-diagnostic path.
@@ -759,6 +785,7 @@ class DimerProp(nn.Module):
             include_overlap=include_overlap,
             max_iterations=self.induction_max_iterations,
             convergence_threshold=self.induction_convergence_threshold,
+            convergence_norm=self.induction_convergence_norm,
             polarizability_table=self.polarizability_table,
         )
         return torch.vstack((Elst, Indu)).T, output_A, output_B
@@ -949,6 +976,7 @@ class DimerProp(nn.Module):
             return_diagnostics=self.collect_induction_diagnostics,
             max_iterations=self.induction_max_iterations,
             convergence_threshold=self.induction_convergence_threshold,
+            convergence_norm=self.induction_convergence_norm,
         )
         if self.collect_induction_diagnostics:
             Indu, induction_diagnostics = induction_result
@@ -1004,6 +1032,7 @@ class DimerProp(nn.Module):
                 self.induction_convergence_threshold
             ),
             "induction_max_iterations": self.induction_max_iterations,
+            "induction_convergence_norm": self.induction_convergence_norm,
             "atom_type_param_type": atom_type_param_type,
             "atom_type_param_config": atom_type_param_config,
             "atom_model_type": atom_model_type,
@@ -2276,6 +2305,53 @@ def _validate_bound_scale(value, name: str, *, allow_none: bool = True):
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"{name} must be finite and strictly greater than zero")
     return scale
+
+
+def _validate_induction_convergence_norm(convergence_norm) -> str:
+    """Validate the reduction used by the Rackers/Thole stopping rule."""
+    if not isinstance(convergence_norm, str):
+        raise ValueError(
+            "induction_convergence_norm must be one of "
+            f"{list(INDUCTION_CONVERGENCE_NORMS)}, got "
+            f"{convergence_norm!r}"
+        )
+    norm = convergence_norm.strip().lower()
+    if norm not in INDUCTION_CONVERGENCE_NORMS:
+        raise ValueError(
+            "induction_convergence_norm must be one of "
+            f"{list(INDUCTION_CONVERGENCE_NORMS)}, got "
+            f"{convergence_norm!r}"
+        )
+    return norm
+
+
+def _scf_residual(delta_A, delta_B, convergence_norm: str):
+    """Reduce a pair of induced-dipole changes to the scalar the loop tests.
+
+    The ``l2`` branch is written to emit the exact op sequence the loop used
+    before this existed -- two `torch.norm` calls and one `torch.maximum` --
+    so a default-configured run is bit-identical, not merely equivalent.
+    """
+    if convergence_norm == "l2":
+        return torch.maximum(torch.norm(delta_A), torch.norm(delta_B))
+    if convergence_norm == "rms":
+        # numel is a Python int on both branches (shapes are static within a
+        # solve), so this is a host-side scalar divide, not an extra sync.
+        n_A = max(delta_A.numel(), 1)
+        n_B = max(delta_B.numel(), 1)
+        return torch.maximum(
+            torch.norm(delta_A) / math.sqrt(n_A),
+            torch.norm(delta_B) / math.sqrt(n_B),
+        )
+    # "max": already validated, so no further branch is reachable.
+    return torch.maximum(
+        delta_A.abs().amax() if delta_A.numel() else torch.zeros(
+            (), device=delta_A.device, dtype=delta_A.dtype
+        ),
+        delta_B.abs().amax() if delta_B.numel() else torch.zeros(
+            (), device=delta_B.device, dtype=delta_B.dtype
+        ),
+    )
 
 
 def _validate_induction_solver_controls(
@@ -4462,51 +4538,129 @@ def _rackers_scf_update(
     mu_induced_0_A: torch.Tensor,
     mu_induced_0_B: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply one unmixed induced-dipole update using mutual tensors."""
-    n_atoms_A = alpha_A.shape[0]
-    n_atoms_B = alpha_B.shape[0]
-    alpha_A_source = alpha_A.index_select(0, e_AB_source)
-    alpha_B_target = alpha_B.index_select(0, e_AB_target)
-    alpha_AA_target = alpha_A.index_select(0, e_AA_target)
-    alpha_BB_target = alpha_B.index_select(0, e_BB_target)
+    """Apply one unmixed induced-dipole update using mutual tensors.
 
-    mu_induced_A_due_B = torch.einsum(
-        "a,aij,aj->ai",
-        alpha_A_source,
-        T2_AB,
-        mu_induced_B.index_select(0, e_AB_target),
+    Kept as the single-shot entry point the tests and any external caller
+    use. A converging loop should build the plan once with
+    ``_rackers_scf_plan`` and call ``_rackers_scf_step`` instead: every
+    argument this function derives from ``alpha_*`` and ``T2_*`` is
+    invariant across SCF iterations, so doing it here repeats work once per
+    iteration for no numerical difference.
+    """
+    plan = _rackers_scf_plan(
+        alpha_A, alpha_B,
+        e_AB_source, e_AB_target, e_AA_target, e_BB_target,
+        T2_AB, T2_AA, T2_BB,
     )
-    mu_induced_A_new = scatter_sum_compile(
-        mu_induced_A_due_B, e_AB_source, dim_size=n_atoms_A
+    return _rackers_scf_step(
+        plan,
+        e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+        e_BB_source, e_BB_target,
+        mu_induced_A, mu_induced_B, mu_induced_0_A, mu_induced_0_B,
     )
-    mu_induced_A_due_A = torch.einsum(
-        "a,aij,aj->ai",
-        alpha_AA_target,
-        T2_AA,
-        mu_induced_A.index_select(0, e_AA_source),
+
+
+def _rackers_scf_plan(
+    alpha_A: torch.Tensor,
+    alpha_B: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    T2_AB: torch.Tensor,
+    T2_AA: torch.Tensor,
+    T2_BB: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fold the polarisabilities into the mutual tensors, once.
+
+    The SCF update contracts ``alpha[a] * T2[a,i,j] * mu[a,j]``. Only ``mu``
+    changes between iterations, so ``alpha * T2`` is loop-invariant and is
+    hoisted here. Four gathers of ``alpha`` and four three-operand
+    contractions per iteration become four two-operand ones, and the
+    gathers happen once for the whole solve.
+    """
+    def scaled(alpha, index, T2):
+        return alpha.index_select(0, index).unsqueeze(-1).unsqueeze(-1) * T2
+
+    return (
+        scaled(alpha_A, e_AB_source, T2_AB),   # A polarised by B
+        scaled(alpha_A, e_AA_target, T2_AA),   # A polarised by A
+        scaled(alpha_B, e_AB_target, T2_AB),   # B polarised by A
+        scaled(alpha_B, e_BB_target, T2_BB),   # B polarised by B
     )
-    mu_induced_A_new += scatter_sum_compile(
-        mu_induced_A_due_A, e_AA_target, dim_size=n_atoms_A
+
+
+def _rackers_contract_T2_mu(aT2: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
+    """``out[a,i] = sum_j aT2[a,i,j] * mu[a,j]`` as a broadcast reduction.
+
+    ``torch.einsum`` routes this through ``bmm``, which on E batched 3x3
+    matrix-vector products is a pathological GEMM: measured on a V100 it
+    costs 451 us at E=250,000 against 58 us for the broadcast form below,
+    and the benchmark in ``scripts/profiling/scf_kernel_bench.py`` shows the
+    gap widening with E. The arithmetic is identical; only the kernel
+    differs.
+    """
+    return (aT2 * mu.unsqueeze(-2)).sum(-1)
+
+
+def _rackers_scatter_rows(
+    src: torch.Tensor, index: torch.Tensor, dim_size: int
+) -> torch.Tensor:
+    """Row-wise scatter-add. ``index_add_`` rather than ``scatter_add_``.
+
+    ``scatter_sum_compile`` has to materialise an int64 index the same shape
+    as ``src`` before it can call ``scatter_add_``; ``index_add_`` consumes
+    the 1-D index directly. Same reduction, same non-determinism from the
+    atomics, 22 us against 35 us per call on a V100 at every edge count
+    measured.
+    """
+    out = src.new_zeros((dim_size, *src.shape[1:]))
+    return out.index_add_(0, index, src)
+
+
+def _rackers_scf_step(
+    plan: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_source: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_source: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    mu_induced_A: torch.Tensor,
+    mu_induced_B: torch.Tensor,
+    mu_induced_0_A: torch.Tensor,
+    mu_induced_0_B: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One induced-dipole update against a prescaled plan."""
+    aT2_A_AB, aT2_A_AA, aT2_B_AB, aT2_B_BB = plan
+    n_atoms_A = mu_induced_0_A.shape[0]
+    n_atoms_B = mu_induced_0_B.shape[0]
+
+    mu_induced_A_due_B = _rackers_contract_T2_mu(
+        aT2_A_AB, mu_induced_B.index_select(0, e_AB_target)
+    )
+    mu_induced_A_new = _rackers_scatter_rows(
+        mu_induced_A_due_B, e_AB_source, n_atoms_A
+    )
+    mu_induced_A_due_A = _rackers_contract_T2_mu(
+        aT2_A_AA, mu_induced_A.index_select(0, e_AA_source)
+    )
+    mu_induced_A_new += _rackers_scatter_rows(
+        mu_induced_A_due_A, e_AA_target, n_atoms_A
     )
     mu_induced_A_new += mu_induced_0_A
 
-    mu_induced_B_due_A = torch.einsum(
-        "a,aij,aj->ai",
-        alpha_B_target,
-        T2_AB,
-        mu_induced_A.index_select(0, e_AB_source),
+    mu_induced_B_due_A = _rackers_contract_T2_mu(
+        aT2_B_AB, mu_induced_A.index_select(0, e_AB_source)
     )
-    mu_induced_B_new = scatter_sum_compile(
-        mu_induced_B_due_A, e_AB_target, dim_size=n_atoms_B
+    mu_induced_B_new = _rackers_scatter_rows(
+        mu_induced_B_due_A, e_AB_target, n_atoms_B
     )
-    mu_induced_B_due_B = torch.einsum(
-        "a,aij,aj->ai",
-        alpha_BB_target,
-        T2_BB,
-        mu_induced_B.index_select(0, e_BB_source),
+    mu_induced_B_due_B = _rackers_contract_T2_mu(
+        aT2_B_BB, mu_induced_B.index_select(0, e_BB_source)
     )
-    mu_induced_B_new += scatter_sum_compile(
-        mu_induced_B_due_B, e_BB_target, dim_size=n_atoms_B
+    mu_induced_B_new += _rackers_scatter_rows(
+        mu_induced_B_due_B, e_BB_target, n_atoms_B
     )
     mu_induced_B_new += mu_induced_0_B
     return mu_induced_A_new, mu_induced_B_new
@@ -4520,6 +4674,7 @@ def _rackers_converge_dipoles(
     direct_T1_BB, direct_T2_BB,
     mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
     max_iterations, convergence_threshold, omega,
+    convergence_norm=DEFAULT_INDUCTION_CONVERGENCE_NORM,
     intramolecular_permanent_field=False,
 ):
     """Solve the induced dipoles and report how the solve went.
@@ -4543,20 +4698,27 @@ def _rackers_converge_dipoles(
     iterations = 0
     residual = torch.zeros((), device=mu_A.device, dtype=mu_A.dtype)
     converged = False
+    plan = _rackers_scf_plan(
+        alpha_A, alpha_B,
+        e_AB_source, e_AB_target, e_AA_target, e_BB_target,
+        mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
+    )
     for _ in range(max_iterations):
         iterations += 1
-        mu_A_old, mu_B_old = mu_A.clone(), mu_B.clone()
-        mu_A_new, mu_B_new = _rackers_scf_update(
-            alpha_A, alpha_B,
+        # No clone: the loop rebinds mu_A/mu_B rather than mutating them, and
+        # _rackers_scf_step does not write through its arguments, so the old
+        # names still reference the previous iterate.
+        mu_A_old, mu_B_old = mu_A, mu_B
+        mu_A_new, mu_B_new = _rackers_scf_step(
+            plan,
             e_AB_source, e_AB_target, e_AA_source, e_AA_target,
             e_BB_source, e_BB_target,
-            mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
             mu_A, mu_B, mu_0_A, mu_0_B,
         )
         mu_A = (1 - omega) * mu_A_old + omega * mu_A_new
         mu_B = (1 - omega) * mu_B_old + omega * mu_B_new
-        residual = torch.maximum(
-            torch.norm(mu_A - mu_A_old), torch.norm(mu_B - mu_B_old)
+        residual = _scf_residual(
+            mu_A - mu_A_old, mu_B - mu_B_old, convergence_norm
         )
         if float(residual.detach()) < convergence_threshold:
             converged = True
@@ -4614,6 +4776,7 @@ def rackers_thole_induction(
     include_overlap: bool = False,
     max_iterations: int = 200,
     convergence_threshold: float = 1e-8,
+    convergence_norm: str = DEFAULT_INDUCTION_CONVERGENCE_NORM,
     omega: float = 0.7,
     polarizability_table: torch.Tensor = constants.polarizability_table,
     return_diagnostics: bool = False,
@@ -4796,22 +4959,31 @@ def rackers_thole_induction(
     scf_iterations = 0
     scf_residual = torch.zeros((), device=RA.device, dtype=mu_induced_A.dtype)
     scf_converged = False
+    scf_plan = _rackers_scf_plan(
+        alpha_A,
+        alpha_B,
+        e_AB_source,
+        e_AB_target,
+        e_AA_target,
+        e_BB_target,
+        mutual_tensors_AB[4],
+        mutual_tensors_AA[4],
+        mutual_tensors_BB[4],
+    )
     for _ in range(max_iterations):
         scf_iterations += 1
-        mu_induced_A_old = mu_induced_A.clone()
-        mu_induced_B_old = mu_induced_B.clone()
-        mu_induced_A_new, mu_induced_B_new = _rackers_scf_update(
-            alpha_A,
-            alpha_B,
+        # No clone: see _rackers_converge_dipoles. The iterates are rebound,
+        # never written through.
+        mu_induced_A_old = mu_induced_A
+        mu_induced_B_old = mu_induced_B
+        mu_induced_A_new, mu_induced_B_new = _rackers_scf_step(
+            scf_plan,
             e_AB_source,
             e_AB_target,
             e_AA_source,
             e_AA_target,
             e_BB_source,
             e_BB_target,
-            mutual_tensors_AB[4],
-            mutual_tensors_AA[4],
-            mutual_tensors_BB[4],
             mu_induced_A,
             mu_induced_B,
             mu_induced_0_A,
@@ -4823,10 +4995,16 @@ def rackers_thole_induction(
         mu_induced_B = (
             (1 - omega) * mu_induced_B_old + omega * mu_induced_B_new
         )
-        delta_A = torch.norm(mu_induced_A - mu_induced_A_old)
-        delta_B = torch.norm(mu_induced_B - mu_induced_B_old)
-        scf_residual = torch.maximum(delta_A, delta_B)
-        if max(delta_A, delta_B) < convergence_threshold:
+        scf_residual = _scf_residual(
+            mu_induced_A - mu_induced_A_old,
+            mu_induced_B - mu_induced_B_old,
+            convergence_norm,
+        )
+        # One device->host sync per iteration, not two. `max()` over a pair of
+        # 0-dim CUDA tensors compares them on the host, which forces a sync of
+        # its own on top of the one the threshold test already needs; the
+        # maximum is already in scf_residual.
+        if bool(scf_residual < convergence_threshold):
             scf_converged = True
             break
 
@@ -4897,6 +5075,7 @@ def rackers_thole_induction(
             mutual_tensors_AB[4][:0], mutual_tensors_AA[4],
             mutual_tensors_BB[4],
             max_iterations, convergence_threshold, omega,
+            convergence_norm=convergence_norm,
             intramolecular_permanent_field=intramolecular_permanent_field,
         )
         energy_dimer = _rackers_polarization_energy(
@@ -6125,6 +6304,7 @@ class AM_DimerParam_Model:
         allow_stale_induction_functional=False,
         induction_convergence_threshold=DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD,
         induction_max_iterations=DEFAULT_INDUCTION_MAX_ITERATIONS,
+        induction_convergence_norm=DEFAULT_INDUCTION_CONVERGENCE_NORM,
         param_n_message=_CLIFF_HEAD_DEFAULT,
         param_n_rbf=_CLIFF_HEAD_DEFAULT,
         param_hidden=_CLIFF_HEAD_DEFAULT,
@@ -6510,6 +6690,13 @@ class AM_DimerParam_Model:
             "induction_max_iterations",
             induction_max_iterations,
         )
+        # Absent from every checkpoint written before this existed, so the
+        # `.get` default keeps those loading as "l2" -- the rule they trained
+        # under.
+        induction_convergence_norm = solver_config.get(
+            "induction_convergence_norm",
+            induction_convergence_norm,
+        )
         loaded_gamma = solver_config.get("component_gamma")
         self.component_gamma = (
             None if loaded_gamma is None else float(loaded_gamma)
@@ -6526,6 +6713,7 @@ class AM_DimerParam_Model:
                 induction_convergence_threshold
             ),
             induction_max_iterations=induction_max_iterations,
+            induction_convergence_norm=induction_convergence_norm,
         )
         if self.dimer_eval_type in ["elst", "elst_damping"]:
             self.dimer_model_elst = DimerProp(
@@ -6537,6 +6725,7 @@ class AM_DimerParam_Model:
                     induction_convergence_threshold
                 ),
                 induction_max_iterations=induction_max_iterations,
+                induction_convergence_norm=induction_convergence_norm,
             )
         else:
             self.dimer_model_elst = None
@@ -6681,7 +6870,16 @@ class AM_DimerParam_Model:
                 )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_excluded_elements:
                 self.dataset = self.dataset[
                     dimer_indices_excluding_elements(
@@ -6753,7 +6951,16 @@ class AM_DimerParam_Model:
                 ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             split_caps = ((0, "train", ds_max_size), (1, "test", ds_max_size_test))
             if ds_excluded_elements:
                 for split_idx, split_label, split_cap in split_caps:
@@ -6879,6 +7086,9 @@ class AM_DimerParam_Model:
             )
             model_config["induction_max_iterations"] = (
                 self.dimer_model.induction_max_iterations
+            )
+            model_config["induction_convergence_norm"] = (
+                self.dimer_model.induction_convergence_norm
             )
         if type(model).__name__ in _CLIFF_PARAMETER_HEADS:
             model_config["d3_damping_parameters"] = deepcopy(
@@ -7326,6 +7536,22 @@ units angstrom
         dist.all_reduce(staged, op=reduce_op)
         return staged.to(tensor.device)
 
+    def _ddp_reduce_epoch_sums(self, total_loss_t, error_sum, n_dimers):
+        """Global ``(total_loss, MAE)`` from this rank's running sums.
+
+        Same reduction as :meth:`_ddp_reduce_epoch_metrics` -- SUM of absolute
+        errors over SUM of dimer counts, so the quotient is the true global MAE
+        rather than a mean of per-rank means -- but fed from accumulators the
+        epoch loop kept on the GPU instead of from a materialised per-dimer
+        error tensor. Doing it this way is what lets the loop avoid a
+        device-to-host copy on every batch.
+        """
+        counts = torch.full_like(error_sum, float(n_dimers))
+        packed = self._ddp_all_reduce(torch.stack((error_sum, counts)))
+        total_MAE = (packed[0] / packed[1]).to(torch.float32).cpu()
+        total_loss = float(self._ddp_all_reduce(total_loss_t.clone()).item())
+        return total_loss, total_MAE
+
     def _ddp_reduce_epoch_metrics(self, total_loss, comp_errors_t, world_size):
         """Global ``(total_loss, MAE)`` from this rank's shard.
 
@@ -7643,8 +7869,18 @@ units angstrom
         is what allows the per-batch collective below to be deadlock-free.
         """
         self.model.train()
-        comp_errors_t = []
-        total_loss = 0.0
+        # Running sums, kept on the training device. The previous shape of this
+        # loop appended `comp_errors.detach().cpu()` per batch and called
+        # `batch_loss.item()` per batch; both are device-to-host copies, and a
+        # D2H copy blocks until every kernel queued ahead of it has finished.
+        # That put a full CUDA synchronise at the end of every step, so the
+        # host could never queue step N+1's forward while step N's tail was
+        # still draining -- at 11,719 steps per rank per epoch the launch gaps
+        # dominate. Summing on the device leaves exactly one host copy per
+        # epoch. float64 because these accumulate thousands of terms.
+        total_loss_t = torch.zeros((), dtype=torch.float64, device=rank_device)
+        error_sum = None
+        n_dimers = 0
         n_skipped = 0
         for n, batch in enumerate(dataloader):
             optimizer.zero_grad(set_to_none=True)  # minor speed-up
@@ -7706,8 +7942,10 @@ units angstrom
                     optimizer.zero_grad(set_to_none=True)
                     continue
             optimizer.step()
-            total_loss += batch_loss.item()
-            comp_errors_t.append(comp_errors.detach().cpu())
+            total_loss_t += batch_loss.detach().double()
+            batch_abs = comp_errors.detach().abs().sum(dim=0, dtype=torch.float64)
+            error_sum = batch_abs if error_sum is None else error_sum + batch_abs
+            n_dimers += comp_errors.shape[0]
         if scheduler is not None:
             scheduler.step()
         if n_skipped and rank == 0:
@@ -7720,13 +7958,16 @@ units angstrom
                 flush=True,
             )
         self.last_epoch_skipped_batches = n_skipped
-        comp_errors_t = torch.cat(comp_errors_t, dim=0)
-        if world_size > 1:
-            return self._ddp_reduce_epoch_metrics(
-                total_loss, comp_errors_t, world_size
+        if error_sum is None:
+            raise RuntimeError(
+                "training epoch ran zero batches: the loader yielded nothing, "
+                "or every batch was skipped on a non-finite gradient norm"
             )
-        total_MAE_t = torch.mean(torch.abs(comp_errors_t), dim=0)
-        return total_loss, total_MAE_t
+        if world_size > 1:
+            return self._ddp_reduce_epoch_sums(total_loss_t, error_sum, n_dimers)
+        return float(total_loss_t.item()), (
+            (error_sum / n_dimers).to(torch.float32).cpu()
+        )
 
     # @torch.inference_mode()
     def __evaluate_batches_single_proc(
@@ -7740,8 +7981,10 @@ units angstrom
         different checkpoints and restore different weights at the end.
         """
         self.model.eval()
-        comp_errors_t = []
-        total_loss = 0.0
+        # Same device-side accumulation as the training loop; see there.
+        total_loss_t = torch.zeros((), dtype=torch.float64, device=rank_device)
+        error_sum = None
+        n_dimers = 0
         # Recorded once per epoch on the first validation batch rather than the
         # whole split: one extra forward is negligible, and a trend only needs a
         # consistent sample. `analysis/bound_occupancy.py` does the full split.
@@ -7768,15 +8011,23 @@ units angstrom
                 batch_loss = self._batch_loss(
                     preds, ref, comp_errors, batch, loss_fn
                 )
-                total_loss += batch_loss.item()
-                comp_errors_t.append(comp_errors.detach().cpu())
-        comp_errors_t = torch.cat(comp_errors_t, dim=0)
-        if world_size > 1:
-            return self._ddp_reduce_epoch_metrics(
-                total_loss, comp_errors_t, world_size
+                total_loss_t += batch_loss.detach().double()
+                batch_abs = comp_errors.detach().abs().sum(
+                    dim=0, dtype=torch.float64
+                )
+                error_sum = (
+                    batch_abs if error_sum is None else error_sum + batch_abs
+                )
+                n_dimers += comp_errors.shape[0]
+        if error_sum is None:
+            raise RuntimeError(
+                "validation epoch ran zero batches: the loader yielded nothing"
             )
-        total_MAE_t = torch.mean(torch.abs(comp_errors_t), dim=0)
-        return total_loss, total_MAE_t
+        if world_size > 1:
+            return self._ddp_reduce_epoch_sums(total_loss_t, error_sum, n_dimers)
+        return float(total_loss_t.item()), (
+            (error_sum / n_dimers).to(torch.float32).cpu()
+        )
 
     def __evaluate_batches_single_proc_elst_no_damping(
         self, dataloader, loss_fn, rank_device
@@ -7927,6 +8178,74 @@ units angstrom
                 rank=rank,
                 shuffle=False,
             )
+        # Worker lifetime and read-ahead depth. With the defaults, every epoch
+        # forked `num_workers` fresh processes, each of which re-imported torch
+        # and re-materialised its copy of the dataset (which stats the store)
+        # before the first batch could land -- paid 2x per epoch, train and
+        # validation, and paid again on the validation loader immediately
+        # after. `persistent_workers` keeps them alive across epochs.
+        #
+        # `prefetch_factor` is deliberately left at torch's default of 2. A
+        # deeper queue would hide more shard-read latency, but the step profile
+        # puts the loader at 1.4 % of main-thread time, so there is no latency
+        # left to hide -- and every in-flight batch is a fresh set of
+        # /dev/shm segments per worker. A stock 7-worker run on a shared chemx
+        # node already died with "unable to allocate shared memory(shm) ...
+        # Resource temporarily unavailable", so raising the depth buys nothing
+        # and spends the one resource that was actually scarce.
+        # Shard-locality sampling, opt-in and off by default.
+        #
+        # `Dataset.get` deserialises a whole shard to return one dimer, so a
+        # uniformly shuffled epoch reads each 16-dimer shard about 16 times --
+        # measured at 79.4 samples/s shuffled against 1301.6 sequential on the
+        # production store (job 12379500). `ShardBlockSampler` shuffles shards
+        # instead of dimers, cuts each loader worker a disjoint block, and
+        # shuffles within the block; the LRU sized to match the block then
+        # serves the whole block off one read per shard.
+        #
+        # This is a different sample distribution from a global shuffle -- a
+        # dimer's batch-mates are drawn from `block_shards * shard_size`
+        # neighbours in the shuffled-shard order rather than from the whole
+        # store -- so it cannot be turned on silently. `block_shards = 0` (the
+        # default) leaves the sampler unbuilt and the epoch ordering exactly
+        # what it was.
+        block_shards = int(getattr(self, "shard_locality_block_shards", 0) or 0)
+        if block_shards > 0 and not getattr(train_dataset, "in_memory", False):
+            shard_size = int(
+                getattr(train_dataset, "datapoint_storage_n_objects", 0) or 0
+            )
+            if shard_size > 1 and hasattr(train_dataset, "set_shard_cache_size"):
+                # Cache and block must match: a block bigger than the cache is
+                # evicted before it is reused and the reads come back.
+                train_dataset.set_shard_cache_size(block_shards)
+                train_sampler = ShardBlockSampler(
+                    train_dataset,
+                    shard_size=shard_size,
+                    batch_size=batch_size,
+                    block_shards=block_shards,
+                    num_workers=num_workers,
+                    seed=43,
+                    num_replicas=world_size if world_size > 1 else None,
+                    rank=rank if world_size > 1 else None,
+                )
+                if rank == 0:
+                    print(
+                        f"  shard-locality sampling ON: shard_size={shard_size} "
+                        f"block_shards={block_shards} "
+                        f"(mixing window {block_shards * shard_size} dimers/worker, "
+                        f"shard cache {block_shards} shards/worker)",
+                        flush=True,
+                    )
+            elif rank == 0:
+                print(
+                    "  shard-locality sampling requested but the training "
+                    "dataset is not a sharded on-disk store; ignoring",
+                    flush=True,
+                )
+
+        loader_kwargs = {}
+        if num_workers > 0:
+            loader_kwargs = {"persistent_workers": True}
         train_loader = APNet2_fused_DataLoader(
             dataset=train_dataset,
             batch_size=batch_size,
@@ -7936,6 +8255,7 @@ units angstrom
             pin_memory=pin_memory,
             collate_fn=collate_fn,
             sampler=train_sampler,
+            **loader_kwargs,
         )
         test_loader = APNet2_fused_DataLoader(
             dataset=test_dataset,
@@ -7945,6 +8265,7 @@ units angstrom
             pin_memory=pin_memory,
             collate_fn=collate_fn,
             sampler=test_sampler,
+            **loader_kwargs,
         )
         if world_size > 1:
             padded = len(train_sampler) * world_size - len(train_dataset)
@@ -8146,9 +8467,11 @@ units angstrom
             )
         solver_threshold = self.dimer_model.induction_convergence_threshold
         solver_max_iterations = self.dimer_model.induction_max_iterations
+        solver_norm = self.dimer_model.induction_convergence_norm
         if (
             solver_threshold != DEFAULT_INDUCTION_CONVERGENCE_THRESHOLD
             or solver_max_iterations != DEFAULT_INDUCTION_MAX_ITERATIONS
+            or solver_norm != DEFAULT_INDUCTION_CONVERGENCE_NORM
         ):
             # Keep default controls absent so historical sidecars still resume,
             # while preventing Adam state fitted under one stopping rule from
@@ -8157,6 +8480,7 @@ units angstrom
                 {
                     "induction_convergence_threshold": solver_threshold,
                     "induction_max_iterations": solver_max_iterations,
+                    "induction_convergence_norm": solver_norm,
                 }
             )
         epochs_completed = 0
@@ -8515,7 +8839,9 @@ units angstrom
         thole_lr=None,
         induction_diagnostics=False,
         induction_convergence_threshold=None,
+        induction_convergence_norm=None,
         induction_max_iterations=None,
+        shard_locality_block_shards=0,
         wandb_config: WandbConfig | None = None,
         _external_rank=None,
         _external_local_rank=None,
@@ -8551,6 +8877,7 @@ units angstrom
         if (
             induction_convergence_threshold is not None
             or induction_max_iterations is not None
+            or induction_convergence_norm is not None
         ) and self.dimer_eval_type not in INDUCTION_DIMER_EVAL_MODES:
             raise ValueError(
                 "induction solver controls require a Rackers/Thole induction "
@@ -8573,8 +8900,26 @@ units angstrom
             effective_threshold,
             effective_max_iterations,
         )
+        effective_norm = _validate_induction_convergence_norm(
+            self.dimer_model.induction_convergence_norm
+            if induction_convergence_norm is None
+            else induction_convergence_norm
+        )
         self.dimer_model.induction_convergence_threshold = effective_threshold
         self.dimer_model.induction_max_iterations = effective_max_iterations
+        self.dimer_model.induction_convergence_norm = effective_norm
+        if self.dimer_model_elst is not None:
+            # The elst companion shares the parameter head and is constructed
+            # from the same controls; leaving it on a stale rule would make the
+            # two halves of a combined route disagree about what "converged"
+            # means.
+            self.dimer_model_elst.induction_convergence_threshold = (
+                effective_threshold
+            )
+            self.dimer_model_elst.induction_max_iterations = (
+                effective_max_iterations
+            )
+            self.dimer_model_elst.induction_convergence_norm = effective_norm
         grad_clip_mode = str(grad_clip_mode).strip().lower()
         if grad_clip_mode not in CLIFF_GRAD_CLIP_MODES:
             raise ValueError(
@@ -8661,14 +9006,23 @@ units angstrom
         print(f"  {lr=}", flush=True)
         print(f"  {thole_lr=}", flush=True)
         print(f"  {induction_diagnostics=}", flush=True)
+        self.shard_locality_block_shards = int(
+            shard_locality_block_shards or 0
+        )
+        print(f"  {shard_locality_block_shards=}", flush=True)
         print(f"  induction_convergence_threshold={effective_threshold}", flush=True)
-        print(f"  induction_max_iterations={effective_max_iterations}\n", flush=True)
+        print(f"  induction_max_iterations={effective_max_iterations}", flush=True)
+        print(f"  induction_convergence_norm={effective_norm}\n", flush=True)
         print(f"  {batch_size=}", flush=True)
 
-        if self.device.type == "cuda":
-            pin_memory = False
-        else:
-            pin_memory = False
+        # Both arms of this used to be `False`, which silently disabled the
+        # pinned staging buffer the `batch.to(device, non_blocking=True)`
+        # downstream needs: without pinned host memory that copy is synchronous
+        # no matter what the flag says, so the H2D transfer of every batch was
+        # serialised against the previous step instead of overlapping it.
+        # Pinned memory is page-locked and cannot be swapped, so it stays off
+        # for CPU-only runs where it buys nothing and costs resident pages.
+        pin_memory = self.device.type == "cuda"
 
         self.shuffle = shuffle
 
@@ -8682,6 +9036,7 @@ units angstrom
             "training/thole_learning_rate": thole_lr,
             "training/induction_diagnostics": induction_diagnostics,
             "training/induction_convergence_threshold": effective_threshold,
+            "training/induction_convergence_norm": effective_norm,
             "training/induction_max_iterations": effective_max_iterations,
             # The CLIFF Eq. (23) total/component weighting changes which
             # physical terms share gradients. It must be visible on W&B so a

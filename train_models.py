@@ -438,6 +438,8 @@ def train_pairwise_model(
     induction_diagnostics=False,
     induction_convergence_threshold=None,
     induction_max_iterations=None,
+    induction_convergence_norm=None,
+    shard_locality_block_shards=0,
     omp_num_threads=8,
     ddp_world_size=1,
     external_rank=None,
@@ -501,8 +503,10 @@ def train_pairwise_model(
         grad_clip_mode (str): `global` clips all parameters together; `component` clips dense CLIFF ELST, EXCH, and IND groups independently.
         thole_lr (float or None): Optional Adam learning rate for only the trainable direct/mutual Thole columns; all other columns retain `lr`.
         induction_diagnostics (bool): Collect and log per-epoch SCF convergence, residual, induced-dipole, and induction-energy health metrics.
+        shard_locality_block_shards (int): 0 disables. Above 0, shuffle shards rather than dimers and give each loader worker a disjoint block of this many shards, backed by an LRU of the same size. Trades a smaller shuffle window for roughly one shard read per shard per epoch instead of one per dimer.
         induction_convergence_threshold (float or None): Optional Rackers/Thole SCF residual threshold. None preserves the checkpoint/default value (historically 1e-8).
         induction_max_iterations (int or None): Optional Rackers/Thole SCF iteration cap. None preserves the checkpoint/default value (historically 200).
+        induction_convergence_norm (str or None): Optional reduction used by the Rackers/Thole stopping rule -- "l2" (historical, extensive in batch size), "rms", or "max". None preserves the checkpoint/default value (historically "l2").
         omp_num_threads (int): Number of OpenMP threads assigned to each training process.
 
     """
@@ -547,6 +551,7 @@ def train_pairwise_model(
     if (
         induction_convergence_threshold is not None
         or induction_max_iterations is not None
+        or induction_convergence_norm is not None
     ):
         if apnet_model_type not in COMBINED_CLIFF_MODEL_TYPES:
             raise ValueError(
@@ -569,6 +574,13 @@ def train_pairwise_model(
                 else induction_max_iterations
             ),
         )
+        if induction_convergence_norm is not None:
+            induction_convergence_norm = (
+                AtomPairwiseModels.mtp_mtp
+                ._validate_induction_convergence_norm(
+                    induction_convergence_norm
+                )
+            )
     if split_manifest:
         # Only the atom-model route resolves a manifest into indices. Accepting
         # it here would train on the trainer's own uniform draw while the run
@@ -1175,6 +1187,14 @@ def train_pairwise_model(
         # no other route prints an "unsupported kwarg" line.
         train_kwargs["_external_rank"] = external_rank
         train_kwargs["_external_local_rank"] = external_local_rank
+    if shard_locality_block_shards:
+        # Same reasoning again -- and left out entirely at the default of 0, so
+        # a run that does not ask for it produces the identical epoch ordering
+        # it always did.  Routes whose `train` has no such parameter drop it
+        # through the unsupported-kwarg filter.
+        train_kwargs["shard_locality_block_shards"] = int(
+            shard_locality_block_shards
+        )
     if is_cliff_model:
         # Added only for the CLIFF routes so every other route's train_kwargs
         # stay exactly as they were.  `component_gamma` is forwarded as-is,
@@ -1191,6 +1211,10 @@ def train_pairwise_model(
             )
         if induction_max_iterations is not None:
             train_kwargs["induction_max_iterations"] = induction_max_iterations
+        if induction_convergence_norm is not None:
+            train_kwargs["induction_convergence_norm"] = (
+                induction_convergence_norm
+            )
     if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
         train_kwargs["end_lr"] = end_lr
     else:
@@ -1756,6 +1780,22 @@ def main():
         ),
     )
     args.add_argument(
+        "--shard_locality_block_shards",
+        type=int,
+        default=0,
+        help=(
+            "0 (default) keeps uniform shuffling. Above 0, sample with "
+            "shard locality: shuffle shards instead of dimers, hand each "
+            "dataloader worker a disjoint block of this many shards, and "
+            "size the dataset's shard LRU to match. Each shard is then read "
+            "about once per epoch instead of once per dimer drawn from it, "
+            "at the cost of a shuffle window of block x shard_size dimers "
+            "rather than the whole store. 256 is a reasonable starting "
+            "point on the 16-dimer CLIFF2 store (4,096-dimer window, "
+            "~54 MB of shard cache per worker)."
+        ),
+    )
+    args.add_argument(
         "--induction_convergence_threshold",
         type=float,
         default=None,
@@ -1771,6 +1811,20 @@ def main():
         help=(
             "Combined CLIFF routes only: Rackers/Thole SCF iteration cap. "
             "Unset preserves the checkpoint or historical 200 default."
+        ),
+    )
+    args.add_argument(
+        "--induction_convergence_norm",
+        type=str,
+        default=None,
+        choices=["l2", "rms", "max"],
+        help=(
+            "Combined CLIFF routes only: how the induced-dipole change is "
+            "reduced before the threshold test. 'l2' is the historical "
+            "unnormalised batch-wide norm, which grows as sqrt(n_atoms) and so "
+            "tightens the effective tolerance as the batch grows; 'rms' and "
+            "'max' are batch-size independent. Unset preserves the checkpoint "
+            "or historical 'l2' default."
         ),
     )
     args.add_argument(
@@ -2041,6 +2095,8 @@ def main():
                 args.induction_convergence_threshold
             ),
             induction_max_iterations=args.induction_max_iterations,
+            induction_convergence_norm=args.induction_convergence_norm,
+            shard_locality_block_shards=args.shard_locality_block_shards,
             omp_num_threads=(
                 args.omp_num_threads
                 if args.omp_num_threads is not None
