@@ -37,6 +37,7 @@ from ..training_tracking import (
 )
 from ..util import scatter_sum_compile
 from ..pt_datasets.shard_locality import ShardBlockSampler
+from typing import Optional
 import os
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -735,10 +736,40 @@ class APNet3D3_AtomType_MPNN(nn.Module):
 
 
 def _build_shard_block_sampler(
-    harness, train_dataset, batch_size, num_workers, world_size=1, rank=0
-):
+    harness,
+    train_dataset,
+    batch_size: int,
+    num_workers: int,
+    world_size: int = 1,
+    rank: int = 0,
+) -> Optional[ShardBlockSampler]:
     """Shard-locality sampling for the ap3d3 route -- opt-in, off by default.
 
+    Parameters
+    ----------
+    harness : APNet3_D3_Model
+        Read only for ``shard_locality_block_shards``; absent or 0 disables.
+    train_dataset : torch.utils.data.Dataset
+        The training dataset.  Must expose ``datapoint_storage_n_objects`` and
+        ``set_shard_cache_size``; anything else declines with a reason.
+    batch_size : int
+        Per-rank batch size, needed to cut the emission order on batch
+        boundaries.
+    num_workers : int
+        The loader's ``num_workers``.
+    world_size : int, default 1
+        DDP world size.
+    rank : int, default 0
+        DDP rank; also gates the diagnostic prints to one process.
+
+    Returns
+    -------
+    ShardBlockSampler or None
+        ``None`` whenever the feature is off or the dataset cannot support it,
+        in which case the caller keeps its existing ``shuffle=True`` loader.
+
+    Notes
+    -----
     `ap3_fused_ds.get()` deserialises an entire shard to return one dimer, and
     `shard_cache_size` defaults to 1, so a globally shuffled epoch reads each
     16-dimer shard about 16 times.  Job 12391962 measured what that costs on
