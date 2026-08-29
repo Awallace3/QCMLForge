@@ -885,9 +885,32 @@ class apnet2_module_dataset(Dataset):
                 # Forces a re-processing of the dataset
                 return ["dimer_missing.pt"]
 
+    def _invalidate_store_listing(self):
+        """Drop the memoised shard listing and length.
+
+        Anything that can change the set of shards on disk -- ``process()``
+        writing one -- has to call this.
+        """
+        self.__dict__.pop("_store_listing_cache", None)
+
+    def _store_listing_key(self):
+        return (bool(self.force_reprocess), self.MAX_SIZE)
+
     @property
     def processed_file_names(self):
-        return self.reprocess_file_names()
+        """Shard listing, globbed once per (force_reprocess, MAX_SIZE).
+
+        ``reprocess_file_names`` globs and natural-sorts the whole store; on
+        the 93,750-shard production store over NFS that is seconds per call,
+        and PyG reads this property on every ``processed_paths`` access.
+        """
+        key = self._store_listing_key()
+        cached = self.__dict__.get("_store_listing_cache")
+        if cached is not None and cached["key"] == key:
+            return cached["names"]
+        names = self.reprocess_file_names()
+        self.__dict__["_store_listing_cache"] = {"key": key, "names": names}
+        return names
 
     def download(self):
         if self.energy_labels and self.qcel_molecules:
@@ -931,6 +954,18 @@ class apnet2_module_dataset(Dataset):
         return
 
     def process(self):
+        """Build the store, then drop anything memoised about its shape.
+
+        ``processed_file_names``/``len`` cache the shard listing; writing a
+        shard is the one thing that invalidates it. try/finally so a partial
+        or failed process leaves no stale listing behind either.
+        """
+        try:
+            return self._process_shards()
+        finally:
+            self._invalidate_store_listing()
+
+    def _process_shards(self):
         self.data = []
         idx = 0
         data_objects = []
@@ -1213,6 +1248,10 @@ class apnet2_module_dataset(Dataset):
             f"dimer_ap2{split_name}_spec_{self.spec_type}_{idx_datapath}.pt",
         )
         self.active_data = torch.load(datapath, weights_only=False)
+        # Arm the guard above; `active_idx_data` was never assigned, so the
+        # one-shard cache could never hit and every sample deserialised a
+        # whole shard.
+        self.active_idx_data = idx_datapath
         try:
             self.active_data[obj_ind]
         except IndexError:
@@ -1404,9 +1443,32 @@ class apnet3_module_dataset(Dataset):
                 # Forces a re-processing of the dataset
                 return ["dimer_missing.pt"]
 
+    def _invalidate_store_listing(self):
+        """Drop the memoised shard listing and length.
+
+        Anything that can change the set of shards on disk -- ``process()``
+        writing one -- has to call this.
+        """
+        self.__dict__.pop("_store_listing_cache", None)
+
+    def _store_listing_key(self):
+        return (bool(self.force_reprocess), self.MAX_SIZE)
+
     @property
     def processed_file_names(self):
-        return self.reprocess_file_names()
+        """Shard listing, globbed once per (force_reprocess, MAX_SIZE).
+
+        ``reprocess_file_names`` globs and natural-sorts the whole store; on
+        the 93,750-shard production store over NFS that is seconds per call,
+        and PyG reads this property on every ``processed_paths`` access.
+        """
+        key = self._store_listing_key()
+        cached = self.__dict__.get("_store_listing_cache")
+        if cached is not None and cached["key"] == key:
+            return cached["names"]
+        names = self.reprocess_file_names()
+        self.__dict__["_store_listing_cache"] = {"key": key, "names": names}
+        return names
 
     def download(self):
         print(
@@ -1447,6 +1509,18 @@ class apnet3_module_dataset(Dataset):
         return
 
     def process(self):
+        """Build the store, then drop anything memoised about its shape.
+
+        ``processed_file_names``/``len`` cache the shard listing; writing a
+        shard is the one thing that invalidates it. try/finally so a partial
+        or failed process leaves no stale listing behind either.
+        """
+        try:
+            return self._process_shards()
+        finally:
+            self._invalidate_store_listing()
+
+    def _process_shards(self):
         idx = 0
         batch_size = self.atomic_batch_size
         if self.spec_type in [1, 2, 7]:
@@ -1719,6 +1793,10 @@ class apnet3_module_dataset(Dataset):
             f"dimer_ap3{split_name}_spec_{self.spec_type}_{idx_datapath}.pt",
         )
         self.active_data = torch.load(datapath, weights_only=False)
+        # Arm the guard above; `active_idx_data` was never assigned, so the
+        # one-shard cache could never hit and every sample deserialised a
+        # whole shard.
+        self.active_idx_data = idx_datapath
         try:
             self.active_data[obj_ind]
         except IndexError:
