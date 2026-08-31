@@ -26,8 +26,8 @@ _PRETRAINED_MODEL_GROUPS = {
         "ap2-fused_ensemble/ap2_3.pt",
     ],
     "dapnet2": [
-        "am_ensemble/am_0.pt",
-        "ap2_ensemble/ap2_0.pt",
+        "dapnet2/backbone/am_0.pt",
+        "dapnet2/backbone/ap2_0.pt",
         "dapnet2/B3LYP-D3aug-cc-pVTZCP_CCSD_LP_T_RP_CBSCP.pt",
     ],
 }
