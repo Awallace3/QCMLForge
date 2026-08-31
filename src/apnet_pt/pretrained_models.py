@@ -17,6 +17,10 @@ from . import atomic_datasets
 # model_dir = os.path.dirname(os.path.realpath(__file__)) + "/models/"
 model_dir = resources.files("apnet_pt").joinpath("models")
 HF_REPO_ID = "awallace3/qcmlforge"
+DAPNET2_BACKBONE_PATHS = {
+    "atom": "dapnet2/backbone/am_0.pt",
+    "apnet2": "dapnet2/backbone/ap2_0.pt",
+}
 _DOWNLOAD_APPROVED = None
 LOGGER = logging.getLogger(__name__)
 
@@ -646,13 +650,54 @@ DAPNET2_PRETRAINED_MODEL_FILENAMES = [
 ]
 
 
-def dapnet2_levels_of_theory_pretrained():
+_DAPNET2_BASIS_NAMES = (
+    "aug-cc-pVDTZ",
+    "aug-cc-pVTQZ",
+    "aug-cc-pVDZ",
+    "aug-cc-pVTZ",
+    "aug-cc-pVQZ",
+    "jun-cc-pVDZ",
+    "cc-pVQZ",
+)
+_DAPNET2_CP_LABELS = ("unCP", "CP", "SA")
+_DAPNET2_TARGET_SUFFIX = f"_{clean_str_for_filename('CCSD(T)/CBS/CP')}.pt"
+
+
+def _decode_dapnet2_method(method: str) -> str:
+    return method.replace("_LP_", "(").replace("_RP_", ")")
+
+
+def _format_dapnet2_level_of_theory(filename: str) -> str:
+    level = filename.removesuffix(_DAPNET2_TARGET_SUFFIX)
+    if level.endswith("_adz"):
+        return f"{_decode_dapnet2_method(level.removesuffix('_adz'))}/adz"
+
+    for basis in _DAPNET2_BASIS_NAMES:
+        basis_start = level.rfind(basis)
+        if basis_start < 1:
+            continue
+        cp_label = level[basis_start + len(basis) :]
+        if cp_label in _DAPNET2_CP_LABELS:
+            method = _decode_dapnet2_method(level[:basis_start])
+            return f"{method}/{basis}/{cp_label}"
+
+    raise ValueError(f"Cannot parse dAPNet2 level from checkpoint {filename!r}")
+
+
+DAPNET2_PRETRAINED_LEVELS = {
+    _format_dapnet2_level_of_theory(name): name
+    for name in DAPNET2_PRETRAINED_MODEL_FILENAMES
+}
+
+
+def dapnet2_levels_of_theory_pretrained() -> list[str]:
+    """Return user-facing source levels with pretrained dAPNet2 models.
+
+    Each value uses ``method/basis/correction`` notation and can be passed
+    directly as ``m1`` to :func:`dapnet2_model_predict`. All models predict a
+    correction to ``CCSD(T)/CBS/CP``.
     """
-    Returns a list of possible m1 levels of theory with pretrained dAPNet2
-    models. These pretrained models predict E=(m1-CCSD(T)/CBS/CP).
-    """
-    target = f"_{clean_str_for_filename('CCSD(T)/CBS/CP')}.pt"
-    return [name.removesuffix(target) for name in DAPNET2_PRETRAINED_MODEL_FILENAMES]
+    return list(DAPNET2_PRETRAINED_LEVELS)
 
 
 def _resolve_dapnet2_pretrained_path(m1: str, m2: str) -> str:
@@ -663,9 +708,10 @@ def _resolve_dapnet2_pretrained_path(m1: str, m2: str) -> str:
         f"dapnet2/{m1_clean}_{m2_clean}.pt",
     ]
     rel_paths.extend(
-        f"dapnet2/{name}"
-        for name in DAPNET2_PRETRAINED_MODEL_FILENAMES
-        if name == f"{m1_clean}_{m2_clean}.pt"
+        f"dapnet2/{filename}"
+        for level, filename in DAPNET2_PRETRAINED_LEVELS.items()
+        if m1 == level
+        or m1_clean == filename.removesuffix(_DAPNET2_TARGET_SUFFIX)
     )
 
     errors = []
@@ -692,19 +738,21 @@ def dapnet2_model_predict(
     use_GPU: bool = None,
 ) -> np.ndarray:
     base_model_paths = _resolve_pretrained_paths(
-        ["am_ensemble/am_0.pt", "ap2_ensemble/ap2_0.pt"]
+        list(DAPNET2_BACKBONE_PATHS.values())
     )
+    atom_model_path = base_model_paths[DAPNET2_BACKBONE_PATHS["atom"]]
+    apnet2_model_path = base_model_paths[DAPNET2_BACKBONE_PATHS["apnet2"]]
     atom_model = AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
         ignore_database_null=True,
         use_GPU=use_GPU,
-    ).set_pretrained_model(model_path=base_model_paths["am_ensemble/am_0.pt"])
+    ).set_pretrained_model(model_path=atom_model_path)
     apnet2 = AtomPairwiseModels.apnet2.APNet2Model(
         atom_model=atom_model.model,
         use_GPU=use_GPU,
     ).set_pretrained_model(
-        ap2_model_path=base_model_paths["ap2_ensemble/ap2_0.pt"],
-        am_model_path=base_model_paths["am_ensemble/am_0.pt"],
+        ap2_model_path=apnet2_model_path,
+        am_model_path=atom_model_path,
     )
     apnet2.model.return_hidden_states = True
     if pre_trained_model_path is None:
