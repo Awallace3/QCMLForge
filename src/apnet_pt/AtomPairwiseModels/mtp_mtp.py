@@ -2110,8 +2110,21 @@ def _rackers_initial_permanent_fields(
     T2_AA: torch.Tensor,
     T1_BB: torch.Tensor,
     T2_BB: torch.Tensor,
+    intramolecular_permanent_field: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build permanent-multipole fields using only direct tensors."""
+    """Build the permanent-multipole field driving the induced dipoles.
+
+    Parameters
+    ----------
+    intramolecular_permanent_field
+        When True each monomer's own multipoles also polarize it, so the
+        dipoles carry polarization the monomer already had in isolation;
+        contracting that against the partner's field is not an induction
+        energy and made this route positive on 421/528 S66x8 geometries, so it
+        is kept only to reproduce pre-fix checkpoints. Default False leaves the
+        dipoles as the response to the partner monomer alone. The
+        intramolecular *mutual* relay in ``_rackers_scf_update`` is unaffected.
+    """
     n_atoms_A = alpha_A.shape[0]
     n_atoms_B = alpha_B.shape[0]
     qA = qA.reshape(-1)
@@ -2149,6 +2162,9 @@ def _rackers_initial_permanent_fields(
     mu_induced_0_B += scatter_sum_compile(
         mu_dipole_B, e_AB_target, dim_size=n_atoms_B
     )
+
+    if not intramolecular_permanent_field:
+        return mu_induced_0_A, mu_induced_0_B
 
     alpha_AA_target = alpha_A.index_select(0, e_AA_target)
     qA_AA_source = qA.index_select(0, e_AA_source)
@@ -2199,51 +2215,118 @@ def _rackers_scf_update(
     mu_induced_0_A: torch.Tensor,
     mu_induced_0_B: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply one unmixed induced-dipole update using mutual tensors."""
-    n_atoms_A = alpha_A.shape[0]
-    n_atoms_B = alpha_B.shape[0]
-    alpha_A_source = alpha_A.index_select(0, e_AB_source)
-    alpha_B_target = alpha_B.index_select(0, e_AB_target)
-    alpha_AA_target = alpha_A.index_select(0, e_AA_target)
-    alpha_BB_target = alpha_B.index_select(0, e_BB_target)
+    """Apply one unmixed induced-dipole update using mutual tensors.
 
-    mu_induced_A_due_B = torch.einsum(
-        "a,aij,aj->ai",
-        alpha_A_source,
-        T2_AB,
-        mu_induced_B.index_select(0, e_AB_target),
+    Single-shot entry point. A converging loop should build the plan once with
+    ``_rackers_scf_plan`` and call ``_rackers_scf_step``, since everything
+    derived here from ``alpha_*`` and ``T2_*`` is loop-invariant.
+    """
+    plan = _rackers_scf_plan(
+        alpha_A, alpha_B,
+        e_AB_source, e_AB_target, e_AA_target, e_BB_target,
+        T2_AB, T2_AA, T2_BB,
     )
-    mu_induced_A_new = scatter_sum_compile(
-        mu_induced_A_due_B, e_AB_source, dim_size=n_atoms_A
+    return _rackers_scf_step(
+        plan,
+        e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+        e_BB_source, e_BB_target,
+        mu_induced_A, mu_induced_B, mu_induced_0_A, mu_induced_0_B,
     )
-    mu_induced_A_due_A = torch.einsum(
-        "a,aij,aj->ai",
-        alpha_AA_target,
-        T2_AA,
-        mu_induced_A.index_select(0, e_AA_source),
+
+
+def _rackers_scf_plan(
+    alpha_A: torch.Tensor,
+    alpha_B: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    T2_AB: torch.Tensor,
+    T2_AA: torch.Tensor,
+    T2_BB: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fold the polarizabilities into the mutual tensors, once.
+
+    The update contracts ``alpha[a] * T2[a,i,j] * mu[a,j]`` and only ``mu``
+    changes between iterations, so the ``alpha`` gathers are hoisted here.
+    """
+    def scaled(alpha, index, T2):
+        return alpha.index_select(0, index).unsqueeze(-1).unsqueeze(-1) * T2
+
+    return (
+        scaled(alpha_A, e_AB_source, T2_AB),   # A polarized by B
+        scaled(alpha_A, e_AA_target, T2_AA),   # A polarized by A
+        scaled(alpha_B, e_AB_target, T2_AB),   # B polarized by A
+        scaled(alpha_B, e_BB_target, T2_BB),   # B polarized by B
     )
-    mu_induced_A_new += scatter_sum_compile(
-        mu_induced_A_due_A, e_AA_target, dim_size=n_atoms_A
+
+
+def _rackers_contract_T2_mu(
+    aT2: torch.Tensor, mu: torch.Tensor
+) -> torch.Tensor:
+    """``out[a,i] = sum_j aT2[a,i,j] * mu[a,j]`` as a broadcast reduction.
+
+    ``torch.einsum`` routes this through ``bmm``, a pathological GEMM for
+    batched 3x3 matvecs (451 us vs 58 us at E=250k on a V100).
+    """
+    return (aT2 * mu.unsqueeze(-2)).sum(-1)
+
+
+def _rackers_scatter_rows(
+    src: torch.Tensor, index: torch.Tensor, dim_size: int
+) -> torch.Tensor:
+    """Row-wise scatter-add via ``index_add_`` rather than ``scatter_add_``.
+
+    ``scatter_add_`` needs an int64 index broadcast to ``src``'s shape first;
+    ``index_add_`` takes the 1-D index directly (22 us vs 35 us on a V100).
+    """
+    out = src.new_zeros((dim_size, *src.shape[1:]))
+    return out.index_add_(0, index, src)
+
+
+def _rackers_scf_step(
+    plan: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    e_AA_source: torch.Tensor,
+    e_AA_target: torch.Tensor,
+    e_BB_source: torch.Tensor,
+    e_BB_target: torch.Tensor,
+    mu_induced_A: torch.Tensor,
+    mu_induced_B: torch.Tensor,
+    mu_induced_0_A: torch.Tensor,
+    mu_induced_0_B: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One induced-dipole update against a prescaled plan."""
+    aT2_A_AB, aT2_A_AA, aT2_B_AB, aT2_B_BB = plan
+    n_atoms_A = mu_induced_0_A.shape[0]
+    n_atoms_B = mu_induced_0_B.shape[0]
+
+    mu_induced_A_due_B = _rackers_contract_T2_mu(
+        aT2_A_AB, mu_induced_B.index_select(0, e_AB_target)
+    )
+    mu_induced_A_new = _rackers_scatter_rows(
+        mu_induced_A_due_B, e_AB_source, n_atoms_A
+    )
+    mu_induced_A_due_A = _rackers_contract_T2_mu(
+        aT2_A_AA, mu_induced_A.index_select(0, e_AA_source)
+    )
+    mu_induced_A_new += _rackers_scatter_rows(
+        mu_induced_A_due_A, e_AA_target, n_atoms_A
     )
     mu_induced_A_new += mu_induced_0_A
 
-    mu_induced_B_due_A = torch.einsum(
-        "a,aij,aj->ai",
-        alpha_B_target,
-        T2_AB,
-        mu_induced_A.index_select(0, e_AB_source),
+    mu_induced_B_due_A = _rackers_contract_T2_mu(
+        aT2_B_AB, mu_induced_A.index_select(0, e_AB_source)
     )
-    mu_induced_B_new = scatter_sum_compile(
-        mu_induced_B_due_A, e_AB_target, dim_size=n_atoms_B
+    mu_induced_B_new = _rackers_scatter_rows(
+        mu_induced_B_due_A, e_AB_target, n_atoms_B
     )
-    mu_induced_B_due_B = torch.einsum(
-        "a,aij,aj->ai",
-        alpha_BB_target,
-        T2_BB,
-        mu_induced_B.index_select(0, e_BB_source),
+    mu_induced_B_due_B = _rackers_contract_T2_mu(
+        aT2_B_BB, mu_induced_B.index_select(0, e_BB_source)
     )
-    mu_induced_B_new += scatter_sum_compile(
-        mu_induced_B_due_B, e_BB_target, dim_size=n_atoms_B
+    mu_induced_B_new += _rackers_scatter_rows(
+        mu_induced_B_due_B, e_BB_target, n_atoms_B
     )
     mu_induced_B_new += mu_induced_0_B
     return mu_induced_A_new, mu_induced_B_new
