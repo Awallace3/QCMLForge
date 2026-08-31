@@ -1193,60 +1193,64 @@ def _inverse_softplus(value: float) -> float:
     return math.log(math.expm1(value))
 
 
+def _rackers_finite_floats(
+    values, message: str, lower_bound: float, strict: bool
+) -> list[float]:
+    """Coerce ``values`` to floats, rejecting anything outside the bound.
+
+    Parameters
+    ----------
+    message
+        Error text for a non-numeric, non-finite, or out-of-bound entry.
+    lower_bound, strict
+        Entries must be ``> lower_bound`` when ``strict``, else ``>=``.
+    """
+    try:
+        floats = [float(value) for value in values]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if any(
+        not math.isfinite(value)
+        or (value <= lower_bound if strict else value < lower_bound)
+        for value in floats
+    ):
+        raise ValueError(message)
+    return floats
+
+
 def _validate_rackers_initialization(
     param_start_mean,
     param_start_std,
     positivity_epsilon,
 ) -> tuple[list[float], list[float], float, list[float]]:
     """Validate and normalize the Rackers positive-parameter initialization."""
-    if not isinstance(param_start_mean, (list, tuple)) or len(
-        param_start_mean
-    ) != 4:
-        raise ValueError("param_start_mean must contain exactly four values")
-    if not isinstance(param_start_std, (list, tuple)) or len(
-        param_start_std
-    ) != 4:
-        raise ValueError("param_start_std must contain exactly four values")
-
-    try:
-        epsilon = float(positivity_epsilon)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            "positivity_epsilon must be finite and strictly greater than zero"
-        ) from exc
-    if not math.isfinite(epsilon) or epsilon <= 0.0:
-        raise ValueError(
-            "positivity_epsilon must be finite and strictly greater than zero"
-        )
-
-    try:
-        positive_means = [float(value) for value in param_start_mean]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            "param_start_mean values must be finite and strictly greater than "
-            "positivity_epsilon"
-        ) from exc
-    if any(
-        not math.isfinite(value) or value <= epsilon
-        for value in positive_means
+    for name, values in (
+        ("param_start_mean", param_start_mean),
+        ("param_start_std", param_start_std),
     ):
-        raise ValueError(
-            "param_start_mean values must be finite and strictly greater than "
-            "positivity_epsilon"
-        )
+        if not isinstance(values, (list, tuple)) or len(values) != 4:
+            raise ValueError(f"{name} must contain exactly four values")
 
-    try:
-        raw_stds = [float(value) for value in param_start_std]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            "param_start_std values must be finite and greater than or equal "
-            "to zero"
-        ) from exc
-    if any(not math.isfinite(value) or value < 0.0 for value in raw_stds):
-        raise ValueError(
-            "param_start_std values must be finite and greater than or equal "
-            "to zero"
-        )
+    (epsilon,) = _rackers_finite_floats(
+        [positivity_epsilon],
+        "positivity_epsilon must be finite and strictly greater than zero",
+        0.0,
+        True,
+    )
+    positive_means = _rackers_finite_floats(
+        param_start_mean,
+        "param_start_mean values must be finite and strictly greater than "
+        "positivity_epsilon",
+        epsilon,
+        True,
+    )
+    raw_stds = _rackers_finite_floats(
+        param_start_std,
+        "param_start_std values must be finite and greater than or equal "
+        "to zero",
+        0.0,
+        False,
+    )
 
     raw_means = [
         _inverse_softplus(value - epsilon) for value in positive_means
@@ -1354,10 +1358,8 @@ def geometric_mean_edge_values(
     e_source: torch.Tensor,
     e_target: torch.Tensor,
 ) -> torch.Tensor:
-    # `torch.isfinite(...).all()` in a Python predicate forces a device sync and
-    # a graph break, and this helper runs six times per Rackers forward pass.
-    # `torch.compiler.is_compiling()` is folded to a constant while tracing, so
-    # the validation stays in eager execution and disappears under compilation.
+    # Guarded because the isfinite predicate forces a device sync and graph
+    # break; is_compiling() folds to a constant so it vanishes under compile.
     if not torch.compiler.is_compiling():
         if not torch.isfinite(source_values).all():
             raise ValueError("source per-atom values must be finite")
@@ -2364,8 +2366,16 @@ def rackers_thole_induction(
     convergence_threshold: float = 1e-8,
     omega: float = 0.7,
     polarizability_table: torch.Tensor = constants.polarizability_table,
+    intramolecular_permanent_field: bool = False,
 ) -> torch.Tensor:
-    """Compute Rackers induction with distinct direct and mutual damping."""
+    """Compute Rackers induction with distinct direct and mutual damping.
+
+    Parameters
+    ----------
+    intramolecular_permanent_field
+        Restores the pre-fix permanent field in which each monomer also
+        polarized itself; see :func:`_rackers_initial_permanent_fields`.
+    """
     del quadA, quadB
     polarizability_table = _polarizability_table_on_device(
         polarizability_table,
@@ -2404,26 +2414,31 @@ def rackers_thole_induction(
         direct_AB,
         "direct",
     )
-    direct_tensors_AA = _rackers_distance_tensors(
-        RA,
-        RA,
-        e_AA_source,
-        e_AA_target,
-        alpha_A,
-        alpha_A,
-        direct_AA,
-        "direct",
-    )
-    direct_tensors_BB = _rackers_distance_tensors(
-        RB,
-        RB,
-        e_BB_source,
-        e_BB_target,
-        alpha_B,
-        alpha_B,
-        direct_BB,
-        "direct",
-    )
+    # The intramolecular direct tensors feed only the intramolecular permanent
+    # field, so building them otherwise is two discarded passes per batch.
+    if intramolecular_permanent_field:
+        direct_tensors_AA = _rackers_distance_tensors(
+            RA,
+            RA,
+            e_AA_source,
+            e_AA_target,
+            alpha_A,
+            alpha_A,
+            direct_AA,
+            "direct",
+        )
+        direct_tensors_BB = _rackers_distance_tensors(
+            RB,
+            RB,
+            e_BB_source,
+            e_BB_target,
+            alpha_B,
+            alpha_B,
+            direct_BB,
+            "direct",
+        )
+    else:
+        direct_tensors_AA = direct_tensors_BB = (None,) * 5
 
     mutual_AB = geometric_mean_edge_values(
         thole_mutual_A,
@@ -2494,26 +2509,35 @@ def rackers_thole_induction(
             direct_tensors_AA[4],
             direct_tensors_BB[3],
             direct_tensors_BB[4],
+            intramolecular_permanent_field=intramolecular_permanent_field,
         )
     )
     mu_induced_A = mu_induced_0_A.clone()
     mu_induced_B = mu_induced_0_B.clone()
 
+    scf_plan = _rackers_scf_plan(
+        alpha_A,
+        alpha_B,
+        e_AB_source,
+        e_AB_target,
+        e_AA_target,
+        e_BB_target,
+        mutual_tensors_AB[4],
+        mutual_tensors_AA[4],
+        mutual_tensors_BB[4],
+    )
     for _ in range(max_iterations):
-        mu_induced_A_old = mu_induced_A.clone()
-        mu_induced_B_old = mu_induced_B.clone()
-        mu_induced_A_new, mu_induced_B_new = _rackers_scf_update(
-            alpha_A,
-            alpha_B,
+        # No clone: the iterates are rebound, never written through.
+        mu_induced_A_old = mu_induced_A
+        mu_induced_B_old = mu_induced_B
+        mu_induced_A_new, mu_induced_B_new = _rackers_scf_step(
+            scf_plan,
             e_AB_source,
             e_AB_target,
             e_AA_source,
             e_AA_target,
             e_BB_source,
             e_BB_target,
-            mutual_tensors_AB[4],
-            mutual_tensors_AA[4],
-            mutual_tensors_BB[4],
             mu_induced_A,
             mu_induced_B,
             mu_induced_0_A,
@@ -2525,9 +2549,13 @@ def rackers_thole_induction(
         mu_induced_B = (
             (1 - omega) * mu_induced_B_old + omega * mu_induced_B_new
         )
-        delta_A = torch.norm(mu_induced_A - mu_induced_A_old)
-        delta_B = torch.norm(mu_induced_B - mu_induced_B_old)
-        if max(delta_A, delta_B) < convergence_threshold:
+        # torch.maximum keeps the reduction on device so the threshold test is
+        # the only device->host sync, instead of one per norm.
+        scf_residual = torch.maximum(
+            torch.norm(mu_induced_A - mu_induced_A_old),
+            torch.norm(mu_induced_B - mu_induced_B_old),
+        )
+        if bool(scf_residual < convergence_threshold):
             break
 
     qA_source = qA.reshape(-1).index_select(0, e_AB_source)

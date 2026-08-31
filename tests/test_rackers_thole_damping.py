@@ -853,58 +853,53 @@ def test_rackers_parameter_head_contract(
     )
 
 
-@pytest.mark.parametrize(
-    "positivity_epsilon",
-    [0.0, -1e-8, float("nan"), float("inf"), -float("inf")],
+def _replaced(values, index, value):
+    """Copy of ``values`` with ``index`` set to ``value``."""
+    updated = list(values)
+    updated[index] = value
+    return updated
+
+
+_MEAN_DOMAIN_MATCH = "param_start_mean values must be finite and strictly greater"
+_STD_DOMAIN_MATCH = "param_start_std values must be finite and greater than or equal"
+_MEAN_OVERFLOW_MATCH = (
+    "transformed param_start_mean values must be finite and representable"
 )
-def test_rackers_initialization_rejects_invalid_positivity_epsilon(
-    nested_hfvr_vw_model, positivity_epsilon
-):
-    with pytest.raises(
-        ValueError,
-        match="positivity_epsilon must be finite and strictly greater than zero",
-    ):
-        RackersTholeDampingNN(
-            atom_model=nested_hfvr_vw_model,
-            positivity_epsilon=positivity_epsilon,
+_STD_OVERFLOW_MATCH = "param_start_std values must be representable"
+
+RACKERS_INVALID_INITIALIZATIONS = [
+    *[
+        ({"positivity_epsilon": value},
+         "positivity_epsilon must be finite and strictly greater than zero")
+        for value in (0.0, -1e-8, float("nan"), float("inf"), -float("inf"))
+    ],
+    *[
+        ({"param_start_mean": _replaced(RACKERS_INITIAL_VALUES, 1, value)},
+         _MEAN_DOMAIN_MATCH)
+        for value in (
+            0.0, -0.1, 1e-8, float("nan"), float("inf"), -float("inf")
         )
+    ],
+    *[
+        ({"param_start_std": _replaced(RACKERS_INITIAL_STDS, 2, value)},
+         _STD_DOMAIN_MATCH)
+        for value in (-0.1, float("nan"), float("inf"), -float("inf"))
+    ],
+    ({"param_start_mean": [1e39, 1.0, 1.0, 1.0]}, _MEAN_OVERFLOW_MATCH),
+    ({"param_start_std": [1e39, 0.0, 0.0, 0.0]}, _STD_OVERFLOW_MATCH),
+]
 
 
 @pytest.mark.parametrize(
-    "invalid_mean",
-    [0.0, -0.1, 1e-8, float("nan"), float("inf"), -float("inf")],
+    "overrides,match", RACKERS_INVALID_INITIALIZATIONS
 )
-def test_rackers_initialization_rejects_invalid_means(
-    nested_hfvr_vw_model, invalid_mean
+def test_rackers_initialization_rejects_invalid_parameters(
+    nested_hfvr_vw_model, overrides, match
 ):
-    means = list(RACKERS_INITIAL_VALUES)
-    means[1] = invalid_mean
-    with pytest.raises(
-        ValueError,
-        match="param_start_mean values must be finite and strictly greater",
-    ):
+    with pytest.raises(ValueError, match=match):
         RackersTholeDampingNN(
             atom_model=nested_hfvr_vw_model,
-            param_start_mean=means,
-        )
-
-
-@pytest.mark.parametrize(
-    "invalid_std",
-    [-0.1, float("nan"), float("inf"), -float("inf")],
-)
-def test_rackers_initialization_rejects_invalid_raw_stds(
-    nested_hfvr_vw_model, invalid_std
-):
-    stds = list(RACKERS_INITIAL_STDS)
-    stds[2] = invalid_std
-    with pytest.raises(
-        ValueError,
-        match="param_start_std values must be finite and greater than or equal",
-    ):
-        RackersTholeDampingNN(
-            atom_model=nested_hfvr_vw_model,
-            param_start_std=stds,
+            **overrides,
         )
 
 
@@ -944,36 +939,6 @@ def test_rackers_initialization_accepts_large_representable_mean(
     assert torch.isfinite(torch.tensor(model.raw_param_start_mean)).all()
     assert torch.isfinite(parameters).all()
     assert torch.all(parameters > 0)
-
-
-@pytest.mark.parametrize(
-    "field,values,match",
-    [
-        (
-            "param_start_mean",
-            [1e39, 1.0, 1.0, 1.0],
-            "transformed param_start_mean values must be finite and representable",
-        ),
-        (
-            "param_start_std",
-            [1e39, 0.0, 0.0, 0.0],
-            "param_start_std values must be representable",
-        ),
-    ],
-)
-def test_rackers_initialization_rejects_embedding_dtype_overflow(
-    nested_hfvr_vw_model, field, values, match
-):
-    kwargs = {
-        "param_start_mean": list(RACKERS_INITIAL_VALUES),
-        "param_start_std": list(RACKERS_INITIAL_STDS),
-    }
-    kwargs[field] = values
-    with pytest.raises(ValueError, match=match):
-        RackersTholeDampingNN(
-            atom_model=nested_hfvr_vw_model,
-            **kwargs,
-        )
 
 
 def test_rackers_initialization_rejects_generated_non_finite_embedding(
@@ -1105,50 +1070,6 @@ def _rackers_kernel_inputs() -> dict[str, torch.Tensor]:
     }
 
 
-def _analytic_rackers_tensors(
-    Ri,
-    Rj,
-    e_source,
-    e_target,
-    alpha_i,
-    alpha_j,
-    damping,
-    damping_type,
-):
-    displacement = (
-        Rj.index_select(0, e_target) - Ri.index_select(0, e_source)
-    ) / constants.au2ang
-    distance = torch.linalg.vector_norm(displacement, dim=1)
-    alpha_source = alpha_i.index_select(0, e_source)
-    alpha_target = alpha_j.index_select(0, e_target)
-    u = distance / ((alpha_source * alpha_target) ** (1.0 / 6.0))
-    if damping_type == "direct":
-        au3 = damping * u ** (3.0 / 2.0)
-        lam_3 = 1.0 - torch.exp(-au3)
-        lam_5 = 1.0 - (1.0 + 0.5 * au3) * torch.exp(-au3)
-    else:
-        assert damping_type == "mutual"
-        au3 = damping * u**3
-        lam_3 = 1.0 - torch.exp(-au3)
-        lam_5 = 1.0 - (1.0 + au3) * torch.exp(-au3)
-
-    inverse_distance = 1.0 / distance
-    T1 = (
-        -(inverse_distance**3 * lam_3).unsqueeze(1) * displacement
-    )
-    displacement_outer = torch.einsum(
-        "ai,aj->aij", displacement, displacement
-    )
-    identity = torch.eye(3, dtype=distance.dtype, device=distance.device)
-    T2 = (
-        3.0 * displacement_outer * lam_5[:, None, None]
-        - distance.square()[:, None, None]
-        * identity[None, :, :]
-        * lam_3[:, None, None]
-    ) * inverse_distance.pow(5)[:, None, None]
-    return displacement, T1, T2
-
-
 class _ControlledRackersAtomParam(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -1173,11 +1094,8 @@ class _ControlledRackersAtomParam(torch.nn.Module):
             (-(0.8 + 0.1 * atom_index), 0.4 + 0.05 * atom_index),
             dim=1,
         )
-        # Stack along dim=1 so the sentinel matches the production
-        # [n_atoms, 4] parameter-head contract for any atom count. Column 0 is
-        # negative and column 1 is below the positivity epsilon so that the
-        # dimer forward pass is shown to pass raw head values through without
-        # re-clamping them.
+        # Column 0 negative and column 1 below the positivity epsilon, so the
+        # dimer forward is shown to pass raw head values through unclamped.
         atom_scale = 1.0 + 0.1 * atom_index
         parameters = torch.stack(
             (
@@ -1396,10 +1314,8 @@ def test_rackers_joint_forward_scatter_and_gradients(
     nested_hfvr_vw_model,
     synthetic_dimer_batch,
 ):
-    # Keep initialization deterministic while checking the gradient seam below.
-    # A random ReLU readout may be entirely dead and legitimately have zero
-    # parameter gradients, so activity is asserted at each raw guess embedding
-    # output instead of requiring every random MLP parameter to be nonzero.
+    # Deterministic init: a random ReLU readout may be dead and legitimately
+    # have zero gradients, so activity is asserted at the raw guess embeddings.
     with torch.random.fork_rng():
         torch.manual_seed(0)
         model = RackersTholeDampingNN(
@@ -1471,93 +1387,38 @@ def test_rackers_joint_forward_scatter_and_gradients(
     assert torch.all(updated_parameters > 0)
 
 
-def test_rackers_kernel_routes_distinct_parameters_and_overlap(monkeypatch):
+def test_rackers_kernel_routes_parameters_overlap_and_permanent_field():
     inputs = _rackers_kernel_inputs()
-    direct_calls = []
-    mutual_calls = []
-    original_direct = mtp_mtp.thole_damping_direct_torch
-    original_mutual = mtp_mtp.thole_damping_mutual_torch
-
-    def record_direct(r_ij, alpha_i, alpha_j, a):
-        direct_calls.append(a.detach().clone())
-        return original_direct(r_ij, alpha_i, alpha_j, a)
-
-    def record_mutual(r_ij, alpha_i, alpha_j, a):
-        mutual_calls.append(a.detach().clone())
-        return original_mutual(r_ij, alpha_i, alpha_j, a)
-
-    monkeypatch.setattr(mtp_mtp, "thole_damping_direct_torch", record_direct)
-    monkeypatch.setattr(mtp_mtp, "thole_damping_mutual_torch", record_mutual)
-
-    pure_energy = mtp_mtp.rackers_thole_induction(
+    default_energy = mtp_mtp.rackers_thole_induction(
         **inputs, include_overlap=False, max_iterations=4
     )
-
-    expected_direct = [
-        geometric_mean_edge_values(
-            inputs["thole_direct_A"],
-            inputs["thole_direct_B"],
-            inputs["e_AB_source"],
-            inputs["e_AB_target"],
-        ),
-        geometric_mean_edge_values(
-            inputs["thole_direct_A"],
-            inputs["thole_direct_A"],
-            inputs["e_AA_source"],
-            inputs["e_AA_target"],
-        ),
-        geometric_mean_edge_values(
-            inputs["thole_direct_B"],
-            inputs["thole_direct_B"],
-            inputs["e_BB_source"],
-            inputs["e_BB_target"],
-        ),
-    ]
-    expected_mutual = [
-        geometric_mean_edge_values(
-            inputs["thole_mutual_A"],
-            inputs["thole_mutual_B"],
-            inputs["e_AB_source"],
-            inputs["e_AB_target"],
-        ),
-        geometric_mean_edge_values(
-            inputs["thole_mutual_A"],
-            inputs["thole_mutual_A"],
-            inputs["e_AA_source"],
-            inputs["e_AA_target"],
-        ),
-        geometric_mean_edge_values(
-            inputs["thole_mutual_B"],
-            inputs["thole_mutual_B"],
-            inputs["e_BB_source"],
-            inputs["e_BB_target"],
-        ),
-    ]
-    assert len(direct_calls) == 3
-    assert len(mutual_calls) == 3
-    for actual, expected in zip(direct_calls, expected_direct):
-        assert torch.equal(actual, expected)
-    for actual, expected in zip(mutual_calls, expected_mutual):
-        assert torch.equal(actual, expected)
-
-    monkeypatch.setattr(
-        mtp_mtp, "thole_damping_direct_torch", original_direct
+    explicit_default = mtp_mtp.rackers_thole_induction(
+        **inputs,
+        include_overlap=False,
+        max_iterations=4,
+        intramolecular_permanent_field=False,
     )
-    monkeypatch.setattr(
-        mtp_mtp, "thole_damping_mutual_torch", original_mutual
+    legacy_energy = mtp_mtp.rackers_thole_induction(
+        **inputs,
+        include_overlap=False,
+        max_iterations=4,
+        intramolecular_permanent_field=True,
     )
+    assert torch.equal(default_energy, explicit_default)
+    assert not torch.allclose(default_energy, legacy_energy)
+
     changed_overlap_inputs = {
         **inputs,
-        "ind_overlap_A": torch.tensor([8.0, 9.0], dtype=torch.float64),
-        "ind_overlap_B": torch.tensor([10.0, 11.0], dtype=torch.float64),
+        "ind_overlap_A": inputs["ind_overlap_A"] + 8.0,
+        "ind_overlap_B": inputs["ind_overlap_B"] + 10.0,
     }
-    pure_energy_changed_overlap = mtp_mtp.rackers_thole_induction(
+    changed_pure_energy = mtp_mtp.rackers_thole_induction(
         **changed_overlap_inputs, include_overlap=False, max_iterations=4
     )
     overlap_energy = mtp_mtp.rackers_thole_induction(
         **inputs, include_overlap=True, max_iterations=4
     )
-    assert torch.equal(pure_energy, pure_energy_changed_overlap)
+    assert torch.equal(default_energy, changed_pure_energy)
 
     dR_AB, _ = mtp_mtp.get_distances(
         inputs["RA"],
@@ -1565,584 +1426,196 @@ def test_rackers_kernel_routes_distinct_parameters_and_overlap(monkeypatch):
         inputs["e_AB_source"],
         inputs["e_AB_target"],
     )
-    dR_AB = dR_AB / constants.au2ang
+    distance = dR_AB / constants.au2ang
     sigma_A = inputs["valence_widths_A"].index_select(
         0, inputs["e_AB_source"]
     )
     sigma_B = inputs["valence_widths_B"].index_select(
         0, inputs["e_AB_target"]
     )
-    B_ij = torch.sqrt(1.0 / (sigma_A * sigma_B))
-    S_ij = (
-        (B_ij * dR_AB) ** 2 / 3.0 + B_ij * dR_AB + 1.0
-    ) * torch.exp(-B_ij * dR_AB)
+    scaled_distance = torch.sqrt(1.0 / (sigma_A * sigma_B)) * distance
+    overlap = (
+        scaled_distance.square() / 3.0 + scaled_distance + 1.0
+    ) * torch.exp(-scaled_distance)
     expected_overlap = (
-        inputs["ind_overlap_A"].index_select(
-            0, inputs["e_AB_source"]
-        )
-        * S_ij
-        * inputs["ind_overlap_B"].index_select(
-            0, inputs["e_AB_target"]
-        )
+        inputs["ind_overlap_A"].index_select(0, inputs["e_AB_source"])
+        * overlap
+        * inputs["ind_overlap_B"].index_select(0, inputs["e_AB_target"])
         * constants.h2kcalmol
     )
     assert torch.allclose(
-        pure_energy - overlap_energy, expected_overlap, atol=1e-6
+        default_energy - overlap_energy, expected_overlap, atol=1e-6
     )
 
 
-def test_rackers_kernel_routes_top_level_direct_monomer_effects(
-    monkeypatch,
-):
+def test_rackers_permanent_and_mutual_field_routing():
     inputs = _rackers_kernel_inputs()
-    original_builder = mtp_mtp._rackers_distance_tensors
-    original_initial_fields = mtp_mtp._rackers_initial_permanent_fields
+    alpha_A = inputs["hirshfeld_volume_ratio_A"]
+    alpha_B = inputs["hirshfeld_volume_ratio_B"]
 
-    def run_with_perturbation(direct_call_to_perturb):
-        direct_call_index = 0
-        captured_initial_fields = []
+    def tensors(prefix, damping_type):
+        left = "A" if prefix != "BB" else "B"
+        right = "B" if prefix == "AB" else left
+        source = inputs[f"e_{prefix}_source"]
+        target = inputs[f"e_{prefix}_target"]
+        damping = geometric_mean_edge_values(
+            inputs[f"thole_{damping_type}_{left}"],
+            inputs[f"thole_{damping_type}_{right}"],
+            source,
+            target,
+        )
+        return mtp_mtp._rackers_distance_tensors(
+            inputs[f"R{left}"],
+            inputs[f"R{right}"],
+            source,
+            target,
+            alpha_A if left == "A" else alpha_B,
+            alpha_A if right == "A" else alpha_B,
+            damping,
+            damping_type,
+        )
 
-        def perturb_builder(*args, **kwargs):
-            nonlocal direct_call_index
-            tensors = original_builder(*args, **kwargs)
-            damping_type = args[-1]
-            if damping_type != "direct":
-                return tensors
+    direct_AB, direct_AA, direct_BB = (
+        tensors(prefix, "direct") for prefix in ("AB", "AA", "BB")
+    )
+    field_args = (
+        alpha_A,
+        alpha_B,
+        inputs["qA"],
+        inputs["muA"],
+        inputs["qB"],
+        inputs["muB"],
+        inputs["e_AB_source"],
+        inputs["e_AB_target"],
+        inputs["e_AA_source"],
+        inputs["e_AA_target"],
+        inputs["e_BB_source"],
+        inputs["e_BB_target"],
+        direct_AB[3],
+        direct_AB[4],
+        direct_AA[3],
+        direct_AA[4],
+        direct_BB[3],
+        direct_BB[4],
+    )
+    default_A, default_B = mtp_mtp._rackers_initial_permanent_fields(
+        *field_args
+    )
+    zero = torch.zeros_like
+    no_intra_A, no_intra_B = mtp_mtp._rackers_initial_permanent_fields(
+        *field_args[:14],
+        zero(direct_AA[3]),
+        zero(direct_AA[4]),
+        zero(direct_BB[3]),
+        zero(direct_BB[4]),
+    )
+    legacy_A, legacy_B = mtp_mtp._rackers_initial_permanent_fields(
+        *field_args, intramolecular_permanent_field=True
+    )
+    assert torch.equal(default_A, no_intra_A)
+    assert torch.equal(default_B, no_intra_B)
+    assert not torch.equal(default_A, legacy_A)
+    assert not torch.equal(default_B, legacy_B)
 
-            current_index = direct_call_index
-            direct_call_index += 1
-            if current_index != direct_call_to_perturb:
-                return tensors
+    mutual_AB, mutual_AA, mutual_BB = (
+        tensors(prefix, "mutual") for prefix in ("AB", "AA", "BB")
+    )
+    update_args = (
+        alpha_A,
+        alpha_B,
+        inputs["e_AB_source"],
+        inputs["e_AB_target"],
+        inputs["e_AA_source"],
+        inputs["e_AA_target"],
+        inputs["e_BB_source"],
+        inputs["e_BB_target"],
+    )
+    zero_A, zero_B = mtp_mtp._rackers_scf_update(
+        *update_args,
+        zero(mutual_AB[4]),
+        zero(mutual_AA[4]),
+        zero(mutual_BB[4]),
+        default_A,
+        default_B,
+        default_A,
+        default_B,
+    )
+    mutual_A, mutual_B = mtp_mtp._rackers_scf_update(
+        *update_args,
+        mutual_AB[4],
+        mutual_AA[4],
+        mutual_BB[4],
+        default_A,
+        default_B,
+        default_A,
+        default_B,
+    )
+    assert not torch.equal(zero_A, mutual_A)
+    assert not torch.equal(zero_B, mutual_B)
 
-            perturbed = list(tensors)
-            perturbed[3] = tensors[3] * 1.7
-            perturbed[4] = tensors[4] * 1.7
-            return tuple(perturbed)
 
-        def capture_initial_fields(*args, **kwargs):
-            fields = original_initial_fields(*args, **kwargs)
-            captured_initial_fields.append(
-                tuple(field.detach().clone() for field in fields)
+def test_rackers_kernel_is_exchange_and_rotation_invariant():
+    inputs = _rackers_kernel_inputs()
+
+    def evaluate(values):
+        return mtp_mtp.rackers_thole_induction(
+            **values, include_overlap=True, max_iterations=4
+        )
+
+    expected = evaluate(inputs)
+    exchanged = {
+        **inputs,
+        **{
+            f"{name}_A": inputs[f"{name}_B"]
+            for name in (
+                "hirshfeld_volume_ratio",
+                "valence_widths",
+                "thole_direct",
+                "thole_mutual",
+                "ind_overlap",
             )
-            return fields
-
-        monkeypatch.setattr(
-            mtp_mtp, "_rackers_distance_tensors", perturb_builder
-        )
-        monkeypatch.setattr(
-            mtp_mtp,
-            "_rackers_initial_permanent_fields",
-            capture_initial_fields,
-        )
-        energy = mtp_mtp.rackers_thole_induction(
-            **inputs, include_overlap=False, max_iterations=4
-        )
-        assert len(captured_initial_fields) == 1
-        assert direct_call_index == 3
-        return energy.detach().clone(), captured_initial_fields[0]
-
-    baseline_energy, (baseline_A, baseline_B) = run_with_perturbation(None)
-    aa_energy, (aa_A, aa_B) = run_with_perturbation(1)
-    bb_energy, (bb_A, bb_B) = run_with_perturbation(2)
-
-    assert not torch.equal(aa_A, baseline_A)
-    assert torch.equal(aa_B, baseline_B)
-    assert not torch.allclose(aa_energy, baseline_energy)
-    assert torch.equal(bb_A, baseline_A)
-    assert not torch.equal(bb_B, baseline_B)
-    assert not torch.allclose(bb_energy, baseline_energy)
-
-
-def test_rackers_kernel_routes_direct_fields_and_mutual_scf_effect():
-    dtype = torch.float64
-    alpha_A = torch.tensor([1.0, 1.5], dtype=dtype)
-    alpha_B = torch.tensor([0.8, 1.2], dtype=dtype)
-    qA = torch.tensor([0.2, -0.1], dtype=dtype)
-    qB = torch.tensor([-0.3, 0.15], dtype=dtype)
-    muA = torch.tensor(
-        [[0.1, 0.0, 0.0], [0.0, 0.1, 0.0]], dtype=dtype
-    )
-    muB = torch.tensor(
-        [[0.0, -0.1, 0.0], [0.0, 0.0, 0.1]], dtype=dtype
-    )
-    e_AB_source = torch.tensor([0, 1], dtype=torch.long)
-    e_AB_target = torch.tensor([0, 1], dtype=torch.long)
-    e_AA_source = torch.tensor([0, 1], dtype=torch.long)
-    e_AA_target = torch.tensor([1, 0], dtype=torch.long)
-    e_BB_source = torch.tensor([0, 1], dtype=torch.long)
-    e_BB_target = torch.tensor([1, 0], dtype=torch.long)
-    T1_AB = torch.ones((2, 3), dtype=dtype) * 0.2
-    T2_AB = torch.eye(3, dtype=dtype).repeat(2, 1, 1) * 0.1
-    zero_T1 = torch.zeros((2, 3), dtype=dtype)
-    zero_T2 = torch.zeros((2, 3, 3), dtype=dtype)
-
-    helper_args = (
-        alpha_A,
-        alpha_B,
-        qA,
-        muA,
-        qB,
-        muB,
-        e_AB_source,
-        e_AB_target,
-        e_AA_source,
-        e_AA_target,
-        e_BB_source,
-        e_BB_target,
-        T1_AB,
-        T2_AB,
-    )
-    base_A, base_B = mtp_mtp._rackers_initial_permanent_fields(
-        *helper_args, zero_T1, zero_T2, zero_T1, zero_T2
-    )
-    direct_AA_A, direct_AA_B = mtp_mtp._rackers_initial_permanent_fields(
-        *helper_args, T1_AB, T2_AB, zero_T1, zero_T2
-    )
-    direct_BB_A, direct_BB_B = mtp_mtp._rackers_initial_permanent_fields(
-        *helper_args, zero_T1, zero_T2, T1_AB, T2_AB
-    )
-    assert not torch.equal(base_A, direct_AA_A)
-    assert torch.equal(base_B, direct_AA_B)
-    assert torch.equal(base_A, direct_BB_A)
-    assert not torch.equal(base_B, direct_BB_B)
-
-    initial_A_before_mutual_update = base_A.clone()
-    initial_B_before_mutual_update = base_B.clone()
-    zero_mutual_A, zero_mutual_B = mtp_mtp._rackers_scf_update(
-        alpha_A,
-        alpha_B,
-        e_AB_source,
-        e_AB_target,
-        e_AA_source,
-        e_AA_target,
-        e_BB_source,
-        e_BB_target,
-        zero_T2,
-        zero_T2,
-        zero_T2,
-        base_A,
-        base_B,
-        base_A,
-        base_B,
-    )
-    changed_mutual_A, changed_mutual_B = mtp_mtp._rackers_scf_update(
-        alpha_A,
-        alpha_B,
-        e_AB_source,
-        e_AB_target,
-        e_AA_source,
-        e_AA_target,
-        e_BB_source,
-        e_BB_target,
-        T2_AB,
-        T2_AB,
-        T2_AB,
-        base_A,
-        base_B,
-        base_A,
-        base_B,
-    )
-    assert torch.equal(base_A, initial_A_before_mutual_update)
-    assert torch.equal(base_B, initial_B_before_mutual_update)
-    assert not torch.equal(zero_mutual_A, changed_mutual_A)
-    assert not torch.equal(zero_mutual_B, changed_mutual_B)
-
-
-def test_rackers_kernel_routes_charge_oracle_orientation_and_symmetry():
-    dtype = torch.float64
-    RA = torch.tensor(
-        [[0.2, -0.4, 0.3], [1.4, 0.6, -0.2]], dtype=dtype
-    )
-    RB = torch.tensor(
-        [[3.7, -0.8, 1.1], [4.4, 1.3, -0.7]], dtype=dtype
-    )
-    alpha_A = torch.tensor([0.7, 1.3], dtype=dtype)
-    alpha_B = torch.tensor([1.1, 0.6], dtype=dtype)
-    qA = torch.tensor([0.35, 0.8], dtype=dtype)
-    qB = torch.tensor([0.55, 0.25], dtype=dtype)
-    e_AB_source = torch.tensor([0, 1], dtype=torch.long)
-    e_AB_target = torch.tensor([1, 0], dtype=torch.long)
-    e_AA_source = torch.tensor([0, 1], dtype=torch.long)
-    e_AA_target = torch.tensor([1, 0], dtype=torch.long)
-    e_BB_source = torch.tensor([1, 0], dtype=torch.long)
-    e_BB_target = torch.tensor([0, 1], dtype=torch.long)
-    direct_AB = torch.tensor([0.31, 0.47], dtype=dtype)
-    direct_AA = torch.tensor([0.4, 0.4], dtype=dtype)
-    direct_BB = torch.tensor([0.38, 0.38], dtype=dtype)
-    mutual_AB = torch.tensor([0.61, 0.79], dtype=dtype)
-    mutual_AA = torch.tensor([0.7, 0.7], dtype=dtype)
-    mutual_BB = torch.tensor([0.72, 0.72], dtype=dtype)
-
-    def evaluate_production(
-        R_first,
-        R_second,
-        alpha_first,
-        alpha_second,
-        q_first,
-        q_second,
-        cross_source,
-        cross_target,
-        first_source,
-        first_target,
-        second_source,
-        second_target,
-        direct_cross,
-        direct_first,
-        direct_second,
-        mutual_cross,
-        mutual_first,
-        mutual_second,
-    ):
-        direct_tensors = (
-            mtp_mtp._rackers_distance_tensors(
-                R_first,
-                R_second,
-                cross_source,
-                cross_target,
-                alpha_first,
-                alpha_second,
-                direct_cross,
-                "direct",
-            ),
-            mtp_mtp._rackers_distance_tensors(
-                R_first,
-                R_first,
-                first_source,
-                first_target,
-                alpha_first,
-                alpha_first,
-                direct_first,
-                "direct",
-            ),
-            mtp_mtp._rackers_distance_tensors(
-                R_second,
-                R_second,
-                second_source,
-                second_target,
-                alpha_second,
-                alpha_second,
-                direct_second,
-                "direct",
-            ),
-        )
-        initial_fields = mtp_mtp._rackers_initial_permanent_fields(
-            alpha_first,
-            alpha_second,
-            q_first,
-            torch.zeros_like(R_first),
-            q_second,
-            torch.zeros_like(R_second),
-            cross_source,
-            cross_target,
-            first_source,
-            first_target,
-            second_source,
-            second_target,
-            direct_tensors[0][3],
-            direct_tensors[0][4],
-            direct_tensors[1][3],
-            direct_tensors[1][4],
-            direct_tensors[2][3],
-            direct_tensors[2][4],
-        )
-        mutual_tensors = (
-            mtp_mtp._rackers_distance_tensors(
-                R_first,
-                R_second,
-                cross_source,
-                cross_target,
-                alpha_first,
-                alpha_second,
-                mutual_cross,
-                "mutual",
-            ),
-            mtp_mtp._rackers_distance_tensors(
-                R_first,
-                R_first,
-                first_source,
-                first_target,
-                alpha_first,
-                alpha_first,
-                mutual_first,
-                "mutual",
-            ),
-            mtp_mtp._rackers_distance_tensors(
-                R_second,
-                R_second,
-                second_source,
-                second_target,
-                alpha_second,
-                alpha_second,
-                mutual_second,
-                "mutual",
-            ),
-        )
-        update = mtp_mtp._rackers_scf_update(
-            alpha_first,
-            alpha_second,
-            cross_source,
-            cross_target,
-            first_source,
-            first_target,
-            second_source,
-            second_target,
-            mutual_tensors[0][4],
-            mutual_tensors[1][4],
-            mutual_tensors[2][4],
-            initial_fields[0],
-            initial_fields[1],
-            initial_fields[0],
-            initial_fields[1],
-        )
-        return direct_tensors, mutual_tensors, initial_fields, update
-
-    actual_direct, actual_mutual, actual_initial, actual_update = (
-        evaluate_production(
-            RA,
-            RB,
-            alpha_A,
-            alpha_B,
-            qA,
-            qB,
-            e_AB_source,
-            e_AB_target,
-            e_AA_source,
-            e_AA_target,
-            e_BB_source,
-            e_BB_target,
-            direct_AB,
-            direct_AA,
-            direct_BB,
-            mutual_AB,
-            mutual_AA,
-            mutual_BB,
-        )
-    )
-
-    displacement_AB, expected_T1_AB, expected_direct_T2_AB = (
-        _analytic_rackers_tensors(
-            RA,
-            RB,
-            e_AB_source,
-            e_AB_target,
-            alpha_A,
-            alpha_B,
-            direct_AB,
-            "direct",
-        )
-    )
-    _, expected_T1_AA, expected_direct_T2_AA = (
-        _analytic_rackers_tensors(
-            RA,
-            RA,
-            e_AA_source,
-            e_AA_target,
-            alpha_A,
-            alpha_A,
-            direct_AA,
-            "direct",
-        )
-    )
-    _, expected_T1_BB, expected_direct_T2_BB = (
-        _analytic_rackers_tensors(
-            RB,
-            RB,
-            e_BB_source,
-            e_BB_target,
-            alpha_B,
-            alpha_B,
-            direct_BB,
-            "direct",
-        )
-    )
-    _, _, expected_mutual_T2_AB = _analytic_rackers_tensors(
-        RA,
-        RB,
-        e_AB_source,
-        e_AB_target,
-        alpha_A,
-        alpha_B,
-        mutual_AB,
-        "mutual",
-    )
-    _, _, expected_mutual_T2_AA = _analytic_rackers_tensors(
-        RA,
-        RA,
-        e_AA_source,
-        e_AA_target,
-        alpha_A,
-        alpha_A,
-        mutual_AA,
-        "mutual",
-    )
-    _, _, expected_mutual_T2_BB = _analytic_rackers_tensors(
-        RB,
-        RB,
-        e_BB_source,
-        e_BB_target,
-        alpha_B,
-        alpha_B,
-        mutual_BB,
-        "mutual",
-    )
-    expected_direct = (
-        (expected_T1_AB, expected_direct_T2_AB),
-        (expected_T1_AA, expected_direct_T2_AA),
-        (expected_T1_BB, expected_direct_T2_BB),
-    )
-    expected_mutual_T2 = (
-        expected_mutual_T2_AB,
-        expected_mutual_T2_AA,
-        expected_mutual_T2_BB,
-    )
-    for actual, expected in zip(actual_direct, expected_direct):
-        assert torch.allclose(actual[3], expected[0], atol=1e-12)
-        assert torch.allclose(actual[4], expected[1], atol=1e-12)
-    for actual, expected in zip(actual_mutual, expected_mutual_T2):
-        assert torch.allclose(actual[4], expected, atol=1e-12)
-
-    alpha_A_cross = alpha_A.index_select(0, e_AB_source)
-    alpha_B_cross = alpha_B.index_select(0, e_AB_target)
-    qA_cross = qA.index_select(0, e_AB_source)
-    qB_cross = qB.index_select(0, e_AB_target)
-    cross_field_A = (
-        alpha_A_cross[:, None] * expected_T1_AB * qB_cross[:, None]
-    )
-    cross_field_B = (
-        alpha_B_cross[:, None] * -expected_T1_AB * qA_cross[:, None]
-    )
-    assert torch.all(
-        torch.einsum("ai,ai->a", cross_field_A, displacement_AB) < 0
-    )
-    assert torch.all(
-        torch.einsum("ai,ai->a", cross_field_B, displacement_AB) > 0
-    )
-
-    expected_initial_A = torch.zeros_like(RA)
-    expected_initial_A.index_add_(0, e_AB_source, cross_field_A)
-    expected_initial_A.index_add_(
-        0,
-        e_AA_target,
-        alpha_A.index_select(0, e_AA_target)[:, None]
-        * -expected_T1_AA
-        * qA.index_select(0, e_AA_source)[:, None],
-    )
-    expected_initial_B = torch.zeros_like(RB)
-    expected_initial_B.index_add_(0, e_AB_target, cross_field_B)
-    expected_initial_B.index_add_(
-        0,
-        e_BB_target,
-        alpha_B.index_select(0, e_BB_target)[:, None]
-        * -expected_T1_BB
-        * qB.index_select(0, e_BB_source)[:, None],
-    )
-    assert torch.allclose(
-        actual_initial[0], expected_initial_A, atol=1e-12
-    )
-    assert torch.allclose(
-        actual_initial[1], expected_initial_B, atol=1e-12
-    )
-
-    expected_update_A = expected_initial_A.clone()
-    expected_update_A.index_add_(
-        0,
-        e_AB_source,
-        alpha_A_cross[:, None]
-        * torch.einsum(
-            "aij,aj->ai",
-            expected_mutual_T2_AB,
-            expected_initial_B.index_select(0, e_AB_target),
-        ),
-    )
-    expected_update_A.index_add_(
-        0,
-        e_AA_target,
-        alpha_A.index_select(0, e_AA_target)[:, None]
-        * torch.einsum(
-            "aij,aj->ai",
-            expected_mutual_T2_AA,
-            expected_initial_A.index_select(0, e_AA_source),
-        ),
-    )
-    expected_update_B = expected_initial_B.clone()
-    expected_update_B.index_add_(
-        0,
-        e_AB_target,
-        alpha_B_cross[:, None]
-        * torch.einsum(
-            "aij,aj->ai",
-            expected_mutual_T2_AB,
-            expected_initial_A.index_select(0, e_AB_source),
-        ),
-    )
-    expected_update_B.index_add_(
-        0,
-        e_BB_target,
-        alpha_B.index_select(0, e_BB_target)[:, None]
-        * torch.einsum(
-            "aij,aj->ai",
-            expected_mutual_T2_BB,
-            expected_initial_B.index_select(0, e_BB_source),
-        ),
-    )
-    assert torch.allclose(actual_update[0], expected_update_A, atol=1e-12)
-    assert torch.allclose(actual_update[1], expected_update_B, atol=1e-12)
-
-    _, _, exchanged_initial, exchanged_update = evaluate_production(
-        RB,
-        RA,
-        alpha_B,
-        alpha_A,
-        qB,
-        qA,
-        e_AB_target,
-        e_AB_source,
-        e_BB_source,
-        e_BB_target,
-        e_AA_source,
-        e_AA_target,
-        direct_AB,
-        direct_BB,
-        direct_AA,
-        mutual_AB,
-        mutual_BB,
-        mutual_AA,
-    )
-    assert torch.allclose(exchanged_initial[0], actual_initial[1])
-    assert torch.allclose(exchanged_initial[1], actual_initial[0])
-    assert torch.allclose(exchanged_update[0], actual_update[1])
-    assert torch.allclose(exchanged_update[1], actual_update[0])
+        },
+        **{
+            f"{name}_B": inputs[f"{name}_A"]
+            for name in (
+                "hirshfeld_volume_ratio",
+                "valence_widths",
+                "thole_direct",
+                "thole_mutual",
+                "ind_overlap",
+            )
+        },
+        "ZA": inputs["ZB"],
+        "RA": inputs["RB"],
+        "qA": inputs["qB"],
+        "muA": inputs["muB"],
+        "quadA": inputs["quadB"],
+        "ZB": inputs["ZA"],
+        "RB": inputs["RA"],
+        "qB": inputs["qA"],
+        "muB": inputs["muA"],
+        "quadB": inputs["quadA"],
+        "e_AB_source": inputs["e_AB_target"],
+        "e_AB_target": inputs["e_AB_source"],
+        "e_AA_source": inputs["e_BB_source"],
+        "e_AA_target": inputs["e_BB_target"],
+        "e_BB_source": inputs["e_AA_source"],
+        "e_BB_target": inputs["e_AA_target"],
+    }
+    assert torch.allclose(evaluate(exchanged), expected, atol=1e-10)
 
     rotation = torch.tensor(
         [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
-        dtype=dtype,
+        dtype=inputs["RA"].dtype,
     )
-    rotated_RA = RA @ rotation.T
-    rotated_RB = RB @ rotation.T
-    _, _, rotated_initial, rotated_update = evaluate_production(
-        rotated_RA,
-        rotated_RB,
-        alpha_A,
-        alpha_B,
-        qA,
-        qB,
-        e_AB_source,
-        e_AB_target,
-        e_AA_source,
-        e_AA_target,
-        e_BB_source,
-        e_BB_target,
-        direct_AB,
-        direct_AA,
-        direct_BB,
-        mutual_AB,
-        mutual_AA,
-        mutual_BB,
-    )
-    assert torch.allclose(rotated_initial[0], actual_initial[0] @ rotation.T)
-    assert torch.allclose(rotated_initial[1], actual_initial[1] @ rotation.T)
-    assert torch.allclose(rotated_update[0], actual_update[0] @ rotation.T)
-    assert torch.allclose(rotated_update[1], actual_update[1] @ rotation.T)
+    rotated = {
+        **inputs,
+        "RA": inputs["RA"] @ rotation.T,
+        "RB": inputs["RB"] @ rotation.T,
+        "muA": inputs["muA"] @ rotation.T,
+        "muB": inputs["muB"] @ rotation.T,
+    }
+    assert torch.allclose(evaluate(rotated), expected, atol=1e-10)
 
 
 def test_rackers_kernel_routes_tensor_builder_rejects_invalid_type():
@@ -2429,86 +1902,47 @@ def test_rackers_dispatch_selects_harness_and_forwards_contract(
     ]
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("param_start_mean", 1.8),
-        ("param_start_std", 0.01),
-        ("param_start_mean", [1.8, 0.34, 0.39]),
-        ("param_start_std", [0.01, 0.01, 0.01]),
-    ],
-)
-def test_rackers_dispatch_rejects_ambiguous_parameter_lists(field, value):
-    kwargs = {
-        "apnet_model_type": "RackersTholeDampingModel",
-        "pre_trained_model_path": None,
-        "param_start_mean": [1.8, 0.34, 0.39, 1.8],
-        "param_start_std": [0.01, 0.01, 0.01, 0.01],
-    }
-    kwargs[field] = value
-    with pytest.raises(ValueError, match="exactly four"):
-        train_models.train_pairwise_model(**kwargs)
+_RACKERS_DISPATCH_BASE = {
+    "apnet_model_type": "RackersTholeDampingModel",
+    "pre_trained_model_path": None,
+}
 
 
 @pytest.mark.parametrize(
-    "field,index,value,match",
+    "overrides,match",
     [
-        (
-            "param_start_mean",
-            0,
-            0.0,
-            "param_start_mean values must be finite and strictly greater",
-        ),
-        (
-            "param_start_mean",
-            1,
-            -0.1,
-            "param_start_mean values must be finite and strictly greater",
-        ),
-        (
-            "param_start_mean",
-            2,
-            float("nan"),
-            "param_start_mean values must be finite and strictly greater",
-        ),
-        (
-            "param_start_mean",
-            3,
-            float("inf"),
-            "param_start_mean values must be finite and strictly greater",
-        ),
-        (
-            "param_start_std",
-            0,
-            -0.1,
-            "param_start_std values must be finite and greater than or equal",
-        ),
-        (
-            "param_start_std",
-            1,
-            float("nan"),
-            "param_start_std values must be finite and greater than or equal",
-        ),
-        (
-            "param_start_std",
-            2,
-            float("inf"),
-            "param_start_std values must be finite and greater than or equal",
-        ),
+        # A scalar or a short list is ambiguous: the four Rackers parameters
+        # have distinct physical meanings, so there is no sane broadcast.
+        ({"param_start_mean": 1.8}, "exactly four"),
+        ({"param_start_std": 0.01}, "exactly four"),
+        ({"param_start_mean": [1.8, 0.34, 0.39]}, "exactly four"),
+        ({"param_start_std": [0.01, 0.01, 0.01]}, "exactly four"),
+        *[
+            ({"param_start_mean": _replaced(RACKERS_INITIAL_VALUES, i, value)},
+             _MEAN_DOMAIN_MATCH)
+            for i, value in enumerate(
+                (0.0, -0.1, float("nan"), float("inf"))
+            )
+        ],
+        *[
+            ({"param_start_std": _replaced(RACKERS_INITIAL_STDS, i, value)},
+             _STD_DOMAIN_MATCH)
+            for i, value in enumerate((-0.1, float("nan"), float("inf")))
+        ],
+        ({"param_start_mean": [1e39, 1.0, 1.0, 1.0]}, _MEAN_OVERFLOW_MATCH),
+        ({"param_start_std": [1e39, 0.0, 0.0, 0.0]}, _STD_OVERFLOW_MATCH),
     ],
 )
-def test_rackers_dispatch_rejects_invalid_initialization_domains(
-    monkeypatch, field, index, value, match
+def test_rackers_dispatch_rejects_invalid_parameters(
+    monkeypatch, overrides, match
 ):
     _patch_rackers_dispatch_fakes(monkeypatch)
     kwargs = {
-        "apnet_model_type": "RackersTholeDampingModel",
-        "pre_trained_model_path": None,
+        **_RACKERS_DISPATCH_BASE,
         "param_start_mean": list(RACKERS_INITIAL_VALUES),
         "param_start_std": list(RACKERS_INITIAL_STDS),
+        **overrides,
     }
-    kwargs[field][index] = value
-
     with pytest.raises(ValueError, match=match):
         train_models.train_pairwise_model(**kwargs)
 
@@ -2517,70 +1951,26 @@ def test_rackers_dispatch_rejects_invalid_initialization_domains(
 
 
 @pytest.mark.parametrize(
-    "field,values,match",
+    "field,values",
     [
-        (
-            "param_start_mean",
-            [1e39, 1.0, 1.0, 1.0],
-            "transformed param_start_mean values must be finite and representable",
-        ),
-        (
-            "param_start_std",
-            [1e39, 0.0, 0.0, 0.0],
-            "param_start_std values must be representable",
-        ),
+        ("param_start_mean", [1000.0, 1.0, 1.0, 1.0]),
+        ("param_start_std", [0.0, 0.01, 0.0, 0.02]),
     ],
 )
-def test_rackers_dispatch_rejects_embedding_dtype_overflow(
-    monkeypatch, field, values, match
+def test_rackers_dispatch_forwards_valid_parameters(
+    monkeypatch, tmp_path, field, values
 ):
     _patch_rackers_dispatch_fakes(monkeypatch)
-    kwargs = {
-        "apnet_model_type": "RackersTholeDampingModel",
-        "pre_trained_model_path": None,
-        "param_start_mean": list(RACKERS_INITIAL_VALUES),
-        "param_start_std": list(RACKERS_INITIAL_STDS),
-    }
-    kwargs[field] = values
-
-    with pytest.raises(ValueError, match=match):
-        train_models.train_pairwise_model(**kwargs)
-
-    assert _FakeAtomTypeParamModel.calls == []
-    assert _FakeRackersTholeDampingModel.calls == []
-
-
-def test_rackers_dispatch_accepts_large_representable_mean(
-    monkeypatch, tmp_path
-):
-    _patch_rackers_dispatch_fakes(monkeypatch)
-    means = [1000.0, 1.0, 1.0, 1.0]
+    kwargs = {field: values}
+    if field == "param_start_mean":
+        kwargs["param_start_std"] = [0.0, 0.0, 0.0, 0.0]
     train_models.train_pairwise_model(
-        apnet_model_type="RackersTholeDampingModel",
-        model_out=str(tmp_path / "valid-large-mean.pt"),
-        pre_trained_model_path=None,
-        param_start_mean=means,
-        param_start_std=[0.0, 0.0, 0.0, 0.0],
+        **_RACKERS_DISPATCH_BASE,
+        model_out=str(tmp_path / f"valid-{field}.pt"),
+        **kwargs,
     )
 
-    assert _FakeRackersTholeDampingModel.calls[0].kwargs[
-        "param_start_mean"
-    ] == means
-
-
-def test_rackers_dispatch_accepts_zero_raw_std(monkeypatch, tmp_path):
-    _patch_rackers_dispatch_fakes(monkeypatch)
-    stds = [0.0, 0.01, 0.0, 0.02]
-    train_models.train_pairwise_model(
-        apnet_model_type="RackersTholeDampingModel",
-        model_out=str(tmp_path / "valid-zero-std.pt"),
-        pre_trained_model_path=None,
-        param_start_std=stds,
-    )
-
-    assert _FakeRackersTholeDampingModel.calls[0].kwargs[
-        "param_start_std"
-    ] == stds
+    assert _FakeRackersTholeDampingModel.calls[0].kwargs[field] == values
 
 
 class _FakeLegacyPairwiseHarness:
