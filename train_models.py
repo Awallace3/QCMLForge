@@ -263,6 +263,7 @@ def train_pairwise_model(
     freeze_atom_model=True,
     build_dataset_only=False,
     include_total_mse=False,
+    shard_locality_block_shards=0,
     wandb_config=None,
 ):
     # Ensure param_start_mean and param_start_std are lists
@@ -671,6 +672,14 @@ def train_pairwise_model(
         include_total_mse=include_total_mse,
         wandb_config=wandb_config,
     )
+    if shard_locality_block_shards:
+        # Left out entirely at the default of 0, so a run that does not ask
+        # for it produces the identical epoch ordering it always did. Routes
+        # whose `train` has no such parameter drop it through the
+        # unsupported-kwarg filter below.
+        train_kwargs["shard_locality_block_shards"] = int(
+            shard_locality_block_shards
+        )
     if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
         train_kwargs["end_lr"] = end_lr
     else:
@@ -936,6 +945,22 @@ def main():
         help="specify world_size for DDP only for AtomModels currently (default: 1)",
     )
     args.add_argument(
+        "--shard_locality_block_shards",
+        type=int,
+        default=0,
+        help=(
+            "0 (default) keeps uniform shuffling. Above 0, sample with "
+            "shard locality: shuffle shards instead of dimers, hand each "
+            "dataloader worker a disjoint block of this many shards, and "
+            "size the dataset's shard LRU to match. Each shard is then read "
+            "about once per epoch instead of once per dimer drawn from it, "
+            "at the cost of a shuffle window of block x shard_size dimers "
+            "rather than the whole store. 256 is a reasonable starting "
+            "point on a 16-dimer fused store (4,096-dimer window, "
+            "~54 MB of shard cache per worker)."
+        ),
+    )
+    args.add_argument(
         "--omp_num_threads",
         type=int,
         default=1,
@@ -1094,6 +1119,7 @@ def main():
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
+            shard_locality_block_shards=args.shard_locality_block_shards,
             wandb_config=pairwise_wandb_config,
         )
     return

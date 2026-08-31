@@ -36,6 +36,8 @@ from ..training_tracking import (
     tracked_ddp_worker,
 )
 from ..util import scatter_sum_compile
+from ..pt_datasets.shard_locality import ShardBlockSampler
+from typing import Optional
 import os
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -733,6 +735,128 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         return E_output, E_sr, E_elst, E_ind, E_disp, hAB, hBA
 
 
+def _build_shard_block_sampler(
+    harness,
+    train_dataset,
+    batch_size: int,
+    num_workers: int,
+    world_size: int = 1,
+    rank: int = 0,
+) -> Optional[ShardBlockSampler]:
+    """Shard-locality sampling for the ap3d3 route -- opt-in, off by default.
+
+    Parameters
+    ----------
+    harness : APNet3_D3_Model
+        Read only for ``shard_locality_block_shards``; absent or 0 disables.
+    train_dataset : torch.utils.data.Dataset
+        The training dataset.  Must expose ``datapoint_storage_n_objects`` and
+        ``set_shard_cache_size``; anything else declines with a reason.
+    batch_size : int
+        Per-rank batch size, needed to cut the emission order on batch
+        boundaries.
+    num_workers : int
+        The loader's ``num_workers``.
+    world_size : int, default 1
+        DDP world size.
+    rank : int, default 0
+        DDP rank; also gates the diagnostic prints to one process.
+
+    Returns
+    -------
+    ShardBlockSampler or None
+        ``None`` whenever the feature is off or the dataset cannot support it,
+        in which case the caller keeps its existing ``shuffle=True`` loader.
+
+    Notes
+    -----
+    `ap3_fused_ds.get()` deserialises an entire shard to return one dimer, and
+    `shard_cache_size` defaults to 1, so a globally shuffled epoch reads each
+    16-dimer shard about 16 times.  Job 12391962 measured what that costs on
+    this route: 89 % of all dataloader-worker CPU is inside `torch.load`, at
+    ~1.66 ms per call and one call per sample -- 20,480 loads per epoch to
+    deliver 20,480 samples.  The store-I/O microbenchmark (job 12379500) puts
+    the same effect at 79.4 samples/s shuffled against 1301.6 sequential.
+
+    `ShardBlockSampler` shuffles shards instead of dimers, hands each loader
+    worker a disjoint block of them, and shuffles within the block; the LRU
+    sized to match the block then serves that whole block off one read per
+    shard.  This is a genuinely different sample distribution -- a dimer's
+    batch-mates come from `block_shards * shard_size` neighbours in the
+    shuffled-shard order rather than from the whole store -- so it must never
+    switch itself on.  `block_shards = 0`, the default, returns None here and
+    leaves the epoch ordering bit-identical to what it was.
+
+    It lives in a function because the ap3d3 route builds its loaders in two
+    places (`ddp_train`, `single_proc_train`) and the two must not drift
+    apart.
+    """
+    block_shards = int(getattr(harness, "shard_locality_block_shards", 0) or 0)
+    if block_shards <= 0 or getattr(train_dataset, "in_memory", False):
+        return None
+    # `single_proc_train` below unwraps a `Subset` before sniffing the dataset
+    # type, so the same wrapper can reach here.  Decline it rather than index
+    # through it: `ShardBlockSampler` maps positions to shard ids via a
+    # *callable* `indices()`, and a `Subset`'s `indices` is a plain list, so
+    # blocking a wrapped dataset would silently address the wrong shards.
+    if not hasattr(train_dataset, "set_shard_cache_size") and hasattr(
+        train_dataset, "dataset"
+    ):
+        if rank == 0:
+            print(
+                "  shard-locality sampling requested but the training dataset is "
+                f"a {type(train_dataset).__name__} wrapper around "
+                f"{type(getattr(train_dataset, 'dataset', None)).__name__}; "
+                "ignoring",
+                flush=True,
+            )
+        return None
+    shard_size = int(getattr(train_dataset, "datapoint_storage_n_objects", 0) or 0)
+    if shard_size <= 1 or not hasattr(train_dataset, "set_shard_cache_size"):
+        # Name what was actually missing.  Job 12394768 printed the older,
+        # vaguer form of this message on three arms and it read as "your
+        # dataset is the wrong kind" when the truth was "this tree's
+        # ap3_fused_ds.py predates the multi-shard LRU" -- so the sweep looked
+        # like a null result instead of a stale checkout.
+        if rank == 0:
+            missing = []
+            if shard_size <= 1:
+                missing.append(
+                    f"datapoint_storage_n_objects={shard_size or 'absent'}"
+                )
+            if not hasattr(train_dataset, "set_shard_cache_size"):
+                missing.append("no set_shard_cache_size (no multi-shard LRU)")
+            print(
+                "  shard-locality sampling requested but the training dataset "
+                f"({type(train_dataset).__name__}) cannot support it: "
+                f"{'; '.join(missing)}; ignoring",
+                flush=True,
+            )
+        return None
+    # Cache and block must match: a block bigger than the cache is evicted
+    # before it is reused and every read comes back.
+    train_dataset.set_shard_cache_size(block_shards)
+    sampler = ShardBlockSampler(
+        train_dataset,
+        shard_size=shard_size,
+        batch_size=batch_size,
+        block_shards=block_shards,
+        num_workers=num_workers,
+        seed=43,
+        num_replicas=world_size if world_size > 1 else None,
+        rank=rank if world_size > 1 else None,
+    )
+    if rank == 0:
+        print(
+            f"  shard-locality sampling ON: shard_size={shard_size} "
+            f"block_shards={block_shards} "
+            f"(mixing window {block_shards * shard_size} dimers/worker, "
+            f"shard cache {block_shards} shards/worker)",
+            flush=True,
+        )
+    return sampler
+
+
 class APNet3D3_AtomType_Model:
     def __init__(
         self,
@@ -1064,7 +1188,16 @@ class APNet3D3_AtomType_Model:
                     )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
         elif not ignore_database_null and self.dataset is None and ds_split_db:
@@ -1168,7 +1301,16 @@ class APNet3D3_AtomType_Model:
                     ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset[0] = self.dataset[0][:ds_max_size]
                 self.dataset[1] = self.dataset[1][:ds_max_size]
@@ -2770,13 +2912,22 @@ units angstrom
         if rank == 0:
             print("Model DDP wrapped")
 
-        train_sampler = (
-            torch.utils.data.distributed.DistributedSampler(
-                train_dataset, num_replicas=world_size, rank=rank
-            )
-            if world_size > 1
-            else None
+        train_sampler = _build_shard_block_sampler(
+            self,
+            train_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            world_size=world_size,
+            rank=rank,
         )
+        if train_sampler is None:
+            train_sampler = (
+                torch.utils.data.distributed.DistributedSampler(
+                    train_dataset, num_replicas=world_size, rank=rank
+                )
+                if world_size > 1
+                else None
+            )
         test_sampler = (
             torch.utils.data.distributed.DistributedSampler(
                 test_dataset, num_replicas=world_size, rank=rank, shuffle=False
@@ -2875,6 +3026,15 @@ units angstrom
         )
         model_saved = False
         for epoch in range(n_epochs):
+            # Re-draw which shards share a block, so a dimer's batch-mates
+            # change from epoch to epoch instead of being frozen at the epoch-0
+            # permutation.  Guarded on the type on purpose: `DistributedSampler`
+            # has never had `set_epoch` called on this route either, and adding
+            # it here would silently change the sample order of every existing
+            # DDP chain.  That is a real defect but it is not this change's to
+            # make.
+            if isinstance(train_sampler, ShardBlockSampler):
+                train_sampler.set_epoch(epoch)
             t1 = time.time()
             test_lowered = False
             train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
@@ -3002,14 +3162,58 @@ units angstrom
                 else ap3_fused_collate_update
             )
 
+        # Worker lifetime and read-ahead depth, set from this route's own
+        # measurement rather than from a general rule -- a deeper prefetch is
+        # the wrong call on a CPU-bound loader and the right one here.
+        #
+        # Job 12391962 sampled this route live: 11 workers and the consumer
+        # together burn 1.01 cores of the 12 allocated, the workers are busy
+        # ~9 % of wall each, and 98 % of what worker CPU there is sits inside
+        # a single `Dataset.get` -> `torch.load`.  This loader is latency-
+        # bound on the shard store, not CPU-bound.  That is the reverse of
+        # the CLIFF2 route, whose step profile puts the loader at 1.4 % of
+        # main-thread time and therefore has no read latency left to hide;
+        # the depth chosen below does not transfer between the two.
+        #
+        # With the defaults every epoch forks `num_workers` fresh processes,
+        # each re-importing torch and re-materialising its view of the store
+        # before the first batch can land -- paid twice per epoch, train and
+        # validation.  The shm watcher in the same job shows exactly that as a
+        # sawtooth: live /dev/shm segments climb to ~217 inside an epoch and
+        # return to zero at every boundary.
+        #
+        # That boundary is also where every observed
+        #     RuntimeError: unable to allocate shared memory(shm) ... (11)
+        # in this route has fired -- in a worker's `_feed` on the first batch
+        # of a new epoch, at W=2, W=7 and W=11 alike, with 188 GB of /dev/shm
+        # free and 677 segments live at the instant of the failure.  It is the
+        # respawn burst that is being refused, not any ceiling.  Keeping the
+        # cohort alive deletes the burst.
+        #
+        # `prefetch_factor` stays at torch's default here and is opt-in only:
+        # a deeper queue is the right lever for a latency-bound loader, but it
+        # multiplies in-flight segments per worker, and until an arm has run
+        # with `persistent_workers` alone the two changes would be confounded.
+        train_sampler = _build_shard_block_sampler(
+            self, train_dataset, batch_size=batch_size, num_workers=num_workers
+        )
+
+        loader_kwargs = {}
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            prefetch = getattr(self, "dataloader_prefetch_factor", None)
+            if prefetch:
+                loader_kwargs["prefetch_factor"] = int(prefetch)
+
         train_loader = APNet2_fused_DataLoader(
             dataset=train_dataset,
             batch_size=batch_size,
-            shuffle=True,
-            # shuffle=False,
+            shuffle=train_sampler is None,
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=collate_fn,
+            sampler=train_sampler,
+            **loader_kwargs,
         )
         test_loader = APNet2_fused_DataLoader(
             dataset=test_dataset,
@@ -3018,6 +3222,7 @@ units angstrom
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=collate_fn,
+            **loader_kwargs,
         )
 
         # (3) Optim/Scheduler
@@ -3133,6 +3338,15 @@ units angstrom
         lowest_test_loss = test_loss
         model_saved = False
         for epoch in range(n_epochs):
+            # Re-draw which shards share a block, so a dimer's batch-mates
+            # change from epoch to epoch instead of being frozen at the epoch-0
+            # permutation.  Guarded on the type on purpose: `DistributedSampler`
+            # has never had `set_epoch` called on this route either, and adding
+            # it here would silently change the sample order of every existing
+            # DDP chain.  That is a real defect but it is not this change's to
+            # make.
+            if isinstance(train_sampler, ShardBlockSampler):
+                train_sampler.set_epoch(epoch)
             t1 = time.time()
             t_out = __train_batch(
                 train_loader,
@@ -3252,6 +3466,7 @@ units angstrom
         skip_compile=True,
         transfer_learning=False,
         include_total_mse=False,
+        shard_locality_block_shards=0,
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
         _tracker_event_directory=None,
@@ -3316,6 +3531,11 @@ units angstrom
         print(f"  {lr_decay=}\n", flush=True)
         print(f"  {end_lr=}\n", flush=True)
         print(f"  {include_total_mse=}\n", flush=True)
+        # Read back off `self` by both training paths.  `ddp_train` is handed
+        # to `mp.spawn` as a bound method, so `self` is pickled to every rank
+        # and this travels with it -- no signature change on either worker.
+        self.shard_locality_block_shards = int(shard_locality_block_shards or 0)
+        print(f"  {shard_locality_block_shards=}", flush=True)
         print(f"  {batch_size=}", flush=True)
 
         if self.device.type == "cuda":
@@ -3340,6 +3560,7 @@ units angstrom
             "training/skip_compile": skip_compile,
             "training/transfer_learning": transfer_learning,
             "training/include_total_mse": include_total_mse,
+            "training/shard_locality_block_shards": self.shard_locality_block_shards,
         }
         if world_size > 1:
             print("Running multi-process training", flush=True)
