@@ -650,13 +650,54 @@ DAPNET2_PRETRAINED_MODEL_FILENAMES = [
 ]
 
 
-def dapnet2_levels_of_theory_pretrained():
+_DAPNET2_BASIS_NAMES = (
+    "aug-cc-pVDTZ",
+    "aug-cc-pVTQZ",
+    "aug-cc-pVDZ",
+    "aug-cc-pVTZ",
+    "aug-cc-pVQZ",
+    "jun-cc-pVDZ",
+    "cc-pVQZ",
+)
+_DAPNET2_CP_LABELS = ("unCP", "CP", "SA")
+_DAPNET2_TARGET_SUFFIX = f"_{clean_str_for_filename('CCSD(T)/CBS/CP')}.pt"
+
+
+def _decode_dapnet2_method(method: str) -> str:
+    return method.replace("_LP_", "(").replace("_RP_", ")")
+
+
+def _format_dapnet2_level_of_theory(filename: str) -> str:
+    level = filename.removesuffix(_DAPNET2_TARGET_SUFFIX)
+    if level.endswith("_adz"):
+        return f"{_decode_dapnet2_method(level.removesuffix('_adz'))}/adz"
+
+    for basis in _DAPNET2_BASIS_NAMES:
+        basis_start = level.rfind(basis)
+        if basis_start < 1:
+            continue
+        cp_label = level[basis_start + len(basis) :]
+        if cp_label in _DAPNET2_CP_LABELS:
+            method = _decode_dapnet2_method(level[:basis_start])
+            return f"{method}/{basis}/{cp_label}"
+
+    raise ValueError(f"Cannot parse dAPNet2 level from checkpoint {filename!r}")
+
+
+DAPNET2_PRETRAINED_LEVELS = {
+    _format_dapnet2_level_of_theory(name): name
+    for name in DAPNET2_PRETRAINED_MODEL_FILENAMES
+}
+
+
+def dapnet2_levels_of_theory_pretrained() -> list[str]:
+    """Return user-facing source levels with pretrained dAPNet2 models.
+
+    Each value uses ``method/basis/correction`` notation and can be passed
+    directly as ``m1`` to :func:`dapnet2_model_predict`. All models predict a
+    correction to ``CCSD(T)/CBS/CP``.
     """
-    Returns a list of possible m1 levels of theory with pretrained dAPNet2
-    models. These pretrained models predict E=(m1-CCSD(T)/CBS/CP).
-    """
-    target = f"_{clean_str_for_filename('CCSD(T)/CBS/CP')}.pt"
-    return [name.removesuffix(target) for name in DAPNET2_PRETRAINED_MODEL_FILENAMES]
+    return list(DAPNET2_PRETRAINED_LEVELS)
 
 
 def _resolve_dapnet2_pretrained_path(m1: str, m2: str) -> str:
@@ -667,9 +708,10 @@ def _resolve_dapnet2_pretrained_path(m1: str, m2: str) -> str:
         f"dapnet2/{m1_clean}_{m2_clean}.pt",
     ]
     rel_paths.extend(
-        f"dapnet2/{name}"
-        for name in DAPNET2_PRETRAINED_MODEL_FILENAMES
-        if name == f"{m1_clean}_{m2_clean}.pt"
+        f"dapnet2/{filename}"
+        for level, filename in DAPNET2_PRETRAINED_LEVELS.items()
+        if m1 == level
+        or m1_clean == filename.removesuffix(_DAPNET2_TARGET_SUFFIX)
     )
 
     errors = []

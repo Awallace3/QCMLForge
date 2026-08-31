@@ -104,6 +104,29 @@ def test_dapnet2_architecture():
     print(output)
     assert np.allclose(output[0], target_energies, atol=1e-6)
 
+def test_dapnet2_pretrained_levels_are_user_facing():
+    levels = apnet_pt.pretrained_models.dapnet2_levels_of_theory_pretrained()
+
+    assert len(levels) == len(set(levels)) == 80
+    assert all("/" in level for level in levels)
+    assert "B3LYP-D3/aug-cc-pVTZ/CP" in levels
+    assert "SAPT0/aug-cc-pVDZ/SA" in levels
+    assert "CCSD(T)-F12a/aug-cc-pVDZ/CP" in levels
+    assert "B3LYP-D3BJ/adz" in levels
+
+
+@pytest.mark.pretrained_models("dapnet2")
+def test_dapnet2_adz_level_resolves_from_user_facing_name():
+    model_path = apnet_pt.pretrained_models._resolve_dapnet2_pretrained_path(
+        "B3LYP-D3BJ/adz",
+        "CCSD(T)/CBS/CP",
+    )
+
+    assert model_path.endswith(
+        "dapnet2/B3LYP-D3BJ_adz_CCSD_LP_T_RP_CBSCP.pt"
+    )
+
+
 # This test intentionally exercises the public Hugging Face inference path.
 # dAPNet2 uses a dedicated AM/APNet2 backbone matching the one used during
 # correction-model training; the regular APNet2 ensemble remains unchanged.
