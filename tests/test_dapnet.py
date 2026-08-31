@@ -104,16 +104,9 @@ def test_dapnet2_architecture():
     print(output)
     assert np.allclose(output[0], target_energies, atol=1e-6)
 
-# This test does not explicitly select local models. It passes locally because
-# the uncommitted pretrained_models.py redirects dapnet2_model_predict() to:
-# /projects/cos-lab-cs207/ds/vlita3/projects/gits/QCMLForge/models/am_ensemble/am_0.pt
-# /projects/cos-lab-cs207/ds/vlita3/projects/gits/QCMLForge/models/ap2_ensemble_06_30_2025/ap2_0.pt
-# /projects/cos-lab-cs207/ds/vlita3/projects/gits/AI4Science_QC/qcml_models/dap2
-# The test checks the public inference path indirectly through its numerical
-# output. CI falls back to Hugging Face, so it will fail with the current
-# backbone and pass after the Hugging Face models are updated. Selecting these
-# workstation-specific paths in the test would keep CI failing after that
-# update because the local files are unavailable there.
+# This test intentionally exercises the public Hugging Face inference path.
+# dAPNet2 uses a dedicated AM/APNet2 backbone matching the one used during
+# correction-model training; the regular APNet2 ensemble remains unchanged.
 @pytest.mark.parametrize(
     ("m1", "ref"),
     [

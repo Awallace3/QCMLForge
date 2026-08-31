@@ -17,6 +17,10 @@ from . import atomic_datasets
 # model_dir = os.path.dirname(os.path.realpath(__file__)) + "/models/"
 model_dir = resources.files("apnet_pt").joinpath("models")
 HF_REPO_ID = "awallace3/qcmlforge"
+DAPNET2_BACKBONE_PATHS = {
+    "atom": "dapnet2/backbone/am_0.pt",
+    "apnet2": "dapnet2/backbone/ap2_0.pt",
+}
 _DOWNLOAD_APPROVED = None
 LOGGER = logging.getLogger(__name__)
 
@@ -692,19 +696,21 @@ def dapnet2_model_predict(
     use_GPU: bool = None,
 ) -> np.ndarray:
     base_model_paths = _resolve_pretrained_paths(
-        ["am_ensemble/am_0.pt", "ap2_ensemble/ap2_0.pt"]
+        list(DAPNET2_BACKBONE_PATHS.values())
     )
+    atom_model_path = base_model_paths[DAPNET2_BACKBONE_PATHS["atom"]]
+    apnet2_model_path = base_model_paths[DAPNET2_BACKBONE_PATHS["apnet2"]]
     atom_model = AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
         ignore_database_null=True,
         use_GPU=use_GPU,
-    ).set_pretrained_model(model_path=base_model_paths["am_ensemble/am_0.pt"])
+    ).set_pretrained_model(model_path=atom_model_path)
     apnet2 = AtomPairwiseModels.apnet2.APNet2Model(
         atom_model=atom_model.model,
         use_GPU=use_GPU,
     ).set_pretrained_model(
-        ap2_model_path=base_model_paths["ap2_ensemble/ap2_0.pt"],
-        am_model_path=base_model_paths["am_ensemble/am_0.pt"],
+        ap2_model_path=apnet2_model_path,
+        am_model_path=atom_model_path,
     )
     apnet2.model.return_hidden_states = True
     if pre_trained_model_path is None:
