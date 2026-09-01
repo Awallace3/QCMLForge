@@ -447,6 +447,18 @@ def train_pairwise_model(
     else:
         pretrained_model = None
         print("\nTraining from scratch...\n")
+    if (
+        is_rackers_model
+        and freeze_atom_model
+        and atom_type_param_model_path is None
+        and pretrained_model is None
+        and not build_dataset_only
+    ):
+        raise ValueError(
+            "Frozen fresh Rackers training requires "
+            "atom_type_param_model_path; pass --unfreeze_atom_model to "
+            "train the nested model from scratch"
+        )
     if is_rackers_model:
         atom_type_hf_vw_model = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
             ds_root=None,

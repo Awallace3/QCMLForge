@@ -222,8 +222,12 @@ class DimerProp(nn.Module):
         parameters_B = output_B[-1]
         hfvr_A = torch.abs(output_A[-2][:, 0])
         hfvr_B = torch.abs(output_B[-2][:, 0])
-        valence_widths_A = output_A[-2][:, 1]
-        valence_widths_B = output_B[-2][:, 1]
+        valence_widths_A = torch.abs(output_A[-2][:, 1]).clamp_min(
+            RACKERS_POSITIVITY_EPSILON
+        )
+        valence_widths_B = torch.abs(output_B[-2][:, 1]).clamp_min(
+            RACKERS_POSITIVITY_EPSILON
+        )
 
         if self.elst_damping_type == "AMOEBA":
             damping_fn = mtp_elst_damping_AMOEBA
@@ -2377,6 +2381,12 @@ def rackers_thole_induction(
         polarized itself; see :func:`_rackers_initial_permanent_fields`.
     """
     del quadA, quadB
+    if include_overlap and not torch.compiler.is_compiling():
+        valence_widths = torch.cat((valence_widths_A, valence_widths_B))
+        if not bool(torch.isfinite(valence_widths).all()):
+            raise ValueError("valence widths must be finite")
+        if not bool((valence_widths > 0).all()):
+            raise ValueError("valence widths must be positive")
     polarizability_table = _polarizability_table_on_device(
         polarizability_table,
         ZA.device,
@@ -2526,6 +2536,7 @@ def rackers_thole_induction(
         mutual_tensors_AA[4],
         mutual_tensors_BB[4],
     )
+    converged = False
     for _ in range(max_iterations):
         # No clone: the iterates are rebound, never written through.
         mu_induced_A_old = mu_induced_A
@@ -2556,7 +2567,13 @@ def rackers_thole_induction(
             torch.norm(mu_induced_B - mu_induced_B_old),
         )
         if bool(scf_residual < convergence_threshold):
+            converged = True
             break
+    if not converged:
+        raise RuntimeError(
+            f"Rackers induction SCF failed to converge in {max_iterations} "
+            "iterations"
+        )
 
     qA_source = qA.reshape(-1).index_select(0, e_AB_source)
     qB_target = qB.reshape(-1).index_select(0, e_AB_target)

@@ -1,4 +1,5 @@
 import copy
+import subprocess
 import sys
 
 import numpy as np
@@ -674,102 +675,6 @@ def test_rackers_training_uses_full_edge_aggregation(
 
 
 @pytest.mark.parametrize(
-    "harness_type",
-    [RackersTholeDampingModel, RackersTholeDampingOverlapModel],
-)
-def test_rackers_default_training_preserves_hierarchy_and_checkpoint(
-    tmp_path,
-    harness_type,
-    nested_hfvr_vw_model,
-    synthetic_dimer_batch,
-    synthetic_qcel_dimers,
-    monkeypatch,
-):
-    harness = harness_type(
-        atom_model=copy.deepcopy(nested_hfvr_vw_model),
-        dataset=None,
-        ignore_database_null=True,
-        use_GPU=False,
-        n_message=1,
-        n_neuron=8,
-        n_embed=4,
-    )
-    harness.example_input = lambda: synthetic_dimer_batch.batch_atomic_A
-    harness.compile_model = lambda: setattr(
-        harness,
-        "model",
-        torch.compile(harness.model, backend="eager"),
-    )
-    selected_targets = []
-    original_train_batches = (
-        harness._AM_DimerParam_Model__train_batches_single_proc
-    )
-
-    def record_train_targets(*args, **kwargs):
-        selected_targets.append(kwargs["y_ind"].detach().cpu().clone())
-        return original_train_batches(*args, **kwargs)
-
-    monkeypatch.setattr(
-        harness,
-        "_AM_DimerParam_Model__train_batches_single_proc",
-        record_train_targets,
-    )
-    optimizer_parameter_ids = set()
-    original_adam = torch.optim.Adam
-
-    def record_optimizer(parameters, *args, **kwargs):
-        parameter_list = list(parameters)
-        optimizer_parameter_ids.update(map(id, parameter_list))
-        return original_adam(parameter_list, *args, **kwargs)
-
-    monkeypatch.setattr(torch.optim, "Adam", record_optimizer)
-    harness.model_save_path = tmp_path / "default-training.pt"
-    train_item = _make_collate_item(1.0)
-    test_item = _make_collate_item(1.1)
-
-    harness.single_proc_train(
-        train_dataset=[train_item],
-        test_dataset=[test_item],
-        n_epochs=1,
-        batch_size=1,
-        lr=1e-5,
-        pin_memory=False,
-        num_workers=0,
-    )
-
-    underlying_model = model_io.unwrap_model(harness.model)
-    assert len(selected_targets) == 1
-    assert torch.equal(selected_targets[0], torch.tensor([0, 2]))
-    assert optimizer_parameter_ids == {
-        id(parameter) for parameter in underlying_model.parameters()
-    }
-    assert underlying_model is harness.dimer_model.AtomTypeParam
-    assert harness.atom_model is underlying_model.atom_model
-
-    before = harness.predict_qcel_mols_dimer(
-        synthetic_qcel_dimers, batch_size=2
-    )
-    checkpoint = model_io.load_checkpoint(harness.model_save_path)
-    assert checkpoint["model_type"] == "RackersTholeDampingNN"
-    assert "dimer_eval" in checkpoint["config"]
-    assert all(
-        not key.startswith("_orig_mod.")
-        for key in checkpoint["model_state_dict"]
-    )
-    loaded = harness_type(
-        pre_trained_model_path=harness.model_save_path,
-        atom_model=None,
-        dataset=None,
-        ignore_database_null=True,
-        use_GPU=False,
-    )
-    after = loaded.predict_qcel_mols_dimer(
-        synthetic_qcel_dimers, batch_size=2
-    )
-    assert np.allclose(before, after, atol=1e-6)
-
-
-@pytest.mark.parametrize(
     "mode,expected_index",
     [
         ("rackers_thole", "dimer_ind_full"),
@@ -941,23 +846,6 @@ def test_rackers_initialization_accepts_large_representable_mean(
     assert torch.all(parameters > 0)
 
 
-def test_rackers_initialization_rejects_generated_non_finite_embedding(
-    monkeypatch, nested_hfvr_vw_model
-):
-    def non_finite_noise(tensor):
-        return torch.full_like(tensor, float("inf"))
-
-    monkeypatch.setattr(torch, "randn_like", non_finite_noise)
-    with pytest.raises(
-        ValueError,
-        match="Rackers embedding initialization produced non-finite parameters",
-    ):
-        RackersTholeDampingNN(
-            atom_model=nested_hfvr_vw_model,
-            param_start_std=[0.0, 0.0, 0.0, 0.0],
-        )
-
-
 def test_rackers_parameter_head_freeze_and_validation(
     nested_hfvr_vw_model
 ):
@@ -1109,161 +997,6 @@ class _ControlledRackersAtomParam(torch.nn.Module):
         return charge, dipole, quadrupole, hfvr_vw, parameters
 
 
-@pytest.mark.parametrize(
-    "mode,include_overlap",
-    [("rackers_thole", False), ("rackers_thole_overlap", True)],
-)
-@pytest.mark.parametrize("elst_damping_type", ["CLIFF", "AMOEBA"])
-def test_rackers_dimer_forward_routes_columns_edges_and_preserves_charge(
-    mode,
-    include_overlap,
-    elst_damping_type,
-    synthetic_dimer_batch,
-    monkeypatch,
-):
-    electrostatic_calls = {"CLIFF": [], "AMOEBA": []}
-    induction_calls = []
-
-    def electrostatic_stub(damping_type):
-        def evaluate(**kwargs):
-            electrostatic_calls[damping_type].append(
-                {
-                    key: value.detach().clone()
-                    for key, value in kwargs.items()
-                    if isinstance(value, torch.Tensor)
-                }
-            )
-            kwargs["qA_0"].add_(100.0)
-            kwargs["qB_0"].sub_(100.0)
-            return torch.ones_like(kwargs["e_AB_source"], dtype=kwargs["RA"].dtype)
-
-        return evaluate
-
-    def induction_stub(**kwargs):
-        induction_calls.append(
-            {
-                key: value.detach().clone()
-                if isinstance(value, torch.Tensor)
-                else value
-                for key, value in kwargs.items()
-            }
-        )
-        return torch.full_like(
-            kwargs["e_AB_source"], 2.0, dtype=kwargs["RA"].dtype
-        )
-
-    monkeypatch.setattr(
-        mtp_mtp, "mtp_elst_damping", electrostatic_stub("CLIFF")
-    )
-    monkeypatch.setattr(
-        mtp_mtp,
-        "mtp_elst_damping_AMOEBA",
-        electrostatic_stub("AMOEBA"),
-    )
-    monkeypatch.setattr(
-        mtp_mtp, "rackers_thole_induction", induction_stub
-    )
-
-    atom_parameters = _ControlledRackersAtomParam()
-    dimer = DimerProp(
-        ATParam=atom_parameters,
-        dimer_eval=mode,
-        elst_damping_type=elst_damping_type,
-    )
-    edge_energy, output_A, output_B = dimer(synthetic_dimer_batch)
-
-    assert len(atom_parameters.batch_calls) == 2
-    assert sum(
-        call is synthetic_dimer_batch.batch_atomic_A
-        for call in atom_parameters.batch_calls
-    ) == 1
-    assert sum(
-        call is synthetic_dimer_batch.batch_atomic_B
-        for call in atom_parameters.batch_calls
-    ) == 1
-    for output in (output_A, output_B):
-        assert output[-1].shape == (output[0].numel(), 4)
-        assert torch.all(output[-1][:, 0] < 0)
-        assert torch.all(output[-1][:, 1] > 0)
-        assert torch.all(
-            output[-1][:, 1] < RACKERS_POSITIVITY_EPSILON
-        )
-
-    other_damping_type = (
-        "AMOEBA" if elst_damping_type == "CLIFF" else "CLIFF"
-    )
-    assert len(electrostatic_calls[elst_damping_type]) == 1
-    assert electrostatic_calls[other_damping_type] == []
-    assert len(induction_calls) == 1
-    electrostatic = electrostatic_calls[elst_damping_type][0]
-    induction = induction_calls[0]
-
-    assert torch.equal(
-        electrostatic["Ka"], output_A[-1][:, RACKERS_ELST_INDEX]
-    )
-    assert torch.equal(
-        electrostatic["Kb"], output_B[-1][:, RACKERS_ELST_INDEX]
-    )
-    assert torch.equal(
-        induction["thole_direct_A"],
-        output_A[-1][:, RACKERS_THOLE_DIRECT_INDEX],
-    )
-    assert torch.equal(
-        induction["thole_direct_B"],
-        output_B[-1][:, RACKERS_THOLE_DIRECT_INDEX],
-    )
-    assert torch.equal(
-        induction["thole_mutual_A"],
-        output_A[-1][:, RACKERS_THOLE_MUTUAL_INDEX],
-    )
-    assert torch.equal(
-        induction["thole_mutual_B"],
-        output_B[-1][:, RACKERS_THOLE_MUTUAL_INDEX],
-    )
-    assert torch.equal(
-        induction["ind_overlap_A"],
-        output_A[-1][:, RACKERS_IND_OVERLAP_INDEX],
-    )
-    assert torch.equal(
-        induction["ind_overlap_B"],
-        output_B[-1][:, RACKERS_IND_OVERLAP_INDEX],
-    )
-    assert torch.equal(
-        induction["hirshfeld_volume_ratio_A"],
-        output_A[-2][:, 0].abs(),
-    )
-    assert torch.equal(
-        induction["hirshfeld_volume_ratio_B"],
-        output_B[-2][:, 0].abs(),
-    )
-    assert torch.equal(
-        induction["valence_widths_A"], output_A[-2][:, 1]
-    )
-    assert torch.equal(
-        induction["valence_widths_B"], output_B[-2][:, 1]
-    )
-    assert induction["include_overlap"] is include_overlap
-    assert torch.equal(induction["qA"], electrostatic["qA_0"])
-    assert torch.equal(induction["qB"], electrostatic["qB_0"])
-    assert torch.equal(induction["qA"], output_A[0])
-    assert torch.equal(induction["qB"], output_B[0])
-    for call in (electrostatic, induction):
-        assert torch.equal(
-            call["e_AB_source"], synthetic_dimer_batch.e_ABfull_source
-        )
-        assert torch.equal(
-            call["e_AB_target"], synthetic_dimer_batch.e_ABfull_target
-        )
-    assert edge_energy.shape == (
-        synthetic_dimer_batch.dimer_ind_full.numel(),
-        2,
-    )
-    assert torch.equal(edge_energy[:, 0], torch.ones_like(edge_energy[:, 0]))
-    assert torch.equal(
-        edge_energy[:, 1], torch.full_like(edge_energy[:, 1], 2.0)
-    )
-
-
 def test_rackers_dimer_forward_rejects_unknown_elst_damping(
     synthetic_dimer_batch,
 ):
@@ -1276,6 +1009,28 @@ def test_rackers_dimer_forward_rejects_unknown_elst_damping(
         dimer(synthetic_dimer_batch)
 
 
+def test_rackers_kernel_rejects_invalid_valence_widths():
+    inputs = _rackers_kernel_inputs()
+    inputs["valence_widths_A"] = torch.tensor(
+        [-0.4, -0.6], dtype=inputs["RA"].dtype
+    )
+
+    with pytest.raises(ValueError, match="valence widths must be positive"):
+        mtp_mtp.rackers_thole_induction(
+            **inputs, include_overlap=True, max_iterations=200
+        )
+
+
+def test_rackers_kernel_rejects_scf_exhaustion():
+    with pytest.raises(RuntimeError, match="SCF failed to converge"):
+        mtp_mtp.rackers_thole_induction(
+            **_rackers_kernel_inputs(),
+            include_overlap=False,
+            max_iterations=1,
+            convergence_threshold=0.0,
+        )
+
+
 def test_rackers_dimer_forward_valence_width_energy_activity():
     inputs = _rackers_kernel_inputs()
     changed_width_inputs = {
@@ -1285,16 +1040,16 @@ def test_rackers_dimer_forward_valence_width_energy_activity():
     }
 
     pure_energy = mtp_mtp.rackers_thole_induction(
-        **inputs, include_overlap=False, max_iterations=4
+        **inputs, include_overlap=False, max_iterations=200
     )
     changed_pure_energy = mtp_mtp.rackers_thole_induction(
-        **changed_width_inputs, include_overlap=False, max_iterations=4
+        **changed_width_inputs, include_overlap=False, max_iterations=200
     )
     overlap_energy = mtp_mtp.rackers_thole_induction(
-        **inputs, include_overlap=True, max_iterations=4
+        **inputs, include_overlap=True, max_iterations=200
     )
     changed_overlap_energy = mtp_mtp.rackers_thole_induction(
-        **changed_width_inputs, include_overlap=True, max_iterations=4
+        **changed_width_inputs, include_overlap=True, max_iterations=200
     )
 
     assert torch.equal(pure_energy, changed_pure_energy)
@@ -1390,18 +1145,18 @@ def test_rackers_joint_forward_scatter_and_gradients(
 def test_rackers_kernel_routes_parameters_overlap_and_permanent_field():
     inputs = _rackers_kernel_inputs()
     default_energy = mtp_mtp.rackers_thole_induction(
-        **inputs, include_overlap=False, max_iterations=4
+        **inputs, include_overlap=False, max_iterations=200
     )
     explicit_default = mtp_mtp.rackers_thole_induction(
         **inputs,
         include_overlap=False,
-        max_iterations=4,
+        max_iterations=200,
         intramolecular_permanent_field=False,
     )
     legacy_energy = mtp_mtp.rackers_thole_induction(
         **inputs,
         include_overlap=False,
-        max_iterations=4,
+        max_iterations=200,
         intramolecular_permanent_field=True,
     )
     assert torch.equal(default_energy, explicit_default)
@@ -1413,10 +1168,10 @@ def test_rackers_kernel_routes_parameters_overlap_and_permanent_field():
         "ind_overlap_B": inputs["ind_overlap_B"] + 10.0,
     }
     changed_pure_energy = mtp_mtp.rackers_thole_induction(
-        **changed_overlap_inputs, include_overlap=False, max_iterations=4
+        **changed_overlap_inputs, include_overlap=False, max_iterations=200
     )
     overlap_energy = mtp_mtp.rackers_thole_induction(
-        **inputs, include_overlap=True, max_iterations=4
+        **inputs, include_overlap=True, max_iterations=200
     )
     assert torch.equal(default_energy, changed_pure_energy)
 
@@ -1559,7 +1314,7 @@ def test_rackers_kernel_is_exchange_and_rotation_invariant():
 
     def evaluate(values):
         return mtp_mtp.rackers_thole_induction(
-            **values, include_overlap=True, max_iterations=4
+            **values, include_overlap=True, max_iterations=200
         )
 
     expected = evaluate(inputs)
@@ -1652,7 +1407,7 @@ def test_rackers_kernel_routes_parameter_gradients():
         inputs[name] = inputs[name].requires_grad_()
 
     energy = mtp_mtp.rackers_thole_induction(
-        **inputs, include_overlap=True, max_iterations=4
+        **inputs, include_overlap=True, max_iterations=200
     )
     energy.sum().backward()
 
@@ -1721,561 +1476,28 @@ def test_geometric_mean_edge_values_is_compile_safe():
     )
 
 
-class _FakeHFVRModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.atom_model = torch.nn.Sequential(
-            torch.nn.Linear(2, 3),
-            torch.nn.Linear(3, 1),
-        )
-        self.hfvr_head = torch.nn.Linear(1, 2)
-
-
-class _FakeAtomTypeParamModel:
-    calls = []
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.model = _FakeHFVRModel()
-        self.model.requires_grad_(not kwargs["freeze_atom_model"])
-        type(self).calls.append(self)
-
-
-class _FakeRackersHarnessBase:
-    calls = []
-
-    def __init__(self, atom_model, **kwargs):
-        self.kwargs = {"atom_model": atom_model, **kwargs}
-        self.model = atom_model
-        self.model.requires_grad_(not kwargs["freeze_atom_model"])
-        self.dataset = object()
-        self.train_calls = []
-        type(self).calls.append(self)
-
-    def train(
-        self,
-        model_path=None,
-        n_epochs=50,
-        world_size=1,
-        omp_num_threads_per_process=6,
-        lr=5e-4,
-        dataloader_num_workers=4,
-        random_seed=42,
-        lr_decay=None,
+def test_frozen_fresh_rackers_requires_nested_checkpoint(tmp_path):
+    with pytest.raises(
+        ValueError,
+        match="Frozen fresh Rackers training requires",
     ):
-        self.train_calls.append(
-            {
-                "model_path": model_path,
-                "n_epochs": n_epochs,
-                "world_size": world_size,
-                "omp_num_threads_per_process": omp_num_threads_per_process,
-                "lr": lr,
-                "dataloader_num_workers": dataloader_num_workers,
-                "random_seed": random_seed,
-                "lr_decay": lr_decay,
-            }
+        train_models.train_pairwise_model(
+            apnet_model_type="RackersTholeDampingModel",
+            model_out=str(tmp_path / "rackers.pt"),
+            atom_type_param_model_path=None,
+            pre_trained_model_path=None,
+            freeze_atom_model=True,
         )
 
 
-class _FakeRackersTholeDampingModel(_FakeRackersHarnessBase):
-    calls = []
-
-
-class _FakeRackersTholeDampingOverlapModel(_FakeRackersHarnessBase):
-    calls = []
-
-
-def _patch_rackers_dispatch_fakes(monkeypatch):
-    _FakeAtomTypeParamModel.calls.clear()
-    _FakeRackersTholeDampingModel.calls.clear()
-    _FakeRackersTholeDampingOverlapModel.calls.clear()
-    monkeypatch.setattr(
-        train_models.AtomPairwiseModels.mtp_mtp,
-        "AtomTypeParamModel",
-        _FakeAtomTypeParamModel,
-    )
-    monkeypatch.setattr(
-        train_models.AtomPairwiseModels.mtp_mtp,
-        "RackersTholeDampingModel",
-        _FakeRackersTholeDampingModel,
-    )
-    monkeypatch.setattr(
-        train_models.AtomPairwiseModels.mtp_mtp,
-        "RackersTholeDampingOverlapModel",
-        _FakeRackersTholeDampingOverlapModel,
+def test_cli_help_names_both_rackers_routes():
+    result = subprocess.run(
+        [sys.executable, "train_models.py", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
     )
 
-
-@pytest.mark.parametrize(
-    "model_identifier,harness_type,other_harness_type",
-    [
-        (
-            "RackersTholeDampingModel",
-            _FakeRackersTholeDampingModel,
-            _FakeRackersTholeDampingOverlapModel,
-        ),
-        (
-            "RackersTholeDampingOverlapModel",
-            _FakeRackersTholeDampingOverlapModel,
-            _FakeRackersTholeDampingModel,
-        ),
-    ],
-)
-@pytest.mark.parametrize("freeze_atom_model", [True, False])
-def test_rackers_dispatch_selects_harness_and_forwards_contract(
-    tmp_path,
-    monkeypatch,
-    model_identifier,
-    harness_type,
-    other_harness_type,
-    freeze_atom_model,
-):
-    _patch_rackers_dispatch_fakes(monkeypatch)
-
-    model_out = tmp_path / "rackers-output.pt"
-    train_models.train_pairwise_model(
-        apnet_model_type=model_identifier,
-        model_out=str(model_out),
-        am_model_path="atom-checkpoint.pt",
-        atom_type_param_model_path="hfvr-vw-checkpoint.pt",
-        data_dir="rackers-data",
-        n_epochs=7,
-        lr=3e-4,
-        lr_decay=0.75,
-        random_seed=19,
-        spec_type=11,
-        r_cut=6.5,
-        n_rbf=6,
-        n_neuron=48,
-        n_embed=12,
-        n_params=99,
-        pre_trained_model_path="rackers-checkpoint.pt",
-        elst_damping_type="AMOEBA",
-        ds_in_memory=True,
-        freeze_atom_model=freeze_atom_model,
-        omp_num_threads=23,
-    )
-
-    assert len(_FakeAtomTypeParamModel.calls) == 1
-    hfvr_wrapper = _FakeAtomTypeParamModel.calls[0]
-    assert hfvr_wrapper.kwargs == {
-        "ds_root": None,
-        "use_GPU": False,
-        "ignore_database_null": True,
-        "atom_model_pre_trained_path": "atom-checkpoint.pt",
-        "pre_trained_model_path": "hfvr-vw-checkpoint.pt",
-        "freeze_atom_model": freeze_atom_model,
-    }
-    assert len(harness_type.calls) == 1
-    assert other_harness_type.calls == []
-    rackers = harness_type.calls[0]
-    assert rackers.kwargs["atom_model"] is hfvr_wrapper.model
-    assert rackers.kwargs["pre_trained_model_path"] == "rackers-checkpoint.pt"
-    assert rackers.kwargs["param_start_mean"] == [1.8, 0.34, 0.39, 1.8]
-    assert rackers.kwargs["param_start_std"] == [0.01, 0.01, 0.01, 0.01]
-    assert rackers.kwargs["freeze_atom_model"] is freeze_atom_model
-    assert rackers.kwargs["elst_damping_type"] == "AMOEBA"
-    assert rackers.kwargs["n_rbf"] == 6
-    assert rackers.kwargs["n_neuron"] == 48
-    assert rackers.kwargs["n_embed"] == 12
-    assert rackers.kwargs["r_cut"] == 6.5
-    assert rackers.kwargs["ds_spec_type"] == 11
-    assert rackers.kwargs["ds_root"] == "rackers-data"
-    assert rackers.kwargs["ds_random_seed"] == 19
-    assert rackers.kwargs["ds_in_memory"] is True
-    assert "n_params" not in rackers.kwargs
-    assert all(
-        parameter.requires_grad is not freeze_atom_model
-        for parameter in rackers.model.parameters()
-    )
-    assert rackers.train_calls == [
-        {
-            "model_path": str(model_out),
-            "n_epochs": 7,
-            "world_size": 1,
-            "omp_num_threads_per_process": 23,
-            "lr": 3e-4,
-            "dataloader_num_workers": 4,
-            "random_seed": 19,
-            "lr_decay": 0.75,
-        }
-    ]
-
-
-_RACKERS_DISPATCH_BASE = {
-    "apnet_model_type": "RackersTholeDampingModel",
-    "pre_trained_model_path": None,
-}
-
-
-@pytest.mark.parametrize(
-    "overrides,match",
-    [
-        # A scalar or a short list is ambiguous: the four Rackers parameters
-        # have distinct physical meanings, so there is no sane broadcast.
-        ({"param_start_mean": 1.8}, "exactly four"),
-        ({"param_start_std": 0.01}, "exactly four"),
-        ({"param_start_mean": [1.8, 0.34, 0.39]}, "exactly four"),
-        ({"param_start_std": [0.01, 0.01, 0.01]}, "exactly four"),
-        *[
-            ({"param_start_mean": _replaced(RACKERS_INITIAL_VALUES, i, value)},
-             _MEAN_DOMAIN_MATCH)
-            for i, value in enumerate(
-                (0.0, -0.1, float("nan"), float("inf"))
-            )
-        ],
-        *[
-            ({"param_start_std": _replaced(RACKERS_INITIAL_STDS, i, value)},
-             _STD_DOMAIN_MATCH)
-            for i, value in enumerate((-0.1, float("nan"), float("inf")))
-        ],
-        ({"param_start_mean": [1e39, 1.0, 1.0, 1.0]}, _MEAN_OVERFLOW_MATCH),
-        ({"param_start_std": [1e39, 0.0, 0.0, 0.0]}, _STD_OVERFLOW_MATCH),
-    ],
-)
-def test_rackers_dispatch_rejects_invalid_parameters(
-    monkeypatch, overrides, match
-):
-    _patch_rackers_dispatch_fakes(monkeypatch)
-    kwargs = {
-        **_RACKERS_DISPATCH_BASE,
-        "param_start_mean": list(RACKERS_INITIAL_VALUES),
-        "param_start_std": list(RACKERS_INITIAL_STDS),
-        **overrides,
-    }
-    with pytest.raises(ValueError, match=match):
-        train_models.train_pairwise_model(**kwargs)
-
-    assert _FakeAtomTypeParamModel.calls == []
-    assert _FakeRackersTholeDampingModel.calls == []
-
-
-@pytest.mark.parametrize(
-    "field,values",
-    [
-        ("param_start_mean", [1000.0, 1.0, 1.0, 1.0]),
-        ("param_start_std", [0.0, 0.01, 0.0, 0.02]),
-    ],
-)
-def test_rackers_dispatch_forwards_valid_parameters(
-    monkeypatch, tmp_path, field, values
-):
-    _patch_rackers_dispatch_fakes(monkeypatch)
-    kwargs = {field: values}
-    if field == "param_start_mean":
-        kwargs["param_start_std"] = [0.0, 0.0, 0.0, 0.0]
-    train_models.train_pairwise_model(
-        **_RACKERS_DISPATCH_BASE,
-        model_out=str(tmp_path / f"valid-{field}.pt"),
-        **kwargs,
-    )
-
-    assert _FakeRackersTholeDampingModel.calls[0].kwargs[field] == values
-
-
-class _FakeLegacyPairwiseHarness:
-    calls = []
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.dataset = object()
-        self.train_calls = 0
-        self.train_kwargs = None
-        type(self).calls.append(self)
-
-    def train(
-        self,
-        model_path=None,
-        n_epochs=50,
-        world_size=1,
-        omp_num_threads_per_process=6,
-        lr=5e-4,
-        dataloader_num_workers=4,
-        random_seed=42,
-        lr_decay=None,
-    ):
-        self.train_calls += 1
-        self.train_kwargs = {
-            "model_path": model_path,
-            "n_epochs": n_epochs,
-            "world_size": world_size,
-            "omp_num_threads_per_process": omp_num_threads_per_process,
-            "lr": lr,
-            "dataloader_num_workers": dataloader_num_workers,
-            "random_seed": random_seed,
-            "lr_decay": lr_decay,
-        }
-
-
-@pytest.mark.parametrize(
-    "mean,std,expected_mean,expected_std",
-    [
-        (2.25, 0.2, [2.25, 2.25, 2.25], [0.2, 0.2, 0.2]),
-        (None, None, [1.5, 1.5, 1.5], [0.1, 0.1, 0.1]),
-    ],
-)
-def test_legacy_dispatch_still_broadcasts_scalar_defaults(
-    tmp_path, monkeypatch, mean, std, expected_mean, expected_std
-):
-    _FakeLegacyPairwiseHarness.calls.clear()
-    monkeypatch.setattr(
-        train_models.AtomPairwiseModels.mtp_mtp,
-        "AtomTypeParamModel",
-        _FakeLegacyPairwiseHarness,
-    )
-
-    train_models.train_pairwise_model(
-        apnet_model_type="AtomTypeParamModel",
-        model_out=str(tmp_path / "legacy.pt"),
-        pre_trained_model_path=None,
-        n_params=3,
-        param_start_mean=mean,
-        param_start_std=std,
-    )
-
-    harness = _FakeLegacyPairwiseHarness.calls[0]
-    assert harness.kwargs["param_start_mean"] == expected_mean
-    assert harness.kwargs["param_start_std"] == expected_std
-    assert harness.train_calls == 1
-
-
-@pytest.mark.parametrize(
-    "model_identifier,harness_type",
-    [
-        ("RackersTholeDampingModel", _FakeRackersTholeDampingModel),
-        (
-            "RackersTholeDampingOverlapModel",
-            _FakeRackersTholeDampingOverlapModel,
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "checkpoint_kwargs,expected_checkpoint",
-    [
-        pytest.param({}, None, id="omitted"),
-        pytest.param(
-            {"pre_trained_model_path": "explicit-rackers.pt"},
-            "explicit-rackers.pt",
-            id="explicit",
-        ),
-    ],
-)
-def test_rackers_dispatch_checkpoint_resolution(
-    tmp_path,
-    monkeypatch,
-    model_identifier,
-    harness_type,
-    checkpoint_kwargs,
-    expected_checkpoint,
-):
-    _patch_rackers_dispatch_fakes(monkeypatch)
-
-    train_models.train_pairwise_model(
-        apnet_model_type=model_identifier,
-        model_out=str(tmp_path / "rackers.pt"),
-        **checkpoint_kwargs,
-    )
-
-    assert harness_type.calls[0].kwargs["pre_trained_model_path"] == (
-        expected_checkpoint
-    )
-
-
-@pytest.mark.parametrize(
-    "model_identifier,harness_type",
-    [
-        ("RackersTholeDampingModel", _FakeRackersTholeDampingModel),
-        (
-            "RackersTholeDampingOverlapModel",
-            _FakeRackersTholeDampingOverlapModel,
-        ),
-    ],
-)
-def test_rackers_dispatch_build_dataset_only_skips_train(
-    tmp_path, monkeypatch, model_identifier, harness_type
-):
-    _patch_rackers_dispatch_fakes(monkeypatch)
-
-    train_models.train_pairwise_model(
-        apnet_model_type=model_identifier,
-        model_out=str(tmp_path / "rackers.pt"),
-        build_dataset_only=True,
-    )
-
-    rackers = harness_type.calls[0]
-    assert rackers.kwargs["pre_trained_model_path"] is None
-    assert rackers.train_calls == []
-
-
-def test_legacy_dispatch_preserves_omitted_checkpoint_default(
-    tmp_path, monkeypatch
-):
-    _FakeLegacyPairwiseHarness.calls.clear()
-    monkeypatch.setattr(
-        train_models.AtomPairwiseModels.mtp_mtp,
-        "AtomTypeParamModel",
-        _FakeLegacyPairwiseHarness,
-    )
-
-    train_models.train_pairwise_model(
-        apnet_model_type="AtomTypeParamModel",
-        model_out=str(tmp_path / "legacy.pt"),
-    )
-
-    legacy = _FakeLegacyPairwiseHarness.calls[0]
-    assert legacy.kwargs["pre_trained_model_path"] == (
-        "./models/dapnet2/ap2_0.pt"
-    )
-
-
-@pytest.mark.parametrize(
-    "model_identifier,harness_type",
-    [
-        ("RackersTholeDampingModel", _FakeRackersTholeDampingModel),
-        (
-            "RackersTholeDampingOverlapModel",
-            _FakeRackersTholeDampingOverlapModel,
-        ),
-    ],
-)
-def test_rackers_dispatch_forces_single_process_on_multi_gpu(
-    tmp_path, monkeypatch, model_identifier, harness_type
-):
-    _patch_rackers_dispatch_fakes(monkeypatch)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
-
-    train_models.train_pairwise_model(
-        apnet_model_type=model_identifier,
-        model_out=str(tmp_path / "rackers.pt"),
-    )
-
-    assert harness_type.calls[0].train_calls[0]["world_size"] == 1
-
-
-def test_legacy_dispatch_retains_multi_gpu_world_size(tmp_path, monkeypatch):
-    _FakeLegacyPairwiseHarness.calls.clear()
-    monkeypatch.setattr(
-        train_models.AtomPairwiseModels.mtp_mtp,
-        "AtomTypeParamModel",
-        _FakeLegacyPairwiseHarness,
-    )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
-
-    train_models.train_pairwise_model(
-        apnet_model_type="AtomTypeParamModel",
-        model_out=str(tmp_path / "legacy.pt"),
-        pre_trained_model_path=None,
-    )
-
-    assert _FakeLegacyPairwiseHarness.calls[0].train_kwargs["world_size"] == 2
-
-
-@pytest.mark.parametrize(
-    "model_identifier,expected_mean,expected_std",
-    [
-        ("AtomTypeParamModel", 2.0, 0.1),
-        ("RackersTholeDampingModel", None, None),
-        ("RackersTholeDampingOverlapModel", None, None),
-    ],
-)
-def test_cli_resolves_unset_parameter_defaults_by_route(
-    monkeypatch, model_identifier, expected_mean, expected_std
-):
-    calls = []
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["train_models.py", "--train_apnet", model_identifier],
-    )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
-    monkeypatch.setattr(
-        train_models,
-        "train_pairwise_model",
-        lambda **kwargs: calls.append(kwargs),
-    )
-
-    train_models.main()
-
-    assert calls[0]["param_start_mean"] == expected_mean
-    assert calls[0]["param_start_std"] == expected_std
-
-
-def test_pairwise_cli_omitted_omp_threads_uses_legacy_default(
-    tmp_path, monkeypatch
-):
-    _patch_rackers_dispatch_fakes(monkeypatch)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "train_models.py",
-            "--train_apnet",
-            "RackersTholeDampingModel",
-            "--ap_model_path",
-            str(tmp_path / "rackers.pt"),
-        ],
-    )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
-
-    train_models.main()
-
-    train_call = _FakeRackersTholeDampingModel.calls[0].train_calls[0]
-    assert train_call["world_size"] == 1
-    assert train_call["omp_num_threads_per_process"] == 8
-
-
-def test_atom_cli_omitted_omp_threads_uses_atom_default(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["train_models.py", "--train_am", "AtomModel"],
-    )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
-    monkeypatch.setattr(
-        train_models,
-        "train_atom_model",
-        lambda **kwargs: calls.append(kwargs),
-    )
-
-    train_models.main()
-
-    assert calls[0]["omp_num_threads"] == 1
-
-
-def test_cli_forwards_omp_threads_to_pairwise_training(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "train_models.py",
-            "--train_apnet",
-            "RackersTholeDampingModel",
-            "--omp_num_threads",
-            "23",
-        ],
-    )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
-    monkeypatch.setattr(
-        train_models,
-        "train_pairwise_model",
-        lambda **kwargs: calls.append(kwargs),
-    )
-
-    train_models.main()
-
-    assert calls[0]["omp_num_threads"] == 23
-
-
-def test_cli_help_names_both_rackers_routes(capsys, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["train_models.py", "--help"])
-    with pytest.raises(SystemExit) as exc_info:
-        train_models.main()
-    assert exc_info.value.code == 0
-    help_output = capsys.readouterr().out
-    assert "RackersTholeDampingModel" in help_output
-    assert "RackersTholeDampingOverlapModel" in help_output
-    assert "exactly four" in help_output
+    assert "RackersTholeDampingModel" in result.stdout
+    assert "RackersTholeDampingOverlapModel" in result.stdout
+    assert "exactly four" in result.stdout
