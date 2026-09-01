@@ -1071,7 +1071,7 @@ def test_rackers_joint_forward_scatter_and_gradients(
 ):
     # Deterministic init: a random ReLU readout may be dead and legitimately
     # have zero gradients, so activity is asserted at the raw guess embeddings.
-    with torch.random.fork_rng():
+    with torch.random.fork_rng(devices=[]):
         torch.manual_seed(0)
         model = RackersTholeDampingNN(
             atom_model=copy.deepcopy(nested_hfvr_vw_model),

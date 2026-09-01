@@ -5083,6 +5083,15 @@ units angstrom
 
 
 class _RackersTholeDampingModelBase(AM_DimerParam_Model):
+    """Shared harness for fixed four-head Rackers Thole models.
+
+    The heads are ordered as electrostatic, direct Thole, mutual Thole, and
+    induction-overlap damping. Checkpoints are standalone v2 checkpoints and
+    must preserve that ordering, the subclass dimer mode, and the complete
+    nested atom-model configuration. The nested model is frozen by default;
+    set ``freeze_atom_model=False`` to train it explicitly.
+    """
+
     DIMER_EVAL: str
 
     def __init__(
@@ -5126,10 +5135,14 @@ class _RackersTholeDampingModelBase(AM_DimerParam_Model):
 
 
 class RackersTholeDampingModel(_RackersTholeDampingModelBase):
+    """Rackers damping with pure induced-point-dipole induction."""
+
     DIMER_EVAL = "rackers_thole"
 
 
 class RackersTholeDampingOverlapModel(_RackersTholeDampingModelBase):
+    """Rackers damping with overlap-corrected induction."""
+
     DIMER_EVAL = "rackers_thole_overlap"
 
 
