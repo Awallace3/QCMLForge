@@ -174,7 +174,11 @@ def test_config_is_pickle_safe_and_resolves_environment():
         "WANDB_RUN_GROUP": "environment-group",
         "WANDB_JOB_TYPE": "environment-job",
     }
-    config = WandbConfig(mode="offline", tags=("user",))
+    config = WandbConfig(
+        mode="offline",
+        tags=("user",),
+        run_config={"dataset.id": "sapt0-1600k-v1"},
+    )
 
     restored = pickle.loads(pickle.dumps(config))
     resolved = restored.resolved(("atomic", "user"), environment=environment)
@@ -184,6 +188,7 @@ def test_config_is_pickle_safe_and_resolves_environment():
     assert resolved.group == "environment-group"
     assert resolved.job_type == "environment-job"
     assert resolved.tags == ("user", "atomic")
+    assert resolved.run_config["dataset.id"] == "sapt0-1600k-v1"
 
     explicit = WandbConfig(mode="offline", job_type="explicit-job").resolved(
         environment=environment
@@ -228,6 +233,10 @@ def test_config_rejects_invalid_values():
         WandbConfig(tags=["not", "a", "tuple"])
     with pytest.raises(TypeError, match="project"):
         WandbConfig(project=3)
+    with pytest.raises(TypeError, match="mapping"):
+        WandbConfig(run_config=[])
+    with pytest.raises(TypeError, match="JSON-serializable"):
+        WandbConfig(run_config={"bad": object()})
 
 
 def test_run_context_sanitizes_paths_and_validates_extra():
@@ -310,7 +319,11 @@ def test_transitive_wandb_import_error_is_preserved():
 
 def test_file_event_tracker_lifecycle_and_atomic_aliases(tmp_path):
     tracker = create_training_tracker(
-        WandbConfig(mode="offline", project="test-project"),
+        WandbConfig(
+            mode="offline",
+            project="test-project",
+            run_config={"dataset.id": "sapt0-1600k-v1"},
+        ),
         is_primary=True,
         run_context=_context(),
         backend=TrackerBackend.FILE_EVENT,
@@ -345,6 +358,7 @@ def test_file_event_tracker_lifecycle_and_atomic_aliases(tmp_path):
         "summary",
         "finish",
     ]
+    assert events[0]["config"]["dataset.id"] == "sapt0-1600k-v1"
     assert events[4]["aliases"] == ["final", "latest"]
     assert reference.endswith(":latest")
     assert events[-1]["exit_code"] == 0

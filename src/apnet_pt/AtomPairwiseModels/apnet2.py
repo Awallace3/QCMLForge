@@ -38,6 +38,12 @@ import qcelemental as qcel
 from copy import deepcopy
 from apnet_pt.torch_util import set_weights_to_value
 from apnet_pt.util import scatter_sum_compile
+from .apnet2_parity import (
+    APNetLazyLinear,
+    checkpoint_score,
+    initialize_tensorflow_defaults,
+    validate_parameter_initialization,
+)
 
 
 def inverse_time_decay(step, initial_lr, decay_steps, decay_rate, staircase=True):
@@ -170,6 +176,8 @@ class APNet2_MPNN(nn.Module):
         r_cut_im=8.0,
         r_cut=5.0,
         return_hidden_states=False,
+        quadrupole_scale=1.0,
+        parameter_initialization="pytorch",
     ):
         # super().__init__(aggr="add")
         super().__init__()
@@ -182,6 +190,10 @@ class APNet2_MPNN(nn.Module):
         self.r_cut_im = r_cut_im
         self.r_cut = r_cut
         self.return_hidden_states = return_hidden_states
+        self.quadrupole_scale = float(quadrupole_scale)
+        self.parameter_initialization = validate_parameter_initialization(
+            parameter_initialization
+        )
 
         layer_nodes_hidden = [
             # input_layer_size,
@@ -235,6 +247,8 @@ class APNet2_MPNN(nn.Module):
             self.directional_layers.append(
                 self._make_layers(layer_nodes_hidden, layer_activations)
             )
+        if self.parameter_initialization == "tensorflow":
+            self.apply(initialize_tensorflow_defaults)
 
     def get_config(self) -> dict:
         """
@@ -253,6 +267,8 @@ class APNet2_MPNN(nn.Module):
             "n_embed": self.n_embed,
             "r_cut_im": self.r_cut_im,
             "r_cut": self.r_cut,
+            "quadrupole_scale": self.quadrupole_scale,
+            "parameter_initialization": self.parameter_initialization,
         }
 
     def get_model_info(self):
@@ -278,8 +294,10 @@ class APNet2_MPNN(nn.Module):
 
     def _make_layers(self, layer_nodes, activations):
         layers = []
-        # Start with a LazyLinear so we don't have to fix input dim
-        layers.append(nn.LazyLinear(layer_nodes[0]))
+        # Start with a LazyLinear so we don't have to fix input dim.
+        layers.append(
+            APNetLazyLinear(layer_nodes[0], self.parameter_initialization)
+        )
         layers.append(activations[0])
         for i in range(len(layer_nodes) - 1):
             layers.append(nn.Linear(layer_nodes[i], layer_nodes[i + 1]))
@@ -314,11 +332,12 @@ class APNet2_MPNN(nn.Module):
         muA_source = muA.index_select(0, e_ABsr_source)
         muB_source = muB.index_select(0, e_ABsr_target)
 
-        # TF implementation uses 3/2 factor for quadrupoles
-        # quadA_source = (3.0 / 2.0) * quadA.index_select(0, e_ABsr_source)
-        # quadB_source = (3.0 / 2.0) * quadB.index_select(0, e_ABsr_target)
-        quadA_source = quadA.index_select(0, e_ABsr_source)
-        quadB_source = quadB.index_select(0, e_ABsr_target)
+        quadA_source = self.quadrupole_scale * quadA.index_select(
+            0, e_ABsr_source
+        )
+        quadB_source = self.quadrupole_scale * quadB.index_select(
+            0, e_ABsr_target
+        )
 
         E_qq = torch.einsum("x,x,x->x", qA_source, qB_source, oodR)
 
@@ -727,6 +746,8 @@ class APNet2Model:
         print_lvl=0,
         ds_qcel_molecules=None,
         ds_energy_labels=None,
+        quadrupole_scale=1.0,
+        parameter_initialization="pytorch",
     ):
         """
         If pre_trained_model_path is provided, the model will be loaded from
@@ -792,6 +813,10 @@ class APNet2Model:
                 n_embed=config.get("n_embed", n_embed),
                 r_cut_im=config.get("r_cut_im", r_cut_im),
                 r_cut=config.get("r_cut", r_cut),
+                quadrupole_scale=config.get("quadrupole_scale", 1.0),
+                parameter_initialization=config.get(
+                    "parameter_initialization", "pytorch"
+                ),
             )
             state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(state_dict)
@@ -804,6 +829,8 @@ class APNet2Model:
                 n_embed=n_embed,
                 r_cut_im=r_cut_im,
                 r_cut=r_cut,
+                quadrupole_scale=quadrupole_scale,
+                parameter_initialization=parameter_initialization,
             )
 
         # Load atom_model from external path if not already loaded from embedded
@@ -2092,6 +2119,8 @@ units angstrom
         num_workers,
         lr_decay=None,
         include_total_mse=False,
+        adam_eps=1e-8,
+        checkpoint_metric="component_mse",
     ):
         print(f"{self.device.type=}")
         if self.device.type == "cpu":
@@ -2164,7 +2193,7 @@ units angstrom
         if rank == 0:
             print("Loaders setup\n")
 
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, eps=adam_eps)
         if lr_decay:
             scheduler = InverseTimeDecayLR(
                 optimizer, lr, len(train_loader) * 60, lr_decay
@@ -2232,8 +2261,11 @@ units angstrom
             )
 
             if rank == 0:
-                if test_loss < lowest_test_loss:
-                    lowest_test_loss = test_loss
+                validation_score = checkpoint_score(
+                    checkpoint_metric, test_loss, total_MAE_v
+                )
+                if validation_score < lowest_test_loss:
+                    lowest_test_loss = validation_score
                     test_lowered = "*"
                     if self.model_save_path:
                         print("Saving model")
@@ -2278,6 +2310,8 @@ units angstrom
         skip_compile=False,
         transfer_learning=False,
         include_total_mse=False,
+        adam_eps=1e-8,
+        checkpoint_metric="component_mse",
     ):
         # (1) Compile Model
         rank_device = self.device
@@ -2316,7 +2350,7 @@ units angstrom
         )
 
         # (3) Optim/Scheduler
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, eps=adam_eps)
         # scheduler = ModLambdaDecayLR(optimizer, lr_decay, lr) if lr_decay else None
         scheduler = (
             InverseTimeDecayLR(optimizer, lr, len(train_loader) * 2, lr_decay)
@@ -2382,7 +2416,9 @@ units angstrom
         track_pretraining_from_locals(self, locals())
 
         # (6) Main training loop
-        lowest_test_loss = test_loss
+        lowest_test_loss = checkpoint_score(
+            checkpoint_metric, test_loss, total_MAE_v
+        )
         for epoch in range(n_epochs):
             t1 = time.time()
             t_out = __train_batch(
@@ -2420,10 +2456,14 @@ units angstrom
                 train_loss, total_MAE_t = t_out
                 test_loss, total_MAE_v = v_out
 
-            # Track best model
+            # Track best model using either native component MSE or the
+            # TensorFlow implementation's total-energy validation MAE.
             star_marker = " "
-            if test_loss < lowest_test_loss:
-                lowest_test_loss = test_loss
+            validation_score = checkpoint_score(
+                checkpoint_metric, test_loss, total_MAE_v
+            )
+            if validation_score < lowest_test_loss:
+                lowest_test_loss = validation_score
                 star_marker = "*"
                 cpu_model = model_io.unwrap_model(self.model).to("cpu")
                 best_model = deepcopy(cpu_model)
@@ -2477,6 +2517,8 @@ units angstrom
         skip_compile=False,
         transfer_learning=False,
         include_total_mse=False,
+        adam_eps=1e-8,
+        checkpoint_metric="component_mse",
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
         _tracker_event_directory=None,
@@ -2553,8 +2595,10 @@ units angstrom
         print("\nTraining Hyperparameters:", flush=True)
         print(f"  {n_epochs=}", flush=True)
         print(f"  {lr=}\n", flush=True)
-        print(f"  {lr_decay=}\n", flush=True)
-        print(f"  {include_total_mse=}\n", flush=True)
+        print(f"  {lr_decay=}", flush=True)
+        print(f"  {include_total_mse=}", flush=True)
+        print(f"  {adam_eps=}", flush=True)
+        print(f"  {checkpoint_metric=}", flush=True)
         if self.prebatched:
             print(f"  Prebatched training data: setting batch_size=1", flush=True)
             batch_size = 1
@@ -2575,6 +2619,8 @@ units angstrom
             "training/skip_compile": skip_compile,
             "training/transfer_learning": transfer_learning,
             "training/include_total_mse": include_total_mse,
+            "training/adam_eps": adam_eps,
+            "training/checkpoint_metric": checkpoint_metric,
         }
         if world_size > 1:
             print("Running multi-process training", flush=True)
@@ -2601,6 +2647,8 @@ units angstrom
                     dataloader_num_workers,
                     lr_decay,
                     include_total_mse,
+                    adam_eps,
+                    checkpoint_metric,
                 ),
                 nprocs=world_size,
                 join=True,
@@ -2622,6 +2670,8 @@ units angstrom
                     skip_compile=skip_compile,
                     transfer_learning=transfer_learning,
                     include_total_mse=include_total_mse,
+                    adam_eps=adam_eps,
+                    checkpoint_metric=checkpoint_metric,
                 ),
                 wandb_config,
                 model_family="pairwise",
