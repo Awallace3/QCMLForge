@@ -1100,6 +1100,15 @@ class APNet2Model:
         ap2_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
         self.model.load_state_dict(ap2_state_dict)
 
+        # ``quadrupole_scale`` is a forward-pass constant rather than a
+        # parameter, so a checkpoint that needs a non-default value -- the
+        # TensorFlow-converted models in models/ap2_tf need 1.5 -- would
+        # otherwise load its weights successfully and still predict the wrong
+        # electrostatics. Adopt it from the checkpoint config.
+        ap2_config = model_io.load_config_from_checkpoint(checkpoint) or {}
+        if "quadrupole_scale" in ap2_config:
+            self.model.quadrupole_scale = float(ap2_config["quadrupole_scale"])
+
         # Load external atom_model if not loaded from embedded
         if not atom_model_loaded_from_embed and am_model_path is not None:
             am_checkpoint = model_io.load_checkpoint(
