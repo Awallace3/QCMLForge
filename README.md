@@ -112,6 +112,23 @@ print(interaction_energies)
 #  [-1.45428585 -2.25829129  2.25395064 -0.49102129 -0.95892391]]
 ```
 
+By default this uses the APNet2 ensemble trained by QCMLForge. Pass
+`weights="ap2_tf_paper"` to use the ensemble published with the AP-Net2 paper
+instead, converted from TensorFlow and verified against the original
+predictions:
+
+```py
+interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
+    mols,
+    compile=False,
+    batch_size=2,
+    weights="ap2_tf_paper",
+)
+```
+
+See [docs/apnet2-tensorflow-weights.md](docs/apnet2-tensorflow-weights.md) for
+the parity data and the loading caveats.
+
 ## Training
 To train the model, run the following command:
 ```bash

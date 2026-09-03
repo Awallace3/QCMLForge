@@ -1,6 +1,6 @@
 """Numerical parity between the original TensorFlow AP-Net2 and QCMLForge.
 
-``models/ap2_tf/**`` is a direct conversion of the SavedModels published with
+``models/ap2_tf_paper/**`` is a direct conversion of the SavedModels published with
 ``github.com/zachglick/apnet`` (branch ``sparse``).  These tests assert that the
 conversion is faithful: loading those checkpoints and predicting must reproduce
 what TensorFlow itself produced for the same dimers.
@@ -55,11 +55,11 @@ pytestmark = pytest.mark.skipif(
 
 
 def atom_model_path(index):
-    return os.path.join(PROJECT_ROOT, "models/ap2_tf/atom_models/atom%d.pt" % index)
+    return os.path.join(PROJECT_ROOT, "models/ap2_tf_paper/atom_models/atom%d.pt" % index)
 
 
 def pair_model_path(index):
-    return os.path.join(PROJECT_ROOT, "models/ap2_tf/pair_models/pair%d.pt" % index)
+    return os.path.join(PROJECT_ROOT, "models/ap2_tf_paper/pair_models/pair%d.pt" % index)
 
 
 @pytest.fixture(scope="module")

@@ -1100,7 +1100,7 @@ class APNet2_AM_Model:
 
         # ``quadrupole_scale`` is a forward-pass constant rather than a
         # parameter, so a checkpoint that needs a non-default value -- the
-        # TensorFlow-converted models in models/ap2_tf need 1.5 -- would
+        # TensorFlow-converted models in models/ap2_tf_paper need 1.5 -- would
         # otherwise load its weights successfully and still predict the wrong
         # electrostatics. The constructor's ``pre_trained_model_path`` branch
         # adopts it from the config; this method has to do the same.

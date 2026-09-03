@@ -17,7 +17,11 @@ from ..training_tracking import (
     track_pretraining_from_locals,
     tracked_ddp_worker,
 )
-from ..hf_pretrained import resolve_pretrained_path
+from ..hf_pretrained import (
+    DEFAULT_APNET2_WEIGHTS,
+    apnet2_weight_paths,
+    resolve_pretrained_path,
+)
 import time
 from ..atomic_datasets import (
     atomic_module_dataset,
@@ -674,7 +678,9 @@ class AtomModel:
             children=[child],
         )
 
-    def set_pretrained_model(self, model_path=None, model_id=None):
+    def set_pretrained_model(
+        self, model_path=None, model_id=None, weights=DEFAULT_APNET2_WEIGHTS
+    ):
         """
         Load a pretrained model from a checkpoint file.
 
@@ -685,7 +691,13 @@ class AtomModel:
         model_path : str, optional
             Path to a checkpoint file
         model_id : int, optional
-            ID of a bundled pretrained model (0-9)
+            Ensemble member of ``weights`` to load
+        weights : str, optional
+            Named weight set to take ``model_id`` from, one of
+            ``apnet_pt.hf_pretrained.apnet2_weight_sets()``. Defaults to the
+            QCMLForge-trained ensemble; pass ``"ap2_tf_paper"`` for the atom
+            models published with the AP-Net2 paper. Ignored when
+            ``model_path`` is given.
 
         Returns
         -------
@@ -693,7 +705,9 @@ class AtomModel:
             Returns self for method chaining
         """
         if model_id is not None:
-            model_path = resolve_pretrained_path(f"am_ensemble/am_{model_id}.pt")
+            model_path = resolve_pretrained_path(
+                apnet2_weight_paths(model_id, weights)["atom"]
+            )
         elif model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 

@@ -63,14 +63,22 @@ over colliding user-supplied keys.
 
 ## Pre-rewrite electrostatics terms
 
-`apnet` commit 593d655 (2021-07-18, "full rewrite") made exactly two numerical
-changes to the analytic multipole electrostatics. It introduced the `3/2`
-quadrupole prefactor above, and it dropped the dipole-quadrupole and
-quadrupole-quadrupole terms from the interaction sum: the pre-rewrite routine
-summed `qq + qu + qQ + uu + uQ + QQ`, the published one sums `qq + qu + qQ + uu`.
-Every commit after it leaves the kernel's arithmetic alone, and the shipped
-SavedModels postdate it, so the published weights were trained against the
-four-term kernel.
+`apnet` commit 593d655 (2021-07-18, "full rewrite") made exactly one numerical
+change to the analytic multipole electrostatics: it dropped the
+dipole-quadrupole and quadrupole-quadrupole terms from the interaction sum. The
+pre-rewrite routine summed `qq + qu + qQ + uu + uQ + QQ`, the published one sums
+`qq + qu + qQ + uu`. Every commit after it leaves the kernel's arithmetic alone,
+and the shipped SavedModels postdate it, so the published weights were trained
+against the four-term kernel.
+
+The `3/2` quadrupole prefactor is *not* a change introduced by that commit. The
+pre-rewrite `apnet/multipoles.py` already multiplies `qpole_redundant(...)` by
+`3.0/2.0` for both reference and predicted quadrupoles before evaluating the
+interaction (`origin/master` = `593d655^` = `e09955b`, lines 129/133/207/211).
+It is a convention conversion for the stored `cartesian_multipoles` layout that
+both eras apply; 593d655 only moved it inside the traced graph. `1.5` is
+therefore the right scale for every TensorFlow code era, and `1.0` corresponds
+to none of them.
 
 `elst_include_uQ_QQ` restores the two dropped terms, defaulting to `False` so
 the published kernel stays the default:
@@ -89,7 +97,7 @@ nothing but the electrostatics.
 
 The flag interacts with `--quadrupole-scale`, which is applied to both
 quadrupole tensors before any term is formed: it therefore enters `uQ` linearly
-and `QQ` quadratically. `(1.5, off)` is the published kernel and `(1.0, on)` is
+and `QQ` quadratically. `(1.5, off)` is the published kernel and `(1.5, on)` is
 the pre-rewrite functional form. Both are forward-pass constants, so changing
 either without retraining perturbs a model whose learned short-range readout
 adapted to the kernel it was trained with. Only the pairs beyond the 8 A cutoff,

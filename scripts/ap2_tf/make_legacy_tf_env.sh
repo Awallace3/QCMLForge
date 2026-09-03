@@ -10,7 +10,7 @@
 # This environment is needed to (a) export the SavedModel variables for
 # scripts/ap2_tf/convert_tf_to_pt.py and (b) regenerate the TensorFlow reference
 # predictions in tests/dataset_data/ap2_tf_parity/.  Ordinary use of the
-# converted checkpoints in models/ap2_tf/** needs none of it.
+# converted checkpoints in models/ap2_tf_paper/** needs none of it.
 #
 # Every version below is pinned because pip's resolver does not backtrack far
 # enough on this stack to find a working combination on its own:

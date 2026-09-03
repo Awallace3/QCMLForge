@@ -127,6 +127,7 @@ H 3.758602 0.500000  0.504284
 H 3.260455 0.500000 -0.872893
 units angstrom
     """,
+    weights: str = "qcmlforge",
 ) -> Dict:
     """
     Predict machine-learned SAPT0 interaction energies for a molecular complex.
@@ -151,6 +152,11 @@ units angstrom
     p4_string : str, optional
         Molecular geometry in Psi4 format with charge, multiplicity, atomic
         symbols, coordinates, and units. Default is a water dimer geometry.
+    weights : str, optional
+        Which APNet2 ensemble to use. "qcmlforge" (default) is the ensemble
+        trained by QCMLForge; "ap2_tf_paper" is the ensemble published with the
+        AP-Net2 paper, converted from TensorFlow, and reproduces the paper's
+        reported predictions.
 
     Returns
     -------
@@ -173,6 +179,7 @@ units angstrom
     IE_pred = apnet_pt.pretrained_models.apnet2_model_predict(
         [mol],
         compile=False,
+        weights=weights,
     )
     return {
         "APNet2 TOTAL INTERACTION (kcal/mol)": float(IE_pred[0, 0]),

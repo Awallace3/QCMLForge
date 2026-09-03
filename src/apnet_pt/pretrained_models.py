@@ -13,6 +13,11 @@ from apnet_pt.pt_datasets.dapnet_ds import clean_str_for_filename
 from . import AtomModels
 from . import AtomPairwiseModels
 from . import atomic_datasets
+from .hf_pretrained import (
+    DEFAULT_APNET2_WEIGHTS,
+    apnet2_weight_paths,
+    apnet2_weight_set_size,
+)
 
 # model_dir = os.path.dirname(os.path.realpath(__file__)) + "/models/"
 model_dir = resources.files("apnet_pt").joinpath("models")
@@ -138,18 +143,41 @@ def _resolve_pretrained_paths(rel_paths: list[str]) -> dict[str, str]:
     return resolved
 
 
+def _reject_fused_weights(weights: str) -> None:
+    """Refuse named weight sets the fused APNet2 model cannot load.
+
+    ``APNet2_AM_MPNN`` keeps the atom and pair networks in one state dict,
+    while the paper's TensorFlow checkpoints keep them separate, so the fused
+    ensemble only exists for QCMLForge-trained weights.
+    """
+    if weights != DEFAULT_APNET2_WEIGHTS:
+        raise ValueError(
+            f"weights={weights!r} has no fused ensemble; the fused "
+            "APNet2_AM_MPNN state dict is incompatible with the separate "
+            "atom/pair checkpoints. Pass ap2_fused=False."
+        )
+
+
 def atom_model_predict(
     mols: list[Molecule],
     compile: bool = True,
     batch_size: int = 3,
     return_mol_arrays: bool = True,
+    weights: str = DEFAULT_APNET2_WEIGHTS,
 ):
-    num_models = 5
-    model_paths = _resolve_pretrained_paths(
-        [f"am_ensemble/am_{i}.pt" for i in range(num_models)]
-    )
+    """
+    Ensemble-average atomic multipoles over a pretrained atom-model ensemble.
+
+    ``weights`` selects the ensemble: the QCMLForge-trained models by default,
+    or ``"ap2_tf_paper"`` for the atom models published with the AP-Net2 paper.
+    """
+    num_models = apnet2_weight_set_size(weights)
+    atom_rel_paths = [
+        apnet2_weight_paths(i, weights)["atom"] for i in range(num_models)
+    ]
+    model_paths = _resolve_pretrained_paths(atom_rel_paths)
     am = AtomModels.ap2_atom_model.AtomModel(
-        pre_trained_model_path=model_paths["am_ensemble/am_0.pt"],
+        pre_trained_model_path=model_paths[atom_rel_paths[0]],
     )
     if compile:
         print("Compiling models...")
@@ -157,7 +185,7 @@ def atom_model_predict(
     models = [copy.deepcopy(am) for _ in range(num_models)]
     for i in range(1, num_models):
         models[i].set_pretrained_model(
-            model_path=model_paths[f"am_ensemble/am_{i}.pt"],
+            model_path=model_paths[atom_rel_paths[i]],
         )
     print("Processing mols...")
     data = [
@@ -222,8 +250,18 @@ def apnet2_model_predict(
     batch_size: int = 16,
     ensemble_model_dir: str = model_dir,
     ap2_fused: bool = False,
+    weights: str = DEFAULT_APNET2_WEIGHTS,
 ):
+    """
+    Ensemble-average APNet2 interaction energies for ``mols``.
+
+    ``weights`` selects the ensemble: the QCMLForge-trained models by default,
+    or ``"ap2_tf_paper"`` for the ensemble published with the AP-Net2 paper.
+    Returns an ``(N, 5)`` array of total energy followed by the electrostatics,
+    exchange, induction and dispersion components, all in kcal/mol.
+    """
     if ap2_fused:
+        _reject_fused_weights(weights)
         num_models = 4
         additional_models_start = 2
         model_paths = _resolve_pretrained_paths(
@@ -234,15 +272,16 @@ def apnet2_model_predict(
             pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
         )
     else:
-        num_models = 5
+        num_models = apnet2_weight_set_size(weights)
         additional_models_start = 1
+        rel_paths = [apnet2_weight_paths(i, weights) for i in range(num_models)]
         model_paths = _resolve_pretrained_paths(
-            [f"ap2_ensemble/ap2_{i}.pt" for i in range(num_models)]
-            + [f"am_ensemble/am_{i}.pt" for i in range(num_models)]
+            [rel["pair"] for rel in rel_paths]
+            + [rel["atom"] for rel in rel_paths]
         )
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
-            pre_trained_model_path=model_paths["ap2_ensemble/ap2_0.pt"],
-            atom_model_pre_trained_path=model_paths["am_ensemble/am_0.pt"],
+            pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
+            atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
         )
     if compile:
         print("Compiling models...")
@@ -255,8 +294,8 @@ def apnet2_model_predict(
             )
         else:
             models[i].set_pretrained_model(
-                ap2_model_path=model_paths[f"ap2_ensemble/ap2_{i}.pt"],
-                am_model_path=model_paths[f"am_ensemble/am_{i}.pt"],
+                ap2_model_path=model_paths[rel_paths[i]["pair"]],
+                am_model_path=model_paths[rel_paths[i]["atom"]],
             )
     pred_IEs = np.zeros((len(mols), 5))
     print("Processing mols...")
@@ -280,6 +319,7 @@ def apnet2_model_predict_pairs(
     fBs: list[dict[str, list[int]]] | None = None,
     print_results: bool = False,
     ap2_fused: bool = True,
+    weights: str = DEFAULT_APNET2_WEIGHTS,
 ):
     """
     Compute ensemble-averaged APNet2 pairwise interaction energies for specified fragment pairs and return per-molecule energies, per-atom pairwise arrays, and a fragment-pair breakdown DataFrame.
@@ -301,6 +341,10 @@ def apnet2_model_predict_pairs(
             If True, print a formatted per-fragment summary to stdout.
         ap2_fused: bool, optional
             If True, use the fused APNet2 variant; otherwise use the standard APNet2 ensemble.
+        weights: str, optional
+            Named weight set from ``apnet_pt.hf_pretrained.apnet2_weight_sets()``.
+            Defaults to the QCMLForge-trained ensemble; ``"ap2_tf_paper"`` selects
+            the ensemble published with the AP-Net2 paper and requires ap2_fused=False.
 
     Returns:
         pred_IEs (numpy.ndarray):
@@ -310,6 +354,10 @@ def apnet2_model_predict_pairs(
         df (pandas.DataFrame):
             Fragment-pair breakdown with columns ["fA-fB", "total", "elst", "exch", "indu", "disp"], one row per fragment-A/fragment-B pair.
     """
+    if ap2_fused:
+        # Reject an unloadable weight set before the fragment arguments: it is
+        # a mistake in the call, not something the fragments can fix.
+        _reject_fused_weights(weights)
     assert fAs is not None, (
         "fAs must be provided. Example: [{'Methyl1_A': [1, 2, 7, 8], 'Methyl2_A': [3, 4, 5, 6]}...]"
     )
@@ -328,15 +376,19 @@ def apnet2_model_predict_pairs(
             pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
         )
     else:
-        additional_models_start = 2
-        num_models = 5
+        # models[0] is built from member 0, so every later member -- including
+        # member 1 -- has to be loaded here, or the average double-counts
+        # member 0 and drops member 1.
+        additional_models_start = 1
+        num_models = apnet2_weight_set_size(weights)
+        rel_paths = [apnet2_weight_paths(i, weights) for i in range(num_models)]
         model_paths = _resolve_pretrained_paths(
-            [f"ap2_ensemble/ap2_{i}.pt" for i in range(num_models)]
-            + [f"am_ensemble/am_{i}.pt" for i in range(num_models)]
+            [rel["pair"] for rel in rel_paths]
+            + [rel["atom"] for rel in rel_paths]
         )
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
-            pre_trained_model_path=model_paths["ap2_ensemble/ap2_0.pt"],
-            atom_model_pre_trained_path=model_paths["am_ensemble/am_0.pt"],
+            pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
+            atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
         )
     if compile:
         print("Compiling models...")
@@ -349,8 +401,8 @@ def apnet2_model_predict_pairs(
             )
         else:
             models[i].set_pretrained_model(
-                ap2_model_path=model_paths[f"ap2_ensemble/ap2_{i}.pt"],
-                am_model_path=model_paths[f"am_ensemble/am_{i}.pt"],
+                ap2_model_path=model_paths[rel_paths[i]["pair"]],
+                am_model_path=model_paths[rel_paths[i]["atom"]],
             )
     pred_IEs = np.zeros((len(mols), 5))
     print("Processing mols...")

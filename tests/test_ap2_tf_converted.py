@@ -1,7 +1,7 @@
 """
 Smoke-test converted TensorFlow APNet models (atom and pair) with water dimers.
 
-These tests check that ``models/ap2_tf/**`` loads, runs, and produces physically
+These tests check that ``models/ap2_tf_paper/**`` loads, runs, and produces physically
 sensible water-dimer energies.  They deliberately do NOT establish that the
 conversion is numerically faithful: every assertion here passed against an
 earlier conversion in which 64 of the 83 pair tensors were never transferred at
@@ -19,8 +19,8 @@ from pprint import pprint as pp
 
 current_file_path = os.path.dirname(os.path.realpath(__file__))
 project_root = os.path.dirname(current_file_path)
-TF_ATOM_MODELS = [f"models/ap2_tf/atom_models/atom{i}.pt" for i in range(5)]
-TF_PAIR_MODELS = [f"models/ap2_tf/pair_models/pair{i}.pt" for i in range(5)]
+TF_ATOM_MODELS = [f"models/ap2_tf_paper/atom_models/atom{i}.pt" for i in range(5)]
+TF_PAIR_MODELS = [f"models/ap2_tf_paper/pair_models/pair{i}.pt" for i in range(5)]
 TF_MODEL_ENSEMBLE = TF_ATOM_MODELS + TF_PAIR_MODELS
 TF_MODEL_ZERO = [TF_ATOM_MODELS[0], TF_PAIR_MODELS[0]]
 
@@ -79,7 +79,7 @@ def test_tf_converted_atom_model_loads():
 
     for i in range(5):
         model_path = os.path.join(
-            project_root, f"models/ap2_tf/atom_models/atom{i}.pt"
+            project_root, f"models/ap2_tf_paper/atom_models/atom{i}.pt"
         )
         
         # Check file exists
@@ -118,12 +118,12 @@ def test_tf_converted_atom_model_loads():
 def test_tf_converted_pair_model_loads():
     """Test that converted TF pair models can be loaded."""
     atom_model_path = os.path.join(
-        project_root, "models/ap2_tf/atom_models/atom0.pt"
+        project_root, "models/ap2_tf_paper/atom_models/atom0.pt"
     )
     
     for i in range(5):
         model_path = os.path.join(
-            project_root, f"models/ap2_tf/atom_models/atom{i}.pt"
+            project_root, f"models/ap2_tf_paper/atom_models/atom{i}.pt"
         )
         
         # Check file exists
@@ -142,7 +142,7 @@ def test_tf_converted_pair_model_loads():
         )
         atom_model.set_pretrained_model(model_path=model_path)
         pair_model_path = os.path.join(
-            project_root, f"models/ap2_tf/pair_models/pair{i}.pt"
+            project_root, f"models/ap2_tf_paper/pair_models/pair{i}.pt"
         )
         
         # Check file exists
@@ -182,10 +182,10 @@ def test_tf_converted_pair_model_loads():
 def test_tf_converted_predict_water_dimer_single():
     """Test prediction on a single water dimer using converted TF models."""
     atom_model_path = os.path.join(
-        project_root, "models/ap2_tf/atom_models/atom0.pt"
+        project_root, "models/ap2_tf_paper/atom_models/atom0.pt"
     )
     pair_model_path = os.path.join(
-        project_root, "models/ap2_tf/pair_models/pair0.pt"
+        project_root, "models/ap2_tf_paper/pair_models/pair0.pt"
     )
     
     # Load models
@@ -246,10 +246,10 @@ def test_tf_converted_predict_water_dimer_single():
 def test_tf_converted_predict_water_dimer_batch():
     """Test batch prediction on multiple water dimers."""
     atom_model_path = os.path.join(
-        project_root, "models/ap2_tf/atom_models/atom0.pt"
+        project_root, "models/ap2_tf_paper/atom_models/atom0.pt"
     )
     pair_model_path = os.path.join(
-        project_root, "models/ap2_tf/pair_models/pair0.pt"
+        project_root, "models/ap2_tf_paper/pair_models/pair0.pt"
     )
     
     # Load models
@@ -319,10 +319,10 @@ def test_tf_converted_ensemble_prediction():
     # Load all 5 model pairs
     for i in range(5):
         atom_model_path = os.path.join(
-            project_root, f"models/ap2_tf/atom_models/atom{i}.pt"
+            project_root, f"models/ap2_tf_paper/atom_models/atom{i}.pt"
         )
         pair_model_path = os.path.join(
-            project_root, f"models/ap2_tf/pair_models/pair{i}.pt"
+            project_root, f"models/ap2_tf_paper/pair_models/pair{i}.pt"
         )
         
         atom_model = AtomModel(
@@ -381,10 +381,10 @@ def test_tf_converted_ensemble_prediction():
 def test_tf_converted_with_elst_breakdown():
     """Test prediction with electrostatic breakdown (multipole vs NN)."""
     atom_model_path = os.path.join(
-        project_root, "models/ap2_tf/atom_models/atom0.pt"
+        project_root, "models/ap2_tf_paper/atom_models/atom0.pt"
     )
     pair_model_path = os.path.join(
-        project_root, "models/ap2_tf/pair_models/pair0.pt"
+        project_root, "models/ap2_tf_paper/pair_models/pair0.pt"
     )
     
     # Load models

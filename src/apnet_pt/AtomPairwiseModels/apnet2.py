@@ -6,7 +6,10 @@ import warnings
 import time
 from ..AtomModels.ap2_atom_model import AtomMPNN, isolate_atomic_property_predictions
 from .. import atomic_datasets
-from ..hf_pretrained import resolve_pretrained_paths
+from ..hf_pretrained import (
+    DEFAULT_APNET2_WEIGHTS,
+    resolve_apnet2_weights,
+)
 from .. import pairwise_datasets
 from .. import model_io
 from ..distributed_metrics import globally_reduced_mae
@@ -1129,7 +1132,11 @@ class APNet2Model:
         return
 
     def set_pretrained_model(
-        self, ap2_model_path=None, am_model_path=None, model_id=None
+        self,
+        ap2_model_path=None,
+        am_model_path=None,
+        model_id=None,
+        weights=DEFAULT_APNET2_WEIGHTS,
     ):
         """
         Load pretrained weights for the APNet2 and AtomMPNN models.
@@ -1145,8 +1152,16 @@ class APNet2Model:
             Path to AtomMPNN checkpoint file. Ignored if ap2_model_path is a v2
             checkpoint with embedded atom_model.
         model_id : int, optional
-            If provided, loads from bundled ensemble models (am_{model_id}.pt
-            and ap2_{model_id}.pt).
+            If provided, loads ensemble member ``model_id`` of ``weights``:
+            the pair model together with the atom model it was trained
+            against.
+        weights : str, optional
+            Named weight set to take ``model_id`` from, one of
+            ``apnet_pt.hf_pretrained.apnet2_weight_sets()``. Defaults to the
+            QCMLForge-trained ensemble; pass ``"ap2_tf_paper"`` for the
+            ensemble published with the AP-Net2 paper, which reproduces the
+            paper's predictions (see docs/apnet2-tensorflow-weights.md).
+            Ignored when explicit paths are given.
 
         Returns
         -------
@@ -1154,14 +1169,9 @@ class APNet2Model:
             Returns self for method chaining.
         """
         if model_id is not None:
-            model_paths = resolve_pretrained_paths(
-                [
-                    f"am_ensemble/am_{model_id}.pt",
-                    f"ap2_ensemble/ap2_{model_id}.pt",
-                ]
-            )
-            am_model_path = model_paths[f"am_ensemble/am_{model_id}.pt"]
-            ap2_model_path = model_paths[f"ap2_ensemble/ap2_{model_id}.pt"]
+            model_paths = resolve_apnet2_weights(model_id, weights)
+            am_model_path = model_paths["atom"]
+            ap2_model_path = model_paths["pair"]
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 
@@ -1200,7 +1210,7 @@ class APNet2Model:
 
         # ``quadrupole_scale`` is a forward-pass constant rather than a
         # parameter, so a checkpoint that needs a non-default value -- the
-        # TensorFlow-converted models in models/ap2_tf need 1.5 -- would
+        # TensorFlow-converted models in models/ap2_tf_paper need 1.5 -- would
         # otherwise load its weights successfully and still predict the wrong
         # electrostatics. Adopt it from the checkpoint config.
         ap2_config = model_io.load_config_from_checkpoint(checkpoint) or {}

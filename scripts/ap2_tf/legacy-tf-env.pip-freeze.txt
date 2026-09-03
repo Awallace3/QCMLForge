@@ -4,7 +4,7 @@
 # on Georgia Tech PACE Phoenix (linux-64, python 3.8.20).
 #
 # This is a record of what was actually used to generate
-# tests/dataset_data/ap2_tf_parity/tf_reference.npz and the models/ap2_tf/**
+# tests/dataset_data/ap2_tf_parity/tf_reference.npz and the models/ap2_tf_paper/**
 # conversions -- not an install target.  Transitive versions here are whatever
 # pip resolved on that date and will drift; the pins that matter are the
 # explicit ones in make_legacy_tf_env.sh.
