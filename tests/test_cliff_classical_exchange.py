@@ -64,6 +64,7 @@ point that accepts Angstrom coordinates, and it converts internally.
 """
 
 import copy
+import hashlib
 import inspect
 import math
 import os
@@ -3710,6 +3711,7 @@ def test_cliff_dispatch_selects_harness_and_forwards_contract(
         pre_trained_model_path="cliff-checkpoint.pt",
         elst_damping_type="AMOEBA",
         ds_in_memory=True,
+        ds_exclude_train_indices_path="exclude-train.npy",
         freeze_atom_model=freeze_atom_model,
         omp_num_threads=17,
     )
@@ -3748,6 +3750,10 @@ def test_cliff_dispatch_selects_harness_and_forwards_contract(
     assert harness.kwargs["ds_root"] == "cliff-data"
     assert harness.kwargs["ds_random_seed"] == 13
     assert harness.kwargs["ds_in_memory"] is True
+    assert (
+        harness.kwargs["ds_exclude_train_indices_path"]
+        == "exclude-train.npy"
+    )
     # Every CLIFF harness fixes its own parameter count; `--n_params 99` above
     # must not reach it.
     assert "n_params" not in harness.kwargs
@@ -4226,6 +4232,7 @@ def test_train_models_help_exits_zero_and_advertises_the_cliff_routes():
     assert "--induction_diagnostics" in help_text
     assert "--induction_convergence_threshold" in help_text
     assert "--induction_max_iterations" in help_text
+    assert "--ds_exclude_train_indices_path" in help_text
 
 
 # ---------------------------------------------------------------------------
@@ -5044,10 +5051,61 @@ def test_dimer_indices_excluding_elements_requires_get():
         mtp_mtp.dimer_indices_excluding_elements(_NoGet(), [11], print_level=0)
 
 
+def test_train_index_exclusion_artifact_is_immutable_and_exact(tmp_path):
+    path = tmp_path / "exclude.npy"
+    excluded = np.array([1, 4], dtype=np.int64)
+    np.save(path, excluded, allow_pickle=False)
+
+    loaded, digest = mtp_mtp.load_excluded_train_indices(path)
+    assert np.array_equal(loaded, excluded)
+    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    validation = np.array([100, 101, 102])
+    splits = [np.arange(8), validation]
+    original_size, keep = mtp_mtp.apply_train_index_exclusion(
+        splits, loaded
+    )
+    assert original_size == 8
+    assert keep.tolist() == [0, 2, 3, 5, 6, 7]
+    assert splits[0].tolist() == [0, 2, 3, 5, 6, 7]
+    assert len(splits[0]) == 8 - len(excluded)
+    assert splits[1] is validation
+
+
+def test_train_index_exclusion_rejects_ambiguous_artifacts(tmp_path):
+    invalid = {
+        "float": np.array([1.0, 2.0]),
+        "matrix": np.array([[1, 2]], dtype=np.int64),
+        "negative": np.array([-1, 2], dtype=np.int64),
+        "unsorted": np.array([2, 1], dtype=np.int64),
+        "duplicate": np.array([1, 1], dtype=np.int64),
+    }
+    for name, values in invalid.items():
+        path = tmp_path / f"{name}.npy"
+        np.save(path, values, allow_pickle=False)
+        with pytest.raises((ValueError, TypeError), match="train|integer|sorted"):
+            mtp_mtp.load_excluded_train_indices(path)
+
+    with pytest.raises(FileNotFoundError, match="not found"):
+        mtp_mtp.load_excluded_train_indices(tmp_path / "missing.npy")
+    wrong_suffix = tmp_path / "exclude.txt"
+    wrong_suffix.write_bytes(b"not a numpy artifact")
+    with pytest.raises(ValueError, match="\.npy"):
+        mtp_mtp.load_excluded_train_indices(wrong_suffix)
+    with pytest.raises(ValueError, match="outside"):
+        mtp_mtp.indices_excluding_dataset_indices(5, np.array([1, 5]))
+    with pytest.raises(ValueError, match="exactly two"):
+        mtp_mtp.apply_train_index_exclusion(
+            [np.arange(5)], np.array([1])
+        )
+
+
 def test_ds_exclude_elements_is_declared_on_the_model_constructor():
     sig = inspect.signature(mtp_mtp.AM_DimerParam_Model.__init__)
     assert "ds_exclude_elements" in sig.parameters
     assert sig.parameters["ds_exclude_elements"].default is None
+    assert "ds_exclude_train_indices_path" in sig.parameters
+    assert sig.parameters["ds_exclude_train_indices_path"].default is None
     # The CLIFF routes reach it through **dataset_kwargs, so they must not
     # shadow it with a positional-only or differently-named parameter.
     for cls in (
@@ -5062,6 +5120,20 @@ def test_ds_exclude_elements_is_declared_on_the_model_constructor():
         assert "ds_exclude_elements" not in params, cls.__name__
 
 
+def test_train_index_exclusion_route_validation_is_fail_closed():
+    with pytest.raises(ValueError, match="positive-parameter routes"):
+        train_models.train_pairwise_model(
+            apnet_model_type="APNet2",
+            ds_exclude_train_indices_path="exclude.npy",
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        train_models.train_pairwise_model(
+            apnet_model_type="CliffClassicalOverlapModel",
+            ds_exclude_elements=[1],
+            ds_exclude_train_indices_path="exclude.npy",
+        )
+
+
 def test_excluded_elements_are_recorded_for_tracking():
     """A filtered run must be distinguishable from a full one on the dashboard.
 
@@ -5070,6 +5142,9 @@ def test_excluded_elements_are_recorded_for_tracking():
     """
     src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.train)
     assert '"data/excluded_elements"' in src
+    assert '"data/excluded_train_indices_sha256"' in src
+    assert '"data/excluded_train_indices_count"' in src
+    assert '"data/effective_train_size"' in src
     assert '"training/grad_clip_norm"' in src
     assert '"training/grad_clip_mode"' in src
     assert '"training/thole_learning_rate"' in src
@@ -5080,6 +5155,8 @@ def test_excluded_elements_are_recorded_for_tracking():
     # every route, not only when something is excluded.
     init_src = inspect.getsource(mtp_mtp.AM_DimerParam_Model.__init__)
     assert "self.ds_excluded_elements" in init_src
+    assert "self.ds_excluded_train_indices_sha256" in init_src
+    assert "apply_train_index_exclusion" in init_src
 
 
 def test_exclude_scan_multiple_bounds_the_raw_dataset_cap():

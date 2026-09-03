@@ -1,3 +1,4 @@
+import hashlib
 import math
 import os
 import re
@@ -556,6 +557,44 @@ class DimerProp(nn.Module):
         self.set_forward(dimer_eval)
         return
 
+    def _polarizability_table(self) -> torch.Tensor:
+        """The free-atom table the induction physics should use.
+
+        Returns the constant table unchanged unless the parameter head carries
+        a trainable per-element scale, in which case it returns
+        ``alpha_0(Z) * exp(s_Z)``.  ``s`` is seeded at zero, so enabling the
+        scale is a no-op until the optimizer moves it, and the default path
+        hands back the same tensor object it always did.
+
+        ``AtomTypeParam`` is unwrapped first because under DDP the training
+        loop rebinds it to the wrapper (see the comment above the ``DDP(...)``
+        call), and ``DDP`` does not proxy attribute access -- reading the
+        parameter straight off it would silently return ``None`` and drop the
+        scale on exactly the multi-GPU runs.  The parameter object is shared, so
+        the reducer still sees its gradient.
+        """
+        base = self.polarizability_table
+        scale = getattr(
+            model_io.unwrap_model(self.AtomTypeParam),
+            "polarizability_log_scale",
+            None,
+        )
+        if scale is None:
+            return base
+        base = base.to(device=scale.device)
+        # 16 of the 103 entries are NaN -- elements the table has no free-atom
+        # value for.  A NaN must stay NaN in the output, but it must not enter
+        # the multiply, because `index_select` hands back a gradient of exactly
+        # zero for every element absent from the batch and `0 * NaN` is NaN.
+        # That would put NaNs in `polarizability_log_scale.grad` on every step,
+        # and component clipping takes one norm over the whole induction group,
+        # so a single NaN there scales *every* induction gradient to NaN.
+        finite = torch.isfinite(base)
+        return torch.where(
+            finite, torch.where(finite, base, torch.zeros_like(base))
+            * torch.exp(scale), base
+        )
+
     def set_d3_damping_parameters(self, d3_damping_parameters=None):
         self.d3_damping_parameters = resolve_d3_damping_parameters(
             d3_damping_parameters
@@ -786,7 +825,7 @@ class DimerProp(nn.Module):
             max_iterations=self.induction_max_iterations,
             convergence_threshold=self.induction_convergence_threshold,
             convergence_norm=self.induction_convergence_norm,
-            polarizability_table=self.polarizability_table,
+            polarizability_table=self._polarizability_table(),
         )
         return torch.vstack((Elst, Indu)).T, output_A, output_B
 
@@ -965,7 +1004,7 @@ class DimerProp(nn.Module):
                 :, CLIFF_CLASSICAL_IND_OVERLAP_INDEX
             ],
             include_overlap=include_overlap,
-            polarizability_table=self.polarizability_table,
+            polarizability_table=self._polarizability_table(),
             variational_energy=self.variational_induction,
             molecule_ind_A=(
                 batch.molecule_ind_A if self.variational_induction else None
@@ -1214,7 +1253,7 @@ class DimerProp(nn.Module):
             hirshfeld_volume_ratio_B=torch.abs(v_B[3]),
             valence_widths_A=v_A[4],
             valence_widths_B=v_B[4],
-            polarizability_table=self.polarizability_table,
+            polarizability_table=self._polarizability_table(),
         )
         return Indu, v_A, v_B
 
@@ -1253,7 +1292,7 @@ class DimerProp(nn.Module):
             hirshfeld_volume_ratio_B=torch.abs(v_B[-2][:, 0]),
             valence_widths_A=v_A[-2][:, 1],
             valence_widths_B=v_B[-2][:, 1],
-            polarizability_table=self.polarizability_table,
+            polarizability_table=self._polarizability_table(),
         )
         # if Indu.isnan().any():
         #     print("Induced dipole energy is NaN, debugging info:")
@@ -1310,7 +1349,7 @@ class DimerProp(nn.Module):
             hirshfeld_volume_ratio_B=torch.abs(v_B[-2][:, 0]),
             valence_widths_A=v_A[-2][:, 1],
             valence_widths_B=v_B[-2][:, 1],
-            polarizability_table=self.polarizability_table,
+            polarizability_table=self._polarizability_table(),
         )
         # if Indu.isnan().any():
         #     print("Induced dipole energy is NaN, debugging info:")
@@ -1379,7 +1418,7 @@ class DimerProp(nn.Module):
             e_BB_target=batch.e_BB_target,
             hirshfeld_volume_ratio_A=torch.abs(v_A[-2][:, 0]),
             hirshfeld_volume_ratio_B=torch.abs(v_B[-2][:, 0]),
-            polarizability_table=self.polarizability_table,
+            polarizability_table=self._polarizability_table(),
         )
         # if Indu.isnan().any():
         #     print("Induced dipole energy is NaN, debugging info:")
@@ -1468,7 +1507,7 @@ class DimerProp(nn.Module):
             e_BB_target=batch.e_BB_target,
             hirshfeld_volume_ratio_A=torch.abs(v_A[-2][:, 0]),
             hirshfeld_volume_ratio_B=torch.abs(v_B[-2][:, 0]),
-            polarizability_table=self.polarizability_table,
+            polarizability_table=self._polarizability_table(),
         )
         if Indu.isnan().any():
             print("Induced dipole energy is NaN, debugging info:")
@@ -1634,6 +1673,83 @@ def normalize_excluded_elements(excluded_elements):
             )
         normalized.add(z)
     return frozenset(normalized)
+
+
+def load_excluded_train_indices(path):
+    """Load a fail-closed immutable ``.npy`` train-index exclusion artifact.
+
+    Indices refer to the capped, unfiltered training split. The artifact must
+    be a sorted, unique, one-dimensional integer array so its SHA-256 is a
+    complete and unambiguous dataset identity.
+    """
+    if path is None:
+        return np.empty(0, dtype=np.int64), None
+    path = os.fspath(path)
+    if not path.endswith(".npy"):
+        raise ValueError(
+            "excluded train-index artifact must be a .npy file "
+            f"(got {path!r})"
+        )
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"excluded train-index artifact not found: {path}")
+    indices = np.load(path, allow_pickle=False)
+    if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+        raise ValueError(
+            "excluded train-index artifact must contain a 1D integer array "
+            f"(got shape={indices.shape}, dtype={indices.dtype})"
+        )
+    indices = indices.astype(np.int64, copy=False)
+    if np.any(indices < 0):
+        raise ValueError("excluded train indices must be non-negative")
+    if indices.size and (
+        np.any(indices[1:] <= indices[:-1])
+    ):
+        raise ValueError("excluded train indices must be sorted and unique")
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return indices, digest.hexdigest()
+
+
+def indices_excluding_dataset_indices(dataset_size, excluded_indices):
+    """Return indices in ``range(dataset_size)`` absent from an exclusion set."""
+    dataset_size = _validate_positive_count(dataset_size, "dataset_size")
+    excluded = np.asarray(excluded_indices)
+    if excluded.ndim != 1 or not np.issubdtype(excluded.dtype, np.integer):
+        raise ValueError("excluded_indices must be a one-dimensional integer array")
+    excluded = excluded.astype(np.int64, copy=False)
+    if excluded.size and np.any(excluded[1:] <= excluded[:-1]):
+        raise ValueError("excluded_indices must be sorted and unique")
+    if excluded.size and (excluded[0] < 0 or excluded[-1] >= dataset_size):
+        raise ValueError(
+            "excluded train index is outside the capped training split: "
+            f"valid range is [0, {dataset_size}), got "
+            f"[{int(excluded[0])}, {int(excluded[-1])}]"
+        )
+    keep = np.ones(dataset_size, dtype=bool)
+    keep[excluded] = False
+    return np.flatnonzero(keep)
+
+
+def apply_train_index_exclusion(dataset_splits, excluded_indices):
+    """Remove selected capped-train indices without touching validation.
+
+    ``dataset_splits`` is mutated only at position 0. Returning both the
+    original capped size and deterministic keep indices makes the exact
+    post-filter size auditable without scanning any datapoints.
+    """
+    if len(dataset_splits) != 2:
+        raise ValueError(
+            "train-index exclusion requires exactly two dataset splits "
+            f"(got {len(dataset_splits)})"
+        )
+    capped_train_size = len(dataset_splits[0])
+    keep = indices_excluding_dataset_indices(
+        capped_train_size, excluded_indices
+    )
+    dataset_splits[0] = dataset_splits[0][keep]
+    return capped_train_size, keep
 
 
 def dimer_indices_excluding_elements(
@@ -2307,6 +2423,29 @@ def _validate_bound_scale(value, name: str, *, allow_none: bool = True):
     return scale
 
 
+def _validate_polarizability_lr(
+    value, *, allow_none: bool = True, name: str = "polarizability_lr"
+):
+    """Validate a learning rate for which zero is meaningful.
+
+    Separate from :func:`_validate_bound_scale` only because zero is
+    meaningful here: it is the control arm that carries the parameter through
+    the checkpoint while holding it at its seed.  ``atom_model_lr`` wants the
+    same semantics, so it borrows this validator under its own name.
+    """
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{name} must be finite and non-negative")
+    try:
+        rate = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be finite and non-negative") from exc
+    if not math.isfinite(rate) or rate < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return rate
+
+
 def _validate_induction_convergence_norm(convergence_norm) -> str:
     """Validate the reduction used by the Rackers/Thole stopping rule."""
     if not isinstance(convergence_norm, str):
@@ -2624,6 +2763,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
+        trainable_polarizability_scale=False,
     ):
         if type(atom_model) is not AtomTypeParamNN:
             raise ValueError("atom_model must be an AtomTypeParamNN")
@@ -2751,6 +2891,17 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
             for p in self._shared_damping_indices:
                 self.guess_layer[p].requires_grad_(False)
                 self.param_readout_layers[p].requires_grad_(False)
+        # Long-range induction magnitude is alpha_0(Z) * HFVR**(4/3).  HFVR
+        # comes from the frozen `atom_model` and alpha_0 is a static table, so
+        # with this off *no trainable parameter scales long-range induction* --
+        # the Thole smearing and the overlap correction both act only at short
+        # range, which is exactly where the measured deficit is smallest.
+        # Registered as a `None` parameter rather than skipped so the attribute
+        # always exists and the `state_dict` stays empty of it until enabled.
+        self.trainable_polarizability_scale = False
+        self.register_parameter("polarizability_log_scale", None)
+        if trainable_polarizability_scale:
+            self.enable_trainable_polarizability_scale()
 
     def _seed_guess_layer_by_Z(self, param_start_mean_by_Z, positivity_epsilon):
         """Overwrite per-element rows of the seed embeddings.
@@ -2935,6 +3086,39 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
                 )
         return occupancy
 
+    def enable_trainable_polarizability_scale(self) -> nn.Parameter:
+        """Make the free-atom polarizability table a trainable per-element scale.
+
+        ``alpha_0(Z)`` becomes ``alpha_0(Z) * exp(s_Z)`` with ``s`` seeded at
+        exactly zero, so a head that enables this predicts bit-identically to
+        one that never did until ``s`` moves.  That is what makes it safe to
+        warm start an existing checkpoint into it, and what makes an
+        ``lr = 0`` arm a true control rather than an approximation of one.
+
+        Off by default and callable after construction, because a checkpoint
+        written before this existed replays its own recorded architecture: it
+        rebuilds a head with the flag false and a ``state_dict`` with no such
+        key, so ``load_state_dict`` stays strict and every pre-existing
+        checkpoint round-trips unchanged.  Turning it on is a training-time
+        decision, not a property of the weights being continued from.
+
+        Exponential rather than a raw multiplier so the scale cannot cross
+        zero and flip the sign of a polarizability, and so equal steps are
+        equal *fractional* changes -- alpha_0 spans two orders of magnitude
+        across the table.
+        """
+        if self.polarizability_log_scale is None:
+            reference = next((parameter for parameter in self.parameters()), None)
+            self.polarizability_log_scale = nn.Parameter(
+                torch.zeros(
+                    constants.polarizability_table.numel(),
+                    dtype=torch.get_default_dtype(),
+                    device=None if reference is None else reference.device,
+                )
+            )
+        self.trainable_polarizability_scale = True
+        return self.polarizability_log_scale
+
     def get_config(self) -> dict:
         return {
             "model_type": self.MODEL_TYPE,
@@ -3022,6 +3206,13 @@ class CliffClassicalNN(_CliffPositiveParamNN):
 
     MODEL_TYPE = "CliffClassicalNN"
     PARAMETER_NAMES = CLIFF_CLASSICAL_PARAMETER_NAMES
+    # Only this head carries the trainable polarizability scale, so only this
+    # head replays it.  Declaring it on `_CliffPositiveParamNN` would forward it
+    # into `CliffExchangeNN.__init__` too, which does not accept it.
+    ARCHITECTURE_CONFIG_KEYS = (
+        *_CliffPositiveParamNN.ARCHITECTURE_CONFIG_KEYS,
+        "trainable_polarizability_scale",
+    )
 
     def __init__(
         self,
@@ -3044,6 +3235,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
+        trainable_polarizability_scale=False,
     ):
         if param_start_mean_by_Z is None:
             param_start_mean_by_Z = CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z
@@ -3063,7 +3255,19 @@ class CliffClassicalNN(_CliffPositiveParamNN):
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
             shared_damping_parameters=shared_damping_parameters,
+            trainable_polarizability_scale=trainable_polarizability_scale,
         )
+
+    def get_config(self) -> dict:
+        # The base `get_config` is a dict literal, not a union over
+        # `ARCHITECTURE_CONFIG_KEYS`, so a key declared on this head has to be
+        # recorded here or the replay loop finds nothing to forward and a
+        # checkpoint silently comes back with the scale switched off.
+        config = super().get_config()
+        config.update(
+            {key: getattr(self, key) for key in self.ARCHITECTURE_CONFIG_KEYS}
+        )
+        return config
 
 
 # --- CLIFF classical head with its own message passing -----------------------
@@ -6276,6 +6480,7 @@ class AM_DimerParam_Model:
         ds_max_size=None,
         ds_max_size_val=None,
         ds_exclude_elements=None,
+        ds_exclude_train_indices_path=None,
         ds_exclude_scan_multiple=2.0,
         ds_atomic_batch_size=200,
         ds_batch_size=16,
@@ -6341,6 +6546,7 @@ class AM_DimerParam_Model:
             ds_max_size (int, optional): Max dataset size (truncates when set). With `ds_exclude_elements` it caps the count *after* filtering. On a split store it caps both splits unless `ds_max_size_val` overrides the validation one.
             ds_max_size_val (int, optional): Separate cap for the validation split of a split store. `None` (the default) reuses `ds_max_size`, which is the historical behaviour. Bounds processing as well as truncation, and requires `ds_max_size`.
             ds_exclude_elements (iterable[int] or None): Atomic numbers to exclude; any dimer containing one is dropped before `ds_max_size` is applied. Atomic numbers only -- element symbols are rejected.
+            ds_exclude_train_indices_path (str or None): Immutable sorted unique `.npy` indices to remove from the capped training split. Validation is unchanged. This is mutually exclusive with element exclusion and is included in tracking/resume identity by SHA-256.
             ds_exclude_scan_multiple (float): How much raw data to make available to the exclusion scan, as a multiple of `ds_max_size`. Must be >= 1. This bounds both the scan and, on an unprocessed store, how many dimers get processed.
             ds_atomic_batch_size (int): Atomic batch size used by dataset construction.
             ds_batch_size (int): Dimers per optimizer step. Recorded on the dataset as `training_batch_size`, which is where `train` reads it from; it is not part of the on-disk layout, so changing it does not invalidate a processed store.
@@ -6777,6 +6983,11 @@ class AM_DimerParam_Model:
             self.dimer_model.AtomTypeParam.atom_model.to(device)
 
         split_dbs = [2, 5, 6, 7]
+        ds_qcel_split_db = (
+            ds_qcel_molecules is not None
+            and len(ds_qcel_molecules) == 2
+            and isinstance(ds_qcel_molecules[0], list)
+        )
         # Element exclusion filters whole dimers, so it has to run before
         # ds_max_size is applied -- otherwise a 5000-dimer request silently
         # returns however many survive. The raw cap is therefore loosened, and
@@ -6787,6 +6998,15 @@ class AM_DimerParam_Model:
         # "give me 5000 filtered dimers" into a full 1.6M-dimer processing job
         # on any machine whose processed store is not already built.
         ds_excluded_elements = normalize_excluded_elements(ds_exclude_elements)
+        (
+            ds_excluded_train_indices,
+            ds_excluded_train_indices_sha256,
+        ) = load_excluded_train_indices(ds_exclude_train_indices_path)
+        if ds_excluded_elements and ds_exclude_train_indices_path is not None:
+            raise ValueError(
+                "ds_exclude_elements and ds_exclude_train_indices_path are "
+                "mutually exclusive because their index spaces differ"
+            )
         ds_exclude_scan_multiple = _validate_scan_multiple(
             ds_exclude_scan_multiple
         )
@@ -6797,6 +7017,22 @@ class AM_DimerParam_Model:
         # Without it a filtered run is indistinguishable from a full one on the
         # dashboard, which is the whole reason for logging the run.
         self.ds_excluded_elements = sorted(ds_excluded_elements)
+        self.ds_excluded_train_indices_path = (
+            os.fspath(ds_exclude_train_indices_path)
+            if ds_exclude_train_indices_path is not None
+            else None
+        )
+        self.ds_excluded_train_indices_sha256 = ds_excluded_train_indices_sha256
+        self.ds_excluded_train_indices_count = int(
+            ds_excluded_train_indices.size
+        )
+        if ds_exclude_train_indices_path is not None and not (
+            self.ds_spec_type in split_dbs or ds_qcel_split_db
+        ):
+            raise ValueError(
+                "ds_exclude_train_indices_path requires a split dataset so "
+                "training indices cannot be confused with validation indices"
+            )
 
         def _raw_cap(cap):
             """How much raw data the exclusion scan may reach for one split."""
@@ -6805,11 +7041,6 @@ class AM_DimerParam_Model:
             return int(math.ceil(cap * float(ds_exclude_scan_multiple)))
 
         ds_raw_max_size = _raw_cap(ds_max_size)
-        ds_qcel_split_db = (
-            ds_qcel_molecules is not None
-            and len(ds_qcel_molecules) == 2
-            and isinstance(ds_qcel_molecules[0], list)
-        )
         # A validation cap only means something when there is a second store to
         # cap. On a single-store spec `train` splits by percentage, so honoring
         # it would be a no-op that the run record reports as a bounded run.
@@ -6979,6 +7210,23 @@ class AM_DimerParam_Model:
                         self.dataset[split_idx] = self.dataset[split_idx][
                             :split_cap
                         ]
+            if ds_excluded_train_indices.size:
+                capped_train_size, keep = apply_train_index_exclusion(
+                    self.dataset, ds_excluded_train_indices
+                )
+                print(
+                    "train-index exclusion: artifact="
+                    f"{self.ds_excluded_train_indices_path}; sha256="
+                    f"{self.ds_excluded_train_indices_sha256}; excluded "
+                    f"{self.ds_excluded_train_indices_count} of "
+                    f"{capped_train_size}; kept {len(keep)}",
+                    flush=True,
+                )
+        self.ds_effective_train_size = (
+            len(self.dataset[0])
+            if isinstance(self.dataset, (list, tuple)) and self.dataset
+            else None
+        )
         print(f"{self.dataset=}")
         self.batch_size = None
         self.shuffle = False
@@ -7647,24 +7895,58 @@ units angstrom
         total_mse = torch.mean(torch.square(pred_total - ref_total))
         return (1.0 - gamma) * total_mse + gamma * component_mse
 
-    def _optimizer_parameter_groups(self, lr: float, thole_lr: float | None):
-        """Return the legacy iterator or disjoint base/Thole Adam groups."""
-        if thole_lr is None:
-            # Preserve the historical optimizer construction exactly when the
-            # new control is not requested.
-            return self.model.parameters()
-        thole_lr = _validate_bound_scale(thole_lr, "thole_lr")
+    def _optimizer_parameter_groups(
+        self,
+        lr: float,
+        thole_lr: float | None,
+        polarizability_lr: float | None = None,
+        atom_model_lr: float | None = None,
+    ):
+        """Return the legacy iterator or disjoint per-role Adam groups."""
         head = model_io.unwrap_model(self.model)
+        alpha_scale = getattr(head, "polarizability_log_scale", None)
+        if (
+            thole_lr is None
+            and polarizability_lr is None
+            and alpha_scale is None
+            and atom_model_lr is None
+        ):
+            # Preserve the historical optimizer construction exactly when no
+            # split is requested.
+            return self.model.parameters()
+        if polarizability_lr is None and alpha_scale is not None:
+            # Fail closed rather than sweep the alpha scale into `base` at the
+            # trunk's rate.  It multiplies every induction energy in the batch,
+            # so an unintended rate on it is not a small mistake.
+            raise ValueError(
+                "this head carries a trainable polarizability scale; "
+                "polarizability_lr must be given explicitly (0.0 freezes it)"
+            )
+        if polarizability_lr is not None and alpha_scale is None:
+            raise ValueError(
+                "polarizability_lr was requested but the head has no "
+                "trainable polarizability scale; pass "
+                "trainable_polarizability_scale=True"
+            )
+        thole_lr = _validate_bound_scale(thole_lr, "thole_lr")
+        polarizability_lr = _validate_polarizability_lr(polarizability_lr)
+        atom_model_lr = _validate_polarizability_lr(
+            atom_model_lr, name="atom_model_lr"
+        )
         if type(head) is not CliffClassicalNN:
             raise ValueError(
-                "thole_lr requires the dense CliffClassicalNN head"
+                "thole_lr, polarizability_lr, and atom_model_lr require the "
+                "dense CliffClassicalNN head"
             )
         thole_columns = {
             CLIFF_CLASSICAL_THOLE_DIRECT_INDEX,
             CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX,
         }
+        split_columns = (
+            sorted(thole_columns) if thole_lr is not None else ()
+        )
         thole_parameters = []
-        for column in sorted(thole_columns):
+        for column in split_columns:
             thole_parameters.extend(
                 parameter
                 for parameter in head.guess_layer[column].parameters()
@@ -7678,37 +7960,93 @@ units angstrom
         shared_damping = getattr(head, "shared_damping_raw", None)
         shared_indices = set(getattr(head, "_shared_damping_indices", ()))
         if (
-            shared_damping is not None
+            thole_lr is not None
+            and shared_damping is not None
             and shared_damping.requires_grad
             and shared_indices & thole_columns
         ):
             thole_parameters.append(shared_damping)
-        if not thole_parameters:
+        if thole_lr is not None and not thole_parameters:
             raise ValueError(
                 "thole_lr was requested but no trainable direct or mutual "
                 "Thole parameters exist"
             )
-        thole_ids = [id(parameter) for parameter in thole_parameters]
-        if len(thole_ids) != len(set(thole_ids)):
-            raise RuntimeError("Thole optimizer parameter group overlaps itself")
+        alpha_parameters = (
+            [alpha_scale]
+            if alpha_scale is not None and alpha_scale.requires_grad
+            else []
+        )
+        # The pretrained trunk.  It is frozen in every default configuration,
+        # in which case `trunk_parameters` is empty and nothing below changes.
+        # Unfrozen, it is 1.89M pretrained parameters against a head of 231k,
+        # and `base` has no way to hold the two at different rates: everything
+        # that is neither Thole nor the alpha scale lands there at one lr.
+        # Running it at the head's rate destroyed the model inside a single
+        # epoch at two rates an order of magnitude apart (jobs 12632350 and
+        # 12632352: validation induction non-finite, >6000 batches skipped),
+        # so an unfrozen trunk must state its rate rather than inherit one.
+        trunk_parameters = [
+            parameter
+            for parameter in head.atom_model.parameters()
+            if parameter.requires_grad
+        ]
+        if atom_model_lr is not None and not trunk_parameters:
+            raise ValueError(
+                "atom_model_lr was requested but the nested atom_model is "
+                "frozen; pass unfreeze_atom_model to train it"
+            )
+        if atom_model_lr is None and trunk_parameters:
+            raise ValueError(
+                "the nested atom_model is trainable but no atom_model_lr was "
+                "given; it would silently inherit the head's lr. Pass it "
+                "explicitly (0.0 carries it through the checkpoint frozen)"
+            )
+        split_parameters = [
+            *thole_parameters,
+            *alpha_parameters,
+            *trunk_parameters,
+        ]
+        split_ids = [id(parameter) for parameter in split_parameters]
+        if len(split_ids) != len(set(split_ids)):
+            raise RuntimeError("optimizer parameter groups overlap")
         trainable = [
             parameter for parameter in head.parameters() if parameter.requires_grad
         ]
         base_parameters = [
-            parameter for parameter in trainable if id(parameter) not in thole_ids
+            parameter for parameter in trainable if id(parameter) not in split_ids
         ]
         if {id(parameter) for parameter in trainable} != {
-            id(parameter) for parameter in (*base_parameters, *thole_parameters)
+            id(parameter) for parameter in (*base_parameters, *split_parameters)
         }:
-            raise RuntimeError("base/Thole optimizer groups do not cover the head")
-        return [
-            {"params": base_parameters, "lr": float(lr), "group_name": "base"},
-            {
-                "params": thole_parameters,
-                "lr": float(thole_lr),
-                "group_name": "thole",
-            },
+            raise RuntimeError("optimizer groups do not cover the head")
+        groups = [
+            {"params": base_parameters, "lr": float(lr), "group_name": "base"}
         ]
+        if thole_parameters:
+            groups.append(
+                {
+                    "params": thole_parameters,
+                    "lr": float(thole_lr),
+                    "group_name": "thole",
+                }
+            )
+        if alpha_parameters:
+            groups.append(
+                {
+                    "params": alpha_parameters,
+                    "lr": float(polarizability_lr),
+                    "group_name": "polarizability",
+                }
+            )
+        if trunk_parameters:
+            groups.append(
+                {
+                    "params": trunk_parameters,
+                    "lr": float(atom_model_lr),
+                    "group_name": "atom_model",
+                }
+            )
+        return groups
 
     def _reduced_induction_diagnostics(
         self, prefix: str, world_size: int
@@ -7764,11 +8102,21 @@ units angstrom
         """Return disjoint dense-head parameter groups by physical component.
 
         The dense ``CliffClassicalNN`` has one embedding/readout stack per
-        parameter column and a frozen nested atom model. Consequently ELST,
-        EXCH, and IND can be clipped independently without assigning a shared
-        trainable tensor arbitrarily. Fail closed if a future architecture adds
-        a shared trainable tensor or if this mode is requested on the MPNN head,
-        whose featurizer is shared across output columns.
+        parameter column, so ELST, EXCH, and IND can be clipped independently
+        without assigning a shared trainable tensor arbitrarily. Fail closed if
+        this mode is requested on the MPNN head, whose featurizer is shared
+        across output columns.
+
+        The nested ``atom_model`` is frozen in the default configuration and
+        contributes nothing. Under ``--unfreeze_atom_model`` it becomes
+        trainable, and it is genuinely shared: its multipoles feed ELST, its
+        Hirshfeld ratios feed the valence widths that EXCH and IND are built
+        from. There is no non-arbitrary way to split it across the three
+        components, so it gets its own group and is clipped once as a trunk.
+        That keeps the three component groups disjoint and independent, which
+        is the whole point of this mode, and it keeps the trunk under the same
+        finite-norm check -- an unfrozen pretrained trunk being where a
+        non-finite gradient is most likely to originate.
         """
         head = model_io.unwrap_model(self.model)
         if type(head) is not CliffClassicalNN:
@@ -7801,6 +8149,23 @@ units angstrom
         shared_damping = getattr(head, "shared_damping_raw", None)
         if shared_damping is not None and shared_damping.requires_grad:
             groups["induction"].append(shared_damping)
+        # The alpha scale multiplies the induced dipoles and nothing else, so
+        # it belongs with induction.  Omitting it is not a silent mis-grouping:
+        # the exact-coverage check below would raise on every step.
+        alpha_scale = getattr(head, "polarizability_log_scale", None)
+        if alpha_scale is not None and alpha_scale.requires_grad:
+            groups["induction"].append(alpha_scale)
+
+        # The shared trunk. Empty and absent unless --unfreeze_atom_model, so
+        # every frozen-atom_model run clips exactly the three groups it always
+        # did and its trajectory is unchanged.
+        trunk = [
+            parameter
+            for parameter in head.atom_model.parameters()
+            if parameter.requires_grad
+        ]
+        if trunk:
+            groups["atom_model"] = trunk
 
         grouped_ids = [
             id(parameter)
@@ -8078,6 +8443,8 @@ units angstrom
         grad_clip_mode="global",
         thole_lr=None,
         induction_diagnostics=False,
+        polarizability_lr=None,
+        atom_model_lr=None,
         rank=0,
         world_size=1,
         local_rank=None,
@@ -8281,7 +8648,10 @@ units angstrom
 
         # (3) Optim/Scheduler
         optimizer = torch.optim.Adam(
-            self._optimizer_parameter_groups(lr, thole_lr), lr=lr
+            self._optimizer_parameter_groups(
+                lr, thole_lr, polarizability_lr, atom_model_lr
+            ),
+            lr=lr,
         )
         scheduler = None
         # criterion = None  # defaults to MSE
@@ -8458,12 +8828,33 @@ units angstrom
                 else None
             ),
         }
+        excluded_train_indices_sha256 = getattr(
+            self, "ds_excluded_train_indices_sha256", None
+        )
+        if excluded_train_indices_sha256 is not None:
+            train_state_identity["excluded_train_indices_sha256"] = (
+                excluded_train_indices_sha256
+            )
         if thole_lr is not None:
             # Optimizer group structure and both restored rates are part of
             # resume correctness. Keep these keys absent on the legacy one-group
             # path so pre-existing sidecars remain compatible.
             train_state_identity.update(
                 {"base_lr": float(lr), "thole_lr": float(thole_lr)}
+            )
+        if polarizability_lr is not None:
+            train_state_identity.update(
+                {
+                    "base_lr": float(lr),
+                    "polarizability_lr": float(polarizability_lr),
+                }
+            )
+        if atom_model_lr is not None:
+            train_state_identity.update(
+                {
+                    "base_lr": float(lr),
+                    "atom_model_lr": float(atom_model_lr),
+                }
             )
         solver_threshold = self.dimer_model.induction_convergence_threshold
         solver_max_iterations = self.dimer_model.induction_max_iterations
@@ -8734,6 +9125,8 @@ units angstrom
         grad_clip_mode="global",
         thole_lr=None,
         induction_diagnostics=False,
+        polarizability_lr=None,
+        atom_model_lr=None,
         local_rank=None,
     ):
         """Run one DDP rank of :meth:`single_proc_train`.
@@ -8761,6 +9154,8 @@ units angstrom
                 grad_clip_mode=grad_clip_mode,
                 thole_lr=thole_lr,
                 induction_diagnostics=induction_diagnostics,
+                polarizability_lr=polarizability_lr,
+                atom_model_lr=atom_model_lr,
                 rank=rank,
                 world_size=world_size,
                 local_rank=local_rank,
@@ -8838,6 +9233,9 @@ units angstrom
         grad_clip_mode="global",
         thole_lr=None,
         induction_diagnostics=False,
+        trainable_polarizability_scale=False,
+        polarizability_lr=None,
+        atom_model_lr=None,
         induction_convergence_threshold=None,
         induction_convergence_norm=None,
         induction_max_iterations=None,
@@ -8873,6 +9271,10 @@ units angstrom
         """
         grad_clip_norm = _validate_bound_scale(grad_clip_norm, "grad_clip_norm")
         thole_lr = _validate_bound_scale(thole_lr, "thole_lr")
+        polarizability_lr = _validate_polarizability_lr(polarizability_lr)
+        atom_model_lr = _validate_polarizability_lr(
+            atom_model_lr, name="atom_model_lr"
+        )
         induction_diagnostics = bool(induction_diagnostics)
         if (
             induction_convergence_threshold is not None
@@ -8941,9 +9343,35 @@ units angstrom
                     "component gradient clipping requires the dense "
                     "CliffClassicalNN head"
                 )
-        if thole_lr is not None:
+        if trainable_polarizability_scale:
+            # Enabled here rather than at construction so a checkpoint written
+            # before this existed -- which replays its own architecture, with
+            # the flag false -- can still be warm started into an arm that
+            # trains the scale.  Seeded at zero, so the continuation starts
+            # bit-identical to the checkpoint it came from.
+            head = model_io.unwrap_model(self.model)
+            if type(head) is not CliffClassicalNN:
+                raise ValueError(
+                    "trainable_polarizability_scale requires the dense "
+                    "CliffClassicalNN head"
+                )
+            head.enable_trainable_polarizability_scale()
+            if polarizability_lr is None:
+                raise ValueError(
+                    "trainable_polarizability_scale requires "
+                    "polarizability_lr (0.0 freezes the scale)"
+                )
+        if (
+            thole_lr is not None
+            or polarizability_lr is not None
+            or atom_model_lr is not None
+        ):
             # Validate the requested optimizer split before any dataset I/O.
-            self._optimizer_parameter_groups(lr, thole_lr)
+            # An unfrozen trunk with no rate of its own raises here, which is
+            # before the dataset build rather than an epoch into the run.
+            self._optimizer_parameter_groups(
+                lr, thole_lr, polarizability_lr, atom_model_lr
+            )
         self.grad_clip_mode = grad_clip_mode
         # Validated before any dataset work so a misconfigured route fails
         # immediately rather than after a dataset build.
@@ -9005,6 +9433,9 @@ units angstrom
         print(f"  {n_epochs=}", flush=True)
         print(f"  {lr=}", flush=True)
         print(f"  {thole_lr=}", flush=True)
+        print(f"  {trainable_polarizability_scale=}", flush=True)
+        print(f"  {polarizability_lr=}", flush=True)
+        print(f"  {atom_model_lr=}", flush=True)
         print(f"  {induction_diagnostics=}", flush=True)
         self.shard_locality_block_shards = int(
             shard_locality_block_shards or 0
@@ -9034,6 +9465,11 @@ units angstrom
             "training/grad_clip_norm": grad_clip_norm,
             "training/grad_clip_mode": grad_clip_mode,
             "training/thole_learning_rate": thole_lr,
+            "training/trainable_polarizability_scale": (
+                trainable_polarizability_scale
+            ),
+            "training/polarizability_learning_rate": polarizability_lr,
+            "training/atom_model_learning_rate": atom_model_lr,
             "training/induction_diagnostics": induction_diagnostics,
             "training/induction_convergence_threshold": effective_threshold,
             "training/induction_convergence_norm": effective_norm,
@@ -9050,10 +9486,22 @@ units angstrom
             "data/excluded_elements": list(
                 getattr(self, "ds_excluded_elements", []) or []
             ),
+            "data/excluded_train_indices_path": getattr(
+                self, "ds_excluded_train_indices_path", None
+            ),
+            "data/excluded_train_indices_sha256": getattr(
+                self, "ds_excluded_train_indices_sha256", None
+            ),
+            "data/excluded_train_indices_count": getattr(
+                self, "ds_excluded_train_indices_count", 0
+            ),
             # Same argument as the exclusion list: a run whose validation split
             # is capped differently from its training split is a different
             # experiment, and the dashboard has to say so.
             "data/train_cap": getattr(self, "ds_max_size", None),
+            "data/effective_train_size": getattr(
+                self, "ds_effective_train_size", None
+            ),
             "data/validation_cap": getattr(self, "ds_max_size_val", None),
             "data/batch_size": batch_size,
             # Stated rather than implied: `batch_size` is per rank, so the
@@ -9091,6 +9539,8 @@ units angstrom
                 grad_clip_mode,
                 thole_lr,
                 induction_diagnostics,
+                polarizability_lr,
+                atom_model_lr,
             )
             if _external_rank is None:
                 configure_distributed_tracking(
@@ -9146,6 +9596,8 @@ units angstrom
                     grad_clip_mode=grad_clip_mode,
                     thole_lr=thole_lr,
                     induction_diagnostics=induction_diagnostics,
+                    polarizability_lr=polarizability_lr,
+                    atom_model_lr=atom_model_lr,
                 ),
                 wandb_config,
                 model_family="parameter",

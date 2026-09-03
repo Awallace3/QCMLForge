@@ -345,10 +345,20 @@ def test_config_records_the_architecture(nested_hfvr_vw_model):
 
 
 def test_dense_head_declares_only_the_shared_architecture_key():
-    """Every positive head can freeze columns; only the MPNN head adds more."""
+    """Every positive head can freeze columns; the others add their own.
+
+    The base tuple is replayed straight into each head's constructor, so a key
+    only belongs there when every subclass accepts it.  The dense head adds the
+    polarizability scale because it is the only head the training route allows
+    to train one; the MPNN head adds its own graph geometry.
+    """
     shared = ("frozen_parameters", "shared_damping_parameters")
-    assert CliffClassicalNN.ARCHITECTURE_CONFIG_KEYS == shared
     assert mtp_mtp._CliffPositiveParamNN.ARCHITECTURE_CONFIG_KEYS == shared
+    assert mtp_mtp.CliffExchangeNN.ARCHITECTURE_CONFIG_KEYS == shared
+    assert CliffClassicalNN.ARCHITECTURE_CONFIG_KEYS == (
+        *shared,
+        "trainable_polarizability_scale",
+    )
 
 
 def test_nested_model_must_be_an_atomtypeparamnn():
@@ -1696,6 +1706,72 @@ def test_zero_call_ddp_diagnostics_still_enter_collectives(
     monkeypatch.setattr(harness, "_ddp_all_reduce", fake_all_reduce)
     assert harness._reduced_induction_diagnostics("train", world_size=2) == {}
     assert operations == ["sum", "max"]
+
+
+def test_component_gradient_groups_cover_an_unfrozen_atom_model(
+    nested_hfvr_vw_model,
+):
+    """Unfreezing the trunk adds a fourth group instead of raising.
+
+    The exact-coverage check exists so that a newly trainable tensor cannot be
+    silently clipped by the wrong component -- or by none. ``atom_model`` is
+    genuinely shared (multipoles -> ELST, Hirshfeld ratios -> the valence
+    widths behind EXCH and IND), so it gets its own group rather than an
+    arbitrary assignment, and the three component groups stay disjoint.
+    """
+    torch.manual_seed(0)
+    harness = mtp_mtp.CliffClassicalOverlapModel(
+        atom_model=nested_hfvr_vw_model,
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+    )
+    head = model_io.unwrap_model(harness.model)
+    # Frozen is the default and must stay a three-group partition, so every
+    # existing run clips exactly what it always did.
+    assert tuple(harness._component_gradient_parameter_groups()) == (
+        "electrostatics",
+        "exchange",
+        "induction",
+    )
+
+    for parameter in head.atom_model.parameters():
+        parameter.requires_grad_(True)
+    groups = harness._component_gradient_parameter_groups()
+    assert tuple(groups) == (
+        "electrostatics",
+        "exchange",
+        "induction",
+        "atom_model",
+    )
+    trunk_ids = {id(p) for p in groups["atom_model"]}
+    assert trunk_ids == {
+        id(p) for p in head.atom_model.parameters() if p.requires_grad
+    }
+    assert trunk_ids
+    # Disjoint from the component groups: the trunk lives in a different
+    # submodule subtree, and the coverage check would have raised otherwise.
+    for component in ("electrostatics", "exchange", "induction"):
+        assert not trunk_ids & {id(p) for p in groups[component]}
+
+    # The trunk is clipped as one unit and stays inside the finite check.
+    for parameter in groups["atom_model"]:
+        parameter.grad = torch.full_like(parameter, 5.0)
+    for component in ("electrostatics", "exchange", "induction"):
+        for parameter in groups[component]:
+            parameter.grad = torch.full_like(parameter, 5.0)
+    reported = harness._clip_gradient_norms(1.0, "component")
+    assert set(reported) == set(groups)
+    after = torch.sqrt(
+        sum(
+            torch.sum(parameter.grad.square())
+            for parameter in groups["atom_model"]
+        )
+    )
+    assert after == pytest.approx(1.0, rel=2e-5)
 
 
 def test_component_gradient_groups_reject_the_shared_mpnn_head(

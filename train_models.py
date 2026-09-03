@@ -419,6 +419,7 @@ def train_pairwise_model(
     frozen_parameters=None,
     shared_damping_parameters=None,
     ds_exclude_elements=None,
+    ds_exclude_train_indices_path=None,
     split_manifest=None,
     ds_class_type="pt",
     DimerProp_model_type="AtomTypeParamNN",
@@ -435,6 +436,9 @@ def train_pairwise_model(
     grad_clip_norm=None,
     grad_clip_mode="global",
     thole_lr=None,
+    trainable_polarizability_scale=False,
+    polarizability_lr=None,
+    atom_model_lr=None,
     induction_diagnostics=False,
     induction_convergence_threshold=None,
     induction_max_iterations=None,
@@ -490,6 +494,7 @@ def train_pairwise_model(
         shared_damping_parameters (list[str] or None): Damping columns to fit as one global scalar shared by every atom and every listed column, instead of one value per element. CLIFF routes only, and disjoint from frozen_parameters.
         batch_size (int or None): Dimers per optimizer step. None (the default) keeps each route's historical dataset batch size. The trainers read this off the dataset as `training_batch_size`, so it is set there rather than on train().
         ds_exclude_elements (list[int] or None): Atomic numbers to exclude. Any dimer containing one is dropped before ds_max_size is applied, so ds_max_size counts surviving dimers. Positive-parameter routes only (Rackers and CLIFF).
+        ds_exclude_train_indices_path (str or None): Sorted unique `.npy` indices to remove from the capped training split while leaving validation unchanged. Positive-parameter split-store routes only; mutually exclusive with ds_exclude_elements.
         ds_class_type (str): Dataset class/storage type identifier (e.g., "pt").
         DimerProp_model_type (str): Dimer property model type name used when constructing AM-DimerParam models.
         ap2_pretrained_model_only (str or None): If provided for APNet3-fused variants, load AP2 weights from this path into the APNet.
@@ -502,6 +507,9 @@ def train_pairwise_model(
         grad_clip_norm (float or None): Gradient-norm clip applied before each optimizer step. None leaves the update unclipped.
         grad_clip_mode (str): `global` clips all parameters together; `component` clips dense CLIFF ELST, EXCH, and IND groups independently.
         thole_lr (float or None): Optional Adam learning rate for only the trainable direct/mutual Thole columns; all other columns retain `lr`.
+        trainable_polarizability_scale (bool): Promote the static free-atom polarizability table to a trainable per-element scale, `alpha_0(Z) -> alpha_0(Z) * exp(s_Z)`, seeded at `s = 0`. This is the only parameter that scales long-range induction; without it `alpha` is fixed by a static table and the frozen atom model's Hirshfeld ratios.
+        polarizability_lr (float or None): Required whenever the scale is enabled, and the Adam learning rate for it alone. `0.0` is legal and is the control arm: the scale rides through the checkpoint at its seed, so the run stays bit-identical to one without it.
+        atom_model_lr (float or None): Required whenever `--unfreeze_atom_model` trains the nested atom model on a dense combined CLIFF route, and the Adam learning rate for that trunk alone. The trunk carries 1.89M pretrained parameters against a 231k head; at the head's rate it destroys the model within one epoch, so it has to be stated rather than inherited.
         induction_diagnostics (bool): Collect and log per-epoch SCF convergence, residual, induced-dipole, and induction-energy health metrics.
         shard_locality_block_shards (int): 0 disables. Above 0, shuffle shards rather than dimers and give each loader worker a disjoint block of this many shards, backed by an LRU of the same size. Trades a smaller shuffle window for roughly one shard read per shard per epoch instead of one per dimer.
         induction_convergence_threshold (float or None): Optional Rackers/Thole SCF residual threshold. None preserves the checkpoint/default value (historically 1e-8).
@@ -541,6 +549,41 @@ def train_pairwise_model(
                 "thole_lr is only supported on the dense combined CLIFF "
                 f"routes {sorted(COMPONENT_CLIP_CLIFF_MODEL_TYPES)}, not "
                 f"{apnet_model_type!r}"
+            )
+    if atom_model_lr is not None:
+        atom_model_lr = AtomPairwiseModels.mtp_mtp._validate_polarizability_lr(
+            atom_model_lr, name="atom_model_lr"
+        )
+        if apnet_model_type not in COMPONENT_CLIP_CLIFF_MODEL_TYPES:
+            raise ValueError(
+                "atom_model_lr is only supported on the dense combined CLIFF "
+                f"routes {sorted(COMPONENT_CLIP_CLIFF_MODEL_TYPES)}, not "
+                f"{apnet_model_type!r}"
+            )
+    if trainable_polarizability_scale or polarizability_lr is not None:
+        polarizability_lr = (
+            AtomPairwiseModels.mtp_mtp._validate_polarizability_lr(
+                polarizability_lr
+            )
+        )
+        if apnet_model_type not in COMPONENT_CLIP_CLIFF_MODEL_TYPES:
+            raise ValueError(
+                "trainable_polarizability_scale is only supported on the "
+                "dense combined CLIFF routes "
+                f"{sorted(COMPONENT_CLIP_CLIFF_MODEL_TYPES)}, not "
+                f"{apnet_model_type!r}"
+            )
+        # Neither half is useful alone, and each silent default would be the
+        # wrong one: a rate with no parameter is a no-op, and a parameter with
+        # no rate lands in the base group at the trunk's rate.
+        if not trainable_polarizability_scale:
+            raise ValueError(
+                "polarizability_lr requires trainable_polarizability_scale"
+            )
+        if polarizability_lr is None:
+            raise ValueError(
+                "trainable_polarizability_scale requires polarizability_lr "
+                "(0.0 freezes the scale at its seed)"
             )
     if induction_diagnostics and apnet_model_type not in COMBINED_CLIFF_MODEL_TYPES:
         raise ValueError(
@@ -589,6 +632,19 @@ def train_pairwise_model(
             "split_manifest is only supported on the atom-model routes "
             "(--train_am), not on --train_apnet "
             f"{apnet_model_type}"
+        )
+    if (
+        ds_exclude_train_indices_path is not None
+        and not is_positive_param_model
+    ):
+        raise ValueError(
+            "ds_exclude_train_indices_path is only supported on the Rackers "
+            f"and CLIFF positive-parameter routes, not {apnet_model_type}"
+        )
+    if ds_exclude_elements and ds_exclude_train_indices_path is not None:
+        raise ValueError(
+            "ds_exclude_elements and ds_exclude_train_indices_path are "
+            "mutually exclusive"
         )
     if ds_exclude_elements and not is_positive_param_model:
         # Only the positive-parameter branch forwards ds_exclude_elements into
@@ -883,6 +939,7 @@ def train_pairwise_model(
             ds_max_size_val=ds_max_size_val,
             ds_batch_size=ds_batch_size,
             ds_exclude_elements=ds_exclude_elements,
+            ds_exclude_train_indices_path=ds_exclude_train_indices_path,
             param_start_mean=param_start_mean,
             param_start_std=param_start_std,
             elst_damping_type=elst_damping_type,
@@ -1204,6 +1261,11 @@ def train_pairwise_model(
         train_kwargs["component_gamma"] = component_gamma
         train_kwargs["total_includes_d3"] = total_includes_d3
         train_kwargs["thole_lr"] = thole_lr
+        train_kwargs["trainable_polarizability_scale"] = (
+            trainable_polarizability_scale
+        )
+        train_kwargs["polarizability_lr"] = polarizability_lr
+        train_kwargs["atom_model_lr"] = atom_model_lr
         train_kwargs["induction_diagnostics"] = induction_diagnostics
         if induction_convergence_threshold is not None:
             train_kwargs["induction_convergence_threshold"] = (
@@ -1519,6 +1581,17 @@ def main():
         ),
     )
     args.add_argument(
+        "--ds_exclude_train_indices_path",
+        type=str,
+        default=None,
+        help=(
+            "Sorted unique .npy dataset indices to remove from the capped "
+            "training split. Validation is unchanged. Supported on Rackers "
+            "and CLIFF positive-parameter routes and mutually exclusive with "
+            "--ds_exclude_elements."
+        ),
+    )
+    args.add_argument(
         "--lr", type=float, default=5e-4, help="Learning Rate: (5e-4 is default)"
     )
     args.add_argument(
@@ -1768,6 +1841,36 @@ def main():
             "Dense combined CLIFF routes only: use this Adam learning rate for "
             "trainable thole_direct/thole_mutual parameters while every other "
             "parameter uses --lr."
+        ),
+    )
+    args.add_argument(
+        "--trainable_polarizability_scale",
+        action="store_true",
+        help=(
+            "Dense combined CLIFF routes only: make the free-atom "
+            "polarizability table a trainable per-element scale seeded at "
+            "1.0. Requires --polarizability_lr."
+        ),
+    )
+    args.add_argument(
+        "--polarizability_lr",
+        type=float,
+        default=None,
+        help=(
+            "Adam learning rate for the polarizability scale alone. 0.0 is "
+            "legal and freezes it at its seed, which is the control arm."
+        ),
+    )
+    args.add_argument(
+        "--atom_model_lr",
+        type=float,
+        default=None,
+        help=(
+            "Dense combined CLIFF routes only: Adam learning rate for the "
+            "nested atom_model alone when --unfreeze_atom_model trains it. "
+            "Required in that case -- the trunk is 1.89M pretrained "
+            "parameters against a 231k head, and at the head's rate it "
+            "diverges inside one epoch. 0.0 is legal and freezes it in place."
         ),
     )
     args.add_argument(
@@ -2084,12 +2187,20 @@ def main():
             frozen_parameters=args.frozen_parameters,
             shared_damping_parameters=args.shared_damping_parameters,
             ds_exclude_elements=args.ds_exclude_elements,
+            ds_exclude_train_indices_path=(
+                args.ds_exclude_train_indices_path
+            ),
             split_manifest=args.split_manifest,
             component_gamma=args.component_gamma,
             total_includes_d3=args.total_includes_d3,
             grad_clip_norm=args.grad_clip_norm,
             grad_clip_mode=args.grad_clip_mode,
             thole_lr=args.thole_lr,
+            trainable_polarizability_scale=(
+                args.trainable_polarizability_scale
+            ),
+            polarizability_lr=args.polarizability_lr,
+            atom_model_lr=args.atom_model_lr,
             induction_diagnostics=args.induction_diagnostics,
             induction_convergence_threshold=(
                 args.induction_convergence_threshold
