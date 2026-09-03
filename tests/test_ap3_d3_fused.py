@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -13,6 +14,9 @@ from qcml_dftd3.d3 import d3
 import apnet_pt
 from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import (
     APNet3D3_AtomType_Model,
+    _as_scalar,
+    _best_mae_sidecar_floor,
+    _best_mae_sidecar_paths,
     build_exponential_decay_scheduler,
     exponential_decay_lr,
 )
@@ -1780,3 +1784,222 @@ if __name__ == "__main__":
     # test_ap3_d3_fused_predict_expansion_to_4_cols()
     # pytest.main([__file__])
     # test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice()
+
+
+# ---------------------------------------------------------------------------
+# Best-MAE sidecar checkpoint
+#
+# The primary checkpoint is starred on validation MSE while every table this
+# model is read in -- the S66x8 gate, the per-component breakdowns -- is in
+# MAE.  The sidecar records the best-MAE epoch without displacing the primary
+# artifact, so the two selectors can disagree without either one being lost.
+# ---------------------------------------------------------------------------
+
+
+def _sidecar_record(model_path):
+    _, record_path = _best_mae_sidecar_paths(model_path)
+    with open(record_path) as f:
+        return json.load(f)
+
+
+def test_best_mae_sidecar_paths_replace_the_extension():
+    ckpt, record = _best_mae_sidecar_paths("/models/run/ap3d3ff.pt")
+    assert ckpt == "/models/run/ap3d3ff.best-mae.pt"
+    assert record == "/models/run/ap3d3ff.best-mae.json"
+
+
+def test_best_mae_floor_is_infinite_when_no_sidecar_exists(tmp_path):
+    target = str(tmp_path / "model.pt")
+    assert _best_mae_sidecar_floor(target) == float("inf")
+
+
+def test_best_mae_floor_reads_a_previous_chunks_record(tmp_path):
+    target = str(tmp_path / "model.pt")
+    ckpt, record = _best_mae_sidecar_paths(target)
+    open(ckpt, "wb").close()
+    with open(record, "w") as f:
+        json.dump({"model_save_path": target, "val_total_MAE": 0.584}, f)
+    assert _best_mae_sidecar_floor(target) == pytest.approx(0.584)
+
+
+def test_best_mae_floor_ignores_a_record_written_for_another_path(tmp_path):
+    # Guards against a fresh experiment inheriting an unrelated run's floor and
+    # silently never writing a sidecar of its own.
+    target = str(tmp_path / "model.pt")
+    ckpt, record = _best_mae_sidecar_paths(target)
+    open(ckpt, "wb").close()
+    with open(record, "w") as f:
+        json.dump({"model_save_path": "/somewhere/else.pt", "val_total_MAE": 0.1}, f)
+    assert _best_mae_sidecar_floor(target) == float("inf")
+
+
+def test_best_mae_floor_ignores_a_corrupt_or_partial_record(tmp_path):
+    target = str(tmp_path / "model.pt")
+    ckpt, record = _best_mae_sidecar_paths(target)
+    open(ckpt, "wb").close()
+    with open(record, "w") as f:
+        f.write("{not json")
+    assert _best_mae_sidecar_floor(target) == float("inf")
+    with open(record, "w") as f:
+        json.dump({"model_save_path": target}, f)
+    assert _best_mae_sidecar_floor(target) == float("inf")
+
+
+def test_best_mae_floor_ignores_a_record_whose_checkpoint_vanished(tmp_path):
+    # The record is written after the checkpoint, so a record without a
+    # checkpoint means the pair is not trustworthy.
+    target = str(tmp_path / "model.pt")
+    _, record = _best_mae_sidecar_paths(target)
+    with open(record, "w") as f:
+        json.dump({"model_save_path": target, "val_total_MAE": 0.1}, f)
+    assert _best_mae_sidecar_floor(target) == float("inf")
+
+
+def test_as_scalar_passes_numbers_and_rejects_vectors():
+    assert _as_scalar(torch.tensor(0.5)) == pytest.approx(0.5)
+    assert _as_scalar(np.float64(0.25)) == pytest.approx(0.25)
+    assert _as_scalar(0.125) == pytest.approx(0.125)
+    assert _as_scalar(torch.tensor([0.1, 0.2])) is None
+    assert _as_scalar(None) is None
+
+
+def _small_ap3d3_harness(tmp_path, name):
+    """The tiny CPU-only training setup used by the sidecar tests."""
+
+    qcel_molecules = [mol_cliff_water_close] * 4
+    energy_labels = [
+        np.array(
+            [
+                -10.779292828139122,
+                11.390991215401051,
+                -3.414543432719425,
+                -2.436025699701581,
+            ]
+        )
+        for _ in qcel_molecules
+    ]
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+    root = tmp_path / name
+    (root / "raw").mkdir(parents=True, exist_ok=True)
+    ds = ap3_fused_module_dataset(
+        root=str(root),
+        r_cut=5.0,
+        r_cut_im=8.0,
+        spec_type=None,
+        max_size=None,
+        force_reprocess=True,
+        atomic_batch_size=4,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        datapoint_storage_n_objects=6,
+        batch_size=2,
+        num_devices=1,
+        skip_processed=True,
+        skip_compile=True,
+        print_level=0,
+        qcel_molecules=qcel_molecules,
+        energy_labels=energy_labels,
+        in_memory=True,
+        random_seed=None,
+    )
+    ap3d3 = APNet3D3_AtomType_Model(
+        dataset=ds,
+        ds_root=None,
+        atom_type_model=atom_type_hf_vw_model.model,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        am_dimer_param_model=atom_type_elst_model,
+        use_precomputed_classical=True,
+        ignore_database_null=True,
+        use_GPU=False,
+        no_disp_nn=False,
+    )
+    return ap3d3, ds
+
+
+def test_training_writes_a_mae_selected_sidecar_beside_the_primary_checkpoint(
+    tmp_path,
+):
+    ap3d3, ds = _small_ap3d3_harness(tmp_path, "sidecar_ds")
+    model_path = str(tmp_path / "ap3d3ff.pt")
+    ap3d3.train(
+        ds,
+        n_epochs=2,
+        skip_compile=True,
+        transfer_learning=False,
+        lr=5e-4,
+        split_percent=0.5,
+        dataloader_num_workers=0,
+        model_path=model_path,
+    )
+
+    sidecar_path, record_path = _best_mae_sidecar_paths(model_path)
+    assert os.path.exists(model_path), "the primary checkpoint must still be written"
+    assert os.path.exists(sidecar_path)
+    assert os.path.exists(record_path)
+
+    record = _sidecar_record(model_path)
+    assert record["selector"] == "val_total_MAE"
+    assert record["model_save_path"] == model_path
+    assert record["training_mode"] == "single_proc"
+    assert 0 <= record["epoch"] < 2
+    assert np.isfinite(record["val_total_MAE"])
+
+    sidecar = torch.load(sidecar_path, weights_only=False)
+    assert sidecar["metadata"]["selector"] == "val_total_MAE"
+    assert sidecar["metadata"]["epoch"] == record["epoch"]
+    # The sidecar is a real checkpoint, not a stub.
+    assert set(sidecar["model_state_dict"]) == set(
+        torch.load(model_path, weights_only=False)["model_state_dict"]
+    )
+
+
+def test_a_later_chunk_does_not_overwrite_a_better_earlier_sidecar(tmp_path):
+    # Chained warm-started chunks each re-seed from their own pre-training
+    # eval, so without the floor a later chunk would bank a worse epoch.
+    ap3d3, ds = _small_ap3d3_harness(tmp_path, "sidecar_chain_ds")
+    model_path = str(tmp_path / "ap3d3ff.pt")
+    train_kwargs = dict(
+        skip_compile=True,
+        transfer_learning=False,
+        lr=5e-4,
+        split_percent=0.5,
+        dataloader_num_workers=0,
+        model_path=model_path,
+    )
+    ap3d3.train(ds, n_epochs=2, **train_kwargs)
+    first = _sidecar_record(model_path)["val_total_MAE"]
+
+    # Plant an unbeatably good record, then run another chunk.  The second
+    # chunk must leave it alone.
+    _, record_path = _best_mae_sidecar_paths(model_path)
+    planted = dict(_sidecar_record(model_path))
+    planted["val_total_MAE"] = -1.0
+    planted["epoch"] = 99
+    with open(record_path, "w") as f:
+        json.dump(planted, f)
+
+    ap3d3.train(ds, n_epochs=1, **train_kwargs)
+    kept = _sidecar_record(model_path)
+    assert kept["val_total_MAE"] == -1.0
+    assert kept["epoch"] == 99
+
+    # And with an unbeatably bad record, the next chunk does replace it.
+    planted["val_total_MAE"] = 1e9
+    with open(record_path, "w") as f:
+        json.dump(planted, f)
+    ap3d3.train(ds, n_epochs=1, **train_kwargs)
+    assert _sidecar_record(model_path)["val_total_MAE"] < 1e9
+    assert np.isfinite(first)

@@ -38,6 +38,7 @@ from ..training_tracking import (
 from ..util import scatter_sum_compile
 from ..pt_datasets.shard_locality import ShardBlockSampler
 import os
+import json
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -61,6 +62,93 @@ def _omitted_metrics(harness) -> tuple[str, ...]:
 
     model = model_io.unwrap_model(harness.model)
     return ("dispersion",) if getattr(model, "no_disp_nn", False) else ()
+
+
+def _best_mae_sidecar_paths(model_save_path: str) -> tuple[str, str]:
+    """Checkpoint and record paths for the MAE-selected sidecar.
+
+    The primary checkpoint is starred on validation MSE, but every table this
+    model is read in -- the S66x8 gate, the per-component breakdowns -- is in
+    MAE, and the two selectors have repeatedly disagreed about which epoch was
+    best.  The sidecar preserves the best-MAE epoch beside the primary artifact
+    instead of displacing it.
+    """
+
+    base, _ = os.path.splitext(model_save_path)
+    return base + ".best-mae.pt", base + ".best-mae.json"
+
+
+def _best_mae_sidecar_floor(model_save_path: str) -> float:
+    """Best validation MAE a previous chunk already banked at this path.
+
+    Long trainings run as a chain of warm-started chunks, and each chunk seeds
+    its selector from its own fresh pre-training eval.  Without this floor a
+    later chunk would overwrite an earlier chunk's sidecar with a worse epoch,
+    because it only ever compares against where it happened to start.  A
+    missing, unreadable, or foreign record returns +inf, which is exactly the
+    single-run behaviour.
+    """
+
+    checkpoint_path, record_path = _best_mae_sidecar_paths(model_save_path)
+    if not os.path.exists(checkpoint_path):
+        return float("inf")
+    try:
+        with open(record_path) as f:
+            record = json.load(f)
+        if record.get("model_save_path") != model_save_path:
+            return float("inf")
+        return float(record["val_total_MAE"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return float("inf")
+
+
+def _save_best_mae_sidecar(harness, value, epoch, training_mode, device) -> None:
+    """Write the MAE-selected sidecar and its record.
+
+    Deliberately additive: this touches neither ``best_model``, ``self.model``,
+    ``model_saved``, the primary checkpoint, nor the optimizer trajectory, so a
+    run with this code produces a bit-identical primary artifact to one without
+    it.  The record is written after the checkpoint so a torn write leaves the
+    floor pointing at the older, fully-written pair.
+    """
+
+    checkpoint_path, record_path = _best_mae_sidecar_paths(harness.model_save_path)
+    cpu_model = model_io.unwrap_model(harness.model).to("cpu")
+    try:
+        harness.save_model(
+            checkpoint_path,
+            metadata={
+                "training_mode": training_mode,
+                "epoch": epoch,
+                "selector": "val_total_MAE",
+                "val_total_MAE": value,
+            },
+        )
+    finally:
+        del cpu_model
+        harness.model.to(device)
+    with open(record_path, "w") as f:
+        json.dump(
+            {
+                "model_save_path": harness.model_save_path,
+                "checkpoint": checkpoint_path,
+                "selector": "val_total_MAE",
+                "val_total_MAE": value,
+                "epoch": epoch,
+                "training_mode": training_mode,
+            },
+            f,
+            indent=2,
+        )
+
+
+def _as_scalar(value):
+    """Return ``value`` as a float, or None when it is not a single number."""
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def inverse_time_decay(step, initial_lr, decay_steps, decay_rate, staircase=True):
@@ -2994,6 +3082,11 @@ units angstrom
             self, locals(), exclude=_omitted_metrics(self)
         )
         model_saved = False
+        lowest_val_mae = (
+            _best_mae_sidecar_floor(self.model_save_path)
+            if self.model_save_path
+            else float("inf")
+        )
         for epoch in range(n_epochs):
             # Re-draw which shards share a block, so a dimer's batch-mates
             # change from epoch to epoch instead of being frozen at the epoch-0
@@ -3040,6 +3133,16 @@ units angstrom
                         model_saved = True
                 else:
                     test_lowered = " "
+                mae_v = _as_scalar(total_MAE_v)
+                if (
+                    self.model_save_path
+                    and mae_v is not None
+                    and mae_v < lowest_val_mae
+                ):
+                    lowest_val_mae = mae_v
+                    _save_best_mae_sidecar(
+                        self, mae_v, epoch, "ddp", rank_device
+                    )
                 dt = time.time() - t1
                 track_epoch_from_locals(
                     self, locals(), exclude=_omitted_metrics(self)
@@ -3307,6 +3410,11 @@ units angstrom
         # (6) Main training loop
         lowest_test_loss = test_loss
         model_saved = False
+        lowest_val_mae = (
+            _best_mae_sidecar_floor(self.model_save_path)
+            if self.model_save_path
+            else float("inf")
+        )
         for epoch in range(n_epochs):
             # Re-draw which shards share a block, so a dimer's batch-mates
             # change from epoch to epoch instead of being frozen at the epoch-0
@@ -3370,6 +3478,13 @@ units angstrom
                     )
                     model_saved = True
                 self.model.to(rank_device)
+
+            mae_v = _as_scalar(total_MAE_v)
+            if self.model_save_path and mae_v is not None and mae_v < lowest_val_mae:
+                lowest_val_mae = mae_v
+                _save_best_mae_sidecar(
+                    self, mae_v, epoch, "single_proc", rank_device
+                )
 
             dt = time.time() - t1
             track_epoch_from_locals(self, locals(), exclude=_omitted_metrics(self))
