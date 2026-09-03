@@ -344,6 +344,12 @@ CLIFF_CLASSICAL_THOLE_DIRECT_INDEX = 1
 CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX = 2
 CLIFF_CLASSICAL_IND_OVERLAP_INDEX = 3
 CLIFF_CLASSICAL_EXCH_INDEX = 4
+CLIFF_CLASSICAL_ANISOTROPY_L1_INDEX = 5
+CLIFF_CLASSICAL_ANISOTROPY_L2_INDEX = 6
+CLIFF_ANISOTROPY_MODES = ("none", "multipole-l1", "multipole-l2", "multipole-l1l2")
+CLIFF_ANISOTROPY_DEFAULT_BOUND = 2.0
+CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE = 1.0
+CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE = 1.0
 
 # Disjoint trainable columns for component-wise gradient clipping. The nested
 # atom model is frozen on the dense CLIFF routes, so these groups cover every
@@ -952,6 +958,20 @@ class DimerProp(nn.Module):
             e_AB_source=batch.e_ABfull_source,
             e_AB_target=batch.e_ABfull_target,
         )
+        anisotropy_kwargs = {}
+        if parameters_A.size(1) > CLIFF_CLASSICAL_ANISOTROPY_L2_INDEX:
+            head = self.AtomTypeParam
+            anisotropy_kwargs = {
+                "dipole_A": output_A[1],
+                "dipole_B": output_B[1],
+                "quadrupole_A": output_A[2],
+                "quadrupole_B": output_B[2],
+                "anisotropy_A": parameters_A[:, CLIFF_CLASSICAL_ANISOTROPY_L1_INDEX:],
+                "anisotropy_B": parameters_B[:, CLIFF_CLASSICAL_ANISOTROPY_L1_INDEX:],
+                "anisotropy_bound": head.anisotropy_bound,
+                "dipole_scale": head.anisotropy_dipole_scale,
+                "quadrupole_scale": head.anisotropy_quadrupole_scale,
+            }
         Exch = cliff_exchange(
             RA=batch.RA,
             RB=batch.RB,
@@ -963,6 +983,7 @@ class DimerProp(nn.Module):
             K_exch_B=parameters_B[:, CLIFF_CLASSICAL_EXCH_INDEX],
             dR_AB=dR_AB,
             width_floor=self._overlap_width_floor(),
+            **anisotropy_kwargs,
         )
         induction_result = rackers_thole_induction(
             ZA=batch.ZA,
@@ -3212,6 +3233,10 @@ class CliffClassicalNN(_CliffPositiveParamNN):
     ARCHITECTURE_CONFIG_KEYS = (
         *_CliffPositiveParamNN.ARCHITECTURE_CONFIG_KEYS,
         "trainable_polarizability_scale",
+        "anisotropy_mode",
+        "anisotropy_bound",
+        "anisotropy_dipole_scale",
+        "anisotropy_quadrupole_scale",
     )
 
     def __init__(
@@ -3236,6 +3261,10 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         frozen_parameters=(),
         shared_damping_parameters=(),
         trainable_polarizability_scale=False,
+        anisotropy_mode="none",
+        anisotropy_bound=CLIFF_ANISOTROPY_DEFAULT_BOUND,
+        anisotropy_dipole_scale=CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE,
+        anisotropy_quadrupole_scale=CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE,
     ):
         if param_start_mean_by_Z is None:
             param_start_mean_by_Z = CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z
@@ -3257,6 +3286,99 @@ class CliffClassicalNN(_CliffPositiveParamNN):
             shared_damping_parameters=shared_damping_parameters,
             trainable_polarizability_scale=trainable_polarizability_scale,
         )
+        self.anisotropy_mode = "none"
+        self.anisotropy_bound = float(anisotropy_bound)
+        self.anisotropy_dipole_scale = float(anisotropy_dipole_scale)
+        self.anisotropy_quadrupole_scale = float(anisotropy_quadrupole_scale)
+        self.anisotropy_readout_layers = nn.ModuleList()
+        if anisotropy_mode != "none":
+            self.enable_multipole_anisotropy(
+                anisotropy_mode,
+                bound=anisotropy_bound,
+                dipole_scale=anisotropy_dipole_scale,
+                quadrupole_scale=anisotropy_quadrupole_scale,
+            )
+
+    def enable_multipole_anisotropy(
+        self,
+        mode="multipole-l1l2",
+        *,
+        bound=CLIFF_ANISOTROPY_DEFAULT_BOUND,
+        dipole_scale=CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE,
+        quadrupole_scale=CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE,
+    ):
+        """Add zero-initialized hidden-state gates for equivariant mu/Q bases."""
+        mode = str(mode).strip().lower()
+        if mode not in CLIFF_ANISOTROPY_MODES or mode == "none":
+            raise ValueError(
+                "anisotropy mode must be one of "
+                f"{list(CLIFF_ANISOTROPY_MODES[1:])}, got {mode!r}"
+            )
+        for name, value in (
+            ("anisotropy_bound", bound),
+            ("anisotropy_dipole_scale", dipole_scale),
+            ("anisotropy_quadrupole_scale", quadrupole_scale),
+        ):
+            value = float(value)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+            setattr(self, name, value)
+        if len(self.anisotropy_readout_layers) == 0:
+            nodes = [self.n_embed, self.n_neuron * 2, self.n_neuron,
+                     max(self.n_neuron // 2, 1), 1]
+            activations = [nn.ReLU(), nn.ReLU(), nn.ReLU(), None]
+            for _ in range(2):
+                stack = nn.ModuleList([
+                    self._make_layers(nodes, activations)
+                    for _ in range(self.n_message + 1)
+                ])
+                for readout in stack:
+                    output_layer = [
+                        module for module in readout.modules()
+                        if isinstance(module, nn.Linear)
+                    ][-1]
+                    nn.init.zeros_(output_layer.weight)
+                    nn.init.zeros_(output_layer.bias)
+                self.anisotropy_readout_layers.append(stack)
+            reference = next(self.parameters())
+            self.anisotropy_readout_layers.to(
+                device=reference.device, dtype=reference.dtype
+            )
+        self.anisotropy_mode = mode
+        return self.anisotropy_readout_layers
+
+    def forward(self, batch):
+        output = super().forward(batch)
+        if self.anisotropy_mode == "none":
+            return output
+        h_list = output[self.h_list_ind]
+        natom = batch.x.size(0)
+        edge_index = batch.edge_index
+        keep_mask = torch.zeros(natom, dtype=torch.bool, device=batch.x.device)
+        if edge_index.size(1):
+            keep_mask.scatter_(0, edge_index[0], True)
+            keep_mask.scatter_(0, edge_index[1], True)
+        gates = output[-1].new_zeros((natom, 2))
+        if h_list.size(0):
+            n_steps = min(self.n_message + 1, h_list.size(1))
+            columns = []
+            for channel in range(2):
+                value = self.anisotropy_readout_layers[channel][0](h_list[:, 0, :])
+                for step in range(1, n_steps):
+                    value = value + self.anisotropy_readout_layers[channel][step](
+                        h_list[:, step, :]
+                    )
+                columns.append(value)
+            gate_kept = torch.cat(columns, dim=-1)
+            if gate_kept.size(0) == natom:
+                gates = gate_kept
+            else:
+                gates[keep_mask] = gate_kept
+        if self.anisotropy_mode == "multipole-l1":
+            gates = torch.stack((gates[:, 0], torch.zeros_like(gates[:, 1])), dim=-1)
+        elif self.anisotropy_mode == "multipole-l2":
+            gates = torch.stack((torch.zeros_like(gates[:, 0]), gates[:, 1]), dim=-1)
+        return (*output[:-1], torch.cat((output[-1], gates), dim=-1))
 
     def get_config(self) -> dict:
         # The base `get_config` is a dict literal, not a union over
@@ -3813,6 +3935,15 @@ def cliff_exchange(
     dR_AB: torch.Tensor | None = None,
     width_floor: float = OVERLAP_WIDTH_FLOOR,
     width_ceiling: float | None = OVERLAP_WIDTH_CEILING,
+    dipole_A: torch.Tensor | None = None,
+    dipole_B: torch.Tensor | None = None,
+    quadrupole_A: torch.Tensor | None = None,
+    quadrupole_B: torch.Tensor | None = None,
+    anisotropy_A: torch.Tensor | None = None,
+    anisotropy_B: torch.Tensor | None = None,
+    anisotropy_bound: float = CLIFF_ANISOTROPY_DEFAULT_BOUND,
+    dipole_scale: float = CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE,
+    quadrupole_scale: float = CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE,
 ) -> torch.Tensor:
     """CLIFF classical exchange repulsion, per intermolecular edge, kcal/mol.
 
@@ -3861,8 +3992,19 @@ def cliff_exchange(
         Strictly positive per-edge exchange energy in kcal/mol, shape
         ``[n_edges]``.
     """
+    supplied = (
+        dipole_A, dipole_B, quadrupole_A, quadrupole_B,
+        anisotropy_A, anisotropy_B,
+    )
+    use_anisotropy = any(value is not None for value in supplied)
+    dR_ang = dR_xyz = None
+    if dR_AB is None or use_anisotropy:
+        if RA is None or RB is None:
+            raise ValueError("RA and RB are required for anisotropic exchange")
+        dR_ang, dR_xyz = get_distances(
+            RA, RB, e_AB_source, e_AB_target
+        )
     if dR_AB is None:
-        dR_ang, _ = get_distances(RA, RB, e_AB_source, e_AB_target)
         dR_AB = dR_ang / constants.au2ang
     elif dR_AB.shape[0] != e_AB_source.shape[0]:
         raise ValueError(
@@ -3880,7 +4022,30 @@ def cliff_exchange(
     )
     K_i = K_exch_A.reshape(-1).index_select(0, e_AB_source)
     K_j = K_exch_B.reshape(-1).index_select(0, e_AB_target)
-    return K_i * K_j * S_ij * constants.h2kcalmol
+    angular = torch.ones_like(S_ij)
+    if use_anisotropy:
+        if any(value is None for value in supplied):
+            raise ValueError(
+                "anisotropic exchange requires dipoles, quadrupoles, and "
+                "anisotropy coefficients for both monomers"
+            )
+        rhat = dR_xyz / dR_ang.unsqueeze(-1)
+        mu_i = dipole_A.index_select(0, e_AB_source)
+        mu_j = dipole_B.index_select(0, e_AB_target)
+        quad_i = quadrupole_A.index_select(0, e_AB_source)
+        quad_j = quadrupole_B.index_select(0, e_AB_target)
+        coeff_i = anisotropy_A.index_select(0, e_AB_source)
+        coeff_j = anisotropy_B.index_select(0, e_AB_target)
+        l1_i = torch.sum(mu_i * rhat, dim=-1) / float(dipole_scale)
+        l1_j = torch.sum(mu_j * (-rhat), dim=-1) / float(dipole_scale)
+        l2_i = torch.einsum("ei,eij,ej->e", rhat, quad_i, rhat) / float(quadrupole_scale)
+        l2_j = torch.einsum("ei,eij,ej->e", rhat, quad_j, rhat) / float(quadrupole_scale)
+        psi_i = coeff_i[:, 0] * l1_i + coeff_i[:, 1] * l2_i
+        psi_j = coeff_j[:, 0] * l1_j + coeff_j[:, 1] * l2_j
+        bound = float(anisotropy_bound)
+        angular = torch.exp(bound * torch.tanh(psi_i / bound))
+        angular = angular * torch.exp(bound * torch.tanh(psi_j / bound))
+    return K_i * K_j * S_ij * angular * constants.h2kcalmol
 
 
 # @torch.compile
@@ -7901,6 +8066,7 @@ units angstrom
         thole_lr: float | None,
         polarizability_lr: float | None = None,
         atom_model_lr: float | None = None,
+        anisotropy_lr: float | None = None,
     ):
         """Return the legacy iterator or disjoint per-role Adam groups."""
         head = model_io.unwrap_model(self.model)
@@ -7910,6 +8076,7 @@ units angstrom
             and polarizability_lr is None
             and alpha_scale is None
             and atom_model_lr is None
+            and anisotropy_lr is None
         ):
             # Preserve the historical optimizer construction exactly when no
             # split is requested.
@@ -7932,6 +8099,9 @@ units angstrom
         polarizability_lr = _validate_polarizability_lr(polarizability_lr)
         atom_model_lr = _validate_polarizability_lr(
             atom_model_lr, name="atom_model_lr"
+        )
+        anisotropy_lr = _validate_polarizability_lr(
+            anisotropy_lr, name="anisotropy_lr"
         )
         if type(head) is not CliffClassicalNN:
             raise ValueError(
@@ -8001,10 +8171,24 @@ units angstrom
                 "given; it would silently inherit the head's lr. Pass it "
                 "explicitly (0.0 carries it through the checkpoint frozen)"
             )
+        anisotropy_layers = getattr(head, "anisotropy_readout_layers", None)
+        anisotropy_parameters = (
+            [p for p in anisotropy_layers.parameters() if p.requires_grad]
+            if anisotropy_layers is not None else []
+        )
+        if anisotropy_lr is not None and not anisotropy_parameters:
+            raise ValueError(
+                "anisotropy_lr was requested but multipole anisotropy is not enabled"
+            )
+        if anisotropy_lr is None and anisotropy_parameters:
+            raise ValueError(
+                "multipole anisotropy is enabled but anisotropy_lr was not given"
+            )
         split_parameters = [
             *thole_parameters,
             *alpha_parameters,
             *trunk_parameters,
+            *anisotropy_parameters,
         ]
         split_ids = [id(parameter) for parameter in split_parameters]
         if len(split_ids) != len(set(split_ids)):
@@ -8044,6 +8228,14 @@ units angstrom
                     "params": trunk_parameters,
                     "lr": float(atom_model_lr),
                     "group_name": "atom_model",
+                }
+            )
+        if anisotropy_parameters:
+            groups.append(
+                {
+                    "params": anisotropy_parameters,
+                    "lr": float(anisotropy_lr),
+                    "group_name": "anisotropy",
                 }
             )
         return groups
@@ -8155,6 +8347,12 @@ units angstrom
         alpha_scale = getattr(head, "polarizability_log_scale", None)
         if alpha_scale is not None and alpha_scale.requires_grad:
             groups["induction"].append(alpha_scale)
+        anisotropy_layers = getattr(head, "anisotropy_readout_layers", None)
+        if anisotropy_layers is not None:
+            groups["exchange"].extend(
+                parameter for parameter in anisotropy_layers.parameters()
+                if parameter.requires_grad
+            )
 
         # The shared trunk. Empty and absent unless --unfreeze_atom_model, so
         # every frozen-atom_model run clips exactly the three groups it always
@@ -8445,6 +8643,7 @@ units angstrom
         induction_diagnostics=False,
         polarizability_lr=None,
         atom_model_lr=None,
+        anisotropy_lr=None,
         rank=0,
         world_size=1,
         local_rank=None,
@@ -8649,7 +8848,7 @@ units angstrom
         # (3) Optim/Scheduler
         optimizer = torch.optim.Adam(
             self._optimizer_parameter_groups(
-                lr, thole_lr, polarizability_lr, atom_model_lr
+                lr, thole_lr, polarizability_lr, atom_model_lr, anisotropy_lr
             ),
             lr=lr,
         )
@@ -9127,6 +9326,7 @@ units angstrom
         induction_diagnostics=False,
         polarizability_lr=None,
         atom_model_lr=None,
+        anisotropy_lr=None,
         local_rank=None,
     ):
         """Run one DDP rank of :meth:`single_proc_train`.
@@ -9156,6 +9356,7 @@ units angstrom
                 induction_diagnostics=induction_diagnostics,
                 polarizability_lr=polarizability_lr,
                 atom_model_lr=atom_model_lr,
+                anisotropy_lr=anisotropy_lr,
                 rank=rank,
                 world_size=world_size,
                 local_rank=local_rank,
@@ -9236,6 +9437,11 @@ units angstrom
         trainable_polarizability_scale=False,
         polarizability_lr=None,
         atom_model_lr=None,
+        anisotropy_mode="none",
+        anisotropy_lr=None,
+        anisotropy_bound=CLIFF_ANISOTROPY_DEFAULT_BOUND,
+        anisotropy_dipole_scale=CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE,
+        anisotropy_quadrupole_scale=CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE,
         induction_convergence_threshold=None,
         induction_convergence_norm=None,
         induction_max_iterations=None,
@@ -9274,6 +9480,9 @@ units angstrom
         polarizability_lr = _validate_polarizability_lr(polarizability_lr)
         atom_model_lr = _validate_polarizability_lr(
             atom_model_lr, name="atom_model_lr"
+        )
+        anisotropy_lr = _validate_polarizability_lr(
+            anisotropy_lr, name="anisotropy_lr"
         )
         induction_diagnostics = bool(induction_diagnostics)
         if (
@@ -9361,16 +9570,34 @@ units angstrom
                     "trainable_polarizability_scale requires "
                     "polarizability_lr (0.0 freezes the scale)"
                 )
+        anisotropy_mode = str(anisotropy_mode).strip().lower()
+        if anisotropy_mode != "none":
+            head = model_io.unwrap_model(self.model)
+            if type(head) is not CliffClassicalNN:
+                raise ValueError(
+                    "multipole anisotropy requires the dense CliffClassicalNN head"
+                )
+            head.enable_multipole_anisotropy(
+                anisotropy_mode,
+                bound=anisotropy_bound,
+                dipole_scale=anisotropy_dipole_scale,
+                quadrupole_scale=anisotropy_quadrupole_scale,
+            )
+            if anisotropy_lr is None:
+                raise ValueError("multipole anisotropy requires anisotropy_lr")
+        elif anisotropy_lr is not None:
+            raise ValueError("anisotropy_lr requires a non-none anisotropy_mode")
         if (
             thole_lr is not None
             or polarizability_lr is not None
             or atom_model_lr is not None
+            or anisotropy_lr is not None
         ):
             # Validate the requested optimizer split before any dataset I/O.
             # An unfrozen trunk with no rate of its own raises here, which is
             # before the dataset build rather than an epoch into the run.
             self._optimizer_parameter_groups(
-                lr, thole_lr, polarizability_lr, atom_model_lr
+                lr, thole_lr, polarizability_lr, atom_model_lr, anisotropy_lr
             )
         self.grad_clip_mode = grad_clip_mode
         # Validated before any dataset work so a misconfigured route fails
@@ -9541,6 +9768,7 @@ units angstrom
                 induction_diagnostics,
                 polarizability_lr,
                 atom_model_lr,
+                anisotropy_lr,
             )
             if _external_rank is None:
                 configure_distributed_tracking(
@@ -9598,6 +9826,7 @@ units angstrom
                     induction_diagnostics=induction_diagnostics,
                     polarizability_lr=polarizability_lr,
                     atom_model_lr=atom_model_lr,
+                    anisotropy_lr=anisotropy_lr,
                 ),
                 wandb_config,
                 model_family="parameter",

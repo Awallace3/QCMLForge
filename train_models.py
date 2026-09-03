@@ -439,6 +439,11 @@ def train_pairwise_model(
     trainable_polarizability_scale=False,
     polarizability_lr=None,
     atom_model_lr=None,
+    anisotropy_mode="none",
+    anisotropy_lr=None,
+    anisotropy_bound=2.0,
+    anisotropy_dipole_scale=1.0,
+    anisotropy_quadrupole_scale=1.0,
     induction_diagnostics=False,
     induction_convergence_threshold=None,
     induction_max_iterations=None,
@@ -560,6 +565,14 @@ def train_pairwise_model(
                 f"routes {sorted(COMPONENT_CLIP_CLIFF_MODEL_TYPES)}, not "
                 f"{apnet_model_type!r}"
             )
+    anisotropy_mode = str(anisotropy_mode).strip().lower()
+    if anisotropy_mode not in AtomPairwiseModels.mtp_mtp.CLIFF_ANISOTROPY_MODES:
+        raise ValueError(
+            "anisotropy_mode must be one of "
+            f"{list(AtomPairwiseModels.mtp_mtp.CLIFF_ANISOTROPY_MODES)}"
+        )
+    if anisotropy_mode != "none" and apnet_model_type not in COMPONENT_CLIP_CLIFF_MODEL_TYPES:
+        raise ValueError("multipole anisotropy requires a dense combined CLIFF route")
     if trainable_polarizability_scale or polarizability_lr is not None:
         polarizability_lr = (
             AtomPairwiseModels.mtp_mtp._validate_polarizability_lr(
@@ -1266,6 +1279,11 @@ def train_pairwise_model(
         )
         train_kwargs["polarizability_lr"] = polarizability_lr
         train_kwargs["atom_model_lr"] = atom_model_lr
+        train_kwargs["anisotropy_mode"] = anisotropy_mode
+        train_kwargs["anisotropy_lr"] = anisotropy_lr
+        train_kwargs["anisotropy_bound"] = anisotropy_bound
+        train_kwargs["anisotropy_dipole_scale"] = anisotropy_dipole_scale
+        train_kwargs["anisotropy_quadrupole_scale"] = anisotropy_quadrupole_scale
         train_kwargs["induction_diagnostics"] = induction_diagnostics
         if induction_convergence_threshold is not None:
             train_kwargs["induction_convergence_threshold"] = (
@@ -1874,6 +1892,16 @@ def main():
         ),
     )
     args.add_argument(
+        "--anisotropy_mode",
+        choices=AtomPairwiseModels.mtp_mtp.CLIFF_ANISOTROPY_MODES,
+        default="none",
+        help="Hidden-state scalar gates on equivariant dipole/quadrupole exchange bases.",
+    )
+    args.add_argument("--anisotropy_lr", type=float, default=None)
+    args.add_argument("--anisotropy_bound", type=float, default=2.0)
+    args.add_argument("--anisotropy_dipole_scale", type=float, default=1.0)
+    args.add_argument("--anisotropy_quadrupole_scale", type=float, default=1.0)
+    args.add_argument(
         "--induction_diagnostics",
         action="store_true",
         default=False,
@@ -2201,6 +2229,11 @@ def main():
             ),
             polarizability_lr=args.polarizability_lr,
             atom_model_lr=args.atom_model_lr,
+            anisotropy_mode=args.anisotropy_mode,
+            anisotropy_lr=args.anisotropy_lr,
+            anisotropy_bound=args.anisotropy_bound,
+            anisotropy_dipole_scale=args.anisotropy_dipole_scale,
+            anisotropy_quadrupole_scale=args.anisotropy_quadrupole_scale,
             induction_diagnostics=args.induction_diagnostics,
             induction_convergence_threshold=(
                 args.induction_convergence_threshold

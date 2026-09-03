@@ -358,6 +358,10 @@ def test_dense_head_declares_only_the_shared_architecture_key():
     assert CliffClassicalNN.ARCHITECTURE_CONFIG_KEYS == (
         *shared,
         "trainable_polarizability_scale",
+        "anisotropy_mode",
+        "anisotropy_bound",
+        "anisotropy_dipole_scale",
+        "anisotropy_quadrupole_scale",
     )
 
 
