@@ -103,6 +103,48 @@ either without retraining perturbs a model whose learned short-range readout
 adapted to the kernel it was trained with. Only the pairs beyond the 8 A cutoff,
 which receive no readout at all, measure the analytic term unaided.
 
+## Where the converted weights stand against the paper
+
+The five converted TensorFlow members, averaged the way
+`apnet/bms_functions.py::predict_sapt` averages them, evaluated on the paper's
+own 150 000-dimer Splinter validation split:
+
+| component | converted ensemble MAE | paper Fig. 2B | delta |
+|---|---|---|---|
+| Elst | 0.3024 | 0.168 | **+0.134** |
+| Exch | 0.1408 | 0.141 | -0.0002 |
+| Ind | 0.0957 | 0.096 | -0.0003 |
+| Disp | 0.0204 | 0.021 | -0.0006 |
+| Total | 0.3293 | 0.201 | +0.128 |
+
+Exchange, induction and dispersion are parity-verified: they land 2-6e-4
+kcal/mol from the published ensemble. Because none of the shared machinery is
+component-specific, that also verifies the conversion, the architecture, the
+featurisation, the ensemble rule and the subset identity. Electrostatics is the
+only open discrepancy.
+
+Two rules follow for anyone comparing to the paper:
+
+- **Compare ensembles, never members.** Averaging the five members is worth
+  0.070 kcal/mol on the total and 0.048 on Elst. Every published AP-Net2 number
+  is a five-model average, so a single-member MAE is not comparable to it.
+- **Use `quadrupole_scale=1.5`.** It is a forward-pass constant rather than a
+  state-dict entry, so a loader that only calls `load_state_dict` reports
+  success and silently evaluates the wrong electrostatics. Setting it to 1.0
+  costs 0.012 kcal/mol of Elst and corresponds to no TensorFlow code era.
+
+The Elst gap is not generalisation -- the training split gives 0.294 against
+the validation split's 0.302 -- and it is not the electrostatics kernel's
+history: re-pairing the atom models (all 20 off-diagonal combinations),
+dropping the `3/2`, and restoring the `uQ`/`QQ` terms are worth +0.011, +0.012
+and +0.0008 respectively, all in the wrong direction and all an order of
+magnitude too small. The leading remaining candidate is the multipole source:
+`PairModel.pretrained(i)` restores `pair{i}` as one SavedModel with its atom
+network embedded by `KerasPairModel(atom_model.model)`, whereas the conversion
+took its multipole weights from the standalone `atom_models/atom{i}`. Until
+that is settled, do not describe the converted checkpoints as reproducing the
+paper's electrostatics.
+
 ## Controlled comparison protocol
 
 1. Keep the atomic checkpoint, processed graph shards, train/validation identities,
