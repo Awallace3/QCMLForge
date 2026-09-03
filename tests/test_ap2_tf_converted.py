@@ -1,8 +1,12 @@
 """
-Test converted TensorFlow APNet models (atom and pair) with water dimers.
+Smoke-test converted TensorFlow APNet models (atom and pair) with water dimers.
 
-This test verifies that the TensorFlow SavedModel weights were correctly
-converted to PyTorch format and can be used for prediction.
+These tests check that ``models/ap2_tf/**`` loads, runs, and produces physically
+sensible water-dimer energies.  They deliberately do NOT establish that the
+conversion is numerically faithful: every assertion here passed against an
+earlier conversion in which 64 of the 83 pair tensors were never transferred at
+all.  ``tests/test_ap2_tf_parity.py`` is the authoritative check -- it compares
+against recorded TensorFlow output for the same dimers.
 """
 import os
 import pytest
@@ -101,7 +105,13 @@ def test_tf_converted_atom_model_loads():
         v = atom_model.predict_qcel_mols([mol_water_dimer.get_fragment(0)], batch_size=1)[0]
         pp(v[0])
         pp(v[1])
-        assert np.allclose(np.array(v_pt[0]), np.array(v[0]), atol=1e-1), f"Should be close to pt model\n{v_pt[0] = }\n{v[0] = }"
+        # The bundled PyTorch model and the TensorFlow model were trained
+        # independently, so this only says the two agree on water to within a
+        # tenth of an electron -- it is a plausibility check, not a check that
+        # the conversion is correct.  See tests/test_ap2_tf_parity.py for that.
+        assert np.allclose(
+            np.asarray(v_pt[0]), np.asarray(v[0]), atol=1e-1
+        ), f"Should be close to pt model\n{v_pt[0] = }\n{v[0] = }"
 
 
 @pytest.mark.pretrained_models(local=TF_MODEL_ENSEMBLE)

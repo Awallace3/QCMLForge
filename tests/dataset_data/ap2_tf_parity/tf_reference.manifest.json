@@ -1,0 +1,203 @@
+{
+  "au2ang": 0.52917721067,
+  "device": "cpu",
+  "dimers": {
+    "count": 24,
+    "npz": "/storage/project/r-cs207-0/awallace43/scratch/ap2tf/parity_dimers.npz",
+    "sha256": "07a595acbf7524cdd0f5b92758d2587ff32f7a918452d062c8b490b831480d8c"
+  },
+  "max_angstrom_round_trip_error": 1.7763568394002505e-15,
+  "models": {
+    "atom0": {
+      "config": {
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut": 5.0
+      },
+      "saved_model_pb_sha256": "a04d250c4bf00fe591f63bbb8a91160fff41937d6b1ad85578a931f1f63a509b",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom0"
+    },
+    "atom1": {
+      "config": {
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut": 5.0
+      },
+      "saved_model_pb_sha256": "a9ed335518c9d8e186f90ded7070d47c3f0dd7c27ee8d10beca8118869db9cbc",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom1"
+    },
+    "atom2": {
+      "config": {
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut": 5.0
+      },
+      "saved_model_pb_sha256": "fc84020ce5542a88c2d6cf18f79be89a20dc600bf2b2c01d47c17c054d9cc562",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom2"
+    },
+    "atom3": {
+      "config": {
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut": 5.0
+      },
+      "saved_model_pb_sha256": "ec3ea3df358942e8428619bb8f3448b27bd734bbbb1d586ca3ec2b73db0cd9ee",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom3"
+    },
+    "atom4": {
+      "config": {
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut": 5.0
+      },
+      "saved_model_pb_sha256": "fde5a6082a2a6e8b804dd494ad62222c44dd7215c2de96d98ee300bd3b0e2430",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom4"
+    },
+    "pair0": {
+      "config": {
+        "atom_model": {
+          "__passive_serialization__": true,
+          "class_name": "KerasAtomModel",
+          "config": {
+            "n_embed": 8,
+            "n_message": 3,
+            "n_neuron": 128,
+            "n_rbf": 8,
+            "r_cut": 5.0
+          }
+        },
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut_im": 8.0
+      },
+      "saved_model_pb_sha256": "f997b02b4a20240294150edf92b66ddae1ff766fd398fc516e1eedaa8ad202ce",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair0"
+    },
+    "pair1": {
+      "config": {
+        "atom_model": {
+          "__passive_serialization__": true,
+          "class_name": "KerasAtomModel",
+          "config": {
+            "n_embed": 8,
+            "n_message": 3,
+            "n_neuron": 128,
+            "n_rbf": 8,
+            "r_cut": 5.0
+          }
+        },
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut_im": 8.0
+      },
+      "saved_model_pb_sha256": "5b5e24b2e7b4ccfad100bfdbf395ca6ea7cc2d862a21ee3549bd058beda11879",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair1"
+    },
+    "pair2": {
+      "config": {
+        "atom_model": {
+          "__passive_serialization__": true,
+          "class_name": "KerasAtomModel",
+          "config": {
+            "n_embed": 8,
+            "n_message": 3,
+            "n_neuron": 128,
+            "n_rbf": 8,
+            "r_cut": 5.0
+          }
+        },
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut_im": 8.0
+      },
+      "saved_model_pb_sha256": "4a7b87b03322354ed1f7e63948584a78c6c06cd2efcf9d1fe150bfea756cd975",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair2"
+    },
+    "pair3": {
+      "config": {
+        "atom_model": {
+          "__passive_serialization__": true,
+          "class_name": "KerasAtomModel",
+          "config": {
+            "n_embed": 8,
+            "n_message": 3,
+            "n_neuron": 128,
+            "n_rbf": 8,
+            "r_cut": 5.0
+          }
+        },
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut_im": 8.0
+      },
+      "saved_model_pb_sha256": "13733f0d7c43c650b9bb05ab704a6d488b51988682c1040977ed848be2de4fff",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair3"
+    },
+    "pair4": {
+      "config": {
+        "atom_model": {
+          "__passive_serialization__": true,
+          "class_name": "KerasAtomModel",
+          "config": {
+            "n_embed": 8,
+            "n_message": 3,
+            "n_neuron": 128,
+            "n_rbf": 8,
+            "r_cut": 5.0
+          }
+        },
+        "n_embed": 8,
+        "n_message": 3,
+        "n_neuron": 128,
+        "n_rbf": 8,
+        "r_cut_im": 8.0
+      },
+      "saved_model_pb_sha256": "4ab01c4c25edc562ac88db4a910bcaf51813f3073f57b1a122a5571eaba9d8ee",
+      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair4"
+    }
+  },
+  "outputs": {
+    "npz": {
+      "path": "tf_reference.npz",
+      "sha256": "41c27e06dbadcfedcfb2af5883c6939dbae4eecfbcb64b93a026016fd6e4b757"
+    }
+  },
+  "reference_total_mae_vs_labels": {
+    "pair0": 0.252022183575491,
+    "pair1": 0.33655753869720684,
+    "pair2": 0.25629247463325555,
+    "pair3": 0.24871434826256214,
+    "pair4": 0.18340956445664838
+  },
+  "source_repo": {
+    "branch": "sparse",
+    "commit": "f093e00bf64190ac30a7706d2a90e66871347b76",
+    "describe": "v0.1.0",
+    "dirty": false,
+    "remote": "https://github.com/zachglick/apnet.git"
+  },
+  "versions": {
+    "numpy": "1.18.5",
+    "python": "3.8.20",
+    "tensorflow": "2.3.4"
+  },
+  "vintage": "new"
+}

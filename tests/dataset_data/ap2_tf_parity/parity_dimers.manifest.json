@@ -1,0 +1,134 @@
+{
+  "source": {
+    "processed_dir": "/storage/home/hcoda1/3/awallace43/gits/qcmlforge/data_dir/processed",
+    "prefix": "dimer_ap2_fused_test_spec_2_",
+    "shards_read": [
+      "dimer_ap2_fused_test_spec_2_0.pt",
+      "dimer_ap2_fused_test_spec_2_1.pt"
+    ],
+    "selection_rule": "first `samples` dimers in naturally sorted shard order"
+  },
+  "samples": 24,
+  "atoms_A_total": 277,
+  "atoms_B_total": 309,
+  "elements_present": [
+    1,
+    6,
+    7,
+    8,
+    9,
+    15,
+    16
+  ],
+  "charged_monomers": 13,
+  "label_means": {
+    "Elst_aug": -0.02630400750786066,
+    "Exch_aug": 5.187470696444582,
+    "Ind_aug": -2.785058952247103,
+    "Disp_aug": -2.2575315999177596
+  },
+  "outputs": {
+    "npz": {
+      "path": "parity_dimers.npz",
+      "sha256": "07a595acbf7524cdd0f5b92758d2587ff32f7a918452d062c8b490b831480d8c"
+    }
+  },
+  "row_provenance": [
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 0
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 1
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 2
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 3
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 4
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 5
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 6
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 7
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 8
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 9
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 10
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 11
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 12
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 13
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 14
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 15
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 0
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 1
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 2
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 3
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 4
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 5
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 6
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 7
+    }
+  ]
+}
