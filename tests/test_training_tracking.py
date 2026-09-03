@@ -527,7 +527,12 @@ def test_wandb_tracker_commits_online_and_uses_offline_alias_reference(
     )
     real_import = importlib.import_module
     tracker = WandbTrainingTracker(
-        WandbConfig(mode=mode, project="project", tags=("user",)),
+        WandbConfig(
+            mode=mode,
+            project="project",
+            tags=("user",),
+            extra_config={"dataset.id": "ap3d3-ff-cliff2-residual-v1"},
+        ),
         _context(),
         lambda name: fake_wandb if name == "wandb" else real_import(name),
     )
@@ -548,6 +553,7 @@ def test_wandb_tracker_commits_online_and_uses_offline_alias_reference(
 
     assert init_calls[0]["resume"] == "never"
     assert init_calls[0]["mode"] == mode
+    assert init_calls[0]["config"]["dataset.id"] == "ap3d3-ff-cliff2-residual-v1"
     assert set(init_calls[0]["tags"]) >= {"user", "atomic", "AtomModel"}
     assert run.metrics[-1] == (
         "val/loss_sum",

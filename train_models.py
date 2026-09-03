@@ -5,6 +5,7 @@ from apnet_pt.training_tracking import WandbConfig
 from apnet_pt.util import load_split_manifest
 import argparse
 import inspect
+import json
 import os
 import random
 from dataclasses import replace
@@ -134,6 +135,13 @@ def build_wandb_run_configs(args, environment=None):
     """
 
     env = os.environ if environment is None else environment
+    extra_config = {}
+    wandb_config_file = getattr(args, "wandb_config_file", None)
+    if wandb_config_file is not None:
+        with open(wandb_config_file) as config_file:
+            extra_config = json.load(config_file)
+        if not isinstance(extra_config, dict):
+            raise ValueError("--wandb-config-file must contain a JSON object")
 
     base_config = WandbConfig(
         mode=args.wandb_mode,
@@ -145,6 +153,7 @@ def build_wandb_run_configs(args, environment=None):
         job_type=args.wandb_job_type,
         notes=args.wandb_notes,
         directory=args.wandb_dir,
+        extra_config=extra_config,
     )
     dual_run = args.train_am != "" and args.train_apnet != ""
     resolved_group = base_config.group or env.get("WANDB_RUN_GROUP")
@@ -2049,6 +2058,11 @@ def main():
     args.add_argument("--wandb-job-type", default=None)
     args.add_argument("--wandb-notes", default=None)
     args.add_argument("--wandb-dir", default=None)
+    args.add_argument(
+        "--wandb-config-file",
+        default=None,
+        help="JSON object merged into the structured W&B run config.",
+    )
     args = args.parse_args()
     # Parse only explicitly supplied parameter initialization values.
     if args.param_start_mean is not None:

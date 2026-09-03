@@ -39,6 +39,7 @@ class WandbConfig:
     job_type: str | None = None
     notes: str | None = None
     directory: str | None = None
+    extra_config: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.mode not in _VALID_MODES:
@@ -64,6 +65,9 @@ class WandbConfig:
                 raise TypeError(f"W&B {field_name} must be a string or None")
         if self.job_type == "":
             raise ValueError("W&B job_type must not be empty")
+        if not isinstance(self.extra_config, Mapping):
+            raise TypeError("W&B extra_config must be a mapping")
+        _ensure_json_serializable(self.extra_config)
 
     def resolved(
         self,
@@ -366,6 +370,8 @@ class WandbTrainingTracker(_BaseTrainingTracker):
             ) from exc
 
         cfg = self.wandb_config
+        initial_config.update(cfg.extra_config)
+        _ensure_json_serializable(initial_config)
         self._run = self._wandb.init(
             project=cfg.project,
             entity=cfg.entity,
