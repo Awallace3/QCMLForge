@@ -19,6 +19,8 @@ from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import (
     _best_mae_sidecar_paths,
     build_exponential_decay_scheduler,
     build_readout_decay,
+    closest_contact_distances,
+    compute_component_mse_loss,
     exponential_decay_lr,
 )
 from apnet_pt.pt_datasets.ap3_fused_ds import (
@@ -199,6 +201,110 @@ def test_readout_decay_rejects_invalid_configuration():
         build_readout_decay(torch.tensor([3.0]), 3, mode="exchange-overlap")
     with pytest.raises(ValueError, match="exchange scale"):
         build_readout_decay(torch.tensor([3.0]), 3, exchange_scale=0.0)
+
+
+def test_component_loss_default_preserves_historical_mse_exactly():
+    preds = torch.tensor([[1.0, -2.0], [4.0, 3.0]])
+    labels = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
+
+    loss, errors = compute_component_mse_loss(
+        preds, labels, include_total_mse=True
+    )
+
+    expected = torch.square(preds - labels).mean()
+    expected += torch.square((preds - labels).sum(dim=1)).mean()
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(errors, preds - labels)
+
+
+def test_plain_huber_uses_same_delta_for_components_and_total():
+    preds = torch.tensor([[0.5, 2.0], [-3.0, 0.25]], requires_grad=True)
+    labels = torch.zeros_like(preds)
+
+    loss, _ = compute_component_mse_loss(
+        preds,
+        labels,
+        include_total_mse=True,
+        loss_mode="huber",
+        huber_delta=1.0,
+    )
+
+    component = torch.nn.functional.huber_loss(
+        preds, labels, delta=1.0, reduction="none"
+    ).mean()
+    total = torch.nn.functional.huber_loss(
+        preds.sum(dim=1), labels.sum(dim=1), delta=1.0
+    )
+    torch.testing.assert_close(loss, component + total)
+    loss.backward()
+    assert torch.all(torch.isfinite(preds.grad))
+
+
+def test_macro_huber_equalizes_occupied_closest_contact_bins():
+    preds = torch.tensor([[1.0], [1.0], [1.0], [4.0]], requires_grad=True)
+    labels = torch.zeros_like(preds)
+    contacts = torch.tensor([1.0, 1.1, 1.2, 4.0])
+    edges = (1.5, 2.0, 2.5, 3.0, 3.5, 4.5, 5.0, 5.5, 6.0)
+
+    loss, _ = compute_component_mse_loss(
+        preds,
+        labels,
+        loss_mode="closest-contact-macro-huber",
+        huber_delta=1.0,
+        closest_contacts=contacts,
+        closest_contact_bin_edges=edges,
+        closest_contact_bin_counts=(3, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+    )
+
+    # Global inverse-frequency weights are N/(K*n_bin): 1.2/3 and 1.2/1.
+    torch.testing.assert_close(loss, torch.tensor(1.2))
+    loss.backward()
+    assert torch.all(torch.isfinite(preds.grad))
+
+
+def test_closest_contact_distances_reduce_full_edges_per_dimer():
+    class Batch:
+        RA = torch.tensor([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
+        RB = torch.tensor([[2.0, 0.0, 0.0], [7.0, 0.0, 0.0]])
+        e_ABfull_source = torch.tensor([0, 0, 1])
+        e_ABfull_target = torch.tensor([0, 1, 1])
+        dimer_ind_full = torch.tensor([0, 0, 1])
+
+    contacts = closest_contact_distances(Batch(), 2)
+
+    torch.testing.assert_close(contacts, torch.tensor([2.0, 3.0]))
+
+
+def test_macro_huber_requires_exactly_ten_strict_bins():
+    preds = torch.ones(2, 1)
+    labels = torch.zeros_like(preds)
+    contacts = torch.tensor([1.0, 2.0])
+    with pytest.raises(ValueError, match="exactly 9"):
+        compute_component_mse_loss(
+            preds,
+            labels,
+            loss_mode="closest-contact-macro-huber",
+            closest_contacts=contacts,
+            closest_contact_bin_edges=(1.5,),
+        )
+    with pytest.raises(ValueError, match="strictly increasing"):
+        compute_component_mse_loss(
+            preds,
+            labels,
+            loss_mode="closest-contact-macro-huber",
+            closest_contacts=contacts,
+            closest_contact_bin_edges=(1.0,) * 9,
+            closest_contact_bin_counts=(1,) * 10,
+        )
+    with pytest.raises(ValueError, match="10 positive"):
+        compute_component_mse_loss(
+            preds,
+            labels,
+            loss_mode="closest-contact-macro-huber",
+            closest_contacts=contacts,
+            closest_contact_bin_edges=tuple(float(x) for x in range(1, 10)),
+            closest_contact_bin_counts=(1,) * 9 + (0,),
+        )
 
 
 def test_exponential_decay_lr_hits_requested_endpoints():

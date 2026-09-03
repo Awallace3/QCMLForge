@@ -444,6 +444,10 @@ def train_pairwise_model(
     freeze_atom_model=True,
     build_dataset_only=False,
     include_total_mse=False,
+    loss_mode="mse",
+    huber_delta=1.0,
+    closest_contact_bin_edges=None,
+    closest_contact_bin_counts=None,
     component_gamma=None,
     total_includes_d3=False,
     grad_clip_norm=None,
@@ -517,7 +521,11 @@ def train_pairwise_model(
         readout_exchange_scale (float): Fixed positive scale applied to the Slater exchange envelope.
         readout_induction_scale (float): Fixed positive scale applied to the inverse-sixth induction envelope.
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
-        include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms. On a CLIFF route it is instead shorthand for component_gamma=0.5 and cannot be combined with an explicit component_gamma.
+        include_total_mse (bool): If true, add a matching total-energy term to the component loss. Historical MSE behavior is unchanged; Huber modes add total Huber. On a CLIFF route it is instead shorthand for component_gamma=0.5 and cannot be combined with an explicit component_gamma.
+    loss_mode (str): APNet3-fused-d3 component objective: mse, huber, or closest-contact-macro-huber.
+    huber_delta (float): Positive Huber transition in kcal/mol for Huber loss modes.
+    closest_contact_bin_edges (sequence[float] or None): Nine frozen Angstrom boundaries defining ten bins for closest-contact macro-Huber.
+    closest_contact_bin_counts (sequence[int] or None): Ten positive global training counts used for inverse-frequency macro weights.
         component_gamma (float or None): CLIFF Eq. (23) component/total loss weight for the combined CLIFF routes. None (the default) keeps the legacy plain multi-column MSE; any float in [0.0, 1.0] selects the Eq. (23) functional. Rejected on CliffExchangeModel and on every pre-existing route.
         total_includes_d3 (bool): If true, the CLIFF Eq. (23) total term includes D3 dispersion and is compared against all four SAPT columns. Requires an explicit component_gamma and one of the combined CLIFF routes.
         grad_clip_norm (float or None): Gradient-norm clip applied before each optimizer step. None leaves the update unclipped.
@@ -821,6 +829,8 @@ def train_pairwise_model(
         no_disp_nn = False
     if apnet_model_type != "APNet3-fused-d3" and readout_decay_mode != "legacy-r3":
         raise ValueError("readout_decay_mode is only supported by APNet3-fused-d3")
+    if apnet_model_type != "APNet3-fused-d3" and loss_mode != "mse":
+        raise ValueError("loss_mode is only supported by APNet3-fused-d3")
     if apnet_model_type == "APNet2":
         APNet = AtomPairwiseModels.apnet2.APNet2Model
     elif apnet_model_type == "APNet2-fused":
@@ -1254,6 +1264,13 @@ def train_pairwise_model(
         include_total_mse=include_total_mse,
         wandb_config=wandb_config,
     )
+    if apnet_model_type == "APNet3-fused-d3":
+        train_kwargs.update(
+            loss_mode=loss_mode,
+            huber_delta=huber_delta,
+            closest_contact_bin_edges=closest_contact_bin_edges or (),
+            closest_contact_bin_counts=closest_contact_bin_counts or (),
+        )
     if grad_clip_norm is not None:
         # Only inserted when requested so routes whose `train` has no
         # `grad_clip_norm` parameter do not print a spurious "skipping
@@ -2021,6 +2038,34 @@ def main():
         help="Fixed positive scale on the inverse-sixth induction envelope (default: 1).",
     )
     args.add_argument(
+        "--loss-mode",
+        choices=AtomPairwiseModels.apnet3_d3_fused.LOSS_MODES,
+        default="mse",
+        help="APNet3-fused-d3 loss: historical MSE, plain Huber, or 10-bin closest-contact macro-Huber.",
+    )
+    args.add_argument(
+        "--huber-delta",
+        type=float,
+        default=1.0,
+        help="Positive Huber transition in kcal/mol (default: 1.0).",
+    )
+    args.add_argument(
+        "--closest-contact-bin-edges",
+        type=float,
+        nargs=9,
+        default=None,
+        metavar="ANGSTROM",
+        help="Nine frozen closest-contact boundaries for ten-bin macro-Huber.",
+    )
+    args.add_argument(
+        "--closest-contact-bin-counts",
+        type=int,
+        nargs=10,
+        default=None,
+        metavar="COUNT",
+        help="Ten positive global training counts for macro-Huber weighting.",
+    )
+    args.add_argument(
         "--unfreeze_dimer_prop_model",
         action="store_true",
         default=False,
@@ -2229,6 +2274,10 @@ def main():
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
+            loss_mode=args.loss_mode,
+            huber_delta=args.huber_delta,
+            closest_contact_bin_edges=args.closest_contact_bin_edges,
+            closest_contact_bin_counts=args.closest_contact_bin_counts,
             ds_max_size=args.ds_max_size,
             ds_max_size_val=args.ds_max_size_val,
             batch_size=args.batch_size,

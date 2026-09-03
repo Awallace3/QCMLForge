@@ -182,18 +182,123 @@ def lr_lambda(epoch, decay_factor, initial_lr, min_lr=4e-5):
     return max(lr, min_lr) / initial_lr
 
 
-def compute_component_mse_loss(preds, labels, loss_fn=None, include_total_mse=False):
-    """Compute component MSE and optionally add a total-energy MSE term."""
+LOSS_MODES = ("mse", "huber", "closest-contact-macro-huber")
+
+
+def closest_contact_distances(batch, n_dimers: int) -> torch.Tensor:
+    """Return each dimer's minimum intermolecular atom-pair distance in Angstrom."""
+    distances = torch.linalg.norm(
+        batch.RA[batch.e_ABfull_source] - batch.RB[batch.e_ABfull_target], dim=1
+    )
+    contacts = torch.full(
+        (n_dimers,), torch.inf, dtype=distances.dtype, device=distances.device
+    )
+    contacts.scatter_reduce_(
+        0, batch.dimer_ind_full.long(), distances, reduce="amin", include_self=True
+    )
+    if not torch.all(torch.isfinite(contacts)):
+        raise ValueError("every dimer must have at least one full intermolecular edge")
+    return contacts
+
+
+def _huber(errors: torch.Tensor, delta: float) -> torch.Tensor:
+    absolute = torch.abs(errors)
+    delta_t = torch.as_tensor(delta, dtype=errors.dtype, device=errors.device)
+    return torch.where(
+        absolute <= delta_t,
+        0.5 * torch.square(errors),
+        delta_t * (absolute - 0.5 * delta_t),
+    )
+
+
+def _macro_average_by_contact_bin(
+    per_example_loss: torch.Tensor,
+    contacts: torch.Tensor,
+    bin_edges: tuple[float, ...],
+    bin_counts: tuple[int, ...],
+) -> torch.Tensor:
+    """Return an unbiased minibatch estimate of the equal-bin population loss."""
+    edges = torch.as_tensor(
+        bin_edges, dtype=contacts.dtype, device=contacts.device
+    )
+    bins = torch.bucketize(contacts.detach(), edges)
+    counts = torch.as_tensor(
+        bin_counts, dtype=per_example_loss.dtype, device=per_example_loss.device
+    )
+    weights = counts.sum() / (counts.numel() * counts)
+    return torch.mean(weights[bins] * per_example_loss)
+
+
+def compute_component_mse_loss(
+    preds,
+    labels,
+    loss_fn=None,
+    include_total_mse=False,
+    *,
+    loss_mode="mse",
+    huber_delta=1.0,
+    closest_contacts=None,
+    closest_contact_bin_edges=(),
+    closest_contact_bin_counts=(),
+):
+    """Compute the configured component loss and optional matching total loss.
+
+    The historical defaults preserve component MSE plus optional total MSE exactly.
+    For Huber modes, ``include_total_mse`` retains its CLI-compatible name but adds
+    a total-energy Huber term using the same delta.
+    """
+    if loss_mode not in LOSS_MODES:
+        raise ValueError(f"loss_mode must be one of {LOSS_MODES}, got {loss_mode!r}")
+    if huber_delta <= 0:
+        raise ValueError("huber_delta must be positive")
     comp_errors = preds - labels
-    batch_loss = (
-        torch.mean(torch.square(comp_errors))
-        if loss_fn is None
-        else loss_fn(preds, labels)
+    total_errors = torch.sum(comp_errors, dim=1)
+    if loss_mode == "mse":
+        batch_loss = (
+            torch.mean(torch.square(comp_errors))
+            if loss_fn is None
+            else loss_fn(preds, labels)
+        )
+        if include_total_mse:
+            batch_loss = batch_loss + torch.mean(torch.square(total_errors))
+        return batch_loss, comp_errors
+
+    component_per_example = torch.mean(_huber(comp_errors, huber_delta), dim=1)
+    total_per_example = _huber(total_errors, huber_delta)
+    if loss_mode == "huber":
+        batch_loss = torch.mean(component_per_example)
+        if include_total_mse:
+            batch_loss = batch_loss + torch.mean(total_per_example)
+        return batch_loss, comp_errors
+
+    if closest_contacts is None:
+        raise ValueError("closest_contacts are required for macro-Huber loss")
+    if len(closest_contact_bin_edges) != 9:
+        raise ValueError("macro-Huber requires exactly 9 edges for 10 bins")
+    if any(
+        right <= left
+        for left, right in zip(
+            closest_contact_bin_edges, closest_contact_bin_edges[1:]
+        )
+    ):
+        raise ValueError("closest-contact bin edges must be strictly increasing")
+    if len(closest_contact_bin_counts) != 10 or any(
+        count <= 0 for count in closest_contact_bin_counts
+    ):
+        raise ValueError("macro-Huber requires 10 positive global bin counts")
+    batch_loss = _macro_average_by_contact_bin(
+        component_per_example,
+        closest_contacts,
+        closest_contact_bin_edges,
+        closest_contact_bin_counts,
     )
     if include_total_mse:
-        total_preds = torch.sum(preds, dim=1)
-        total_labels = torch.sum(labels, dim=1)
-        batch_loss = batch_loss + torch.mean(torch.square(total_preds - total_labels))
+        batch_loss = batch_loss + _macro_average_by_contact_bin(
+            total_per_example,
+            closest_contacts,
+            closest_contact_bin_edges,
+            closest_contact_bin_counts,
+        )
     return batch_loss, comp_errors
 
 
@@ -2538,6 +2643,26 @@ units angstrom
     def __cleanup(self):
         dist.destroy_process_group()
 
+    def _configured_component_loss(
+        self, preds, labels, loss_fn, batch, include_total_mse
+    ):
+        contacts = (
+            closest_contact_distances(batch, preds.shape[0])
+            if self.loss_mode == "closest-contact-macro-huber"
+            else None
+        )
+        return compute_component_mse_loss(
+            preds,
+            labels,
+            loss_fn=loss_fn,
+            include_total_mse=include_total_mse,
+            loss_mode=self.loss_mode,
+            huber_delta=self.huber_delta,
+            closest_contacts=contacts,
+            closest_contact_bin_edges=self.closest_contact_bin_edges,
+            closest_contact_bin_counts=self.closest_contact_bin_counts,
+        )
+
     def __train_batches_single_proc(
         self,
         dataloader,
@@ -2568,11 +2693,8 @@ units angstrom
                 labels[:, 2] -= batch.E_classical_ind
                 if not self.model.no_disp_nn:
                     labels[:, 3] -= batch.E_classical_disp
-            batch_loss, comp_errors = compute_component_mse_loss(
-                preds,
-                labels,
-                loss_fn=loss_fn,
-                include_total_mse=include_total_mse,
+            batch_loss, comp_errors = self._configured_component_loss(
+                preds, labels, loss_fn, batch, include_total_mse
             )
             batch_loss.backward()
             optimizer.step()
@@ -2614,11 +2736,8 @@ units angstrom
                     labels[:, 2] -= batch.E_classical_ind
                     if not self.model.no_disp_nn:
                         labels[:, 3] -= batch.E_classical_disp
-                batch_loss, comp_errors = compute_component_mse_loss(
-                    preds,
-                    labels,
-                    loss_fn=loss_fn,
-                    include_total_mse=include_total_mse,
+                batch_loss, comp_errors = self._configured_component_loss(
+                    preds, labels, loss_fn, batch, include_total_mse
                 )
                 total_loss += batch_loss.item()
                 comp_errors_t.append(comp_errors.detach().cpu())
@@ -2762,11 +2881,8 @@ units angstrom
 
             # Labels are [batch_size, 5], we use first n_comp components
             labels = batch.y[:, :n_comp]
-            batch_loss, comp_errors = compute_component_mse_loss(
-                preds,
-                labels,
-                loss_fn=loss_fn,
-                include_total_mse=include_total_mse,
+            batch_loss, comp_errors = self._configured_component_loss(
+                preds, labels, loss_fn, batch, include_total_mse
             )
             batch_loss.backward()
             optimizer.step()
@@ -2859,11 +2975,8 @@ units angstrom
                 #     labels[:, 0] -= batch.E_classical_elst if hasattr(batch, 'E_classical_elst') else 0
                 #     labels[:, 2] -= batch.E_classical_ind if hasattr(batch, 'E_classical_ind') else 0
 
-                batch_loss, comp_errors = compute_component_mse_loss(
-                    preds,
-                    labels,
-                    loss_fn=loss_fn,
-                    include_total_mse=include_total_mse,
+                batch_loss, comp_errors = self._configured_component_loss(
+                    preds, labels, loss_fn, batch, include_total_mse
                 )
                 total_loss += batch_loss.item()
                 comp_errors_t.append(comp_errors.detach().cpu())
@@ -2915,11 +3028,8 @@ units angstrom
                 labels[:, 2] -= batch.E_classical_ind
                 if not self.model.no_disp_nn:
                     labels[:, 3] -= batch.E_classical_disp
-            batch_loss, comp_errors = compute_component_mse_loss(
-                preds,
-                labels,
-                loss_fn=loss_fn,
-                include_total_mse=include_total_mse,
+            batch_loss, comp_errors = self._configured_component_loss(
+                preds, labels, loss_fn, batch, include_total_mse
             )
 
             batch_loss.backward()
@@ -2979,11 +3089,8 @@ units angstrom
                     labels[:, 2] -= batch.E_classical_ind
                     if not self.model.no_disp_nn:
                         labels[:, 3] -= batch.E_classical_disp
-                batch_loss, comp_errors = compute_component_mse_loss(
-                    preds,
-                    labels,
-                    loss_fn=loss_fn,
-                    include_total_mse=include_total_mse,
+                batch_loss, comp_errors = self._configured_component_loss(
+                    preds, labels, loss_fn, batch, include_total_mse
                 )
 
                 total_loss += batch_loss.item()
@@ -3644,6 +3751,10 @@ units angstrom
         skip_compile=True,
         transfer_learning=False,
         include_total_mse=False,
+        loss_mode="mse",
+        huber_delta=1.0,
+        closest_contact_bin_edges=(),
+        closest_contact_bin_counts=(),
         shard_locality_block_shards=0,
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
@@ -3709,6 +3820,27 @@ units angstrom
         print(f"  {lr_decay=}\n", flush=True)
         print(f"  {end_lr=}\n", flush=True)
         print(f"  {include_total_mse=}\n", flush=True)
+        if loss_mode not in LOSS_MODES:
+            raise ValueError(f"loss_mode must be one of {LOSS_MODES}, got {loss_mode!r}")
+        if huber_delta <= 0:
+            raise ValueError("huber_delta must be positive")
+        closest_contact_bin_edges = tuple(float(x) for x in closest_contact_bin_edges)
+        closest_contact_bin_counts = tuple(int(x) for x in closest_contact_bin_counts)
+        if loss_mode == "closest-contact-macro-huber" and (
+            len(closest_contact_bin_edges) != 9
+            or len(closest_contact_bin_counts) != 10
+        ):
+            raise ValueError(
+                "closest-contact-macro-huber requires 9 bin edges and 10 counts"
+            )
+        self.loss_mode = loss_mode
+        self.huber_delta = float(huber_delta)
+        self.closest_contact_bin_edges = closest_contact_bin_edges
+        self.closest_contact_bin_counts = closest_contact_bin_counts
+        print(f"  {self.loss_mode=}", flush=True)
+        print(f"  {self.huber_delta=}", flush=True)
+        print(f"  {self.closest_contact_bin_edges=}", flush=True)
+        print(f"  {self.closest_contact_bin_counts=}", flush=True)
         # Read back off `self` by both training paths.  `ddp_train` is handed
         # to `mp.spawn` as a bound method, so `self` is pickled to every rank
         # and this travels with it -- no signature change on either worker.
@@ -3738,6 +3870,10 @@ units angstrom
             "training/skip_compile": skip_compile,
             "training/transfer_learning": transfer_learning,
             "training/include_total_mse": include_total_mse,
+            "training/loss_mode": self.loss_mode,
+            "training/huber_delta": self.huber_delta,
+            "training/closest_contact_bin_edges": list(self.closest_contact_bin_edges),
+            "training/closest_contact_bin_counts": list(self.closest_contact_bin_counts),
             "training/shard_locality_block_shards": self.shard_locality_block_shards,
         }
         if world_size > 1:
