@@ -722,10 +722,26 @@ def train_pairwise_model(
     return
 
 
-def set_all_seeds(seed=42, cudnn_reproducibility=False):
+def set_all_seeds(seed=42, cudnn_reproducibility=False, deterministic=False):
     """
     Set all relevant random seeds for reproducibility.
+
+    Seeding alone does not make GPU training reproducible. The APNet2 message
+    passing accumulates edge contributions with ``Tensor.scatter_add_``, which
+    on CUDA sums in nondeterministic thread order, so two runs of an identical
+    configuration diverge. The divergence starts near float32 epsilon and is
+    then amplified by training, which makes small one-factor effects
+    unmeasurable. ``deterministic=True`` requests deterministic kernels for
+    ``scatter_add_`` and ``gather`` backward at some cost in throughput.
     """
+    if deterministic:
+        # cuBLAS reads this when it first creates a handle, so set it before
+        # anything can touch CUDA.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        # warn_only keeps an op without a deterministic kernel from aborting a
+        # long run; the warning names it so the gap is visible.
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        cudnn_reproducibility = True
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -824,6 +840,16 @@ def main():
     )
     args.add_argument(
         "--random_seed", type=int, default=0, help="Random seed for initialization"
+    )
+    args.add_argument(
+        "--deterministic",
+        action="store_true",
+        help=(
+            "Request deterministic CUDA kernels so an identical configuration "
+            "reproduces run to run. Needed for one-factor parity comparisons, "
+            "because nondeterministic scatter_add_ otherwise produces a "
+            "run-to-run spread comparable to the effects being measured."
+        ),
     )
     args.add_argument(
         "--spec_type_am",
@@ -1103,7 +1129,7 @@ def main():
     args.param_start_mean = parse_param_list(args.param_start_mean)
     args.param_start_std = parse_param_list(args.param_start_std)
     pprint(args)
-    set_all_seeds(args.random_seed)
+    set_all_seeds(args.random_seed, deterministic=args.deterministic)
     atom_wandb_config, pairwise_wandb_config = build_wandb_run_configs(args)
     if args.train_am != "":
         train_atom_model(

@@ -1,4 +1,5 @@
 import math
+import os
 
 import pytest
 import torch
@@ -88,3 +89,74 @@ def test_checkpoint_score_supports_tensorflow_total_mae_policy():
     assert checkpoint_score("total_mae", component_mse, total_mae) is total_mae
     with pytest.raises(ValueError, match="checkpoint metric"):
         checkpoint_score("unknown", component_mse, total_mae)
+
+
+def _global_rng_probe():
+    return torch.randint(0, 2**31 - 1, (4,)).tolist()
+
+
+def test_initialization_policies_consume_different_global_rng_draws():
+    """The confound behind the shuffling fix.
+
+    The TensorFlow policy re-initializes the pair dense kernels on top of the
+    PyTorch defaults, so it draws a different number of values from the global
+    RNG. Anything downstream that reseeds off the global RNG therefore changes
+    with the initialization policy.
+    """
+    probes = {}
+    for policy in ("pytorch", "tensorflow"):
+        torch.manual_seed(4201)
+        APNet2_AM_MPNN(atom_model=AtomMPNN(), parameter_initialization=policy)
+        probes[policy] = _global_rng_probe()
+
+    assert probes["pytorch"] != probes["tensorflow"]
+
+
+def test_seeded_loader_generator_makes_batch_order_independent_of_init_policy():
+    """Regression test for the shuffling confound.
+
+    ``single_proc_train`` hands the training loader its own generator. Without
+    one, ``RandomSampler`` reseeds from the global torch RNG each epoch, so the
+    initialization policy silently changes batch order too.
+    """
+    from apnet_pt.pt_datasets.ap2_fused_ds import APNet2_fused_DataLoader
+
+    dataset = list(range(64))
+
+    def order(policy, *, seeded):
+        torch.manual_seed(4201)
+        APNet2_AM_MPNN(atom_model=AtomMPNN(), parameter_initialization=policy)
+        kwargs = {}
+        if seeded:
+            generator = torch.Generator()
+            generator.manual_seed(4201)
+            kwargs["generator"] = generator
+        loader = APNet2_fused_DataLoader(
+            dataset=dataset,
+            batch_size=8,
+            shuffle=True,
+            collate_fn=list,
+            **kwargs,
+        )
+        # Two passes, because the leak reappears at every epoch boundary.
+        return [list(batch) for _ in range(2) for batch in loader]
+
+    assert order("pytorch", seeded=True) == order("tensorflow", seeded=True)
+    # Guard the premise: without the generator the policies really do diverge,
+    # so this test would fail to detect a regression if it were vacuous.
+    assert order("pytorch", seeded=False) != order("tensorflow", seeded=False)
+
+
+def test_set_all_seeds_can_request_deterministic_algorithms():
+    import train_models
+
+    previously_enabled = torch.are_deterministic_algorithms_enabled()
+    try:
+        train_models.set_all_seeds(4201, deterministic=False)
+        assert torch.are_deterministic_algorithms_enabled() is False
+
+        train_models.set_all_seeds(4201, deterministic=True)
+        assert torch.are_deterministic_algorithms_enabled() is True
+        assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+    finally:
+        torch.use_deterministic_algorithms(previously_enabled)

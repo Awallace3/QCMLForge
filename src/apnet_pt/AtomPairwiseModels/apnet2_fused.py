@@ -1729,6 +1729,7 @@ units angstrom
         pretrain_test_loss=True,
         adam_eps=1e-8,
         checkpoint_metric="component_mse",
+        random_seed=42,
     ):
         # (1) Compile Model
         """
@@ -1748,6 +1749,7 @@ units angstrom
             skip_compile (bool): If True, skip torch.compile step.
             transfer_learning (bool): If True, use transfer-learning evaluation/training routines that aggregate component predictions before loss.
             pretrain_test_loss (bool): If True, initialize best-model selection using the pre-training test loss; if False, require strictly better test loss to replace the saved best model.
+            random_seed (int): Seeds the training loader's own shuffling generator so per-epoch batch order is reproducible and independent of how many draws parameter initialization took from the global torch RNG.
 
         """
         rank_device = self.device
@@ -1763,6 +1765,13 @@ units angstrom
         # (2) Dataloaders
         # if self.ds_spec_type in [1, 5, 6]:
         collate_fn = ap2_fused_collate_update
+        # Give the shuffling sampler its own generator. Without one,
+        # RandomSampler reseeds from the global torch RNG every epoch, so any
+        # change that consumes a different number of global draws beforehand
+        # (for example the TensorFlow parameter-initialization policy) also
+        # changes batch order and confounds one-factor comparisons.
+        train_loader_generator = torch.Generator()
+        train_loader_generator.manual_seed(int(random_seed))
         train_loader = APNet2_fused_DataLoader(
             dataset=train_dataset,
             batch_size=batch_size,
@@ -1771,6 +1780,7 @@ units angstrom
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=collate_fn,
+            generator=train_loader_generator,
         )
         test_loader = APNet2_fused_DataLoader(
             dataset=test_dataset,
@@ -2087,6 +2097,7 @@ units angstrom
                     pretrain_test_loss=pretrain_test_loss,
                     adam_eps=adam_eps,
                     checkpoint_metric=checkpoint_metric,
+                    random_seed=random_seed,
                 ),
                 wandb_config,
                 model_family="pairwise",

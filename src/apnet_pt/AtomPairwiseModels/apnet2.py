@@ -2312,6 +2312,7 @@ units angstrom
         include_total_mse=False,
         adam_eps=1e-8,
         checkpoint_metric="component_mse",
+        random_seed=42,
     ):
         # (1) Compile Model
         rank_device = self.device
@@ -2331,6 +2332,13 @@ units angstrom
             collate_fn = apnet2_collate_update_prebatched
         else:
             collate_fn = apnet2_collate_update
+        # Give the shuffling sampler its own generator. Without one,
+        # RandomSampler reseeds from the global torch RNG every epoch, so any
+        # change that consumes a different number of global draws beforehand
+        # (for example the TensorFlow parameter-initialization policy) also
+        # changes batch order and confounds one-factor comparisons.
+        train_loader_generator = torch.Generator()
+        train_loader_generator.manual_seed(int(random_seed))
         train_loader = APNet2_DataLoader(
             dataset=train_dataset,
             batch_size=batch_size,
@@ -2339,6 +2347,7 @@ units angstrom
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=collate_fn,
+            generator=train_loader_generator,
         )
         test_loader = APNet2_DataLoader(
             dataset=test_dataset,
@@ -2672,6 +2681,7 @@ units angstrom
                     include_total_mse=include_total_mse,
                     adam_eps=adam_eps,
                     checkpoint_metric=checkpoint_metric,
+                    random_seed=random_seed,
                 ),
                 wandb_config,
                 model_family="pairwise",
