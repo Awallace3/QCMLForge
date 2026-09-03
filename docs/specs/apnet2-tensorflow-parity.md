@@ -15,6 +15,11 @@ controls so experiments can change one factor at a time.
 | Saved pair checkpoint | Lowest validation total-energy MAE | Lowest validation component MSE |
 | Quadrupoles in analytic electrostatics | Multiply by `3/2` | No multiplier |
 
+The quadrupole multiplier is the one entry that is not merely a training
+default: it changes the forward pass, so it must be set correctly to *evaluate*
+a TensorFlow-derived checkpoint, not only to retrain like one. See
+[Running APNet2 with the original TensorFlow weights](../apnet2-tensorflow-weights.md).
+
 Both implementations optimize an unweighted MSE over the four SAPT components,
 use batch size 16, learning rate `5e-4`, three message-passing iterations, eight
 radial functions, 128 base neurons, eight-dimensional embeddings, a 5 Å

@@ -126,6 +126,13 @@ python3 ./train_models.py \
 Optional experiment tracking is documented in
 [Training with Weights & Biases](docs/training-with-wandb.md).
 
+## Reproducing the original TensorFlow AP-Net2
+
+`models/ap2_tf/` holds the published TensorFlow ensemble converted to PyTorch
+checkpoints, which reproduce the original model's predictions to float32
+accumulation noise. See
+[Running APNet2 with the original TensorFlow weights](docs/apnet2-tensorflow-weights.md).
+
 # PyTorch AtomicModule 
 Code re-implemented from TensorFlow version located [here](https://github.com/zachglick/apnet)
 
