@@ -18,6 +18,7 @@ from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import (
     _best_mae_sidecar_floor,
     _best_mae_sidecar_paths,
     build_exponential_decay_scheduler,
+    build_readout_decay,
     exponential_decay_lr,
 )
 from apnet_pt.pt_datasets.ap3_fused_ds import (
@@ -145,6 +146,59 @@ def set_weights_to_value(model, value=0.9):
         for param in model.parameters():
             param.fill_(value)  # Set all elements to the given value
     return
+
+
+def test_readout_decay_legacy_is_inverse_cube_for_every_component():
+    distances = torch.tensor([2.0, 3.0, 6.0])
+    decay = build_readout_decay(distances, 4)
+
+    assert decay.shape == (3, 4)
+    torch.testing.assert_close(decay, distances.reciprocal().pow(3)[:, None].expand(-1, 4))
+
+
+def test_exchange_overlap_readout_decay_changes_only_exchange_column():
+    distances = torch.tensor([3.0, 6.0])
+    overlap = torch.tensor([0.2, 0.01])
+    legacy = build_readout_decay(distances, 3)
+    decay = build_readout_decay(
+        distances,
+        3,
+        mode="exchange-overlap",
+        exchange_overlap=overlap,
+        exchange_scale=0.5,
+    )
+
+    torch.testing.assert_close(decay[:, [0, 2]], legacy[:, [0, 2]])
+    torch.testing.assert_close(decay[:, 1], 0.5 * overlap)
+
+
+def test_exchange_overlap_induction_r6_has_locked_asymptotics():
+    distances = torch.tensor([3.0, 6.0])
+    overlap = torch.tensor([0.2, 0.01])
+    decay = build_readout_decay(
+        distances,
+        4,
+        mode="exchange-overlap-induction-r6",
+        exchange_overlap=overlap,
+        exchange_scale=2.0,
+        induction_scale=4.0,
+    )
+
+    torch.testing.assert_close(decay[:, 1], 2.0 * overlap)
+    assert decay[1, 2] / decay[0, 2] == pytest.approx((3.0 / 6.0) ** 6)
+    # The optional dispersion head remains legacy r^-3 in this controlled arm.
+    assert decay[1, 3] / decay[0, 3] == pytest.approx((3.0 / 6.0) ** 3)
+
+
+def test_readout_decay_rejects_invalid_configuration():
+    with pytest.raises(ValueError, match="mode"):
+        build_readout_decay(torch.tensor([3.0]), 3, mode="unknown")
+    with pytest.raises(ValueError, match="3 or 4"):
+        build_readout_decay(torch.tensor([3.0]), 2)
+    with pytest.raises(ValueError, match="exchange_overlap"):
+        build_readout_decay(torch.tensor([3.0]), 3, mode="exchange-overlap")
+    with pytest.raises(ValueError, match="exchange scale"):
+        build_readout_decay(torch.tensor([3.0]), 3, exchange_scale=0.0)
 
 
 def test_exponential_decay_lr_hits_requested_endpoints():

@@ -52,6 +52,9 @@ from .mtp_mtp import (
     AtomTypeParamNN,
     DimerProp,
     AtomTypeParamModel,
+    OVERLAP_WIDTH_CEILING,
+    OVERLAP_WIDTH_FLOOR,
+    atomic_overlap_S_ij,
     isolate_atom_parameter_predictions_ap3,
     load_dimer_prop_from_checkpoint,
 )
@@ -192,6 +195,51 @@ def compute_component_mse_loss(preds, labels, loss_fn=None, include_total_mse=Fa
         total_labels = torch.sum(labels, dim=1)
         batch_loss = batch_loss + torch.mean(torch.square(total_preds - total_labels))
     return batch_loss, comp_errors
+
+
+READOUT_DECAY_MODES = (
+    "legacy-r3",
+    "exchange-overlap",
+    "exchange-overlap-induction-r6",
+)
+
+
+def build_readout_decay(
+    distances: torch.Tensor,
+    n_components: int,
+    mode: str = "legacy-r3",
+    exchange_overlap: torch.Tensor | None = None,
+    exchange_scale: float = 1.0,
+    induction_scale: float = 1.0,
+) -> torch.Tensor:
+    """Build per-edge, per-component AP3D3 readout envelopes.
+
+    ``distances`` are in Angstrom. The optional exchange overlap is the
+    dimensionless Slater overlap from :func:`atomic_overlap_S_ij`; callers must
+    compute it from the same short-range edges and valence widths. Explicit,
+    checkpointed scales let experiments match typical legacy activation scales
+    without fitting the S66x8 gate.
+    """
+    if mode not in READOUT_DECAY_MODES:
+        raise ValueError(f"readout decay mode must be one of {READOUT_DECAY_MODES}, got {mode!r}")
+    if n_components not in (3, 4):
+        raise ValueError(f"readout decay requires 3 or 4 components, got {n_components}")
+    if not np.isfinite(exchange_scale) or exchange_scale <= 0:
+        raise ValueError("readout exchange scale must be finite and > 0")
+    if not np.isfinite(induction_scale) or induction_scale <= 0:
+        raise ValueError("readout induction scale must be finite and > 0")
+
+    inverse_cube = distances.reciprocal().pow(3)
+    decay = inverse_cube.unsqueeze(-1).expand(-1, n_components).clone()
+    if mode == "legacy-r3":
+        return decay
+    if exchange_overlap is None or exchange_overlap.shape != distances.shape:
+        raise ValueError("exchange_overlap must match distances for overlap decay modes")
+
+    decay[:, 1] = exchange_scale * exchange_overlap
+    if mode == "exchange-overlap-induction-r6":
+        decay[:, 2] = induction_scale * distances.reciprocal().pow(6)
+    return decay
 
 
 class AsymptoticDecayLR(torch.optim.lr_scheduler._LRScheduler):
@@ -335,6 +383,9 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         no_disp_nn=False,
         freeze_dimer_prop_model=None,
         d3_damping_parameters=None,
+        readout_decay_mode="legacy-r3",
+        readout_exchange_scale=1.0,
+        readout_induction_scale=1.0,
     ):
         super().__init__()
         self.dimer_prop_model = dimer_prop_model
@@ -352,6 +403,18 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         self.d3_damping_parameters = resolve_d3_damping_parameters(
             d3_damping_parameters
         )
+        if readout_decay_mode not in READOUT_DECAY_MODES:
+            raise ValueError(
+                f"readout decay mode must be one of {READOUT_DECAY_MODES}, "
+                f"got {readout_decay_mode!r}"
+            )
+        if not np.isfinite(readout_exchange_scale) or readout_exchange_scale <= 0:
+            raise ValueError("readout exchange scale must be finite and > 0")
+        if not np.isfinite(readout_induction_scale) or readout_induction_scale <= 0:
+            raise ValueError("readout induction scale must be finite and > 0")
+        self.readout_decay_mode = readout_decay_mode
+        self.readout_exchange_scale = float(readout_exchange_scale)
+        self.readout_induction_scale = float(readout_induction_scale)
 
         if self.freeze_dimer_prop_model:
             if self.dimer_prop_model is not None:
@@ -451,6 +514,9 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             "no_disp_nn": self.no_disp_nn,
             "freeze_dimer_prop_model": self.freeze_dimer_prop_model,
             "d3_damping_parameters": deepcopy(self.d3_damping_parameters),
+            "readout_decay_mode": self.readout_decay_mode,
+            "readout_exchange_scale": self.readout_exchange_scale,
+            "readout_induction_scale": self.readout_induction_scale,
         }
 
     def get_model_info(self):
@@ -747,7 +813,25 @@ class APNet3D3_AtomType_MPNN(nn.Module):
 
         E_sr = EAB_sr + EBA_sr
 
-        cutoff = (1.0 / (dR_sr**3)).unsqueeze(-1)
+        exchange_overlap = None
+        if self.readout_decay_mode != "legacy-r3":
+            exchange_overlap = atomic_overlap_S_ij(
+                vwA,
+                vwB,
+                e_ABsr_source,
+                e_ABsr_target,
+                dR_sr / constants.au2ang,
+                width_floor=OVERLAP_WIDTH_FLOOR,
+                width_ceiling=OVERLAP_WIDTH_CEILING,
+            )
+        cutoff = build_readout_decay(
+            dR_sr,
+            E_sr.shape[-1],
+            mode=self.readout_decay_mode,
+            exchange_overlap=exchange_overlap,
+            exchange_scale=self.readout_exchange_scale,
+            induction_scale=self.readout_induction_scale,
+        )
         E_sr *= cutoff
         E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
         if self.use_precomputed_classical:
@@ -954,6 +1038,9 @@ class APNet3D3_AtomType_Model:
         no_disp_nn=False,
         freeze_dimer_prop_model=True,
         d3_damping_parameters=None,
+        readout_decay_mode="legacy-r3",
+        readout_exchange_scale=1.0,
+        readout_induction_scale=1.0,
     ):
         """
         the path and all other parameters will be ignored except for dataset.
@@ -1091,6 +1178,9 @@ class APNet3D3_AtomType_Model:
                 no_disp_nn=no_disp_nn,
                 freeze_dimer_prop_model=freeze_dimer_prop_model,
                 d3_damping_parameters=resolved_d3_damping_parameters,
+                readout_decay_mode=config.get("readout_decay_mode", "legacy-r3"),
+                readout_exchange_scale=config.get("readout_exchange_scale", 1.0),
+                readout_induction_scale=config.get("readout_induction_scale", 1.0),
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)
@@ -1115,6 +1205,9 @@ class APNet3D3_AtomType_Model:
                 no_disp_nn=no_disp_nn,
                 freeze_dimer_prop_model=freeze_dimer_prop_model,
                 d3_damping_parameters=resolved_d3_damping_parameters,
+                readout_decay_mode=readout_decay_mode,
+                readout_exchange_scale=readout_exchange_scale,
+                readout_induction_scale=readout_induction_scale,
             )
         self.use_precomputed_classical = use_precomputed_classical
         self.d3_damping_parameters = deepcopy(resolved_d3_damping_parameters)

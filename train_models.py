@@ -427,6 +427,9 @@ def train_pairwise_model(
     ds_type="total_component_energies",
     no_disp_nn=False,
     use_precomputed_classical=None,
+    readout_decay_mode="legacy-r3",
+    readout_exchange_scale=1.0,
+    readout_induction_scale=1.0,
     freeze_dimer_prop_model=True,
     freeze_atom_model=True,
     build_dataset_only=False,
@@ -500,6 +503,9 @@ def train_pairwise_model(
         ap2_pretrained_model_only (str or None): If provided for APNet3-fused variants, load AP2 weights from this path into the APNet.
         ds_type (str): Dataset energy-type selector (e.g., "total_component_energies", "fsapt_energies").
         no_disp_nn (bool): Skip the dispersion readout when training APNet3-fused-d3 and compute D3 at predict time instead.
+        readout_decay_mode (str): APNet3-fused-d3 readout envelope. legacy-r3 preserves the shared inverse cube; exchange-overlap uses the physical Slater overlap for exchange; exchange-overlap-induction-r6 additionally uses inverse-sixth induction.
+        readout_exchange_scale (float): Fixed positive scale applied to the Slater exchange envelope.
+        readout_induction_scale (float): Fixed positive scale applied to the inverse-sixth induction envelope.
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
         include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms. On a CLIFF route it is instead shorthand for component_gamma=0.5 and cannot be combined with an explicit component_gamma.
         component_gamma (float or None): CLIFF Eq. (23) component/total loss weight for the combined CLIFF routes. None (the default) keeps the legacy plain multi-column MSE; any float in [0.0, 1.0] selects the Eq. (23) functional. Rejected on CliffExchangeModel and on every pre-existing route.
@@ -803,6 +809,8 @@ def train_pairwise_model(
             f"WARNING: --no_disp_nn applies only to APNet3-fused-d3 (requested {apnet_model_type}); ignoring flag."
         )
         no_disp_nn = False
+    if apnet_model_type != "APNet3-fused-d3" and readout_decay_mode != "legacy-r3":
+        raise ValueError("readout_decay_mode is only supported by APNet3-fused-d3")
     if apnet_model_type == "APNet2":
         APNet = AtomPairwiseModels.apnet2.APNet2Model
     elif apnet_model_type == "APNet2-fused":
@@ -1117,6 +1125,9 @@ def train_pairwise_model(
             no_disp_nn=no_disp_nn,
             ds_batch_size=ds_batch_size,
             freeze_dimer_prop_model=freeze_dimer_prop_model,
+            readout_decay_mode=readout_decay_mode,
+            readout_exchange_scale=readout_exchange_scale,
+            readout_induction_scale=readout_induction_scale,
         )
         if ap2_pretrained_model_only is not None:
             print(f"Loading AP2 pretrained weights from {ap2_pretrained_model_only}")
@@ -1978,6 +1989,28 @@ def main():
         help="APNet3-fused-d3 only: train elst/exch/indu (three components) and compute D3 at predict time instead of a dispersion NN.",
     )
     args.add_argument(
+        "--readout_decay_mode",
+        choices=AtomPairwiseModels.apnet3_d3_fused.READOUT_DECAY_MODES,
+        default="legacy-r3",
+        help=(
+            "APNet3-fused-d3 readout envelope. 'legacy-r3' preserves current "
+            "behavior; 'exchange-overlap' changes exchange only; "
+            "'exchange-overlap-induction-r6' additionally changes induction."
+        ),
+    )
+    args.add_argument(
+        "--readout_exchange_scale",
+        type=float,
+        default=1.0,
+        help="Fixed positive scale on the Slater exchange envelope (default: 1).",
+    )
+    args.add_argument(
+        "--readout_induction_scale",
+        type=float,
+        default=1.0,
+        help="Fixed positive scale on the inverse-sixth induction envelope (default: 1).",
+    )
+    args.add_argument(
         "--unfreeze_dimer_prop_model",
         action="store_true",
         default=False,
@@ -2173,6 +2206,9 @@ def main():
             ds_type=args.ds_type,
             no_disp_nn=args.no_disp_nn,
             use_precomputed_classical=args.use_precomputed_classical,
+            readout_decay_mode=args.readout_decay_mode,
+            readout_exchange_scale=args.readout_exchange_scale,
+            readout_induction_scale=args.readout_induction_scale,
             freeze_dimer_prop_model=not args.unfreeze_dimer_prop_model,
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
