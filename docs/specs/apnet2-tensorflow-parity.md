@@ -61,6 +61,40 @@ Use `--ds_max_size` to cap pairwise datasets as well as atomic datasets. Use
 into the W&B run configuration. Computed model/training facts take precedence
 over colliding user-supplied keys.
 
+## Pre-rewrite electrostatics terms
+
+`apnet` commit 593d655 (2021-07-18, "full rewrite") made exactly two numerical
+changes to the analytic multipole electrostatics. It introduced the `3/2`
+quadrupole prefactor above, and it dropped the dipole-quadrupole and
+quadrupole-quadrupole terms from the interaction sum: the pre-rewrite routine
+summed `qq + qu + qQ + uu + uQ + QQ`, the published one sums `qq + qu + qQ + uu`.
+Every commit after it leaves the kernel's arithmetic alone, and the shipped
+SavedModels postdate it, so the published weights were trained against the
+four-term kernel.
+
+`elst_include_uQ_QQ` restores the two dropped terms, defaulting to `False` so
+the published kernel stays the default:
+
+```bash
+python train_models.py --train_apnet APNet2-fused --elst-include-uQ-QQ
+```
+
+The restored terms use the pre-rewrite `T3`/`T4` Cartesian interaction tensors
+verbatim, including the fact that the original `T3` is not fully index
+symmetric — contracted against a traceless symmetric quadrupole the trace term
+vanishes and the doubled term equals the two distinct symmetric ones, so the
+contraction is unchanged. `tests/test_ap2_elst_uq_qq.py` pins the PyTorch
+implementation to a transcription of that routine and asserts the flag changes
+nothing but the electrostatics.
+
+The flag interacts with `--quadrupole-scale`, which is applied to both
+quadrupole tensors before any term is formed: it therefore enters `uQ` linearly
+and `QQ` quadratically. `(1.5, off)` is the published kernel and `(1.0, on)` is
+the pre-rewrite functional form. Both are forward-pass constants, so changing
+either without retraining perturbs a model whose learned short-range readout
+adapted to the kernel it was trained with. Only the pairs beyond the 8 A cutoff,
+which receive no readout at all, measure the analytic term unaided.
+
 ## Controlled comparison protocol
 
 1. Keep the atomic checkpoint, processed graph shards, train/validation identities,

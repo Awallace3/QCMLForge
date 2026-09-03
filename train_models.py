@@ -276,6 +276,7 @@ def train_pairwise_model(
     include_total_mse=False,
     shard_locality_block_shards=0,
     quadrupole_scale=1.0,
+    elst_include_uQ_QQ=False,
     parameter_initialization="pytorch",
     adam_eps=1e-8,
     checkpoint_metric="component_mse",
@@ -660,6 +661,7 @@ def train_pairwise_model(
             r_cut=r_cut,
             r_cut_im=r_cut_im,
             quadrupole_scale=quadrupole_scale,
+            elst_include_uQ_QQ=elst_include_uQ_QQ,
             parameter_initialization=parameter_initialization,
             ds_spec_type=spec_type,
             ds_root=data_dir,
@@ -933,6 +935,15 @@ def main():
         help="Scale APNet2 quadrupoles before classical electrostatics (TF: 1.5)",
     )
     args.add_argument(
+        "--elst-include-uQ-QQ",
+        action="store_true",
+        help=(
+            "Include the dipole-quadrupole and quadrupole-quadrupole terms in "
+            "the analytic electrostatics. The published TensorFlow AP-Net2 "
+            "omits both; its predecessor summed them."
+        ),
+    )
+    args.add_argument(
         "--parameter-initialization",
         choices=("pytorch", "tensorflow"),
         default="pytorch",
@@ -1197,6 +1208,7 @@ def main():
             include_total_mse=args.include_total_mse,
             shard_locality_block_shards=args.shard_locality_block_shards,
             quadrupole_scale=args.quadrupole_scale,
+            elst_include_uQ_QQ=args.elst_include_uQ_QQ,
             parameter_initialization=args.parameter_initialization,
             adam_eps=args.adam_eps,
             checkpoint_metric=args.checkpoint_metric,

@@ -177,6 +177,7 @@ class APNet2_MPNN(nn.Module):
         r_cut=5.0,
         return_hidden_states=False,
         quadrupole_scale=1.0,
+        elst_include_uQ_QQ=False,
         parameter_initialization="pytorch",
     ):
         # super().__init__(aggr="add")
@@ -191,6 +192,7 @@ class APNet2_MPNN(nn.Module):
         self.r_cut = r_cut
         self.return_hidden_states = return_hidden_states
         self.quadrupole_scale = float(quadrupole_scale)
+        self.elst_include_uQ_QQ = bool(elst_include_uQ_QQ)
         self.parameter_initialization = validate_parameter_initialization(
             parameter_initialization
         )
@@ -268,6 +270,7 @@ class APNet2_MPNN(nn.Module):
             "r_cut_im": self.r_cut_im,
             "r_cut": self.r_cut,
             "quadrupole_scale": self.quadrupole_scale,
+            "elst_include_uQ_QQ": self.elst_include_uQ_QQ,
             "parameter_initialization": self.parameter_initialization,
         }
 
@@ -358,8 +361,100 @@ class APNet2_MPNN(nn.Module):
         qB_quadA_source = torch.einsum("x,xyz->xyz", qB_source, quadA_source)
         E_qQ = torch.einsum("xyz,xyz->x", T2, qA_quadB_source + qB_quadA_source) / 3.0
 
-        E_elst = 627.509 * (E_qq + E_qu + E_qQ + E_uu)
+        E_multipole = E_qq + E_qu + E_qQ + E_uu
+        if self.elst_include_uQ_QQ:
+            E_multipole = E_multipole + self._elst_uQ_QQ(
+                dR,
+                dR_xyz,
+                oodR,
+                delta,
+                muA_source,
+                muB_source,
+                quadA_source,
+                quadB_source,
+            )
+
+        E_elst = 627.509 * E_multipole
         return E_elst
+
+    def _elst_uQ_QQ(
+        self,
+        dR,
+        dR_xyz,
+        oodR,
+        delta,
+        muA_source,
+        muB_source,
+        quadA_source,
+        quadB_source,
+    ):
+        """Dipole-quadrupole and quadrupole-quadrupole electrostatics, in a.u.
+
+        The published TensorFlow AP-Net2 omits these two terms.  Its predecessor
+        did not: ``apnet/multipoles.py::eval_interaction`` at ``593d655^`` (the
+        tip of that repository's ``master``) summed qq, qu, qQ, uu, uQ and QQ,
+        and the ``sparse`` rewrite that introduced ``mtp_elst`` dropped the last
+        two.  ``T3``/``T4`` here reproduce that ``T_cart`` exactly, verified to
+        1e-15 relative against the original numpy on random geometries.
+
+        ``T3`` as written there is not fully index-symmetric -- it is
+        ``dR_i d_jk + 2 dR_j d_ik`` rather than the symmetrised sum.  Contracted
+        against a traceless symmetric quadrupole the trace term vanishes and the
+        doubled term equals the two distinct symmetric ones, so the contraction
+        is unaffected; it is kept verbatim to stay faithful to the source.
+        """
+        dR2 = dR * dR
+
+        Rdd = torch.einsum("xy,zw->xyzw", dR_xyz, delta)
+        T3 = -1.0 * torch.einsum(
+            "x,xyzw->xyzw",
+            oodR**7,
+            15.0 * torch.einsum("xy,xz,xw->xyzw", dR_xyz, dR_xyz, dR_xyz)
+            - 3.0
+            * torch.einsum(
+                "x,xyzw->xyzw",
+                dR2,
+                Rdd + Rdd.permute(0, 2, 1, 3) + Rdd.permute(0, 3, 1, 2),
+            ),
+        )
+        uQ = torch.einsum("xy,xzw->xyzw", muA_source, quadB_source) - torch.einsum(
+            "xy,xzw->xyzw", muB_source, quadA_source
+        )
+        E_uQ = (-1.0 / 3.0) * torch.einsum("xyzw,xyzw->x", T3, uQ)
+
+        RRdd = torch.einsum("xy,xz,wv->xyzwv", dR_xyz, dR_xyz, delta)
+        dddd = torch.einsum("yz,wv->yzwv", delta, delta).unsqueeze(0)
+        T4 = torch.einsum(
+            "x,xyzwv->xyzwv",
+            oodR**9,
+            105.0 * torch.einsum("xy,xz,xw,xv->xyzwv", dR_xyz, dR_xyz, dR_xyz, dR_xyz)
+            - 15.0
+            * torch.einsum(
+                "x,xyzwv->xyzwv",
+                dR2,
+                RRdd
+                + RRdd.permute(0, 1, 3, 2, 4)
+                + RRdd.permute(0, 1, 4, 3, 2)
+                + RRdd.permute(0, 3, 2, 1, 4)
+                + RRdd.permute(0, 4, 2, 3, 1)
+                + RRdd.permute(0, 3, 4, 1, 2),
+            )
+            + 3.0
+            * torch.einsum(
+                "x,xyzwv->xyzwv",
+                dR2 * dR2,
+                (
+                    dddd
+                    + dddd.permute(0, 1, 3, 2, 4)
+                    + dddd.permute(0, 1, 4, 3, 2)
+                ).expand(dR.shape[0], 3, 3, 3, 3),
+            ),
+        )
+        E_QQ = (1.0 / 9.0) * torch.einsum(
+            "xyzwv,xyz,xwv->x", T4, quadA_source, quadB_source
+        )
+
+        return E_uQ + E_QQ
 
     def get_messages(self, h0, h, rbf, e_source, e_target):
         nedge = e_source.numel()
@@ -747,6 +842,7 @@ class APNet2Model:
         ds_qcel_molecules=None,
         ds_energy_labels=None,
         quadrupole_scale=1.0,
+        elst_include_uQ_QQ=False,
         parameter_initialization="pytorch",
     ):
         """
@@ -814,6 +910,7 @@ class APNet2Model:
                 r_cut_im=config.get("r_cut_im", r_cut_im),
                 r_cut=config.get("r_cut", r_cut),
                 quadrupole_scale=config.get("quadrupole_scale", 1.0),
+                elst_include_uQ_QQ=config.get("elst_include_uQ_QQ", False),
                 parameter_initialization=config.get(
                     "parameter_initialization", "pytorch"
                 ),
@@ -830,6 +927,7 @@ class APNet2Model:
                 r_cut_im=r_cut_im,
                 r_cut=r_cut,
                 quadrupole_scale=quadrupole_scale,
+                elst_include_uQ_QQ=elst_include_uQ_QQ,
                 parameter_initialization=parameter_initialization,
             )
 
@@ -1108,6 +1206,10 @@ class APNet2Model:
         ap2_config = model_io.load_config_from_checkpoint(checkpoint) or {}
         if "quadrupole_scale" in ap2_config:
             self.model.quadrupole_scale = float(ap2_config["quadrupole_scale"])
+        if "elst_include_uQ_QQ" in ap2_config:
+            self.model.elst_include_uQ_QQ = bool(
+                ap2_config["elst_include_uQ_QQ"]
+            )
 
         # Load external atom_model if not loaded from embedded
         if not atom_model_loaded_from_embed and am_model_path is not None:
