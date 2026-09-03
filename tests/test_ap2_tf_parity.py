@@ -137,7 +137,20 @@ def test_atom_model_reproduces_tensorflow(parity_inputs, index):
 
 @pytest.mark.parametrize("index", MODEL_INDICES)
 def test_pair_model_reproduces_tensorflow(parity_inputs, index):
-    """Converted APNet2Model component energies must match KerasPairModel."""
+    """Converted APNet2Model component energies must match KerasPairModel.
+
+    This is also what rules out the embedded-atom-submodel worry. The reference
+    was recorded with ``PairModel.from_file``, which is ``pretrained`` with an
+    explicit path: both call ``tf.keras.models.load_model`` with
+    ``atom_model=None``, so TensorFlow predicted these components using the atom
+    network embedded in the pair SavedModel by
+    ``KerasPairModel(atom_model.model)``. This test feeds the converted pair
+    network multipoles from the *standalone* ``atom_models/atom{index}``
+    instead. Electrostatics consumes those multipoles analytically, so the two
+    multipole sources agreeing to ~1e-4 kcal/mol means the embedded submodel and
+    the standalone atom model are the same network. Do not re-open that question
+    without breaking this test first.
+    """
     pair_model = APNet2Model(
         pre_trained_model_path=pair_model_path(index),
         atom_model_pre_trained_path=atom_model_path(index),
@@ -146,8 +159,9 @@ def test_pair_model_reproduces_tensorflow(parity_inputs, index):
     )
     pair_model.model.eval()
     # The TensorFlow pair model scales both quadrupole tensors by 3/2 inside
-    # mtp_elst; losing that factor is worth ~0.5 kcal/mol and would otherwise
-    # pass every shape and load check.
+    # mtp_elst; losing that factor moves electrostatics on these dimers by 0.086
+    # kcal/mol on average and up to 0.498, and would otherwise pass every shape
+    # and load check.
     assert pair_model.model.quadrupole_scale == pytest.approx(1.5)
 
     predicted = np.asarray(

@@ -128,8 +128,12 @@ checkpoints therefore carry `quadrupole_scale: 1.5` in their config.
 
 This is a forward-pass constant, not a parameter, so it does not live in the
 state dict. A loader that only calls `load_state_dict` will load the weights
-successfully and still predict the wrong electrostatics — about 0.5 kcal/mol on
-total MAE, with no error and no warning.
+successfully and still predict the wrong electrostatics, with no error and no
+warning. On the 24 parity dimers, dropping 1.5 to 1.0 moves electrostatics by
+0.086 kcal/mol on average and up to 0.498 kcal/mol, and moves exchange,
+induction and dispersion by exactly zero. Against labels the damage is smaller
+than that spread suggests — some of it cancels — but still 0.012 kcal/mol of
+Elst MAE on the paper's validation split.
 `APNet2Model.set_pretrained_model` now reads it out of the checkpoint config.
 If you write your own loader, do the same.
 

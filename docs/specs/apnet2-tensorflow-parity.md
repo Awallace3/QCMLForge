@@ -138,12 +138,29 @@ the validation split's 0.302 -- and it is not the electrostatics kernel's
 history: re-pairing the atom models (all 20 off-diagonal combinations),
 dropping the `3/2`, and restoring the `uQ`/`QQ` terms are worth +0.011, +0.012
 and +0.0008 respectively, all in the wrong direction and all an order of
-magnitude too small. The leading remaining candidate is the multipole source:
-`PairModel.pretrained(i)` restores `pair{i}` as one SavedModel with its atom
-network embedded by `KerasPairModel(atom_model.model)`, whereas the conversion
-took its multipole weights from the standalone `atom_models/atom{i}`. Until
-that is settled, do not describe the converted checkpoints as reproducing the
-paper's electrostatics.
+magnitude too small.
+
+It is also not the multipole source. `PairModel.pretrained(i)` restores
+`pair{i}` as one SavedModel with its atom network embedded by
+`KerasPairModel(atom_model.model)`, while the conversion took its multipole
+weights from the standalone `atom_models/atom{i}`, so the two could in
+principle be different networks. They are not:
+`tests/test_ap2_tf_parity.py::test_pair_model_reproduces_tensorflow` compares
+the converted pair network fed by the standalone atom model against components
+TensorFlow itself produced through the embedded submodel, and agrees to
+1.2e-4 kcal/mol on electrostatics across 24 dimers and all five members.
+Electrostatics consumes the multipoles analytically, so that agreement is only
+possible if the two multipole sources are the same network.
+
+What that leaves is a discrepancy between the *shipped TensorFlow SavedModels*
+and the paper's reported electrostatics MAE, not between TensorFlow and
+QCMLForge. The conversion reproduces the SavedModels' own forward pass to
+~1e-4 kcal/mol; evaluating those SavedModels in TensorFlow on the same
+150 000-dimer subset would confirm the published checkpoints themselves give
+0.30 rather than 0.168, and is the experiment that would close this out. Until
+then, describe these checkpoints as reproducing the published SavedModels'
+predictions -- which is verified -- and not as reproducing the paper's
+reported electrostatics error.
 
 ## Controlled comparison protocol
 
