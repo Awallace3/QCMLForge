@@ -67,7 +67,7 @@ over colliding user-supplied keys.
    the same PDB13K molecule cache. Do not call a 13,326-row local PDB cache the
    paper-exact 13,216-row benchmark without an identity manifest.
 
-## Run-to-run nondeterminism sets the resolution floor
+## Seed choice sets the resolution floor
 
 GPU training of this model is not reproducible by seeding alone. APNet2 message
 passing accumulates edge contributions with `Tensor.scatter_add_`, which on CUDA
@@ -86,20 +86,38 @@ trajectories are an unintended replicate pair. Observed validation loss:
 | 1 | 13152.473 | 12827.399 | 2.5% |
 | 10 | 2197.929 | 1800.070 | 18% |
 
-At epoch 10 the pair differs by 0.130 kcal/mol in `val/mae/total` while the full
-six-arm spread is only 0.213 kcal/mol. A single seed at ten epochs therefore
-cannot rank these factors, and small one-factor deltas from such a screen are
-noise until replicated.
+`--deterministic` removes that divergence. It requests deterministic
+`scatter_add_` and `gather` backward kernels and pins the cuBLAS workspace. Two
+three-epoch runs of one configuration, submitted as separate array tasks that
+landed on different V100 nodes, produced zero differences across every logged
+metric and the same checkpoint SHA-256. Neither run emitted a `warn_only`
+fallback warning, so every op had a deterministic kernel and `torch.compile` did
+not reintroduce a nondeterministic reduction. Cost: about 4% per epoch (75.2 s
+against 72.3 s), with epoch 0 unchanged at ~154 s because compilation dominates
+it. Verify this per configuration rather than assuming it — the compiled graph,
+not just the eager ops, has to cooperate.
 
-Two consequences for the protocol:
+What determinism does not buy is resolution. Rerunning the same six arms with
+`--deterministic` and three seeds each gives a pooled within-arm standard
+deviation of **0.126 kcal/mol** in validation total MAE at 10 epochs on 10K
+samples — essentially the 0.130 kcal/mol the nondeterministic replicate pair
+showed, and wider than the v1 screen's entire six-arm range of 0.213. Every
+one-factor effect in that rerun is at most 0.4x the seed spread when arms are
+compared at a fixed epoch. None of the four differences above is resolvable at
+this scale.
+
+Consequences for the protocol:
 
 - Pass `--deterministic` for any comparison meant to isolate one factor. It
-  requests deterministic `scatter_add_` and `gather` backward kernels and pins
-  the cuBLAS workspace, at some throughput cost. Note that `torch.compile`
-  generates its own reduction kernels, so pair `--deterministic` with a
-  replicate pair to confirm bit-identical trajectories rather than assuming it.
-- Otherwise budget seed replicates and compare arms against the replicate
-  spread, never against a single baseline run.
+  makes a run reproducible and reduces the noise to a single term, seed choice,
+  that replicates can actually estimate.
+- Compare arms at a fixed epoch, not at each arm's selected checkpoint, whenever
+  `--checkpoint-metric` differs between them. Two arms that select on the
+  ranking metric otherwise get a selection advantage over arms that do not.
+- Read every delta as a multiple of the pooled within-arm spread. Separating a
+  difference `d` at two standard errors needs roughly `n >= 8 sigma^2 / d^2`
+  seeds per arm: about 50 for `d = 0.05` at `sigma = 0.126`, about 13 for
+  `d = 0.10`. If an effect needs that many seeds, buy scale or epochs instead.
 
 ## Shuffling determinism
 
