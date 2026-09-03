@@ -39,6 +39,7 @@ class WandbConfig:
     job_type: str | None = None
     notes: str | None = None
     directory: str | None = None
+    run_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in _VALID_MODES:
@@ -377,6 +378,7 @@ class WandbTrainingTracker(_BaseTrainingTracker):
             dir=cfg.directory,
             mode=cfg.mode,
             config=initial_config,
+            id=cfg.run_id,
             resume="never",
         )
         if self._run is None:

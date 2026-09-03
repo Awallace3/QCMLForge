@@ -145,6 +145,7 @@ def build_wandb_run_configs(args, environment=None):
         job_type=args.wandb_job_type,
         notes=args.wandb_notes,
         directory=args.wandb_dir,
+        run_id=getattr(args, "wandb_id", None),
     )
     dual_run = args.train_am != "" and args.train_apnet != ""
     resolved_group = base_config.group or env.get("WANDB_RUN_GROUP")
@@ -2044,6 +2045,7 @@ def main():
     args.add_argument("--wandb-job-type", default=None)
     args.add_argument("--wandb-notes", default=None)
     args.add_argument("--wandb-dir", default=None)
+    args.add_argument("--wandb-id", default=None)
     args = args.parse_args()
     # Parse only explicitly supplied parameter initialization values.
     if args.param_start_mean is not None:
