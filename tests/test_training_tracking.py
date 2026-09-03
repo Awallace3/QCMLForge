@@ -529,6 +529,7 @@ def test_wandb_tracker_commits_online_and_uses_offline_alias_reference(
     tracker = WandbTrainingTracker(
         WandbConfig(
             mode=mode,
+            run_id="deterministic-run-id",
             project="project",
             tags=("user",),
             extra_config={"dataset.id": "ap3d3-ff-cliff2-residual-v1"},
@@ -552,6 +553,7 @@ def test_wandb_tracker_commits_online_and_uses_offline_alias_reference(
     tracker.finish()
 
     assert init_calls[0]["resume"] == "never"
+    assert init_calls[0]["id"] == "deterministic-run-id"
     assert init_calls[0]["mode"] == mode
     assert init_calls[0]["config"]["dataset.id"] == "ap3d3-ff-cliff2-residual-v1"
     assert set(init_calls[0]["tags"]) >= {"user", "atomic", "AtomModel"}

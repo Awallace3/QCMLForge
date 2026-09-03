@@ -145,6 +145,7 @@ def build_wandb_run_configs(args, environment=None):
 
     base_config = WandbConfig(
         mode=args.wandb_mode,
+        run_id=getattr(args, "wandb_run_id", None),
         project=args.wandb_project,
         entity=args.wandb_entity,
         name=args.wandb_name,
@@ -2050,6 +2051,7 @@ def main():
         choices=("disabled", "online", "offline"),
         default=wandb_mode_default,
     )
+    args.add_argument("--wandb-run-id", default=None)
     args.add_argument("--wandb-project", default=None)
     args.add_argument("--wandb-entity", default=None)
     args.add_argument("--wandb-name", default=None)

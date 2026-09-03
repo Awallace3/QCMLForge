@@ -31,6 +31,7 @@ class WandbConfig:
     """User-facing W&B configuration that is safe to pass through ``mp.spawn``."""
 
     mode: Literal["disabled", "online", "offline"] = "disabled"
+    run_id: str | None = None
     project: str | None = None
     entity: str | None = None
     name: str | None = None
@@ -52,6 +53,7 @@ class WandbConfig:
         ):
             raise TypeError("W&B tags must be a tuple of non-empty strings")
         for field_name in (
+            "run_id",
             "project",
             "entity",
             "name",
@@ -373,6 +375,7 @@ class WandbTrainingTracker(_BaseTrainingTracker):
         initial_config.update(cfg.extra_config)
         _ensure_json_serializable(initial_config)
         self._run = self._wandb.init(
+            id=cfg.run_id,
             project=cfg.project,
             entity=cfg.entity,
             name=cfg.name,
