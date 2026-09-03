@@ -155,8 +155,8 @@ units angstrom
     weights : str, optional
         Which APNet2 ensemble to use. "qcmlforge" (default) is the ensemble
         trained by QCMLForge; "ap2_tf_paper" is the ensemble published with the
-        AP-Net2 paper, converted from TensorFlow, and reproduces the paper's
-        reported predictions.
+        AP-Net2 paper, converted from TensorFlow and verified against its
+        forward pass.
 
     Returns
     -------

@@ -1159,8 +1159,8 @@ class APNet2Model:
             Named weight set to take ``model_id`` from, one of
             ``apnet_pt.hf_pretrained.apnet2_weight_sets()``. Defaults to the
             QCMLForge-trained ensemble; pass ``"ap2_tf_paper"`` for the
-            ensemble published with the AP-Net2 paper, which reproduces the
-            paper's predictions (see docs/apnet2-tensorflow-weights.md).
+            ensemble published with the AP-Net2 paper (see
+            docs/apnet2-tensorflow-weights.md).
             Ignored when explicit paths are given.
 
         Returns

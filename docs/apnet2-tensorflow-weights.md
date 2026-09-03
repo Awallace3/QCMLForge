@@ -10,6 +10,12 @@ approximation.
 Use these checkpoints when you need the published numbers. Use the checkpoints
 in `models/` (or your own training run) when you want QCMLForge's own models.
 
+"The original model's predictions" means the TensorFlow forward pass, recorded
+and compared dimer by dimer. Against the paper's *reported* MAEs the converted
+ensemble matches exchange, induction and dispersion to 2-6e-4 kcal/mol but sits
++0.134 kcal/mol high on electrostatics; see
+[Where the converted weights stand against the paper](specs/apnet2-tensorflow-parity.md#where-the-converted-weights-stand-against-the-paper).
+
 ## Selecting them by name: `weights="ap2_tf_paper"`
 
 The same checkpoints are published under `ap2_tf_paper/` in the

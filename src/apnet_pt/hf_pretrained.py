@@ -183,7 +183,7 @@ APNET2_WEIGHT_SETS = {
         "n_models": 5,
         "description": (
             "AP-Net2 ensemble published with the paper (zachglick/apnet), "
-            "converted from TensorFlow. Reproduces the paper's predictions."
+            "converted from TensorFlow and verified against its forward pass."
         ),
     },
 }
