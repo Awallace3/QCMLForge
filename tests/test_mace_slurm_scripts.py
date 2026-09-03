@@ -498,3 +498,55 @@ def test_submission_uses_fake_sbatch_without_cluster_access(tmp_path):
     assert sum("--dependency=afterok:" in call for call in calls) == 18
     assert any("train_mace_atomic_properties.sbatch" in call for call in calls)
     assert sum("train_mace_ap3d3.sbatch" in call for call in calls) == 15
+
+
+def test_pair_route_runs_without_a_feature_cache_and_names_the_source(tmp_path):
+    """An unset FEATURE_CACHE_DIR means featurize on the forward pass.
+
+    Precomputing every monomer costs 1.8 TB and is impossible once the MACE
+    trunk is unfrozen, so the cache has to be optional -- but an unset variable
+    and a broken cache are different things, and only the first is allowed.
+    """
+
+    env = _base_pair_env(tmp_path, "MACE-AP3D3-DirectPolar", "direct-no-cache")
+    _add_artifact(env, tmp_path)
+    _add_atom_checkpoint(env, tmp_path)
+    env.pop("FEATURE_CACHE_DIR", None)
+    result = _run(JOBS[2], env)
+    assert result.returncode == 0, result.stderr
+    assert "features=forward-pass" in result.stdout
+
+
+def test_pair_route_names_the_cache_it_actually_read(tmp_path):
+    env = _base_pair_env(tmp_path, "MACE-AP3D3-DirectPolar", "direct-cache-named")
+    _add_artifact(env, tmp_path)
+    _add_complete_cache(env, tmp_path)
+    _add_atom_checkpoint(env, tmp_path)
+    result = _run(JOBS[2], env)
+    assert result.returncode == 0, result.stderr
+    assert f"features=cache:{env['FEATURE_CACHE_DIR']}" in result.stdout
+
+
+def test_atomic_job_no_longer_demands_a_feature_cache(tmp_path):
+    """Without FEATURE_CACHE_DIR the job must clear its precondition block.
+
+    It still fails further along on the placeholder MACE artifact -- the point
+    is only that neither the cache nor its preparation manifest is what stops
+    it any more.
+    """
+
+    artifact = tmp_path / "mace.model"
+    artifact.write_bytes(b"mace")
+    atom_data = ROOT / "tests" / "dataset_data" / "mace_atomic_properties_smoke.pkl"
+    env = {
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "RUN_ID": "atomic-no-cache",
+        "SEED": "0",
+        "MACE_MODEL_PATH": str(artifact),
+        "MACE_MODEL_SHA256": _sha(artifact),
+        "ATOM_DATA_PATH": str(atom_data),
+    }
+    result = _run(JOBS[1], env)
+    combined = result.stderr + result.stdout
+    assert "PREP_MANIFEST" not in combined
+    assert "feature cache" not in combined.lower()

@@ -554,3 +554,96 @@ def test_forward_dimer_accepts_integer_total_charge_from_datasets():
     assert features_b.total_charge.dtype.is_floating_point
     assert features_a.total_charge.reshape(-1).tolist() == [-1.0]
     assert features_b.total_charge.reshape(-1).tolist() == [0.0]
+
+
+@pytest.mark.mace_integration
+@pytest.mark.parametrize("feature_mode", ["final-layer-scalars", "all-scalars+norms"])
+def test_batched_monomer_featurization_matches_serial(feature_mode):
+    """One collated backbone call must reproduce per-monomer calls exactly.
+
+    Monomers are separate graphs, so the short-range neighbour lists carry no
+    cross-monomer edges and the long-range k-space sum is indexed per graph.
+    Overlapping the monomers in space makes any accidental coupling visible.
+    """
+
+    from tests.mace_integration import polar_mace_artifact
+
+    backbone = load_verified_polar_mace(
+        polar_mace_artifact(), expected_sha256=POLAR_1S_SHA256, offline=True
+    )
+    featurizer = MACEPolarFeaturizer(
+        backbone, checkpoint_sha256=POLAR_1S_SHA256, feature_mode=feature_mode
+    )
+    assert featurizer.cache is None and featurizer.graph_builder is None
+
+    water = ([8, 1, 1], [[0.0, 0.0, 0.0], [0.0, 0.757, 0.587], [0.0, -0.757, 0.587]])
+    ammonia = (
+        [7, 1, 1, 1],
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, -0.939, -0.383],
+            [0.813, 0.470, -0.383],
+            [-0.813, 0.470, -0.383],
+        ],
+    )
+    positions = torch.tensor(water[1] + ammonia[1], dtype=torch.float32)
+    numbers = torch.tensor(water[0] + ammonia[0], dtype=torch.long)
+    batch = torch.tensor([0] * len(water[0]) + [1] * len(ammonia[0]), dtype=torch.long)
+    charge = torch.zeros(2, dtype=torch.float32)
+    spin = torch.ones(2, dtype=torch.float32)
+
+    features, direct = featurizer.forward_monomer(
+        positions, numbers, charge, spin, batch=batch
+    )
+    for monomer in range(2):
+        indices = torch.where(batch == monomer)[0]
+        expected_features, expected_direct = featurizer._run_single(
+            positions[indices],
+            numbers[indices],
+            charge[monomer : monomer + 1],
+            spin[monomer : monomer + 1],
+        )
+        for name in ("invariant", "equivariant"):
+            torch.testing.assert_close(
+                getattr(features, name)[indices],
+                getattr(expected_features, name),
+                atol=1.0e-5,
+                rtol=1.0e-5,
+            )
+        for name in ("density_coefficients", "charges", "positions_angstrom"):
+            torch.testing.assert_close(
+                getattr(direct, name)[indices],
+                getattr(expected_direct, name),
+                atol=1.0e-5,
+                rtol=1.0e-5,
+            )
+        torch.testing.assert_close(
+            direct.molecular_dipole_eangstrom[monomer : monomer + 1],
+            expected_direct.molecular_dipole_eangstrom,
+            atol=1.0e-5,
+            rtol=1.0e-5,
+        )
+    assert torch.equal(features.batch, batch)
+    assert torch.equal(features.atomic_numbers, numbers)
+
+
+def test_parity_atol_default_clears_measured_cuda_kernel_noise():
+    """The guard must catch a mis-extraction, not float32 reduction order.
+
+    Job 12781573 (V100, torch 2.10.0+cu128) measured the private-vs-public
+    final-scalar gap as exactly 0.0 on CPU at every batch size, and on CUDA as
+    5.96e-07 serial against 1.371e-06 batched over the same 1196 atoms -- the
+    two paths select different reduction kernels once the batch is large enough.
+    The previous 1.0e-6 default sat inside that band, so it discriminated batch
+    size rather than correctness.
+    """
+
+    import inspect
+
+    from apnet_pt.mace.encoder import MACEPolarFeaturizer
+
+    default = inspect.signature(MACEPolarFeaturizer).parameters["parity_atol"].default
+    measured_cuda_batched_max = 1.371e-06
+    plausible_mis_extraction = 1.0e-2
+    assert default > measured_cuda_batched_max
+    assert default < plausible_mis_extraction

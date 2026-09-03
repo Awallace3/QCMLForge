@@ -22,9 +22,16 @@ verify_file() {
 }
 
 for variable in RUN_ROOT RUN_ID SEED MACE_MODEL_PATH MACE_MODEL_SHA256 \
-    FEATURE_CACHE_DIR PREP_MANIFEST ATOM_DATA_PATH; do
+    ATOM_DATA_PATH; do
     require_var "$variable"
 done
+# FEATURE_CACHE_DIR is optional: unset runs the MACE backbone on the forward
+# pass.  Set it and the cache plus its preparation manifest are both required,
+# because a half-specified cache is a corruption rather than a choice.
+if [[ -n "${FEATURE_CACHE_DIR:-}" ]]; then
+    require_var PREP_MANIFEST
+fi
+PREP_MANIFEST="${PREP_MANIFEST:-}"
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -41,14 +48,17 @@ mkdir -p \
     "$RUN_DIR/diagnostics" "$RUN_DIR/tmp" "$RUN_DIR/checkpoints"
 export TMPDIR="$RUN_DIR/tmp"
 verify_file "$MACE_MODEL_PATH" "$MACE_MODEL_SHA256" "MACE artifact"
-[[ -f "$FEATURE_CACHE_DIR/COMPLETE.json" ]] || \
-    fail "partial feature cache: COMPLETE.json is missing"
-[[ -f "$PREP_MANIFEST" ]] || fail "feature-preparation manifest is missing: $PREP_MANIFEST"
+if [[ -n "${FEATURE_CACHE_DIR:-}" ]]; then
+    [[ -f "$FEATURE_CACHE_DIR/COMPLETE.json" ]] || \
+        fail "partial feature cache: COMPLETE.json is missing"
+    [[ -f "$PREP_MANIFEST" ]] || fail "feature-preparation manifest is missing: $PREP_MANIFEST"
+fi
 [[ -f "$ATOM_DATA_PATH" ]] || fail "atomic smoke dataset is missing: $ATOM_DATA_PATH"
 [[ ! -e "$DIRECT_MODEL_OUT" && ! -e "$LEARNED_MODEL_OUT" ]] || \
     fail "existing atomic MODEL_OUT is forbidden; use a new RUN_ID (no implicit resume)"
 
-"$PYTHON_BIN" - "$FEATURE_CACHE_DIR/COMPLETE.json" "$MACE_MODEL_SHA256" <<'PY'
+if [[ -n "${FEATURE_CACHE_DIR:-}" ]]; then
+    "$PYTHON_BIN" - "$FEATURE_CACHE_DIR/COMPLETE.json" "$MACE_MODEL_SHA256" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -58,6 +68,7 @@ if record.get("status") != "complete":
 if record.get("mace_sha256") != sys.argv[2]:
     raise SystemExit("feature cache MACE digest mismatch")
 PY
+fi
 
 SOURCE_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || printf unknown)"
 {
@@ -100,13 +111,19 @@ record = {
         "mace": {"path": str(Path(mace_path).resolve()), "sha256": mace_sha}
     },
     "parameter_counts": {"status": "pending model construction"},
-    "feature_preparation_manifest": str(Path(prep).resolve()),
+    "feature_preparation_manifest": str(Path(prep).resolve()) if prep else None,
+    "feature_source": "cache" if prep else "forward-pass",
     "requeue_safe_checkpoint": False,
 }
 Path(output).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY
 
-export PYTHON_BIN MACE_MODEL_PATH MACE_MODEL_SHA256 FEATURE_CACHE_DIR
+if [[ -n "${FEATURE_CACHE_DIR:-}" ]]; then
+    MACE_CACHE_FLAG="--mace_cache_dir $FEATURE_CACHE_DIR"
+else
+    MACE_CACHE_FLAG=""
+fi
+export PYTHON_BIN MACE_MODEL_PATH MACE_MODEL_SHA256 MACE_CACHE_FLAG
 export ATOM_DATA_PATH SEED DIRECT_MODEL_OUT LEARNED_MODEL_OUT
 cat > "$RUN_DIR/diagnostics/run-atomic.sh" <<'BASH'
 #!/usr/bin/env bash
@@ -118,7 +135,7 @@ set -euo pipefail
     --mace_model_path "$MACE_MODEL_PATH" \
     --mace_model_sha256 "$MACE_MODEL_SHA256" \
     --mace_offline \
-    --mace_cache_dir "$FEATURE_CACHE_DIR" \
+    ${MACE_CACHE_FLAG} \
     --smoke_atom_data_path "$ATOM_DATA_PATH" \
     --n_epochs_atom 1 --random_seed "$SEED" --world_size_ddp 1 \
     --dataloader_num_workers 0 --skip_compile \
@@ -130,7 +147,7 @@ set -euo pipefail
     --mace_model_path "$MACE_MODEL_PATH" \
     --mace_model_sha256 "$MACE_MODEL_SHA256" \
     --mace_offline \
-    --mace_cache_dir "$FEATURE_CACHE_DIR" \
+    ${MACE_CACHE_FLAG} \
     --smoke_atom_data_path "$ATOM_DATA_PATH" \
     --n_epochs_atom 1 --random_seed "$SEED" --world_size_ddp 1 \
     --dataloader_num_workers 0 --skip_compile \
@@ -194,7 +211,10 @@ record = {
         "direct-completion": count(direct_path),
         "learned": count(learned_path),
     },
-    "feature_preparation_manifest": str(Path(prep_manifest).resolve()),
+    "feature_preparation_manifest": (
+        str(Path(prep_manifest).resolve()) if prep_manifest else None
+    ),
+    "feature_source": "cache" if prep_manifest else "forward-pass",
     "start_epoch": int(started),
     "end_epoch": int(ended),
     "elapsed": int(elapsed),

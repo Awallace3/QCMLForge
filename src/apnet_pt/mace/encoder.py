@@ -291,7 +291,14 @@ class MACEPolarFeaturizer(torch.nn.Module):
         graph_builder: Callable[..., dict[str, torch.Tensor]] | None = None,
         private_adapter: Any | None = None,
         multipole_contract: str = POLAR_DENSITY_L1_CONTRACT,
-        parity_atol: float = 1.0e-6,
+        # 1e-6 sat inside float32 CUDA rounding: the private and public paths
+        # are bit-identical on CPU at every batch size, but on a V100 their
+        # largest per-atom gap grows with batch size (5.96e-07 serial vs
+        # 1.371e-06 batched over the same 1196 atoms, job 12781573) because the
+        # two call sequences select different reduction kernels.  A real
+        # mis-extraction is O(1), so 1e-4 still catches every defect this guard
+        # exists for while being immune to kernel selection.
+        parity_atol: float = 1.0e-4,
     ) -> None:
         super().__init__()
         if feature_mode not in self.valid_feature_modes:
@@ -456,6 +463,7 @@ class MACEPolarFeaturizer(torch.nn.Module):
         atomic_numbers: torch.Tensor,
         total_charge: torch.Tensor,
         total_spin: torch.Tensor,
+        node_batch: torch.Tensor | None = None,
     ) -> MACEAtomicFeatures:
         public_scalars = outputs["node_feats"].to(dtype=self.dtype)
         natom = public_scalars.shape[0]
@@ -473,7 +481,9 @@ class MACEPolarFeaturizer(torch.nn.Module):
                 rtol=1.0e-6,
             ):
                 raise RuntimeError(
-                    "private PolarMACE adapter failed public-final-scalar parity"
+                    "private PolarMACE adapter failed public-final-scalar "
+                    f"parity: max|private-public| = {self.last_private_parity_error:.3e} "
+                    f"over {natom} atoms exceeds atol={self.parity_atol:.3e}"
                 )
             invariant = torch.cat(
                 (
@@ -499,7 +509,11 @@ class MACEPolarFeaturizer(torch.nn.Module):
         return MACEAtomicFeatures(
             invariant=invariant.detach(),
             equivariant=equivariant.detach(),
-            batch=torch.zeros(natom, dtype=torch.long, device=invariant.device),
+            batch=(
+                torch.zeros(natom, dtype=torch.long, device=invariant.device)
+                if node_batch is None
+                else node_batch.to(invariant.device)
+            ),
             atomic_numbers=atomic_numbers.to(invariant.device),
             total_charge=total_charge.to(invariant),
             total_spin=total_spin.to(invariant),
@@ -557,6 +571,149 @@ class MACEPolarFeaturizer(torch.nn.Module):
             )
         return features, direct
 
+    def _default_batched_graph_builder(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        ptr: list[int],
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        import numpy as np
+        from mace.data import AtomicData, Configuration
+        from mace.tools import AtomicNumberTable
+        from mace.tools.torch_geometric import DataLoader
+
+        z_table = AtomicNumberTable(self.backbone_elements)
+        heads = getattr(self.backbone, "heads", ["Default"])
+        cutoff = float(self.backbone.r_max)
+        numbers_cpu = atomic_numbers.detach().cpu().numpy()
+        positions_cpu = positions.detach().cpu().numpy()
+        graphs = []
+        for monomer in range(len(ptr) - 1):
+            start, stop = ptr[monomer], ptr[monomer + 1]
+            properties = {
+                "total_charge": float(total_charge[monomer].item()),
+                "total_spin": float(total_spin[monomer].item()),
+                "external_field": np.zeros(3),
+                "fermi_level": 0.0,
+            }
+            config = Configuration(
+                atomic_numbers=numbers_cpu[start:stop],
+                positions=positions_cpu[start:stop],
+                properties=properties,
+                property_weights={},
+            )
+            graphs.append(
+                AtomicData.from_config(
+                    config, z_table=z_table, cutoff=cutoff, heads=heads
+                )
+            )
+        collated = next(
+            iter(DataLoader(graphs, batch_size=len(graphs), shuffle=False))
+        )
+        result = collated.to_dict()
+        result["atomic_numbers"] = atomic_numbers
+        return result
+
+    def _build_batched_graph(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        ptr: list[int],
+    ) -> dict[str, torch.Tensor]:
+        graph = self._default_batched_graph_builder(
+            positions,
+            atomic_numbers,
+            total_charge,
+            total_spin,
+            ptr,
+            self.dtype,
+        )
+        device = self._backbone_device()
+        converted = {}
+        for name, value in graph.items():
+            if not torch.is_tensor(value):
+                converted[name] = value
+            elif torch.is_floating_point(value):
+                converted[name] = value.to(device=device, dtype=self.dtype)
+            else:
+                converted[name] = value.to(device=device)
+        return converted
+
+    def _run_batched(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        ptr: list[int],
+        node_batch: torch.Tensor,
+    ) -> tuple[MACEAtomicFeatures, PolarMACEDirectOutputs]:
+        """Featurize every monomer of a batch with one backbone call.
+
+        Monomers are isolated from one another, so the collated graph carries no
+        edges between them and each atom sees exactly the neighbourhood it would
+        see alone.  The per-atom results therefore match running the monomers
+        one at a time through ``_run_single``.
+        """
+
+        graph = self._build_batched_graph(
+            positions, atomic_numbers, total_charge, total_spin, ptr
+        )
+        self.backbone.eval()
+        with torch.no_grad():
+            outputs = self.backbone(graph, training=False, compute_force=False)
+            features = self._runtime_features(
+                graph,
+                outputs,
+                atomic_numbers,
+                total_charge,
+                total_spin,
+                node_batch,
+            )
+        required = {"density_coefficients", "charges", "dipole"}
+        missing = required.difference(outputs)
+        if missing:
+            raise ValueError(f"PolarMACE output is missing {sorted(missing)}")
+        density = outputs["density_coefficients"].detach().to(dtype=self.dtype)
+        if density.ndim != 2 or density.shape[1] != 4:
+            raise ValueError(
+                "PolarMACE artifact has an incompatible direct multipole width"
+            )
+        direct = PolarMACEDirectOutputs(
+            density_coefficients=density,
+            charges=outputs["charges"].detach().to(dtype=self.dtype),
+            molecular_dipole_eangstrom=outputs["dipole"].detach().to(dtype=self.dtype),
+            positions_angstrom=graph["positions"].detach().to(dtype=self.dtype),
+            batch=node_batch.to(density.device),
+            total_charge=total_charge.to(density),
+            multipole_contract=self.multipole_contract,
+        )
+        # Same reconstruction guard as the serial path, accumulated per monomer
+        # instead of over the whole batch.
+        contribution = (
+            direct.charges[:, None] * direct.positions_angstrom
+            + direct.intrinsic_dipole_eangstrom
+        )
+        reconstructed = direct.molecular_dipole_eangstrom.new_zeros(
+            direct.molecular_dipole_eangstrom.shape
+        )
+        reconstructed.index_add_(0, direct.batch, contribution)
+        if not torch.allclose(
+            reconstructed,
+            direct.molecular_dipole_eangstrom,
+            atol=1.0e-5,
+            rtol=1.0e-6,
+        ):
+            raise ValueError(
+                "PolarMACE direct coefficients do not reconstruct molecular dipole"
+            )
+        return features, direct
+
     def _cache_key(
         self,
         positions: torch.Tensor,
@@ -575,6 +732,82 @@ class MACEPolarFeaturizer(torch.nn.Module):
             total_spin=float(total_spin.item()),
             dtype=self.dtype,
         ).cache_hash
+
+    def _forward_monomer_batched(
+        self,
+        positions_angstrom: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        batch: torch.Tensor,
+        monomers: list[int],
+    ) -> tuple[MACEAtomicFeatures, PolarMACEDirectOutputs]:
+        """Uncached ``forward_monomer`` with a single backbone call per batch.
+
+        The serial path runs the backbone once per monomer, which leaves a
+        training step waiting on kernel launches rather than on arithmetic.
+        Atoms are permuted into contiguous per-monomer blocks, featurized
+        together, then scattered back into the caller's ordering.
+        """
+
+        device = positions_angstrom.device
+        index_groups = [torch.where(batch == monomer)[0] for monomer in monomers]
+        perm = torch.cat(index_groups)
+        sizes = [int(group.numel()) for group in index_groups]
+        ptr = [0]
+        for size in sizes:
+            ptr.append(ptr[-1] + size)
+        node_batch = torch.repeat_interleave(
+            torch.arange(len(monomers), dtype=torch.long, device=device),
+            torch.tensor(sizes, dtype=torch.long, device=device),
+        )
+        features, direct = self._run_batched(
+            positions_angstrom[perm],
+            atomic_numbers[perm],
+            total_charge,
+            total_spin,
+            ptr,
+            node_batch,
+        )
+        if self.resolved_feature_schema not in {None, features.feature_schema}:
+            raise RuntimeError("cached PolarMACE feature schema does not match runtime")
+        self.resolved_feature_schema = features.feature_schema
+
+        indices = perm.to(features.invariant.device)
+        invariant = features.invariant.new_empty(features.invariant.shape)
+        invariant.index_copy_(0, indices, features.invariant)
+        equivariant = features.equivariant.new_empty(features.equivariant.shape)
+        equivariant.index_copy_(0, indices, features.equivariant)
+        density = direct.density_coefficients.new_empty(
+            direct.density_coefficients.shape
+        )
+        density.index_copy_(0, indices, direct.density_coefficients)
+        charges = direct.charges.new_empty(direct.charges.shape)
+        charges.index_copy_(0, indices, direct.charges)
+        positions = direct.positions_angstrom.new_empty(
+            direct.positions_angstrom.shape
+        )
+        positions.index_copy_(0, indices, direct.positions_angstrom)
+
+        features = MACEAtomicFeatures(
+            invariant=invariant,
+            equivariant=equivariant,
+            batch=batch.to(invariant.device),
+            atomic_numbers=atomic_numbers.to(invariant.device),
+            total_charge=total_charge.to(invariant),
+            total_spin=total_spin.to(invariant),
+            feature_schema=features.feature_schema,
+        )
+        direct = PolarMACEDirectOutputs(
+            density_coefficients=density,
+            charges=charges,
+            molecular_dipole_eangstrom=direct.molecular_dipole_eangstrom,
+            positions_angstrom=positions,
+            batch=batch.to(density.device),
+            total_charge=total_charge.to(density),
+            multipole_contract=self.multipole_contract,
+        )
+        return features, direct
 
     def forward_monomer(
         self,
@@ -631,6 +864,16 @@ class MACEPolarFeaturizer(torch.nn.Module):
             len(monomers),
         ):
             raise ValueError("charge and spin must contain one value per monomer")
+
+        if self.cache is None and self.graph_builder is None:
+            return self._forward_monomer_batched(
+                positions_angstrom,
+                atomic_numbers,
+                total_charge,
+                total_spin,
+                batch,
+                monomers,
+            )
 
         per_monomer = []
         for monomer in monomers:

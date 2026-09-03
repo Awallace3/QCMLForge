@@ -75,10 +75,16 @@ fi
 
 if [[ "$ROUTE" == *-mace ]]; then
     verify_named_pair MACE_MODEL_PATH MACE_MODEL_SHA256 "MACE artifact"
-    require_var FEATURE_CACHE_DIR
-    [[ -f "$FEATURE_CACHE_DIR/COMPLETE.json" ]] || \
-        fail "partial feature cache: COMPLETE.json is missing"
-    "${PYTHON_BIN}" - "$FEATURE_CACHE_DIR/COMPLETE.json" "$MACE_MODEL_SHA256" <<'PY'
+    # A precomputed cache is optional.  Leaving FEATURE_CACHE_DIR unset runs the
+    # backbone on the forward pass instead, which is the only route available
+    # once the trunk is unfrozen and the only one that does not need the 1.8 TB
+    # the r8 cache occupies.  When the variable IS set the cache must still be
+    # complete and digest-matched: an unset variable is a choice, a partial
+    # cache is a corruption.
+    if [[ -n "${FEATURE_CACHE_DIR:-}" ]]; then
+        [[ -f "$FEATURE_CACHE_DIR/COMPLETE.json" ]] || \
+            fail "partial feature cache: COMPLETE.json is missing"
+        "${PYTHON_BIN}" - "$FEATURE_CACHE_DIR/COMPLETE.json" "$MACE_MODEL_SHA256" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -88,6 +94,10 @@ if record.get("status") != "complete":
 if record.get("mace_sha256") != sys.argv[2]:
     raise SystemExit("feature cache MACE digest mismatch")
 PY
+        export FEATURE_SOURCE="cache:${FEATURE_CACHE_DIR}"
+    else
+        export FEATURE_SOURCE="forward-pass"
+    fi
     SUBMODEL_RECORDS+=("mace=${MACE_MODEL_PATH}|${MACE_MODEL_SHA256}")
 fi
 
@@ -124,7 +134,10 @@ PHYSICS_HASH="${PHYSICS_VALUES%%|*}"
 D3_PARAMS="${PHYSICS_VALUES#*|}"
 
 if [[ "${VALIDATE_ONLY:-0}" == 1 ]]; then
-    printf 'validation complete for MODEL_OPTION=%s\n' "$MODEL_OPTION"
+    # Name the feature source here too: it is the one setting a dry run can get
+    # wrong silently, and by the time the manifest records it the job is live.
+    printf 'validation complete for MODEL_OPTION=%s features=%s\n' \
+        "$MODEL_OPTION" "${FEATURE_SOURCE:-not-applicable}"
     exit 0
 fi
 [[ "$N_EPOCHS" -le 2 ]] || \
@@ -171,8 +184,10 @@ if [[ "$ROUTE" == *-mace ]]; then
         --mace_model_path "$MACE_MODEL_PATH"
         --mace_model_sha256 "$MACE_MODEL_SHA256"
         --mace_offline
-        --mace_cache_dir "$FEATURE_CACHE_DIR"
     )
+    if [[ -n "${FEATURE_CACHE_DIR:-}" ]]; then
+        TRAIN_ARGS+=(--mace_cache_dir "$FEATURE_CACHE_DIR")
+    fi
 fi
 if [[ "$ROUTE" == atom-mace ]]; then
     TRAIN_ARGS+=(--mace_atom_model_path "$MACE_ATOM_MODEL_PATH")
@@ -183,6 +198,7 @@ fi
     "$PHYSICS_CONFIG_PATH" "$PHYSICS_CONFIG_SHA256" "$PHYSICS_HASH" \
     "$BATCH_SIZE" "$START_EPOCH" "${SUBMODEL_RECORDS[@]}" <<'PY'
 import json
+import os
 import pickle
 import sys
 from pathlib import Path
@@ -215,6 +231,10 @@ manifest = {
     "physics_config": {"path": physics_path, "sha256": physics_sha},
     "physics_hash": physics_hash,
     "submodels": submodel_records,
+    # "forward-pass" means the MACE backbone ran inside the training step rather
+    # than reading a precomputed cache; the two are not interchangeable
+    # provenance, so the manifest names which one produced the features.
+    "feature_source": os.environ.get("FEATURE_SOURCE", "not-applicable"),
     "batch_size": int(batch_size),
     "start_epoch": int(start_epoch),
     "parameter_counts": {"status": "pending model construction"},
