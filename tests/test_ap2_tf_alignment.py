@@ -160,3 +160,41 @@ def test_set_all_seeds_can_request_deterministic_algorithms():
         assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
     finally:
         torch.use_deterministic_algorithms(previously_enabled)
+
+
+@pytest.mark.parametrize("saved_scale", [1.0, 1.5])
+def test_fused_set_pretrained_model_adopts_quadrupole_scale(tmp_path, saved_scale):
+    """A checkpoint's quadrupole scale must survive ``set_pretrained_model``.
+
+    ``quadrupole_scale`` is a forward-pass constant, not a state-dict entry, so
+    a loader that only calls ``load_state_dict`` reports success and still
+    evaluates the wrong electrostatics.  The TensorFlow-converted checkpoints
+    need 1.5; the historical default is 1.0.
+    """
+
+    from apnet_pt.AtomPairwiseModels.apnet2_fused import APNet2_AM_Model
+
+    saved = APNet2_AM_MPNN(atom_model=AtomMPNN(), quadrupole_scale=saved_scale)
+    checkpoint_path = tmp_path / "ap2_fused.pt"
+    torch.save(
+        {
+            "model_state_dict": saved.state_dict(),
+            "config": {
+                "n_message": saved.n_message,
+                "n_rbf": saved.n_rbf,
+                "n_neuron": saved.n_neuron,
+                "n_embed": saved.n_embed,
+                "r_cut": saved.r_cut,
+                "r_cut_im": saved.r_cut_im,
+                "quadrupole_scale": saved_scale,
+            },
+        },
+        checkpoint_path,
+    )
+
+    model = APNet2_AM_Model(
+        atom_model=AtomMPNN(), ds_root=None, ignore_database_null=True, use_GPU=False
+    )
+    assert model.model.quadrupole_scale == 1.0
+    model.set_pretrained_model(ap2_model_path=str(checkpoint_path))
+    assert model.model.quadrupole_scale == saved_scale

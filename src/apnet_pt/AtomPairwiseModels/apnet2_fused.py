@@ -983,7 +983,12 @@ class APNet2_AM_Model:
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 
-        checkpoint = torch.load(ap2_model_path)
+        # ``weights_only=False`` to match the constructor's loader above.
+        # torch 2.6 flipped the default, and the fused pair module keeps an
+        # ``APNetLazyLinear`` whose parameter is an ``UninitializedParameter``
+        # until the first forward pass, which the weights-only unpickler
+        # rejects outright.
+        checkpoint = torch.load(ap2_model_path, weights_only=False)
         if "_orig_mod" not in list(self.model.state_dict().keys())[0]:
             model_state_dict = {
                 k.replace("_orig_mod.", ""): v
@@ -992,6 +997,16 @@ class APNet2_AM_Model:
             self.model.load_state_dict(model_state_dict)
         else:
             self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        # ``quadrupole_scale`` is a forward-pass constant rather than a
+        # parameter, so a checkpoint that needs a non-default value -- the
+        # TensorFlow-converted models in models/ap2_tf need 1.5 -- would
+        # otherwise load its weights successfully and still predict the wrong
+        # electrostatics. The constructor's ``pre_trained_model_path`` branch
+        # adopts it from the config; this method has to do the same.
+        config = checkpoint.get("config") or {}
+        if "quadrupole_scale" in config:
+            self.model.quadrupole_scale = float(config["quadrupole_scale"])
         return self
 
     def _qcel_example_input(
