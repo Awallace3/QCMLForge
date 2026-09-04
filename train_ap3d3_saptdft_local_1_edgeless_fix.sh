@@ -23,8 +23,21 @@ set -euo pipefail
 # MODEL_DIR, so the directory is a single knob.
 
 ITER=1
-MODEL_DIR=./models/ap3_saptpbe0_edgeless_fix/${ITER}
+MODEL_DIR=${MODEL_DIR:-./models/ap3_saptpbe0_edgeless_fix/${ITER}}
 DATA_DIR=${DATA_DIR:-../qcmlforge/data_dir}
+
+# All five stages report to one dedicated W&B project, grouped so the sequence
+# reads as a single retrain.  --wandb-mode defaults to "disabled" in
+# train_models.py, so every stage passes "online" explicitly; without it the
+# runs would train fine and log nothing.
+WANDB_PROJECT=${WANDB_PROJECT:-ap3d3-edgeless-fix-retrain}
+WANDB_GROUP=${WANDB_GROUP:-ap3d3-saptpbe0-edgeless-fix-iter${ITER}}
+WANDB_DIR=${WANDB_DIR:-${MODEL_DIR}/wandb}
+
+# No DDP anywhere.  batch_size is hardcoded to 16 in train_models.py and
+# DistributedSampler shards the dataset per rank, so --world_size_ddp 4 was
+# training the atom model at an effective batch of 64.  Single-process keeps the
+# AP2 hyperparameters intact, and gloo all-reduce buys little at batch 16.
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -58,19 +71,77 @@ if [ ! -d "${DATA_DIR}" ]; then
     exit 1
 fi
 
-if compgen -G "${MODEL_DIR}/*.pt" > /dev/null; then
-    echo "Refusing to overwrite checkpoints already in ${MODEL_DIR}" >&2
-    echo "Bump ITER or MODEL_DIR to start a new retrain." >&2
-    exit 1
-fi
 
-mkdir -p "${MODEL_DIR}"
+# STAGES selects which stages this invocation runs, so the stack can be split
+# across jobs: stage 1's training data (spec 4) is on Phoenix already, while
+# stages 2 and 5 need spec 1 / spec 10 staged there first.  Stage N still
+# requires stage N-1's checkpoint to exist, which is asserted below.
+STAGES=${STAGES:-1 2 3 4 5}
+
+# skip_stage <n> <output.pt>
+#
+# Nothing is ever overwritten by accident.  A stage whose completion marker
+# exists is redone only under RESUME=1, so a job that dies in stage 4 picks up
+# there instead of repeating 500 atom epochs.  A stage whose output exists with
+# *no* marker is a partial or foreign checkpoint, and that always refuses --
+# which is also what protects models/ap3_saptpbe0/${ITER} if MODEL_DIR is ever
+# pointed back at it.  The marker is written only after the stage exits 0, which
+# matters for stage 5: its checkpoint exists from the `cp` before a single epoch
+# has run.
+skip_stage() {
+    local n="$1" out="$2"
+    case " ${STAGES} " in
+        *" ${n} "*) ;;
+        *) echo "STAGES=${STAGES}: stage ${n} not selected, skipping" >&2; return 0 ;;
+    esac
+    if [ -f "${MODEL_DIR}/.stage${n}.done" ]; then
+        if [ "${RESUME:-0}" = "1" ]; then
+            echo "RESUME: stage ${n} already complete, skipping" >&2
+            return 0
+        fi
+        echo "Stage ${n} already completed in ${MODEL_DIR}." >&2
+        echo "Pass RESUME=1 to skip completed stages, or bump ITER/MODEL_DIR." >&2
+        exit 1
+    fi
+    if [ -e "${out}" ]; then
+        echo "Stage ${n} output ${out} exists with no completion marker." >&2
+        echo "Refusing to overwrite a partial or foreign checkpoint." >&2
+        exit 1
+    fi
+    return 1
+}
+
+# A stage silently training against a missing upstream checkpoint is the one
+# failure mode that would waste the whole run, so require the inputs up front.
+require_input() {
+    if [ ! -f "$1" ]; then
+        echo "Missing upstream checkpoint $1" >&2
+        echo "Run the earlier stages first (STAGES=... ) or point MODEL_DIR at them." >&2
+        exit 1
+    fi
+}
+
+mkdir -p "${MODEL_DIR}" "${WANDB_DIR}"
+
+# wandb needs credentials before stage 1 starts, not 500 epochs later.
+python3 -c "
+import sys, netrc, os, pathlib
+if os.environ.get('WANDB_API_KEY'):
+    sys.exit(0)
+try:
+    hosts = netrc.netrc(pathlib.Path.home() / '.netrc').hosts
+except Exception as exc:
+    sys.exit(f'no WANDB_API_KEY and ~/.netrc unreadable ({exc}); run wandb login')
+if not any('wandb' in host for host in hosts):
+    sys.exit('no WANDB_API_KEY and no wandb entry in ~/.netrc; run wandb login')
+"
 
 # ---------------------------------------------------------------------------
 # Stage 1: AP2 AtomMPNN on PBE0 monomers (spec 4 -> monomers_ap3_spec_1_pbe0.pkl)
 #
 # This is the stage the fix is in.  Re-enabled.
 # ---------------------------------------------------------------------------
+if ! skip_stage 1 "${MODEL_DIR}/am_ap2_1.pt"; then
 python3 \
     -u \
     ./train_models.py \
@@ -97,9 +168,25 @@ python3 \
     --spec_type_am \
     4 \
     --world_size_ddp \
-    4 \
+    1 \
     --omp_num_threads \
-    4
+    8 \
+    --wandb-mode \
+    online \
+    --wandb-project \
+    "${WANDB_PROJECT}" \
+    --wandb-group \
+    "${WANDB_GROUP}" \
+    --wandb-name \
+    s1-am-ap2 \
+    --wandb-job-type \
+    atom-model \
+    --wandb-tags \
+    edgeless-fix ap3d3 saptpbe0 retrain \
+    --wandb-dir \
+    "${WANDB_DIR}"
+touch "${MODEL_DIR}/.stage1.done"
+fi
 
 # ---------------------------------------------------------------------------
 # Stage 2: Hirshfeld volume-ratio/valence-width AtomTypeParamNN on PBE0
@@ -107,6 +194,8 @@ python3 \
 #
 # Consumes the stage-1 atom model, so it must be retrained too.  Re-enabled.
 # ---------------------------------------------------------------------------
+if ! skip_stage 2 "${MODEL_DIR}/atp_hfvr_1.pt"; then
+require_input "${MODEL_DIR}/am_ap2_1.pt"
 python3 \
     -u \
     ./train_models.py \
@@ -135,12 +224,31 @@ python3 \
     --world_size_ddp \
     1 \
     --omp_num_threads \
-    16
+    16 \
+    --wandb-mode \
+    online \
+    --wandb-project \
+    "${WANDB_PROJECT}" \
+    --wandb-group \
+    "${WANDB_GROUP}" \
+    --wandb-name \
+    s2-atp-hfvr \
+    --wandb-job-type \
+    atom-type-param \
+    --wandb-tags \
+    edgeless-fix ap3d3 saptpbe0 retrain \
+    --wandb-dir \
+    "${WANDB_DIR}"
+touch "${MODEL_DIR}/.stage2.done"
+fi
 
 # ---------------------------------------------------------------------------
 # Stage 3: Electrostatic K AtomTypeParamNN on Splinter SAPT0/aug-cc-pVDZ
 # dimers (spec 2)
 # ---------------------------------------------------------------------------
+if ! skip_stage 3 "${MODEL_DIR}/atp_elst_1.pt"; then
+require_input "${MODEL_DIR}/am_ap2_1.pt"
+require_input "${MODEL_DIR}/atp_hfvr_1.pt"
 python3 \
     -u \
     ./train_models.py \
@@ -181,12 +289,32 @@ python3 \
     --world_size_ddp \
     1 \
     --omp_num_threads \
-    16
+    16 \
+    --wandb-mode \
+    online \
+    --wandb-project \
+    "${WANDB_PROJECT}" \
+    --wandb-group \
+    "${WANDB_GROUP}" \
+    --wandb-name \
+    s3-atp-elst \
+    --wandb-job-type \
+    dimer-param \
+    --wandb-tags \
+    edgeless-fix ap3d3 saptpbe0 retrain \
+    --wandb-dir \
+    "${WANDB_DIR}"
+touch "${MODEL_DIR}/.stage3.done"
+fi
 
 # ---------------------------------------------------------------------------
 # Stage 4: APNet3D3 on Splinter SAPT0/aug-cc-pVDZ (spec 2), with -D3 + NN
 # dispersion
 # ---------------------------------------------------------------------------
+if ! skip_stage 4 "${MODEL_DIR}/ap3d3_1.pt"; then
+require_input "${MODEL_DIR}/am_ap2_1.pt"
+require_input "${MODEL_DIR}/atp_hfvr_1.pt"
+require_input "${MODEL_DIR}/atp_elst_1.pt"
 python3 \
     -u \
     ./train_models.py \
@@ -215,14 +343,35 @@ python3 \
     --spec_type_ap \
     2 \
     --lr \
-    5e-4
+    5e-4 \
+    --wandb-mode \
+    online \
+    --wandb-project \
+    "${WANDB_PROJECT}" \
+    --wandb-group \
+    "${WANDB_GROUP}" \
+    --wandb-name \
+    s4-ap3d3-sapt0 \
+    --wandb-job-type \
+    ap3d3-sapt0 \
+    --wandb-tags \
+    edgeless-fix ap3d3 saptpbe0 retrain \
+    --wandb-dir \
+    "${WANDB_DIR}"
+touch "${MODEL_DIR}/.stage4.done"
+fi
 
 # ---------------------------------------------------------------------------
 # Stage 5: copy the SAPT0/aug-cc-pVDZ model, then fine-tune on 124k
 # SAPT(PBE0)-D4(I)/aug-cc-pVDZ (spec 10)
 # ---------------------------------------------------------------------------
-cp "${MODEL_DIR}/ap3d3_1.pt" "${MODEL_DIR}/ap3d3_1_saptpbe0.pt"
 
+if ! skip_stage 5 "${MODEL_DIR}/ap3d3_1_saptpbe0.pt"; then
+require_input "${MODEL_DIR}/am_ap2_1.pt"
+require_input "${MODEL_DIR}/atp_hfvr_1.pt"
+require_input "${MODEL_DIR}/atp_elst_1.pt"
+require_input "${MODEL_DIR}/ap3d3_1.pt"
+cp "${MODEL_DIR}/ap3d3_1.pt" "${MODEL_DIR}/ap3d3_1_saptpbe0.pt"
 python3 \
     -u \
     ./train_models.py \
@@ -255,4 +404,20 @@ python3 \
     --ds_class_type \
     lmdb \
     --unfreeze_dimer_prop_model \
-    --unfreeze_atom_model
+    --unfreeze_atom_model \
+    --wandb-mode \
+    online \
+    --wandb-project \
+    "${WANDB_PROJECT}" \
+    --wandb-group \
+    "${WANDB_GROUP}" \
+    --wandb-name \
+    s5-ap3d3-saptpbe0 \
+    --wandb-job-type \
+    ap3d3-saptpbe0-finetune \
+    --wandb-tags \
+    edgeless-fix ap3d3 saptpbe0 retrain \
+    --wandb-dir \
+    "${WANDB_DIR}"
+touch "${MODEL_DIR}/.stage5.done"
+fi
