@@ -95,6 +95,93 @@ either without retraining perturbs a model whose learned short-range readout
 adapted to the kernel it was trained with. Only the pairs beyond the 8 A cutoff,
 which receive no readout at all, measure the analytic term unaided.
 
+## Where the converted weights stand against the paper
+
+The published TensorFlow SavedModels, evaluated in TensorFlow 2.3 on the
+paper's own 150 000-dimer Splinter validation split and averaged the way
+`apnet/bms_functions.py::predict_sapt` averages them, reproduce Fig. 2B:
+
+| component | TensorFlow ensemble | paper Fig. 2B | delta |
+|---|---|---|---|
+| Elst | 0.167 | 0.168 | -0.001 |
+| Exch | 0.141 | 0.141 | -0.000 |
+| Ind | 0.096 | 0.096 | -0.000 |
+| Disp | 0.020 | 0.021 | -0.001 |
+| Total | 0.200 | 0.201 | -0.001 |
+
+Maximum absolute total error 14.30 kcal/mol against the paper's "under 15",
+and 97.32% of dimers within 1 kcal/mol against the paper's "over 97%". The
+shipped checkpoints are the paper's model, so any gap between QCMLForge and
+Fig. 2B is QCMLForge's.
+
+The converted PyTorch ensemble, after the atom-model fix below, reproduces
+those TensorFlow numbers rather than approximating them:
+
+| component | converted ensemble MAE | TensorFlow ensemble MAE | paper Fig. 2B |
+|---|---|---|---|
+| Elst | 0.16704 | 0.16704 | 0.168 |
+| Exch | 0.14079 | 0.14079 | 0.141 |
+| Ind | 0.09567 | 0.09567 | 0.096 |
+| Disp | 0.02043 | 0.02043 | 0.021 |
+| Total | 0.19992 | 0.19992 | 0.201 |
+
+Per dimer, the converted ensemble differs from the TensorFlow ensemble by a
+mean of 1.6e-5 kcal/mol on the total; one dimer out of 150 000 exceeds 1e-2 on
+any component, an induction outlier that is unchanged by the fix and most
+likely a pair sitting on the 8 A cutoff. Per member the mean total difference
+is 2-3e-5 kcal/mol.
+
+Two rules follow for anyone comparing to the paper:
+
+- **Compare ensembles, never members.** Averaging the five members is worth
+  about 0.09 kcal/mol on the total. Every published AP-Net2 number is a
+  five-model average, so a single-member MAE is not comparable to it.
+- **Use `quadrupole_scale=1.5`.** It is a forward-pass constant rather than a
+  state-dict entry, so a loader that only calls `load_state_dict` reports
+  success and silently evaluates the wrong electrostatics. Setting it to 1.0
+  costs 0.012 kcal/mol of Elst and corresponds to no TensorFlow code era.
+
+### The electrostatics gap was an atom-model indexing defect
+
+Before the fix in `AtomMPNN.forward`, the converted ensemble gave Elst 0.3024
+against the paper's 0.168 while exchange, induction and dispersion were already
+within 6e-4. The asymmetry was the diagnosis. `get_pair` feeds the shared
+short-range readout only the *charges*; dipoles and quadrupoles reach the
+energy through `mtp_elst` alone. Only electrostatics can be wrong on its own,
+and only through the multipoles.
+
+`AtomMPNN.forward` used to drop atoms with no intramonomer edge before message
+passing and renumber `e_source`/`e_target` onto the filtered indices, but it
+scattered the dipole and quadrupole messages with the *unfiltered* atom count.
+Those accumulators are indexed by original atom number, so one edgeless atom
+shifted every later atom in the batch onto another atom's multipoles and left
+the batch's trailing atoms holding the readout-of-zero bias. Charges escaped
+because they rode a separate filtered tensor that was written back through the
+same mask.
+
+An atom has no intramonomer edge exactly when its monomer is a single atom --
+a halide or alkali ion, 5 971 of the 150 000 validation dimers (3.98%). At the
+evaluation batch size of 32 each of those poisons the rest of its batch, so
+42% of dimers came out wrong, and the ensemble Elst MAE moved by 0.13
+kcal/mol. TensorFlow does not filter: such an atom receives `m_i = 0` and
+flows through the update and readout layers, so its dipole is the readout
+layer's bias rather than zero. Parity requires not filtering, not merely
+re-indexing.
+
+The 24-dimer TensorFlow parity fixture could not see this. It batches at size
+4, which would have caught the defect, but the first 24 dimers in shard order
+are all ordinary organic pairs and none has a single-atom monomer. The fixture
+is now 26 dimers: the same 24 plus the first dimer in shard order with a
+monatomic monomer and the dimer immediately behind it, since the corruption
+lands on whatever shares the batch *after* the lone atom. Regenerate it with
+`scripts/ap2_tf/make_parity_dimers.py --ensure-monatomic`.
+
+Neither the electrostatics kernel's history nor the multipole source was
+responsible: re-pairing the atom models across all 20 off-diagonal
+combinations, dropping the `3/2`, and restoring the `uQ`/`QQ` terms are worth
++0.011, +0.012 and +0.0008 kcal/mol respectively, all in the wrong direction
+and all an order of magnitude too small.
+
 ## Controlled comparison protocol
 
 1. Keep the atomic checkpoint, processed graph shards, train/validation identities,
