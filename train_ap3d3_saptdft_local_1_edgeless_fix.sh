@@ -26,6 +26,16 @@ ITER=1
 MODEL_DIR=${MODEL_DIR:-./models/ap3_saptpbe0_edgeless_fix/${ITER}}
 DATA_DIR=${DATA_DIR:-../qcmlforge/data_dir}
 
+# Every stage's training data sits in a different directory on Phoenix -- spec 4
+# in data_0, spec 1 in data_dir, the spec 2 / spec 10 dimers in data_dimer_1 --
+# so the data dir is per stage.  Each one defaults to DATA_DIR, which keeps a
+# single-directory local run working unchanged.
+DATA_DIR_S1=${DATA_DIR_S1:-${DATA_DIR}}
+DATA_DIR_S2=${DATA_DIR_S2:-${DATA_DIR}}
+DATA_DIR_S3=${DATA_DIR_S3:-${DATA_DIR}}
+DATA_DIR_S4=${DATA_DIR_S4:-${DATA_DIR}}
+DATA_DIR_S5=${DATA_DIR_S5:-${DATA_DIR}}
+
 # All five stages report to one dedicated W&B project, grouped so the sequence
 # reads as a single retrain.  --wandb-mode defaults to "disabled" in
 # train_models.py, so every stage passes "online" explicitly; without it the
@@ -65,11 +75,13 @@ print(f'preflight ok: apnet_pt at {resolved}, edgeless fix present')
 # The original script's relative ../qcmlforge/data_dir resolves only from the
 # author's checkout layout, not from a worktree.  Fail here rather than after
 # stage 1 has already spent GPU hours.
-if [ ! -d "${DATA_DIR}" ]; then
-    echo "DATA_DIR ${DATA_DIR} does not exist (cwd $(pwd))." >&2
-    echo "Set DATA_DIR=/path/to/data_dir and re-run." >&2
-    exit 1
-fi
+for d in "${DATA_DIR_S1}" "${DATA_DIR_S2}" "${DATA_DIR_S3}" "${DATA_DIR_S4}" "${DATA_DIR_S5}"; do
+    if [ ! -d "${d}" ]; then
+        echo "Data dir ${d} does not exist (cwd $(pwd))." >&2
+        echo "Set DATA_DIR, or DATA_DIR_S1..DATA_DIR_S5, and re-run." >&2
+        exit 1
+    fi
+done
 
 
 # STAGES selects which stages this invocation runs, so the stack can be split
@@ -164,7 +176,7 @@ python3 \
     --n_embed_atom \
     8 \
     --data_dir \
-    "${DATA_DIR}" \
+    "${DATA_DIR_S1}" \
     --spec_type_am \
     4 \
     --world_size_ddp \
@@ -218,7 +230,7 @@ python3 \
     --n_embed \
     8 \
     --data_dir \
-    "${DATA_DIR}" \
+    "${DATA_DIR_S2}" \
     --spec_type_ap \
     1 \
     --world_size_ddp \
@@ -273,7 +285,7 @@ python3 \
     --n_params \
     1 \
     --data_dir \
-    "${DATA_DIR}" \
+    "${DATA_DIR_S3}" \
     --spec_type_ap \
     2 \
     --lr \
@@ -339,9 +351,11 @@ python3 \
     --n_embed \
     8 \
     --data_dir \
-    "${DATA_DIR}" \
+    "${DATA_DIR_S4}" \
     --spec_type_ap \
     2 \
+    --ds_class_type \
+    lmdb \
     --lr \
     5e-4 \
     --wandb-mode \
@@ -396,7 +410,7 @@ python3 \
     --n_embed \
     8 \
     --data_dir \
-    "${DATA_DIR}" \
+    "${DATA_DIR_S5}" \
     --spec_type_ap \
     10 \
     --lr \
