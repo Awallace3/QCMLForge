@@ -11,9 +11,9 @@ Use these checkpoints when you need the published numbers. Use the checkpoints
 in `models/` (or your own training run) when you want QCMLForge's own models.
 
 "The original model's predictions" means the TensorFlow forward pass, recorded
-and compared dimer by dimer. Against the paper's *reported* MAEs the converted
-ensemble matches exchange, induction and dispersion to 2-6e-4 kcal/mol but sits
-+0.134 kcal/mol high on electrostatics; see
+and compared dimer by dimer. On the paper's own 150 000-dimer validation split
+the converted ensemble lands on the TensorFlow ensemble to five decimals on
+every component and on the paper's reported Fig. 2B MAEs to 0.001 kcal/mol; see
 [Where the converted weights stand against the paper](specs/apnet2-tensorflow-parity.md#where-the-converted-weights-stand-against-the-paper).
 
 ## Selecting them by name: `weights="ap2_tf_paper"`
@@ -169,9 +169,13 @@ because the energies remained finite and kept the right signs. Measured against
 labels on the 24-dimer set, total MAE was 48.1 / 12.3 / 275.5 / 36.7 / 20.2
 kcal/mol for models 0–4, against TensorFlow's 0.25 / 0.34 / 0.26 / 0.25 / 0.18.
 
-**This, not the `sparse`/`master` question below, explains the accuracy
-discrepancy previously seen against the paper.** The atom models were always
-correct; the pair models were never usable.
+**This, not the `sparse`/`master` question below, explains the first accuracy
+discrepancy seen against the paper.** The atom model *weights* were always
+correct; the pair model weights were never usable. A second discrepancy
+survived that fix -- electrostatics 0.134 kcal/mol high with the other three
+components already at parity -- and was a defect in QCMLForge's own
+`AtomMPNN.forward`, not in the weights: see
+[The electrostatics gap was an atom-model indexing defect](specs/apnet2-tensorflow-parity.md#the-electrostatics-gap-was-an-atom-model-indexing-defect).
 
 `tests/test_ap2_tf_parity.py` now asserts that all 83 tensors are present,
 finite, and non-lazy, so this specific failure cannot recur silently.
