@@ -1,15 +1,8 @@
-"""The dipole-quadrupole and quadrupole-quadrupole electrostatics terms.
+"""The optional dipole-quadrupole and quadrupole-quadrupole electrostatics terms.
 
-The published TensorFlow AP-Net2 omits both.  Its predecessor did not: the
-``master`` tip of ``github.com/zachglick/apnet`` (commit ``e09955b``, which is
-``593d655^``) summed qq, qu, qQ, uu, uQ and QQ in
-``apnet/multipoles.py::eval_interaction``, and the ``sparse`` rewrite that
-replaced it with ``KerasPairModel.mtp_elst`` dropped the last two while adding
-a 3/2 factor on both quadrupole tensors.
-
-``reference_T_cart`` below is that pre-rewrite ``T_cart`` transcribed verbatim,
-so these tests pin ``_elst_uQ_QQ`` to the code it is meant to restore rather
-than to a re-derivation of the multipole expansion.
+``sparse``'s ``mtp_elst`` dropped both; ``multipoles.py::eval_interaction`` at
+``593d655^`` summed them.  ``reference_T_cart`` transcribes that ``T_cart``
+verbatim, pinning the kernel to the code it restores.
 """
 
 import numpy as np
@@ -19,6 +12,7 @@ import torch
 from apnet_pt.AtomModels.ap2_atom_model import AtomMPNN
 from apnet_pt.AtomPairwiseModels.apnet2 import APNet2_MPNN
 from apnet_pt.AtomPairwiseModels.apnet2_fused import APNet2_AM_MPNN
+from apnet_pt.AtomPairwiseModels.apnet2_parity import elst_uQ_QQ
 
 MODEL_FACTORIES = [
     lambda **kwargs: APNet2_MPNN(**kwargs),
@@ -80,7 +74,7 @@ def reference_uQ_QQ(dR_xyz, muA, muB, quadA, quadB):
 
 
 def random_multipoles(n_edge, seed):
-    """Traceless symmetric quadrupoles, as both atom models are trained to emit."""
+    """Traceless symmetric quadrupoles, as the atom models are trained to emit."""
     rng = np.random.default_rng(seed)
     quads = []
     for _ in range(n_edge):
@@ -94,9 +88,8 @@ def random_multipoles(n_edge, seed):
     )
 
 
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_uQ_QQ_reproduces_pre_rewrite_kernel(model_factory):
-    """``_elst_uQ_QQ`` must match the original numpy to float64 precision."""
+def test_uQ_QQ_reproduces_pre_rewrite_kernel():
+    """``elst_uQ_QQ`` must match the original numpy to float64 precision."""
     n_edge = 6
     muA, muB, quadA = random_multipoles(n_edge, seed=11)
     _, _, quadB = random_multipoles(n_edge, seed=12)
@@ -104,10 +97,9 @@ def test_uQ_QQ_reproduces_pre_rewrite_kernel(model_factory):
     # Keep well away from r=0; the terms fall off as r^-7 and r^-9.
     dR_xyz = rng.normal(size=(n_edge, 3)) + 4.0
 
-    model = model_factory(elst_include_uQ_QQ=True)
     dR_xyz_t = torch.tensor(dR_xyz, dtype=torch.float64)
     dR_t = torch.sqrt((dR_xyz_t * dR_xyz_t).sum(-1))
-    got = model._elst_uQ_QQ(
+    got = elst_uQ_QQ(
         dR_t,
         dR_xyz_t,
         1.0 / dR_t,

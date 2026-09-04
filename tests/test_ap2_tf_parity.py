@@ -1,20 +1,12 @@
 """Numerical parity between the original TensorFlow AP-Net2 and QCMLForge.
 
-``models/ap2_tf_paper/**`` is a direct conversion of the SavedModels published with
-``github.com/zachglick/apnet`` (branch ``sparse``).  These tests assert that the
-conversion is faithful: loading those checkpoints and predicting must reproduce
-what TensorFlow itself produced for the same dimers.
-
-The TensorFlow numbers live in ``tests/dataset_data/ap2_tf_parity/``, generated
-once by ``scripts/ap2_tf/tf_reference_predictions.py`` inside the legacy
-TensorFlow 2.3 / python 3.8 environment.  Recording them as a fixture is what
-lets this run in ordinary CI, which has no TensorFlow, no python 3.8, and none
-of the 100 MB of SavedModels.
-
-Tolerances are set well above the observed disagreement (3e-6 on multipoles,
-1.3e-4 kcal/mol on energy components) but far below anything physically
-meaningful, so genuine regressions in the conversion or in the forward pass are
-caught while float32 reduction-order differences across platforms are not.
+``models/ap2_tf_paper/**`` converts the SavedModels published with
+``github.com/zachglick/apnet`` (branch ``sparse``); predicting with them must
+reproduce what TensorFlow produced.  The TensorFlow numbers were recorded once
+by ``scripts/ap2_tf/tf_reference_predictions.py`` in a TF 2.3 / py3.8
+environment into ``tests/dataset_data/ap2_tf_parity/`` so this runs in ordinary
+CI.  Tolerances sit above the observed disagreement (3e-6 multipoles, 1.3e-4
+kcal/mol components) and far below anything physically meaningful.
 """
 
 import hashlib
@@ -159,17 +151,9 @@ def test_atom_model_reproduces_tensorflow(parity_inputs, index):
 def test_pair_model_reproduces_tensorflow(parity_inputs, index):
     """Converted APNet2Model component energies must match KerasPairModel.
 
-    This is also what rules out the embedded-atom-submodel worry. The reference
-    was recorded with ``PairModel.from_file``, which is ``pretrained`` with an
-    explicit path: both call ``tf.keras.models.load_model`` with
-    ``atom_model=None``, so TensorFlow predicted these components using the atom
-    network embedded in the pair SavedModel by
-    ``KerasPairModel(atom_model.model)``. This test feeds the converted pair
-    network multipoles from the *standalone* ``atom_models/atom{index}``
-    instead. Electrostatics consumes those multipoles analytically, so the two
-    multipole sources agreeing to ~1e-4 kcal/mol means the embedded submodel and
-    the standalone atom model are the same network. Do not re-open that question
-    without breaking this test first.
+    TensorFlow used the atom network embedded in the pair SavedModel; this feeds
+    the standalone ``atom_models/atom{index}``.  Electrostatics consumes those
+    multipoles analytically, so agreement proves the two are the same network.
     """
     pair_model = APNet2Model(
         pre_trained_model_path=pair_model_path(index),
@@ -178,10 +162,8 @@ def test_pair_model_reproduces_tensorflow(parity_inputs, index):
         use_GPU=False,
     )
     pair_model.model.eval()
-    # The TensorFlow pair model scales both quadrupole tensors by 3/2 inside
-    # mtp_elst; losing that factor moves electrostatics on these dimers by 0.086
-    # kcal/mol on average and up to 0.498, and would otherwise pass every shape
-    # and load check.
+    # Losing mtp_elst's 3/2 quadrupole factor moves electrostatics on these
+    # dimers by up to 0.498 kcal/mol and passes every shape and load check.
     assert pair_model.model.quadrupole_scale == pytest.approx(1.5)
 
     predicted = np.asarray(
@@ -194,13 +176,31 @@ def test_pair_model_reproduces_tensorflow(parity_inputs, index):
 
 
 @pytest.mark.parametrize("index", MODEL_INDICES)
-def test_set_pretrained_model_adopts_quadrupole_scale(index):
-    """``set_pretrained_model`` must not silently drop the checkpoint's scale.
+def test_checkpoint_is_complete_and_provenanced(index):
+    """Every tensor came from TensorFlow, and the 3/2 scale survives loading.
 
-    It loads weights into an already-constructed model, so a forward-pass
-    constant that lives in the config rather than the state dict is easy to
-    lose -- and losing it produces plausible-looking, wrong energies.
+    The first conversion omitted 64 of 83 pair tensors: ``load_state_dict``
+    accepted it and ``nn.LazyLinear`` drew the rest from the global seed.  The
+    3/2 scale lives in the config, so ``set_pretrained_model`` can drop it.
     """
+    for path, expected_tensors in (
+        (atom_model_path(index), 135),
+        (pair_model_path(index), 83),
+    ):
+        checkpoint = torch.load(path, weights_only=False)
+        state = checkpoint["model_state_dict"]
+        assert len(state) == expected_tensors
+        for name, tensor in state.items():
+            assert not isinstance(
+                tensor, torch.nn.parameter.UninitializedParameter
+            ), name
+            assert torch.isfinite(tensor).all(), name
+        provenance = checkpoint["tf_provenance"]
+        assert provenance["source_repo"]["commit"]
+        assert len(provenance["saved_model_pb_sha256"]) == 64
+        assert provenance["tensorflow"].startswith("2.3")
+        assert provenance["n_pt_tensors"] == expected_tensors
+
     atom_model = AtomModel(ds_root=None, ignore_database_null=True, use_GPU=False)
     atom_model.set_pretrained_model(model_path=atom_model_path(index))
     pair_model = APNet2Model(
@@ -212,44 +212,7 @@ def test_set_pretrained_model_adopts_quadrupole_scale(index):
         am_model_path=atom_model_path(index),
     )
     assert pair_model.model.quadrupole_scale == pytest.approx(1.5)
-
-
-@pytest.mark.parametrize("index", MODEL_INDICES)
-def test_pair_model_has_no_uninitialized_parameters(index):
-    """Every pair tensor must come from TensorFlow, not from a lazy-init draw.
-
-    The first conversion of these checkpoints omitted 64 of 83 tensors.
-    ``load_state_dict`` accepted it, ``nn.LazyLinear`` then materialised
-    ``readout_layer_indu.0.*`` from the global torch seed, and the induction
-    component became seed-dependent noise.
-    """
-    checkpoint = torch.load(pair_model_path(index), weights_only=False)
-    state = checkpoint["model_state_dict"]
-    assert len(state) == 83
-    for name, tensor in state.items():
-        assert not isinstance(tensor, torch.nn.parameter.UninitializedParameter), name
-        assert torch.isfinite(tensor).all(), name
-
-    pair_model = APNet2Model(
-        pre_trained_model_path=pair_model_path(index),
-        atom_model_pre_trained_path=atom_model_path(index),
-        ignore_database_null=True,
-        use_GPU=False,
-    )
     for name, parameter in pair_model.model.named_parameters():
-        assert not isinstance(parameter, torch.nn.parameter.UninitializedParameter), name
-
-
-def test_conversion_provenance_is_recorded():
-    """A checkpoint that claims paper-exact numerics must say where it came from."""
-    for index in MODEL_INDICES:
-        for path, expected_tensors in (
-            (atom_model_path(index), 135),
-            (pair_model_path(index), 83),
-        ):
-            checkpoint = torch.load(path, weights_only=False)
-            provenance = checkpoint["tf_provenance"]
-            assert provenance["source_repo"]["commit"]
-            assert len(provenance["saved_model_pb_sha256"]) == 64
-            assert provenance["tensorflow"].startswith("2.3")
-            assert provenance["n_pt_tensors"] == expected_tensors
+        assert not isinstance(
+            parameter, torch.nn.parameter.UninitializedParameter
+        ), name

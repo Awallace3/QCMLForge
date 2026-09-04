@@ -248,10 +248,8 @@ def main():
     }
     if args.kind == "pair":
         config["r_cut_im"] = args.r_cut_im
-        # ``KerasPairModel.mtp_elst`` multiplies both quadrupole tensors by 3/2
-        # before contracting them with T2; QCMLForge exposes that factor as
-        # ``quadrupole_scale`` and defaults it to 1.0, so reproducing the
-        # original numbers requires carrying 1.5 in the checkpoint config.
+        # ``KerasPairModel.mtp_elst`` scales both quadrupole tensors by 3/2;
+        # QCMLForge defaults that factor to 1.0, so carry 1.5 in the config.
         config["quadrupole_scale"] = args.quadrupole_scale
 
     provenance = {

@@ -350,28 +350,10 @@ class AtomMPNN(MessagePassing):
         dipole = torch.zeros(natom, 3, dtype=torch.float32, device=Z.device)
         qpole = torch.zeros(natom, 3, 3, dtype=torch.float32, device=Z.device)
 
-        # A batch in which *every* atom is edgeless -- a lone ion, or a batch of
-        # only monatomic monomers -- used to take an early return here.  It
-        # disagreed with the loop below on four counts: it stacked the embedding
-        # ``n_message + 1`` times instead of running the update layers, skipped
-        # the charge readout, left the multipoles at exactly zero instead of the
-        # readout biases, and returned charge as ``[natom, 1]`` rather than
-        # ``[natom]``.  So a lone ion's ``h_list`` -- which feeds the pair
-        # model's exchange, induction and dispersion -- depended on whether it
-        # happened to share a batch with a larger monomer.
-        #
-        # The loop needs no special case: with zero edges the gathers, einsums
-        # and segment sums all produce empty tensors and the scatters yield
-        # zeros, which is the same zero message a mixed batch gives an edgeless
-        # atom, and the same thing TensorFlow AP-Net2 feeds its update layers.
-
-        # Atoms with no neighbor inside ``r_cut`` -- a monatomic monomer sharing
-        # a batch with larger ones -- stay in place instead of being filtered
-        # out.  They receive a zero message, which is exactly what the original
-        # TensorFlow AP-Net2 feeds its update layers.  Filtering renumbered the
-        # message-passing indices while the dipole and quadrupole accumulators
-        # kept the original numbering, so one such atom shifted every later
-        # atom's multipoles onto the wrong atom.
+        # Edgeless atoms stay in place: the loop below hands them a zero message,
+        # as TensorFlow AP-Net2 does.  Filtering them renumbered the message
+        # indices while the multipole accumulators kept the original numbering,
+        # and the zero-edge early return skipped the readouts entirely.
         h_list = [h_list_0[0]]
 
         e_source = edge_index[0]

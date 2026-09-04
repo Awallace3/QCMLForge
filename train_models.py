@@ -734,23 +734,17 @@ def set_all_seeds(seed=42, cudnn_reproducibility=False, deterministic=False):
     """
     Set all relevant random seeds for reproducibility.
 
-    Seeding alone does not make GPU training reproducible. The APNet2 message
-    passing accumulates edge contributions with ``Tensor.scatter_add_``, which
-    on CUDA sums in nondeterministic thread order, so two runs of an identical
-    configuration diverge. The divergence starts near float32 epsilon and is
-    then amplified by training, which makes small one-factor effects
-    unmeasurable. ``deterministic=True`` requests deterministic kernels for
-    ``scatter_add_`` and ``gather`` backward at some cost in throughput.
+    Seeding alone is not enough on CUDA: ``scatter_add_`` in the message passing
+    sums in nondeterministic thread order, and the float32-epsilon divergence is
+    amplified by training. ``deterministic=True`` requests deterministic kernels.
     """
     if deterministic:
-        # cuBLAS reads this when it first creates a handle, so set it before
-        # anything can touch CUDA.
+        # cuBLAS reads this at handle creation, so set it before touching CUDA.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        # Spawned DDP ranks start fresh interpreters; this inherited marker lets
-        # ``tracked_ddp_worker`` enable the process-local PyTorch setting there.
+        # Spawned DDP ranks start fresh interpreters; ``tracked_ddp_worker``
+        # re-applies the process-local setting from this inherited marker.
         os.environ["QCMLFORGE_DETERMINISTIC"] = "1"
-        # warn_only keeps an op without a deterministic kernel from aborting a
-        # long run; the warning names it so the gap is visible.
+        # warn_only so a missing deterministic kernel warns instead of aborting.
         torch.use_deterministic_algorithms(True, warn_only=True)
         cudnn_reproducibility = True
     random.seed(seed)
@@ -856,10 +850,8 @@ def main():
         "--deterministic",
         action="store_true",
         help=(
-            "Request deterministic CUDA kernels so an identical configuration "
-            "reproduces run to run. Needed for one-factor parity comparisons, "
-            "because nondeterministic scatter_add_ otherwise produces a "
-            "run-to-run spread comparable to the effects being measured."
+            "Request deterministic CUDA kernels; without them the run-to-run "
+            "spread is comparable to the parity effects being measured"
         ),
     )
     args.add_argument(
@@ -948,8 +940,7 @@ def main():
         action="store_true",
         help=(
             "Include the dipole-quadrupole and quadrupole-quadrupole terms in "
-            "the analytic electrostatics. The published TensorFlow AP-Net2 "
-            "omits both; its predecessor summed them."
+            "the analytic electrostatics (the published TensorFlow AP-Net2 omits both)"
         ),
     )
     args.add_argument(

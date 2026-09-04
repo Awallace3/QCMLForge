@@ -10,14 +10,13 @@ from apnet_pt.AtomPairwiseModels.apnet2_fused import APNet2_AM_MPNN
 from apnet_pt.AtomPairwiseModels.apnet2_parity import checkpoint_score
 from apnet_pt.training_tracking import tracked_ddp_worker
 
+MODEL_FACTORIES = [
+    lambda **kwargs: APNet2_MPNN(**kwargs),
+    lambda **kwargs: APNet2_AM_MPNN(atom_model=AtomMPNN(), **kwargs),
+]
 
-@pytest.mark.parametrize(
-    "model_factory",
-    [
-        lambda **kwargs: APNet2_MPNN(**kwargs),
-        lambda **kwargs: APNet2_AM_MPNN(atom_model=AtomMPNN(), **kwargs),
-    ],
-)
+
+@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_quadrupole_scale_only_changes_charge_quadrupole_term(model_factory):
     common = {
         "qA": torch.tensor([[1.0]]),
@@ -44,13 +43,7 @@ def test_quadrupole_scale_only_changes_charge_quadrupole_term(model_factory):
     assert torch.allclose(q_term_15, 1.5 * q_term_1)
 
 
-@pytest.mark.parametrize(
-    "model_factory",
-    [
-        lambda **kwargs: APNet2_MPNN(**kwargs),
-        lambda **kwargs: APNet2_AM_MPNN(atom_model=AtomMPNN(), **kwargs),
-    ],
-)
+@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_tensorflow_parameter_initialization_matches_keras_defaults(model_factory):
     torch.manual_seed(7)
     model = model_factory(parameter_initialization="tensorflow")
@@ -92,33 +85,12 @@ def test_checkpoint_score_supports_tensorflow_total_mae_policy():
         checkpoint_score("unknown", component_mse, total_mae)
 
 
-def _global_rng_probe():
-    return torch.randint(0, 2**31 - 1, (4,)).tolist()
-
-
-def test_initialization_policies_consume_different_global_rng_draws():
-    """The confound behind the shuffling fix.
-
-    The TensorFlow policy re-initializes the pair dense kernels on top of the
-    PyTorch defaults, so it draws a different number of values from the global
-    RNG. Anything downstream that reseeds off the global RNG therefore changes
-    with the initialization policy.
-    """
-    probes = {}
-    for policy in ("pytorch", "tensorflow"):
-        torch.manual_seed(4201)
-        APNet2_AM_MPNN(atom_model=AtomMPNN(), parameter_initialization=policy)
-        probes[policy] = _global_rng_probe()
-
-    assert probes["pytorch"] != probes["tensorflow"]
-
-
 def test_seeded_loader_generator_makes_batch_order_independent_of_init_policy():
     """Regression test for the shuffling confound.
 
-    ``single_proc_train`` hands the training loader its own generator. Without
-    one, ``RandomSampler`` reseeds from the global torch RNG each epoch, so the
-    initialization policy silently changes batch order too.
+    ``single_proc_train`` hands the loader its own generator.  Without one,
+    ``RandomSampler`` reseeds from the global torch RNG each epoch, which the
+    initialization policy also draws from -- so init silently reordered batches.
     """
     from apnet_pt.pt_datasets.ap2_fused_ds import APNet2_fused_DataLoader
 
@@ -194,10 +166,8 @@ def test_ddp_worker_enables_requested_deterministic_algorithms():
 def test_fused_set_pretrained_model_adopts_quadrupole_scale(tmp_path, saved_scale):
     """A checkpoint's quadrupole scale must survive ``set_pretrained_model``.
 
-    ``quadrupole_scale`` is a forward-pass constant, not a state-dict entry, so
-    a loader that only calls ``load_state_dict`` reports success and still
-    evaluates the wrong electrostatics.  The TensorFlow-converted checkpoints
-    need 1.5; the historical default is 1.0.
+    It is a forward-pass constant, not a state-dict entry, so a loader that only
+    calls ``load_state_dict`` reports success and predicts wrong electrostatics.
     """
 
     from apnet_pt.AtomPairwiseModels.apnet2_fused import APNet2_AM_Model

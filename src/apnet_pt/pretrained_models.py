@@ -144,12 +144,7 @@ def _resolve_pretrained_paths(rel_paths: list[str]) -> dict[str, str]:
 
 
 def _reject_fused_weights(weights: str) -> None:
-    """Refuse named weight sets the fused APNet2 model cannot load.
-
-    ``APNet2_AM_MPNN`` keeps the atom and pair networks in one state dict,
-    while the paper's TensorFlow checkpoints keep them separate, so the fused
-    ensemble only exists for QCMLForge-trained weights.
-    """
+    """Refuse named weight sets that ship no single fused state dict."""
     if weights != DEFAULT_APNET2_WEIGHTS:
         raise ValueError(
             f"weights={weights!r} has no fused ensemble; the fused "
@@ -165,11 +160,10 @@ def atom_model_predict(
     return_mol_arrays: bool = True,
     weights: str = DEFAULT_APNET2_WEIGHTS,
 ):
-    """
-    Ensemble-average atomic multipoles over a pretrained atom-model ensemble.
+    """Ensemble-average atomic multipoles over a pretrained atom-model ensemble.
 
-    ``weights`` selects the ensemble: the QCMLForge-trained models by default,
-    or ``"ap2_tf_paper"`` for the atom models published with the AP-Net2 paper.
+    ``weights`` names the ensemble: QCMLForge-trained by default, or
+    ``"ap2_tf_paper"`` for the atom models published with the AP-Net2 paper.
     """
     num_models = apnet2_weight_set_size(weights)
     atom_rel_paths = [
@@ -185,6 +179,8 @@ def atom_model_predict(
             model_path=model_paths[atom_rel_paths[i]],
         )
     if compile:
+        # Compile after loading: state dicts have no ``_orig_mod.`` prefix, so
+        # loading into an already-compiled module fails on missing keys.
         print("Compiling models...")
         for model in models:
             model.compile_model()
@@ -253,13 +249,10 @@ def apnet2_model_predict(
     ap2_fused: bool = False,
     weights: str = DEFAULT_APNET2_WEIGHTS,
 ):
-    """
-    Ensemble-average APNet2 interaction energies for ``mols``.
+    """Ensemble-average APNet2 interaction energies for ``mols``.
 
-    ``weights`` selects the ensemble: the QCMLForge-trained models by default,
-    or ``"ap2_tf_paper"`` for the ensemble published with the AP-Net2 paper.
-    Returns an ``(N, 5)`` array of total energy followed by the electrostatics,
-    exchange, induction and dispersion components, all in kcal/mol.
+    ``weights`` names the ensemble, as in :func:`atom_model_predict`. Returns an
+    ``(N, 5)`` array: total, elst, exch, indu, disp, all in kcal/mol.
     """
     if ap2_fused:
         _reject_fused_weights(weights)
@@ -296,6 +289,8 @@ def apnet2_model_predict(
                 am_model_path=model_paths[rel_paths[i]["atom"]],
             )
     if compile:
+        # Compile after loading: state dicts have no ``_orig_mod.`` prefix, so
+        # loading into an already-compiled module fails on missing keys.
         print("Compiling models...")
         for model in models:
             model.compile_model()
@@ -357,8 +352,6 @@ def apnet2_model_predict_pairs(
             Fragment-pair breakdown with columns ["fA-fB", "total", "elst", "exch", "indu", "disp"], one row per fragment-A/fragment-B pair.
     """
     if ap2_fused:
-        # Reject an unloadable weight set before the fragment arguments: it is
-        # a mistake in the call, not something the fragments can fix.
         _reject_fused_weights(weights)
     assert fAs is not None, (
         "fAs must be provided. Example: [{'Methyl1_A': [1, 2, 7, 8], 'Methyl2_A': [3, 4, 5, 6]}...]"
@@ -378,9 +371,8 @@ def apnet2_model_predict_pairs(
             pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
         )
     else:
-        # models[0] is built from member 0, so every later member -- including
-        # member 1 -- has to be loaded here, or the average double-counts
-        # member 0 and drops member 1.
+        # models[0] is member 0, so loading must start at 1; starting at 2
+        # double-counted member 0 and dropped member 1.
         additional_models_start = 1
         num_models = apnet2_weight_set_size(weights)
         rel_paths = [apnet2_weight_paths(i, weights) for i in range(num_models)]
@@ -404,6 +396,8 @@ def apnet2_model_predict_pairs(
                 am_model_path=model_paths[rel_paths[i]["atom"]],
             )
     if compile:
+        # Compile after loading: state dicts have no ``_orig_mod.`` prefix, so
+        # loading into an already-compiled module fails on missing keys.
         print("Compiling models...")
         for model in models:
             model.compile_model()

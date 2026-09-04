@@ -44,6 +44,7 @@ from apnet_pt.util import scatter_sum_compile
 from .apnet2_parity import (
     APNetLazyLinear,
     checkpoint_score,
+    elst_uQ_QQ,
     initialize_tensorflow_defaults,
     validate_parameter_initialization,
 )
@@ -366,7 +367,7 @@ class APNet2_MPNN(nn.Module):
 
         E_multipole = E_qq + E_qu + E_qQ + E_uu
         if self.elst_include_uQ_QQ:
-            E_multipole = E_multipole + self._elst_uQ_QQ(
+            E_multipole = E_multipole + elst_uQ_QQ(
                 dR,
                 dR_xyz,
                 oodR,
@@ -379,85 +380,6 @@ class APNet2_MPNN(nn.Module):
 
         E_elst = 627.509 * E_multipole
         return E_elst
-
-    def _elst_uQ_QQ(
-        self,
-        dR,
-        dR_xyz,
-        oodR,
-        delta,
-        muA_source,
-        muB_source,
-        quadA_source,
-        quadB_source,
-    ):
-        """Dipole-quadrupole and quadrupole-quadrupole electrostatics, in a.u.
-
-        The published TensorFlow AP-Net2 omits these two terms.  Its predecessor
-        did not: ``apnet/multipoles.py::eval_interaction`` at ``593d655^`` (the
-        tip of that repository's ``master``) summed qq, qu, qQ, uu, uQ and QQ,
-        and the ``sparse`` rewrite that introduced ``mtp_elst`` dropped the last
-        two.  ``T3``/``T4`` here reproduce that ``T_cart`` exactly, verified to
-        1e-15 relative against the original numpy on random geometries.
-
-        ``T3`` as written there is not fully index-symmetric -- it is
-        ``dR_i d_jk + 2 dR_j d_ik`` rather than the symmetrised sum.  Contracted
-        against a traceless symmetric quadrupole the trace term vanishes and the
-        doubled term equals the two distinct symmetric ones, so the contraction
-        is unaffected; it is kept verbatim to stay faithful to the source.
-        """
-        dR2 = dR * dR
-
-        Rdd = torch.einsum("xy,zw->xyzw", dR_xyz, delta)
-        T3 = -1.0 * torch.einsum(
-            "x,xyzw->xyzw",
-            oodR**7,
-            15.0 * torch.einsum("xy,xz,xw->xyzw", dR_xyz, dR_xyz, dR_xyz)
-            - 3.0
-            * torch.einsum(
-                "x,xyzw->xyzw",
-                dR2,
-                Rdd + Rdd.permute(0, 2, 1, 3) + Rdd.permute(0, 3, 1, 2),
-            ),
-        )
-        uQ = torch.einsum("xy,xzw->xyzw", muA_source, quadB_source) - torch.einsum(
-            "xy,xzw->xyzw", muB_source, quadA_source
-        )
-        E_uQ = (-1.0 / 3.0) * torch.einsum("xyzw,xyzw->x", T3, uQ)
-
-        RRdd = torch.einsum("xy,xz,wv->xyzwv", dR_xyz, dR_xyz, delta)
-        dddd = torch.einsum("yz,wv->yzwv", delta, delta).unsqueeze(0)
-        T4 = torch.einsum(
-            "x,xyzwv->xyzwv",
-            oodR**9,
-            105.0 * torch.einsum("xy,xz,xw,xv->xyzwv", dR_xyz, dR_xyz, dR_xyz, dR_xyz)
-            - 15.0
-            * torch.einsum(
-                "x,xyzwv->xyzwv",
-                dR2,
-                RRdd
-                + RRdd.permute(0, 1, 3, 2, 4)
-                + RRdd.permute(0, 1, 4, 3, 2)
-                + RRdd.permute(0, 3, 2, 1, 4)
-                + RRdd.permute(0, 4, 2, 3, 1)
-                + RRdd.permute(0, 3, 4, 1, 2),
-            )
-            + 3.0
-            * torch.einsum(
-                "x,xyzwv->xyzwv",
-                dR2 * dR2,
-                (
-                    dddd
-                    + dddd.permute(0, 1, 3, 2, 4)
-                    + dddd.permute(0, 1, 4, 3, 2)
-                ).expand(dR.shape[0], 3, 3, 3, 3),
-            ),
-        )
-        E_QQ = (1.0 / 9.0) * torch.einsum(
-            "xyzwv,xyz,xwv->x", T4, quadA_source, quadB_source
-        )
-
-        return E_uQ + E_QQ
 
     def get_messages(self, h0, h, rbf, e_source, e_target):
         nedge = e_source.numel()
@@ -1208,11 +1130,9 @@ class APNet2Model:
         ap2_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
         self.model.load_state_dict(ap2_state_dict)
 
-        # ``quadrupole_scale`` is a forward-pass constant rather than a
-        # parameter, so a checkpoint that needs a non-default value -- the
-        # TensorFlow-converted models in models/ap2_tf_paper need 1.5 -- would
-        # otherwise load its weights successfully and still predict the wrong
-        # electrostatics. Adopt it from the checkpoint config.
+        # ``quadrupole_scale`` is a forward-pass constant, not a state-dict
+        # entry, so a checkpoint needing 1.5 (models/ap2_tf_paper) would
+        # otherwise load cleanly and predict the wrong electrostatics.
         ap2_config = model_io.load_config_from_checkpoint(checkpoint) or {}
         if "quadrupole_scale" in ap2_config:
             self.model.quadrupole_scale = float(ap2_config["quadrupole_scale"])
@@ -2453,11 +2373,9 @@ units angstrom
             collate_fn = apnet2_collate_update_prebatched
         else:
             collate_fn = apnet2_collate_update
-        # Give the shuffling sampler its own generator. Without one,
-        # RandomSampler reseeds from the global torch RNG every epoch, so any
-        # change that consumes a different number of global draws beforehand
-        # (for example the TensorFlow parameter-initialization policy) also
-        # changes batch order and confounds one-factor comparisons.
+        # Give the shuffling sampler its own generator: RandomSampler otherwise
+        # reseeds from the global torch RNG each epoch, so anything that draws
+        # from it first (e.g. the init policy) also reorders batches.
         train_loader_generator = torch.Generator()
         train_loader_generator.manual_seed(int(random_seed))
         train_loader = APNet2_DataLoader(

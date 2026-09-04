@@ -153,10 +153,8 @@ units angstrom
         Molecular geometry in Psi4 format with charge, multiplicity, atomic
         symbols, coordinates, and units. Default is a water dimer geometry.
     weights : str, optional
-        Which APNet2 ensemble to use. "qcmlforge" (default) is the ensemble
-        trained by QCMLForge; "ap2_tf_paper" is the ensemble published with the
-        AP-Net2 paper, converted from TensorFlow and verified against its
-        forward pass.
+        APNet2 ensemble to use: "qcmlforge" (default), or "ap2_tf_paper" for the
+        ensemble published with the AP-Net2 paper.
 
     Returns
     -------

@@ -165,42 +165,27 @@ def resolve_pretrained_path(rel_path: str) -> str:
 
 DEFAULT_APNET2_WEIGHTS = "qcmlforge"
 
-#: Named APNet2 weight sets. Each entry gives the Hugging Face-relative path
-#: templates for the atom (multipole) model and its matching pair model, plus
-#: how many ensemble members exist. ``ap2_tf_paper`` is the ensemble published
-#: with the AP-Net2 paper (``zachglick/apnet``), converted from TensorFlow;
-#: see docs/apnet2-tensorflow-weights.md.
+#: Named APNet2 weight sets: Hugging Face-relative path templates for the atom
+#: (multipole) and pair models plus ensemble sizes. ``ap2_tf_paper`` is the
+#: ensemble published with the paper (``zachglick/apnet``), converted from
+#: TensorFlow; see docs/apnet2-tensorflow-weights.md.
 APNET2_WEIGHT_SETS = {
     "qcmlforge": {
         "atom": "am_ensemble/am_{model_id}.pt",
         "pair": "ap2_ensemble/ap2_{model_id}.pt",
         "n_models": 5,
         "n_atom_models": 10,
-        "description": "APNet2 ensemble trained by QCMLForge (default).",
     },
     "ap2_tf_paper": {
         "atom": "ap2_tf_paper/atom_models/atom{model_id}.pt",
         "pair": "ap2_tf_paper/pair_models/pair{model_id}.pt",
         "n_models": 5,
-        "description": (
-            "AP-Net2 ensemble published with the paper (zachglick/apnet), "
-            "converted from TensorFlow; reproduces the TensorFlow forward pass "
-            "and the paper's reported MAEs."
-        ),
     },
 }
 
 
 def apnet2_weight_sets() -> list[str]:
-    """
-    List the named APNet2 weight sets accepted by ``weights=``.
-
-    Returns
-    -------
-    list[str]
-        Weight-set names, including ``"qcmlforge"`` (the default, trained by
-        this project) and ``"ap2_tf_paper"`` (the published paper ensemble).
-    """
+    """Named APNet2 weight sets accepted by ``weights=``."""
     return list(APNET2_WEIGHT_SETS)
 
 
@@ -214,20 +199,31 @@ def _apnet2_weight_set(weights: str) -> dict:
         ) from None
 
 
+def _checked_model_id(model_id, weights: str, kind: str) -> tuple[dict, int]:
+    """Validate ``model_id`` against a weight set's size for ``kind``."""
+    weight_set = _apnet2_weight_set(weights)
+    n_models = int(
+        weight_set.get("n_atom_models", weight_set["n_models"])
+        if kind == "atom"
+        else weight_set["n_models"]
+    )
+    try:
+        model_id = operator.index(model_id)
+    except TypeError:
+        raise TypeError(
+            f"model_id must be an integer, got {type(model_id).__name__}"
+        ) from None
+    if not 0 <= model_id < n_models:
+        label = "atom model_id" if kind == "atom" else "model_id"
+        raise ValueError(
+            f"{label} must be in [0, {n_models - 1}] for weights={weights!r}, "
+            f"got {model_id}"
+        )
+    return weight_set, model_id
+
+
 def apnet2_weight_set_size(weights: str = DEFAULT_APNET2_WEIGHTS) -> int:
-    """
-    Number of ensemble members in a named APNet2 weight set.
-
-    Parameters
-    ----------
-    weights : str, optional
-        Weight-set name from :func:`apnet2_weight_sets`.
-
-    Returns
-    -------
-    int
-        Count of ``model_id`` values the weight set provides.
-    """
+    """Number of pair-model ensemble members in a named weight set."""
     return int(_apnet2_weight_set(weights)["n_models"])
 
 
@@ -235,55 +231,19 @@ def apnet2_atom_weight_path(
     model_id: int, weights: str = DEFAULT_APNET2_WEIGHTS
 ) -> str:
     """Repository-relative atom checkpoint path for a named weight set."""
-    weight_set = _apnet2_weight_set(weights)
-    n_models = int(weight_set.get("n_atom_models", weight_set["n_models"]))
-    try:
-        model_id = operator.index(model_id)
-    except TypeError:
-        raise TypeError(
-            f"model_id must be an integer, got {type(model_id).__name__}"
-        ) from None
-    if not 0 <= model_id < n_models:
-        raise ValueError(
-            f"atom model_id must be in [0, {n_models - 1}] for "
-            f"weights={weights!r}, got {model_id}"
-        )
+    weight_set, model_id = _checked_model_id(model_id, weights, "atom")
     return weight_set["atom"].format(model_id=model_id)
 
 
 def apnet2_weight_paths(
     model_id: int, weights: str = DEFAULT_APNET2_WEIGHTS
 ) -> dict[str, str]:
-    """
-    Repository-relative paths for one member of an APNet2 weight set.
+    """Repository-relative ``{"atom", "pair"}`` paths for one ensemble member.
 
-    Parameters
-    ----------
-    model_id : int
-        Ensemble member index.
-    weights : str, optional
-        Weight-set name from :func:`apnet2_weight_sets`.
-
-    Returns
-    -------
-    dict[str, str]
-        ``{"atom": <rel path>, "pair": <rel path>}`` inside the QCMLForge
-        Hugging Face repository. The two entries belong together: each pair
-        model was trained against its own atom model.
+    The two entries belong together: each pair model was trained against its
+    own atom model.
     """
-    weight_set = _apnet2_weight_set(weights)
-    n_models = int(weight_set["n_models"])
-    try:
-        model_id = operator.index(model_id)
-    except TypeError:
-        raise TypeError(
-            f"model_id must be an integer, got {type(model_id).__name__}"
-        ) from None
-    if not 0 <= model_id < n_models:
-        raise ValueError(
-            f"model_id must be in [0, {n_models - 1}] for weights={weights!r}, "
-            f"got {model_id}"
-        )
+    weight_set, model_id = _checked_model_id(model_id, weights, "pair")
     return {
         kind: weight_set[kind].format(model_id=model_id)
         for kind in ("atom", "pair")
@@ -293,22 +253,7 @@ def apnet2_weight_paths(
 def resolve_apnet2_weights(
     model_id: int, weights: str = DEFAULT_APNET2_WEIGHTS
 ) -> dict[str, str]:
-    """
-    Resolve local checkpoint paths for one member of an APNet2 weight set.
-
-    Parameters
-    ----------
-    model_id : int
-        Ensemble member index.
-    weights : str, optional
-        Weight-set name from :func:`apnet2_weight_sets`.
-
-    Returns
-    -------
-    dict[str, str]
-        ``{"atom": <local path>, "pair": <local path>}``, downloaded or taken
-        from the local cache by :func:`resolve_pretrained_paths`.
-    """
+    """Local ``{"atom", "pair"}`` checkpoint paths, downloading if needed."""
     rel_paths = apnet2_weight_paths(model_id, weights)
     resolved = resolve_pretrained_paths(list(rel_paths.values()))
     return {kind: resolved[rel] for kind, rel in rel_paths.items()}
