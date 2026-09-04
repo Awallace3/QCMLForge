@@ -19,6 +19,9 @@ conda activate qcml
 pip install -e .
 ```
 
+The MCP server is optional. Install it with `pip install -e '.[mcp]'`; the core
+package and direct tool-function imports remain usable without that extra.
+
 ### Running tests
 
 Some tests require pretrained model artifacts from the QCMLForge Hugging Face
@@ -133,15 +136,35 @@ the parity data and the loading caveats.
 To train the model, run the following command:
 ```bash
 python3 ./train_models.py \
-    --train_ap2 \
+    --train_apnet APNet2 \
     --ap_model_path ./models/example/ap2_example.pt \
-    --n_epochs 5 
+    --n_epochs 5
 ```
+
+The Rackers models jointly train electrostatic damping plus direct and mutual
+Thole damping. The overlap variant also uses its fourth, induction-overlap
+output:
+
+```bash
+python3 ./train_models.py \
+    --train_apnet RackersTholeDampingOverlapModel \
+    --am_model_path ./models/example/am_example.pt \
+    --atom_type_param_model_path ./models/example/atom_type_params.pt \
+    --ap_model_path ./models/example/rackers_overlap.pt
+```
+
+Use `RackersTholeDampingModel` for pure induced-point-dipole induction. Fresh
+Rackers training freezes the nested atom-type model by default and therefore
+requires `--atom_type_param_model_path`; pass `--unfreeze_atom_model` to train
+that nested model from scratch. Rackers checkpoints are standalone v2
+checkpoints and validate the model type, fixed parameter order (`elst`,
+`thole_direct`, `thole_mutual`, `ind_overlap`), dimer mode, and nested model
+configuration when loaded.
 
 ## Experiment tracking
 
 Optional experiment tracking is documented in
-[Training with Weights & Biases](docs/training-with-wandb.md).
+[Training with Weights & Biases](docs/wandb.md).
 
 ## Reproducing the original TensorFlow AP-Net2
 

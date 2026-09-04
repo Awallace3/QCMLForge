@@ -2,16 +2,59 @@ import numpy as np
 import qcelemental as qcel
 from typing import List, Tuple, Dict
 from pprint import pprint as pp
-from mcp.server.fastmcp import FastMCP
 import apnet_pt
 
 try:
     from .timings import is_psi4_installed
-    from .timings import estimate_timings
 except ImportError:
     # Fall back to absolute imports when run as a script
     from timings import is_psi4_installed
-    from timings import estimate_timings
+
+try:
+    from .timings import estimate_timings
+except ImportError:
+    try:
+        from timings import estimate_timings
+    except ImportError:
+        # estimate_timings needs psi4; its callers check is_psi4_installed()
+        # first, so the rest of the server stays importable without it.
+        estimate_timings = None
+
+
+MCP_IMPORT_ERROR_MESSAGE = (
+    "qcml_mcp.server requires the optional MCP server dependency. "
+    "Install it with: pip install 'qcmlforge[mcp]'"
+)
+
+
+class _MissingFastMCP:
+    """Stand-in for FastMCP used when the optional `mcp` package is absent.
+
+    Keeps this module importable so the tool functions below can still be
+    imported and called directly; any real server operation raises instead.
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def tool(self, *args, **kwargs):
+        # FastMCP.tool() registers the function and returns it unchanged.
+        def decorator(fn):
+            return fn
+
+        return decorator
+
+    def __getattr__(self, name):
+        raise ImportError(MCP_IMPORT_ERROR_MESSAGE)
+
+
+try:
+    from mcp.server.fastmcp import FastMCP
+
+    MCP_AVAILABLE = True
+except ImportError:
+    FastMCP = _MissingFastMCP
+    MCP_AVAILABLE = False
 
 
 # Create an MCP server
@@ -389,8 +432,10 @@ units angstrom
             Molecular geometry in Psi4 format.
     """
     qcel_molecule = qcel.models.Molecule.from_data(p4_string)
-    if is_psi4_installed() is False:
-        print("Psi4 is not installed. Please install Psi4 to use this function.")
+    if is_psi4_installed() is False or estimate_timings is None:
+        raise RuntimeError(
+            "Psi4 is not installed. Please install Psi4 to use this function."
+        )
     mols = [qcel_molecule]
     if manybody and qcel_molecule.fragments_:
         for n, i in enumerate(qcel_molecule.fragments_):

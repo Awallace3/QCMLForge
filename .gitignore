@@ -241,3 +241,5 @@ train_saptdft.py
 tests/dataset_data/ap2_fused_ensemble_test.pt
 
 .github/hooks/workmux-status
+*.pdf
+docs/superpowers

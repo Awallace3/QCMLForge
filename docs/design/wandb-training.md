@@ -97,7 +97,7 @@ There is no shared callback or event layer. Therefore, a CLI-only integration wo
 | `src/apnet_pt/AtomPairwiseModels/apnet3_d3_fused.py` | `APNet3D3_AtomType_Model` | 3- or 4-component training |
 | `src/apnet_pt/AtomPairwiseModels/apnet3_fused_variants.py` | `APNet3_AtomType_Model` variant | total and SAPT components |
 | `src/apnet_pt/AtomPairwiseModels/dapnet2.py` | `APNet2_dAPNet2Model`, `dAPNet2Model` | scalar or component pairwise metrics |
-| `src/apnet_pt/AtomPairwiseModels/mtp_mtp.py` | `AM_DimerParam_Model`, pairwise `AtomTypeParamModel` | dynamically selected parameter targets |
+| `src/apnet_pt/AtomPairwiseModels/mtp_mtp.py` | `AM_DimerParam_Model`, pairwise `AtomTypeParamModel`, `RackersTholeDampingModel`, `RackersTholeDampingOverlapModel` | dynamically selected parameter targets or Rackers electrostatics/induction |
 
 “All model training runs” means all rows above, including callable legacy harnesses that are not selected by `train_models.py`.
 
