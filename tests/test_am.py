@@ -270,6 +270,70 @@ def test_edgeless_atom_does_not_shift_multipoles():
     assert torch.as_tensor(batched[0][1]).shape == (1, 3)
 
 
+def test_lone_atom_prediction_is_independent_of_batch_composition():
+    """A lone ion must predict the same thing however it is batched.
+
+    ``AtomMPNN.forward`` used to take an early return when *every* atom in the
+    batch was edgeless, and that return disagreed with the message-passing loop
+    on four counts: it stacked the embedding instead of running the update
+    layers, skipped the charge readout, left the multipoles at exactly zero
+    rather than the readout biases, and returned charge as ``[natom, 1]``. So a
+    monatomic monomer's ``h_list`` -- which feeds the pair model's exchange,
+    induction and dispersion -- depended on whether it happened to share a batch
+    with a larger monomer. There is now one path, and it is the TensorFlow one.
+    """
+    torch.manual_seed(4201)
+    atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    atom_model.model.eval()
+
+    (alone,) = atom_model.predict_qcel_mols([mon_element], batch_size=1)
+    # Every atom edgeless, so this is the batch shape that used to take the
+    # early return.
+    all_monatomic = atom_model.predict_qcel_mols(
+        [mon_element, mon_element], batch_size=2
+    )[0]
+    # Mixed batch, so this is the message-passing loop with a zero message.
+    mixed = atom_model.predict_qcel_mols([mon_element, mol_water], batch_size=2)[0]
+
+    assert torch.as_tensor(alone[0]).shape == (1,)
+    for tag, got in (("all-monatomic", all_monatomic), ("mixed", mixed)):
+        for name, ref, value in zip(("charge", "dipole", "qpole", "hlist"), alone, got):
+            assert torch.allclose(
+                torch.as_tensor(ref), torch.as_tensor(value), atol=1e-6
+            ), f"{name} of a lone atom changed in a {tag} batch"
+
+
+@pytest.mark.pretrained_models("am")
+def test_edgeless_atom_multipoles_are_small_readout_biases():
+    """Pin the size of what a lone atom's multipoles actually are.
+
+    With a zero message the readout layers return their biases, so a spherical
+    ion picks up a small nonzero dipole and quadrupole rather than exact zeros.
+    That is what TensorFlow AP-Net2 does, and the trained ensembles learned
+    biases near zero -- around 1e-4 -- which is why the converted weights still
+    reproduce the TensorFlow forward pass to 1e-7. This test fails if a retrain
+    ever learns large biases, which would make the physics visibly wrong.
+    """
+    atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    ).set_pretrained_model(model_id=0)
+    atom_model.model.eval()
+
+    charge, dipole, qpole, _ = atom_model.predict_qcel_mols(
+        [mon_element], batch_size=1
+    )[0]
+
+    assert torch.allclose(torch.as_tensor(charge), torch.tensor([1.0]), atol=1e-5)
+    assert torch.as_tensor(dipole).abs().max() < 1e-2
+    assert torch.as_tensor(qpole).abs().max() < 1e-2
+
+
 @pytest.mark.pretrained_models("am")
 def test_am_element():
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(

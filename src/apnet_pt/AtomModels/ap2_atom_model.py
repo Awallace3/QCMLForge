@@ -317,7 +317,9 @@ class AtomMPNN(MessagePassing):
         # [edges, 4 * n_embed, n_rbf]
         h_all_dot = torch.einsum("ez,er->ezr", h_all, rbf)
         # [edges, 4 * n_embed * n_rbf]
-        h_all_dot = h_all_dot.view(nedge, -1)
+        # Spell the trailing size out rather than inferring it: a batch with no
+        # edges at all -- a lone ion -- makes ``-1`` ambiguous and raises.
+        h_all_dot = h_all_dot.view(nedge, h_all.size(-1) * rbf.size(-1))
 
         # [edges,  n_embed * 4 * n_rbf + n_embed * 4 + n_rbf]
         m_ij = torch.cat([h_all, h_all_dot, rbf], dim=-1)
@@ -348,23 +350,20 @@ class AtomMPNN(MessagePassing):
         dipole = torch.zeros(natom, 3, dtype=torch.float32, device=Z.device)
         qpole = torch.zeros(natom, 3, 3, dtype=torch.float32, device=Z.device)
 
-        if edge_index.size(1) == 0:
-            # need h_list to have the same number of dimensions as the number of message passing layers
-            h_list = [h_list_0[0] for i in range(self.n_message + 1)]
-            h_list = torch.stack(h_list, dim=1)
-            molecule_ind.requires_grad_(False)
-            molecule_ind = molecule_ind.long()
-            num_mols = natom_per_mol.size(0)
-            total_charge_pred = scatter_sum_compile(
-                charge, molecule_ind, num_mols, reduce="sum"
-            )
-            total_charge_pred = total_charge_pred.squeeze()
-            total_charge_err = total_charge_pred - total_charge
-            charge_err = torch.repeat_interleave(
-                total_charge_err / natom_per_mol.float(), natom_per_mol
-            ).unsqueeze(1)
-            charge = charge - charge_err
-            return charge, dipole, qpole, h_list
+        # A batch in which *every* atom is edgeless -- a lone ion, or a batch of
+        # only monatomic monomers -- used to take an early return here.  It
+        # disagreed with the loop below on four counts: it stacked the embedding
+        # ``n_message + 1`` times instead of running the update layers, skipped
+        # the charge readout, left the multipoles at exactly zero instead of the
+        # readout biases, and returned charge as ``[natom, 1]`` rather than
+        # ``[natom]``.  So a lone ion's ``h_list`` -- which feeds the pair
+        # model's exchange, induction and dispersion -- depended on whether it
+        # happened to share a batch with a larger monomer.
+        #
+        # The loop needs no special case: with zero edges the gathers, einsums
+        # and segment sums all produce empty tensors and the scatters yield
+        # zeros, which is the same zero message a mixed batch gives an edgeless
+        # atom, and the same thing TensorFlow AP-Net2 feeds its update layers.
 
         # Atoms with no neighbor inside ``r_cut`` -- a monatomic monomer sharing
         # a batch with larger ones -- stay in place instead of being filtered
@@ -469,7 +468,9 @@ class AtomMPNN(MessagePassing):
             total_charge_err / natom_per_mol.float(), natom_per_mol
         ).unsqueeze(1)
         charge = charge - charge_err
-        charge = charge.squeeze()
+        # squeeze(-1), not squeeze(): a one-atom batch would otherwise collapse
+        # to a 0-dim tensor and break the per-molecule slicing downstream.
+        charge = charge.squeeze(-1)
         # changed to dim=0 from dim=1 for usage in Param fitting # AMW 8/20/25
         # Breaks test_apnet2_train_qcel_molecules_in_memory_transfer test,
         # dimensions no longer correct... figure out another way to fix this. reverting back to dim=1 # AMW 9/17/25
