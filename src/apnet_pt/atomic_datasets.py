@@ -14,7 +14,7 @@ from apnet_pt import constants
 from torch_geometric.data import Data
 from torch_geometric.data import Batch, Dataset
 from . import util
-from .lmdb_utils import acquire_lmdb_env, release_lmdb_env
+from .lmdb_utils import LmdbEnvHandleMixin, acquire_lmdb_env, release_lmdb_env
 
 import os.path as osp
 import torch
@@ -1490,7 +1490,7 @@ class atomic_induced_dipole_precomputed_dataset(Dataset):
         )
 
 
-class atomic_module_dataset_lmdb(Dataset):
+class atomic_module_dataset_lmdb(LmdbEnvHandleMixin, Dataset):
     """
     LMDB-based dataset for atomic induced dipole training with efficient storage.
 
@@ -2073,7 +2073,7 @@ class atomic_module_dataset_lmdb(Dataset):
         )
 
 
-class atomic_hirshfeld_valencewdith_only_module_dataset(Dataset):
+class atomic_hirshfeld_valencewdith_only_module_dataset(LmdbEnvHandleMixin, Dataset):
     def __init__(
         self,
         root,

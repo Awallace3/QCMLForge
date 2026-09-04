@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 import pytest
 import torch
@@ -24,10 +25,17 @@ PREPARE_PY = ROOT / "scripts" / "prepare_mace_ap3d3_features.py"
 
 
 def _run(path, env):
+    merged = {**os.environ, **env}
+    # The job scripts call ``python``.  Append the interpreter running the
+    # tests so the suite does not silently depend on an activated environment;
+    # appending keeps any PATH the caller prepended (fake srun/sbatch) ahead.
+    merged["PATH"] = os.pathsep.join(
+        [merged.get("PATH", ""), str(Path(sys.executable).parent)]
+    )
     return subprocess.run(
         ["bash", str(path)],
         cwd=ROOT,
-        env={**os.environ, **env},
+        env=merged,
         capture_output=True,
         text=True,
         check=False,

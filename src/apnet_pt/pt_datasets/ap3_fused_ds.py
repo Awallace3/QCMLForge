@@ -11,7 +11,7 @@ import torch
 from torch_geometric.data import download_url
 
 from .. import util
-from ..lmdb_utils import acquire_lmdb_env, release_lmdb_env
+from ..lmdb_utils import LmdbEnvHandleMixin, acquire_lmdb_env, release_lmdb_env
 from ..AtomModels.ap2_atom_model import AtomModel
 from ..hf_pretrained import resolve_pretrained_path
 from .. import atomic_datasets
@@ -1481,7 +1481,7 @@ class ap3_fused_module_dataset(Dataset):
         return self.data[idx]
 
 
-class ap3_fused_module_dataset_lmdb(Dataset):
+class ap3_fused_module_dataset_lmdb(LmdbEnvHandleMixin, Dataset):
     split_spec_types = AP3_FUSED_SPLIT_SPEC_TYPES
 
     @classmethod
