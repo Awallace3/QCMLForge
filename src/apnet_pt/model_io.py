@@ -272,7 +272,10 @@ def load_checkpoint(
     """
     if map_location is None:
         map_location = "cpu"
-    return torch.load(path, map_location=map_location, weights_only=False)
+    with torch.serialization.safe_globals(
+        [torch.nn.parameter.UninitializedParameter]
+    ):
+        return torch.load(path, map_location=map_location, weights_only=True)
 
 
 def load_state_dict_from_checkpoint(
@@ -705,8 +708,11 @@ def save_best_mae_record(
     floor pointing at the older, fully-written pair rather than at a fragment.
     """
     payload = {
-        "model_save_path": model_save_path,
-        "checkpoint": checkpoint,
+        # ``str`` not because it is tidier: the trainer hands this through from
+        # ``self.model_save_path``, which is a ``Path`` whenever the caller
+        # built it with ``pathlib``, and ``json.dump`` raises on one.
+        "model_save_path": str(model_save_path),
+        "checkpoint": str(checkpoint),
         "selector": BEST_MAE_SELECTOR,
         BEST_MAE_SELECTOR: float(val_total_MAE),
         "component_MAE": [float(v) for v in component_MAE],

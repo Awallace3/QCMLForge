@@ -37,6 +37,7 @@ from ..training_tracking import (
 )
 from ..util import scatter_sum_compile
 from ..pt_datasets.shard_locality import ShardBlockSampler
+from typing import Optional
 import os
 import json
 import torch.distributed as dist
@@ -823,10 +824,40 @@ class APNet3D3_AtomType_MPNN(nn.Module):
 
 
 def _build_shard_block_sampler(
-    harness, train_dataset, batch_size, num_workers, world_size=1, rank=0
-):
+    harness,
+    train_dataset,
+    batch_size: int,
+    num_workers: int,
+    world_size: int = 1,
+    rank: int = 0,
+) -> Optional[ShardBlockSampler]:
     """Shard-locality sampling for the ap3d3 route -- opt-in, off by default.
 
+    Parameters
+    ----------
+    harness : APNet3_D3_Model
+        Read only for ``shard_locality_block_shards``; absent or 0 disables.
+    train_dataset : torch.utils.data.Dataset
+        The training dataset.  Must expose ``datapoint_storage_n_objects`` and
+        ``set_shard_cache_size``; anything else declines with a reason.
+    batch_size : int
+        Per-rank batch size, needed to cut the emission order on batch
+        boundaries.
+    num_workers : int
+        The loader's ``num_workers``.
+    world_size : int, default 1
+        DDP world size.
+    rank : int, default 0
+        DDP rank; also gates the diagnostic prints to one process.
+
+    Returns
+    -------
+    ShardBlockSampler or None
+        ``None`` whenever the feature is off or the dataset cannot support it,
+        in which case the caller keeps its existing ``shuffle=True`` loader.
+
+    Notes
+    -----
     `ap3_fused_ds.get()` deserialises an entire shard to return one dimer, and
     `shard_cache_size` defaults to 1, so a globally shuffled epoch reads each
     16-dimer shard about 16 times.  Job 12391962 measured what that costs on
@@ -844,9 +875,9 @@ def _build_shard_block_sampler(
     switch itself on.  `block_shards = 0`, the default, returns None here and
     leaves the epoch ordering bit-identical to what it was.
 
-    This mirrors the block in `mtp_mtp.py`; it lives in a function because the
-    ap3d3 route builds its loaders in two places (`ddp_train`,
-    `single_proc_train`) and the two must not drift apart.
+    It lives in a function because the ap3d3 route builds its loaders in two
+    places (`ddp_train`, `single_proc_train`) and the two must not drift
+    apart.
     """
     block_shards = int(getattr(harness, "shard_locality_block_shards", 0) or 0)
     if block_shards <= 0 or getattr(train_dataset, "in_memory", False):
@@ -3234,19 +3265,18 @@ units angstrom
                 else ap3_fused_collate_update
             )
 
-        # Worker lifetime and read-ahead depth.  mtp_mtp.py carries the same
-        # `persistent_workers` block with the opposite justification for
-        # `prefetch_factor`, and the difference between the two routes is
-        # measured rather than assumed.
+        # Worker lifetime and read-ahead depth, set from this route's own
+        # measurement rather than from a general rule -- a deeper prefetch is
+        # the wrong call on a CPU-bound loader and the right one here.
         #
         # Job 12391962 sampled this route live: 11 workers and the consumer
         # together burn 1.01 cores of the 12 allocated, the workers are busy
         # ~9 % of wall each, and 98 % of what worker CPU there is sits inside
         # a single `Dataset.get` -> `torch.load`.  This loader is latency-
-        # bound on the shard store, not CPU-bound -- which is the reverse of
-        # CLIFF2, where the step profile puts the loader at 1.4 % of
-        # main-thread time.  So the reasoning in mtp_mtp.py that there is "no
-        # latency left to hide" is a statement about that route, not this one.
+        # bound on the shard store, not CPU-bound.  That is the reverse of
+        # the CLIFF2 route, whose step profile puts the loader at 1.4 % of
+        # main-thread time and therefore has no read latency left to hide;
+        # the depth chosen below does not transfer between the two.
         #
         # With the defaults every epoch forks `num_workers` fresh processes,
         # each re-importing torch and re-materialising its view of the store

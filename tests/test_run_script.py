@@ -144,7 +144,7 @@ def _parse_recorded_calls(calls, monkeypatch):
         "train_pairwise_model",
         lambda **kwargs: parsed_calls.append(kwargs),
     )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda _seed: None)
+    monkeypatch.setattr(train_models, "set_all_seeds", lambda *_a, **_k: None)
 
     for call in calls:
         assert call[:2] == ["-u", "./train_models.py"]

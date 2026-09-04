@@ -10,7 +10,7 @@ import pickle
 import time
 from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -172,6 +172,14 @@ def _spawn_external_tracker(rank: int, world_size: int, event_directory: str) ->
     )
 
 
+def test_config_normalizes_mapping_to_pickle_safe_dict():
+    config = WandbConfig(run_config=MappingProxyType({"dataset.id": "fixture"}))
+
+    assert config.run_config == {"dataset.id": "fixture"}
+    assert isinstance(config.run_config, dict)
+    pickle.dumps(config)
+
+
 def test_config_is_pickle_safe_and_resolves_environment():
     environment = {
         "WANDB_PROJECT": "environment-project",
@@ -179,7 +187,11 @@ def test_config_is_pickle_safe_and_resolves_environment():
         "WANDB_RUN_GROUP": "environment-group",
         "WANDB_JOB_TYPE": "environment-job",
     }
-    config = WandbConfig(mode="offline", tags=("user",))
+    config = WandbConfig(
+        mode="offline",
+        tags=("user",),
+        run_config={"dataset.id": "sapt0-1600k-v1"},
+    )
 
     restored = pickle.loads(pickle.dumps(config))
     resolved = restored.resolved(("atomic", "user"), environment=environment)
@@ -189,6 +201,7 @@ def test_config_is_pickle_safe_and_resolves_environment():
     assert resolved.group == "environment-group"
     assert resolved.job_type == "environment-job"
     assert resolved.tags == ("user", "atomic")
+    assert resolved.run_config["dataset.id"] == "sapt0-1600k-v1"
 
     explicit = WandbConfig(mode="offline", job_type="explicit-job").resolved(
         environment=environment
@@ -233,6 +246,10 @@ def test_config_rejects_invalid_values():
         WandbConfig(tags=["not", "a", "tuple"])
     with pytest.raises(TypeError, match="project"):
         WandbConfig(project=3)
+    with pytest.raises(TypeError, match="mapping"):
+        WandbConfig(run_config=[])
+    with pytest.raises(TypeError, match="JSON-serializable"):
+        WandbConfig(run_config={"bad": object()})
 
 
 def test_run_context_sanitizes_paths_and_validates_extra():
@@ -315,7 +332,11 @@ def test_transitive_wandb_import_error_is_preserved():
 
 def test_file_event_tracker_lifecycle_and_atomic_aliases(tmp_path):
     tracker = create_training_tracker(
-        WandbConfig(mode="offline", project="test-project"),
+        WandbConfig(
+            mode="offline",
+            project="test-project",
+            run_config={"dataset.id": "sapt0-1600k-v1"},
+        ),
         is_primary=True,
         run_context=_context(),
         backend=TrackerBackend.FILE_EVENT,
@@ -350,6 +371,7 @@ def test_file_event_tracker_lifecycle_and_atomic_aliases(tmp_path):
         "summary",
         "finish",
     ]
+    assert events[0]["config"]["dataset.id"] == "sapt0-1600k-v1"
     assert events[4]["aliases"] == ["final", "latest"]
     assert reference.endswith(":latest")
     assert events[-1]["exit_code"] == 0

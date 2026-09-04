@@ -2117,8 +2117,6 @@ class AtomTypeParamNN(nn.Module):
         parameters it returns.
         """
         x = batch.x
-        edge_index = batch.edge_index
-        molecule_ind = batch.molecule_ind
         # current_model_device = next(self.parameters()).device
         # model_device = next(self.atom_model.parameters()).device
         am_out = self.atom_model(batch)
@@ -2131,39 +2129,26 @@ class AtomTypeParamNN(nn.Module):
         Z = x
         K_list = [self.guess_layer[p](Z) for p in range(self.n_params)]
         K = torch.cat(K_list, dim=-1)  # shape (n_atoms, n_params)
-        # print(f"{K = }")
-        atoms_with_edges = torch.cat([edge_index[0], edge_index[1]]).unique()
-        keep_mask = torch.isin(
-            torch.arange(len(molecule_ind), device=molecule_ind.device),
-            atoms_with_edges,
-        )
-        if not keep_mask.any():
-            return (
-                charge.squeeze(-1),
-                dipole,
-                qpole,
-                *am_out[3:],
-                K.squeeze(-1) if self.n_params == 1 else K,
-            )
-        K_filtered = K[keep_mask]  # shape (n_atoms_filtered, n_params)
+        # h_list carries a row for every atom, including atoms with no
+        # intramonomer edge (monatomic monomers, isolated ions), so the readout
+        # correction applies to all rows of K. This used to filter K down to
+        # edge-bearing atoms to line up with a pre-filtered h_list; AtomMPNN
+        # returns full-length outputs since the edgeless-atom fix.
         n_message_steps = min(self.n_message + 1, h_list.size(1))
         frozen = getattr(self, "_frozen_parameter_indices", ())
+        updates = []
         for p in range(self.n_params):
-            if p in frozen:
-                # Held at its per-element seed: no correction, and __init__ has
-                # already detached this column's parameters from the graph.
-                continue
-            for i in range(n_message_steps):
-                param_update = self.param_readout_layers[p][i](h_list[:, i, :])
-                K_filtered[:, p] += param_update.squeeze(-1)
-        # K[keep_mask] = torch.relu(K_filtered)  # + 1.00001
-        K[keep_mask] = K_filtered  # + 1.00001
-        # if K.isnan().any():
-        #     print("K has NaN values, debugging info:")
-        #     print(f"{K_filtered =}")
-        #     print(f"{Z =}")
-        #     print(f"{h_list=}")
-        #     raise ValueError("K has NaN values")
+            update = K.new_zeros(K.size(0))
+            # A frozen column is held at its per-element seed: no correction,
+            # and __init__ has already detached its parameters from the graph.
+            if p not in frozen:
+                for i in range(n_message_steps):
+                    param_update = self.param_readout_layers[p][i](
+                        h_list[:, i, :]
+                    )
+                    update = update + param_update.squeeze(-1)
+            updates.append(update)
+        K = K + torch.stack(updates, dim=-1)
         return (
             charge,
             dipole,
@@ -3624,10 +3609,14 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             ],
             dim=-1,
         )
-        h_all_dot = torch.einsum("ez,er->ezr", h_all, rbf).reshape(nedge, -1)
+        # Trailing size spelled out, not inferred: an edgeless batch makes
+        # ``-1`` ambiguous and raises.  Same reason as ``AtomMPNN``.
+        h_all_dot = torch.einsum("ez,er->ezr", h_all, rbf).reshape(
+            nedge, h_all.size(-1) * rbf.size(-1)
+        )
         return torch.cat([h_all, h_all_dot, rbf], dim=-1)
 
-    def _node_features(self, charge, dipole, qpole, nested_params, h_list, keep_mask):
+    def _node_features(self, charge, dipole, qpole, nested_params, h_list):
         """Concatenate the nested representation with the physical scalars."""
         q = charge.reshape(charge.size(0), -1)[:, :1]
         mu = torch.sqrt(
@@ -3642,7 +3631,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         valence_width = nested_params[:, 1:2]
         scalars = torch.cat([q, mu, quad, hfvr, valence_width], dim=-1)
         return torch.cat(
-            [h_list.reshape(h_list.size(0), -1), scalars[keep_mask]], dim=-1
+            [h_list.reshape(h_list.size(0), -1), scalars], dim=-1
         )
 
     def _raw_head_output(self, batch):
@@ -3659,44 +3648,32 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         K = torch.cat(
             [self.guess_layer[p](Z) for p in range(self.n_params)], dim=-1
         )
-        if edge_index.size(1) == 0:
-            # No graph, so no message passing and no correction: the seed is
-            # the answer. Returned unsqueezed, unlike `AtomTypeParamNN`'s
-            # no-edge branch, so this head's output rank does not depend on
-            # whether the monomer had edges.
-            return (charge, dipole, qpole, *am_out[3:], K)
-
-        keep_mask = torch.zeros(natom, dtype=torch.bool, device=Z.device)
-        keep_mask.scatter_(0, edge_index[0], True)
-        keep_mask.scatter_(0, edge_index[1], True)
-
+        # Every atom keeps its row, including one with no intramonomer edge:
+        # the loop below hands it a zero message, exactly as ``AtomMPNN`` does
+        # since the edgeless-atom fix.  Filtering here renumbered the message
+        # indices out of step with the full-length ``h_list`` this head is
+        # handed, and made an atom's parameters depend on what else shared its
+        # batch.
         e_source, e_target = edge_index[0], edge_index[1]
-        edge_keep = keep_mask[e_source] & keep_mask[e_target]
-        e_source = e_source[edge_keep]
-        e_target = e_target[edge_keep]
-        idx_map = (torch.cumsum(keep_mask, dim=0) - 1).long()
-        e_source = idx_map[e_source]
-        e_target = idx_map[e_target]
 
-        R = batch.R[keep_mask, :]
-        n_kept = R.size(0)
+        R = batch.R
         dR, _ = get_distances(R, R, e_source, e_target)
         rbf = self.param_distance_layer(dR)
 
         features = self._node_features(
-            charge, dipole, qpole, nested_params, h_list, keep_mask
+            charge, dipole, qpole, nested_params, h_list
         )
         h_states = [
             self.param_hidden_norms[0](
                 self.param_input_layer(features)
-                + self.param_type_embed(Z[keep_mask])
+                + self.param_type_embed(Z)
             )
         ]
         for i in range(self.param_n_message):
             m_ij = self._param_messages(
                 h_states[0], h_states[-1], rbf, e_source, e_target
             )
-            m_i = scatter_sum_compile(m_ij, e_source, n_kept, reduce="sum")
+            m_i = scatter_sum_compile(m_ij, e_source, natom, reduce="sum")
             # Normalized before it is stored, so both the next message step and
             # every readout see an O(1) state regardless of depth or how many
             # neighbours were summed into it.
@@ -3725,16 +3702,9 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             columns.append(column)
         correction = torch.cat(columns, dim=-1)
 
-        # Scatter the per-kept-atom correction back onto every atom without a
-        # boolean-mask write. `idx_map` already maps each atom to its row in the
-        # filtered arrays; clamping makes the leading -1 a valid gather index and
-        # `where` discards those rows along with every other unkept one. The
-        # equivalent `K[keep_mask] = ...` is what makes Inductor fall back on
-        # `aten.nonzero`, and this form is static-shaped instead.
-        gathered = correction.index_select(0, idx_map.clamp(min=0))
-        K = K + torch.where(
-            keep_mask.unsqueeze(-1), gathered, torch.zeros_like(gathered)
-        )
+        # One row per atom on both sides, so this is a plain add: no masked
+        # write, and nothing for Inductor to fall back on `aten.nonzero` for.
+        K = K + correction
         return (charge, dipole, qpole, *am_out[3:], K)
 
     def get_config(self) -> dict:
