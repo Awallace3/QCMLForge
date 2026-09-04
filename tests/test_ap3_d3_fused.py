@@ -192,6 +192,21 @@ def test_exchange_overlap_induction_r6_has_locked_asymptotics():
     assert decay[1, 3] / decay[0, 3] == pytest.approx((3.0 / 6.0) ** 3)
 
 
+def test_exchange_r1_readout_changes_only_exchange_column():
+    distances = torch.tensor([2.0, 4.0, 8.0])
+    legacy = build_readout_decay(distances, 4)
+    decay = build_readout_decay(
+        distances,
+        4,
+        mode="exchange-r1",
+        exchange_scale=0.25,
+    )
+
+    torch.testing.assert_close(decay[:, [0, 2, 3]], legacy[:, [0, 2, 3]])
+    torch.testing.assert_close(decay[:, 1], 0.25 * distances.reciprocal())
+    assert decay[2, 1] / decay[0, 1] == pytest.approx(0.25)
+
+
 def test_hybrid_readout_preserves_short_range_and_overlap_tail():
     distances = torch.tensor([2.0, 2.5, 3.0, 3.5, 4.0])
     overlap = torch.tensor([0.8, 0.7, 0.6, 0.5, 0.4])

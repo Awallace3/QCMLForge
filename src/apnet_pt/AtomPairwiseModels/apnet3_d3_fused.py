@@ -307,6 +307,7 @@ READOUT_DECAY_MODES = (
     "exchange-overlap",
     "exchange-overlap-induction-r6",
     "exchange-hybrid-r3-overlap",
+    "exchange-r1",
 )
 
 
@@ -347,6 +348,9 @@ def build_readout_decay(
     inverse_cube = distances.reciprocal().pow(3)
     decay = inverse_cube.unsqueeze(-1).expand(-1, n_components).clone()
     if mode == "legacy-r3":
+        return decay
+    if mode == "exchange-r1":
+        decay[:, 1] = exchange_scale * distances.reciprocal()
         return decay
     if exchange_overlap is None or exchange_overlap.shape != distances.shape:
         raise ValueError("exchange_overlap must match distances for overlap decay modes")
@@ -952,7 +956,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         E_sr = EAB_sr + EBA_sr
 
         exchange_overlap = None
-        if self.readout_decay_mode != "legacy-r3":
+        if self.readout_decay_mode not in ("legacy-r3", "exchange-r1"):
             exchange_overlap = atomic_overlap_S_ij(
                 vwA,
                 vwB,

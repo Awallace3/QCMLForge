@@ -2030,7 +2030,8 @@ def main():
             "behavior; 'exchange-overlap' changes exchange only; "
             "'exchange-overlap-induction-r6' additionally changes induction; "
             "'exchange-hybrid-r3-overlap' smoothly joins legacy short range "
-            "to the Slater-overlap tail."
+            "to the Slater-overlap tail; 'exchange-r1' is the deliberately "
+            "slow inverse-distance exchange ablation."
         ),
     )
     args.add_argument(
