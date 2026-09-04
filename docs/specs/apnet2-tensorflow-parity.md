@@ -63,22 +63,14 @@ over colliding user-supplied keys.
 
 ## Pre-rewrite electrostatics terms
 
-`apnet` commit 593d655 (2021-07-18, "full rewrite") made exactly one numerical
-change to the analytic multipole electrostatics: it dropped the
-dipole-quadrupole and quadrupole-quadrupole terms from the interaction sum. The
-pre-rewrite routine summed `qq + qu + qQ + uu + uQ + QQ`, the published one sums
-`qq + qu + qQ + uu`. Every commit after it leaves the kernel's arithmetic alone,
-and the shipped SavedModels postdate it, so the published weights were trained
-against the four-term kernel.
-
-The `3/2` quadrupole prefactor is *not* a change introduced by that commit. The
-pre-rewrite `apnet/multipoles.py` already multiplies `qpole_redundant(...)` by
-`3.0/2.0` for both reference and predicted quadrupoles before evaluating the
-interaction (`origin/master` = `593d655^` = `e09955b`, lines 129/133/207/211).
-It is a convention conversion for the stored `cartesian_multipoles` layout that
-both eras apply; 593d655 only moved it inside the traced graph. `1.5` is
-therefore the right scale for every TensorFlow code era, and `1.0` corresponds
-to none of them.
+`apnet` commit 593d655 (2021-07-18, "full rewrite") made exactly two numerical
+changes to the analytic multipole electrostatics. It introduced the `3/2`
+quadrupole prefactor above, and it dropped the dipole-quadrupole and
+quadrupole-quadrupole terms from the interaction sum: the pre-rewrite routine
+summed `qq + qu + qQ + uu + uQ + QQ`, the published one sums `qq + qu + qQ + uu`.
+Every commit after it leaves the kernel's arithmetic alone, and the shipped
+SavedModels postdate it, so the published weights were trained against the
+four-term kernel.
 
 `elst_include_uQ_QQ` restores the two dropped terms, defaulting to `False` so
 the published kernel stays the default:
@@ -97,7 +89,7 @@ nothing but the electrostatics.
 
 The flag interacts with `--quadrupole-scale`, which is applied to both
 quadrupole tensors before any term is formed: it therefore enters `uQ` linearly
-and `QQ` quadratically. `(1.5, off)` is the published kernel and `(1.5, on)` is
+and `QQ` quadratically. `(1.5, off)` is the published kernel and `(1.0, on)` is
 the pre-rewrite functional form. Both are forward-pass constants, so changing
 either without retraining perturbs a model whose learned short-range readout
 adapted to the kernel it was trained with. Only the pairs beyond the 8 A cutoff,
@@ -105,62 +97,101 @@ which receive no readout at all, measure the analytic term unaided.
 
 ## Where the converted weights stand against the paper
 
-The five converted TensorFlow members, averaged the way
-`apnet/bms_functions.py::predict_sapt` averages them, evaluated on the paper's
-own 150 000-dimer Splinter validation split:
+The published TensorFlow SavedModels, evaluated in TensorFlow 2.3 on the
+paper's own 150 000-dimer Splinter validation split and averaged the way
+`apnet/bms_functions.py::predict_sapt` averages them, reproduce Fig. 2B:
 
-| component | converted ensemble MAE | paper Fig. 2B | delta |
+| component | TensorFlow ensemble | paper Fig. 2B | delta |
 |---|---|---|---|
-| Elst | 0.3024 | 0.168 | **+0.134** |
-| Exch | 0.1408 | 0.141 | -0.0002 |
-| Ind | 0.0957 | 0.096 | -0.0003 |
-| Disp | 0.0204 | 0.021 | -0.0006 |
-| Total | 0.3293 | 0.201 | +0.128 |
+| Elst | 0.167 | 0.168 | -0.001 |
+| Exch | 0.141 | 0.141 | -0.000 |
+| Ind | 0.096 | 0.096 | -0.000 |
+| Disp | 0.020 | 0.021 | -0.001 |
+| Total | 0.200 | 0.201 | -0.001 |
 
-Exchange, induction and dispersion are parity-verified: they land 2-6e-4
-kcal/mol from the published ensemble. Because none of the shared machinery is
-component-specific, that also verifies the conversion, the architecture, the
-featurisation, the ensemble rule and the subset identity. Electrostatics is the
-only open discrepancy.
+Maximum absolute total error 14.30 kcal/mol against the paper's "under 15",
+and 97.32% of dimers within 1 kcal/mol against the paper's "over 97%". The
+shipped checkpoints are the paper's model, so any gap between QCMLForge and
+Fig. 2B is QCMLForge's.
+
+The converted PyTorch ensemble, after the atom-model fix below, reproduces
+those TensorFlow numbers rather than approximating them:
+
+| component | converted ensemble MAE | TensorFlow ensemble MAE | paper Fig. 2B |
+|---|---|---|---|
+| Elst | 0.16704 | 0.16704 | 0.168 |
+| Exch | 0.14079 | 0.14079 | 0.141 |
+| Ind | 0.09567 | 0.09567 | 0.096 |
+| Disp | 0.02043 | 0.02043 | 0.021 |
+| Total | 0.19992 | 0.19992 | 0.201 |
+
+Per dimer, the converted ensemble differs from the TensorFlow ensemble by a
+mean of 1.6e-5 kcal/mol on the total; one dimer out of 150 000 exceeds 1e-2 on
+any component, an induction outlier that is unchanged by the fix and most
+likely a pair sitting on the 8 A cutoff. Per member the mean total difference
+is 2-3e-5 kcal/mol.
 
 Two rules follow for anyone comparing to the paper:
 
 - **Compare ensembles, never members.** Averaging the five members is worth
-  0.070 kcal/mol on the total and 0.048 on Elst. Every published AP-Net2 number
-  is a five-model average, so a single-member MAE is not comparable to it.
+  about 0.09 kcal/mol on the total. Every published AP-Net2 number is a
+  five-model average, so a single-member MAE is not comparable to it.
 - **Use `quadrupole_scale=1.5`.** It is a forward-pass constant rather than a
   state-dict entry, so a loader that only calls `load_state_dict` reports
   success and silently evaluates the wrong electrostatics. Setting it to 1.0
   costs 0.012 kcal/mol of Elst and corresponds to no TensorFlow code era.
 
-The Elst gap is not generalisation -- the training split gives 0.294 against
-the validation split's 0.302 -- and it is not the electrostatics kernel's
-history: re-pairing the atom models (all 20 off-diagonal combinations),
-dropping the `3/2`, and restoring the `uQ`/`QQ` terms are worth +0.011, +0.012
-and +0.0008 respectively, all in the wrong direction and all an order of
-magnitude too small.
+### The electrostatics gap was an atom-model indexing defect
 
-It is also not the multipole source. `PairModel.pretrained(i)` restores
+Before the fix in `AtomMPNN.forward`, the converted ensemble gave Elst 0.3024
+against the paper's 0.168 while exchange, induction and dispersion were already
+within 6e-4. The asymmetry was the diagnosis. `get_pair` feeds the shared
+short-range readout only the *charges*; dipoles and quadrupoles reach the
+energy through `mtp_elst` alone. Only electrostatics can be wrong on its own,
+and only through the multipoles.
+
+`AtomMPNN.forward` used to drop atoms with no intramonomer edge before message
+passing and renumber `e_source`/`e_target` onto the filtered indices, but it
+scattered the dipole and quadrupole messages with the *unfiltered* atom count.
+Those accumulators are indexed by original atom number, so one edgeless atom
+shifted every later atom in the batch onto another atom's multipoles and left
+the batch's trailing atoms holding the readout-of-zero bias. Charges escaped
+because they rode a separate filtered tensor that was written back through the
+same mask.
+
+An atom has no intramonomer edge exactly when its monomer is a single atom --
+a halide or alkali ion, 5 971 of the 150 000 validation dimers (3.98%). At the
+evaluation batch size of 32 each of those poisons the rest of its batch, so
+42% of dimers came out wrong, and the ensemble Elst MAE moved by 0.13
+kcal/mol. TensorFlow does not filter: such an atom receives `m_i = 0` and
+flows through the update and readout layers, so its dipole is the readout
+layer's bias rather than zero. Parity requires not filtering, not merely
+re-indexing.
+
+The 24-dimer TensorFlow parity fixture could not see this. It batches at size
+4, which would have caught the defect, but the first 24 dimers in shard order
+are all ordinary organic pairs and none has a single-atom monomer. The fixture
+is now 26 dimers: the same 24 plus the first dimer in shard order with a
+monatomic monomer and the dimer immediately behind it, since the corruption
+lands on whatever shares the batch *after* the lone atom. Regenerate it with
+`scripts/ap2_tf/make_parity_dimers.py --ensure-monatomic`.
+
+Nothing else that was suspected turned out to be responsible. The
+electrostatics kernel's history is not: re-pairing the atom models across all
+20 off-diagonal combinations, dropping the `3/2`, and restoring the `uQ`/`QQ`
+terms are worth +0.011, +0.012 and +0.0008 kcal/mol respectively, all in the
+wrong direction and all an order of magnitude too small.
+
+The multipole source is not either. `PairModel.pretrained(i)` restores
 `pair{i}` as one SavedModel with its atom network embedded by
-`KerasPairModel(atom_model.model)`, while the conversion took its multipole
+`KerasPairModel(atom_model.model)`, while the conversion takes its multipole
 weights from the standalone `atom_models/atom{i}`, so the two could in
 principle be different networks. They are not:
 `tests/test_ap2_tf_parity.py::test_pair_model_reproduces_tensorflow` compares
 the converted pair network fed by the standalone atom model against components
-TensorFlow itself produced through the embedded submodel, and agrees to
-1.2e-4 kcal/mol on electrostatics across 24 dimers and all five members.
-Electrostatics consumes the multipoles analytically, so that agreement is only
-possible if the two multipole sources are the same network.
-
-What that leaves is a discrepancy between the *shipped TensorFlow SavedModels*
-and the paper's reported electrostatics MAE, not between TensorFlow and
-QCMLForge. The conversion reproduces the SavedModels' own forward pass to
-~1e-4 kcal/mol; evaluating those SavedModels in TensorFlow on the same
-150 000-dimer subset would confirm the published checkpoints themselves give
-0.30 rather than 0.168, and is the experiment that would close this out. Until
-then, describe these checkpoints as reproducing the published SavedModels'
-predictions -- which is verified -- and not as reproducing the paper's
-reported electrostatics error.
+TensorFlow itself produced through the embedded submodel. Electrostatics
+consumes the multipoles analytically, so agreement there is only possible if
+the two sources are the same network.
 
 ## Controlled comparison protocol
 

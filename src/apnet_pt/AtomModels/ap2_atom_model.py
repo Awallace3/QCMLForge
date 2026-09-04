@@ -366,36 +366,17 @@ class AtomMPNN(MessagePassing):
             charge = charge - charge_err
             return charge, dipole, qpole, h_list
 
-        # 1) Filter out atoms that don't have edges
-        # Create keep_mask directly from edge_index without using torch.isin
-        # This is more compile-friendly than torch.isin with unbacked symbolic shapes
-        natom = len(molecule_ind)
-        keep_mask = torch.zeros(natom, dtype=torch.bool, device=molecule_ind.device)
-        if edge_index.size(1) > 0:
-            # Mark all atoms that appear in edge_index as True
-            keep_mask.scatter_(0, edge_index[0], True)
-            keep_mask.scatter_(0, edge_index[1], True)
-        filtered_charge = charge[keep_mask]
+        # Atoms with no neighbor inside ``r_cut`` -- a monatomic monomer sharing
+        # a batch with larger ones -- stay in place instead of being filtered
+        # out.  They receive a zero message, which is exactly what the original
+        # TensorFlow AP-Net2 feeds its update layers.  Filtering renumbered the
+        # message-passing indices while the dipole and quadrupole accumulators
+        # kept the original numbering, so one such atom shifted every later
+        # atom's multipoles onto the wrong atom.
+        h_list = [h_list_0[0]]
 
-        # Now `filtered_charge` contains only atoms from molecules that have >= 2 atoms and edges
-        h_list = [h_list_0[0][keep_mask]]
-
-        # Now we need to filter the edge_index to only include edges between
-        # atoms in molecules with >= 2 atoms.
         e_source = edge_index[0]
         e_target = edge_index[1]
-        edge_keep = keep_mask[e_source] & keep_mask[e_target]
-        e_source = e_source[edge_keep]
-        e_target = e_target[edge_keep]
-        idx_map = (
-            torch.cumsum(keep_mask, dim=0) - 1
-        )  # shape [N], each kept atom -> new index
-        idx_map = idx_map.long()  # ensure integer
-        e_source = idx_map[e_source]
-        e_target = idx_map[e_target]
-
-        R = R[keep_mask, :]
-        natom_filtered = R.size(0)
 
         #  [edges]
         dR, dR_xyz = get_distances(R, R, e_source, e_target)
@@ -415,13 +396,13 @@ class AtomMPNN(MessagePassing):
             # [atoms x message_embedding_dim]
             # m_i = unsorted_segment_sum_2d(m_ij, e_source, natom)
             # write unsorted_segment_sum_2d using scatter
-            m_i = scatter_sum_compile(m_ij, e_source, natom_filtered, reduce="sum")
+            m_i = scatter_sum_compile(m_ij, e_source, natom, reduce="sum")
 
             # [atomx x hidden_dim]
             h_next = self.charge_update_layers[i](m_i)
             h_list.append(h_next)
             charge_update = self.charge_readout_layers[i](h_list[i + 1])
-            filtered_charge += charge_update
+            charge = charge + charge_update
 
             #####################
             ### dipole update ###
@@ -474,7 +455,6 @@ class AtomMPNN(MessagePassing):
         ### enforce charge conservation ###
         ###################################
 
-        charge[keep_mask] = filtered_charge
         molecule_ind.requires_grad_(False)
         molecule_ind = molecule_ind.long()
         num_mols = natom_per_mol.size(0)

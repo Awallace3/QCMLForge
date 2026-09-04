@@ -2,9 +2,9 @@
   "au2ang": 0.52917721067,
   "device": "cpu",
   "dimers": {
-    "count": 24,
-    "npz": "/storage/project/r-cs207-0/awallace43/scratch/ap2tf/parity_dimers.npz",
-    "sha256": "07a595acbf7524cdd0f5b92758d2587ff32f7a918452d062c8b490b831480d8c"
+    "count": 26,
+    "npz": "/storage/scratch1/3/awallace43/ap2-fixture/parity_dimers.npz",
+    "sha256": "1b5a91543b16f733a372b5f18ff38188de82cc80613c7f87761f9bbb469c7e85"
   },
   "max_angstrom_round_trip_error": 1.7763568394002505e-15,
   "models": {
@@ -176,16 +176,16 @@
   },
   "outputs": {
     "npz": {
-      "path": "tf_reference.npz",
-      "sha256": "41c27e06dbadcfedcfb2af5883c6939dbae4eecfbcb64b93a026016fd6e4b757"
+      "path": "/storage/home/hcoda1/3/awallace43/scratch/ap2-fixture/tf_reference.npz",
+      "sha256": "70ec7eac2eb7d6a254c04676de77109d953e696ce557a9418d7e4ffeb69198ca"
     }
   },
   "reference_total_mae_vs_labels": {
-    "pair0": 0.252022183575491,
-    "pair1": 0.33655753869720684,
-    "pair2": 0.25629247463325555,
-    "pair3": 0.24871434826256214,
-    "pair4": 0.18340956445664838
+    "pair0": 0.24157718353902824,
+    "pair1": 0.32560131238775425,
+    "pair2": 0.2546052425728843,
+    "pair3": 0.24091096412254187,
+    "pair4": 0.1878310007361786
   },
   "source_repo": {
     "branch": "sparse",

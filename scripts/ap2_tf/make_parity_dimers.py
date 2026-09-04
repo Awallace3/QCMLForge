@@ -13,6 +13,17 @@ The dimers are taken in shard order, which makes the selection a pure function
 of ``--processed-dir``, ``--prefix``, and ``--samples``; ``row_provenance`` in
 the manifest names the shard and in-shard index of every row so the choice stays
 auditable after the fact.
+
+``--ensure-monatomic`` extends that rule by one case.  A monomer with a single
+atom has no intramonomer edge, which is a distinct code path in both
+featurisers and the one the original fixture happened to miss entirely -- the
+atom model corrupted the multipoles of every atom batched after such a monomer
+and 24 dimers of ordinary organic pairs could not see it.  When the first
+``samples`` dimers contain no monatomic monomer, two more are appended: the
+first dimer in shard order that has one, and the dimer immediately after it.
+The trailing dimer is what makes the check bite, because the damage lands on
+whatever shares the batch *after* the lone atom, so a monatomic dimer appended
+alone at the end of the list would prove nothing.
 """
 
 import argparse
@@ -41,7 +52,26 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def collect(processed_dir, prefix, samples):
+def _record(data):
+    y = data.y.reshape(-1).to(torch.float64).numpy()
+    if y.shape != (4,):
+        raise SystemExit("y shape %s, expected (4,)" % (y.shape,))
+    return {
+        "ZA": data.ZA.to(torch.int64).numpy(),
+        "ZB": data.ZB.to(torch.int64).numpy(),
+        "RA": data.RA.to(torch.float64).numpy(),
+        "RB": data.RB.to(torch.float64).numpy(),
+        "TQA": int(data.total_charge_A.item()),
+        "TQB": int(data.total_charge_B.item()),
+        "labels": y,
+    }
+
+
+def is_monatomic(record):
+    return len(record["ZA"]) == 1 or len(record["ZB"]) == 1
+
+
+def collect(processed_dir, prefix, samples, ensure_monatomic=False):
     paths = sorted(
         Path(processed_dir).glob(prefix + "*.pt"), key=lambda p: natural_key(p.name)
     )
@@ -51,36 +81,47 @@ def collect(processed_dir, prefix, samples):
     records = []
     provenance = []
     shards_read = []
+    # ``wanted`` grows once past ``samples``: to +1 when the first monatomic
+    # dimer is found and to +2 so the dimer after it comes along to receive any
+    # corruption.  ``hunting`` stops the scan as soon as that is satisfied.
+    wanted = samples
+    hunting = ensure_monatomic
+
+    def take(path, position, record, reason):
+        records.append(record)
+        provenance.append(
+            {"shard": path.name, "index_in_shard": position, "reason": reason}
+        )
+
     for path in paths:
         objects = torch.load(str(path), map_location="cpu", weights_only=False)
         shards_read.append(path.name)
         for position, data in enumerate(objects):
-            if len(records) == samples:
+            if len(records) >= wanted and not hunting:
                 break
-            y = data.y.reshape(-1).to(torch.float64).numpy()
-            if y.shape != (4,):
-                raise SystemExit(
-                    "%s[%d] has y shape %s, expected (4,)" % (path.name, position, y.shape)
-                )
-            records.append(
-                {
-                    "ZA": data.ZA.to(torch.int64).numpy(),
-                    "ZB": data.ZB.to(torch.int64).numpy(),
-                    "RA": data.RA.to(torch.float64).numpy(),
-                    "RB": data.RB.to(torch.float64).numpy(),
-                    "TQA": int(data.total_charge_A.item()),
-                    "TQB": int(data.total_charge_B.item()),
-                    "labels": y,
-                }
-            )
-            provenance.append({"shard": path.name, "index_in_shard": position})
-        if len(records) == samples:
+            record = _record(data)
+            if len(records) < samples:
+                take(path, position, record, "leading")
+                if hunting and is_monatomic(record):
+                    hunting = False
+            elif len(records) < wanted:
+                take(path, position, record, "follows monatomic")
+                hunting = False
+            elif is_monatomic(record):
+                wanted = len(records) + 2
+                take(path, position, record, "monatomic")
+        if len(records) >= wanted and not hunting:
             break
 
-    if len(records) != samples:
+    if len(records) < samples:
         raise SystemExit(
             "Collected %d dimers from %d shards, wanted %d"
             % (len(records), len(paths), samples)
+        )
+    if hunting:
+        raise SystemExit(
+            "No dimer with a monatomic monomer, followed by another dimer, "
+            "exists in %s%s*.pt" % (processed_dir, prefix)
         )
     return records, provenance, shards_read
 
@@ -106,6 +147,12 @@ def main():
     parser.add_argument("--processed-dir", required=True)
     parser.add_argument("--prefix", required=True, help="e.g. dimer_ap2_fused_test_spec_2_")
     parser.add_argument("--samples", type=int, default=24)
+    parser.add_argument(
+        "--ensure-monatomic",
+        action="store_true",
+        help="append the first monatomic-monomer dimer and its successor when "
+        "the leading `samples` dimers contain none",
+    )
     parser.add_argument("--out-npz", required=True)
     parser.add_argument("--out-manifest", required=True)
     parser.add_argument("--overwrite", action="store_true")
@@ -116,7 +163,7 @@ def main():
             raise SystemExit("Refusing to overwrite existing %s" % target)
 
     records, provenance, shards_read = collect(
-        args.processed_dir, args.prefix, args.samples
+        args.processed_dir, args.prefix, args.samples, args.ensure_monatomic
     )
     arrays = flatten(records)
     Path(args.out_npz).parent.mkdir(parents=True, exist_ok=True)
@@ -128,12 +175,24 @@ def main():
             "processed_dir": str(args.processed_dir),
             "prefix": args.prefix,
             "shards_read": shards_read,
-            "selection_rule": "first `samples` dimers in naturally sorted shard order",
+            "selection_rule": (
+                "first `samples` dimers in naturally sorted shard order"
+                + (
+                    ", plus the first dimer with a monatomic monomer and its "
+                    "successor when none of those has one"
+                    if args.ensure_monatomic
+                    else ""
+                )
+            ),
         },
         "samples": len(records),
         "atoms_A_total": int(arrays["sizes_A"].sum()),
         "atoms_B_total": int(arrays["sizes_B"].sum()),
         "elements_present": [int(z) for z in elements],
+        "monatomic_monomers": int(
+            np.count_nonzero(arrays["sizes_A"] == 1)
+            + np.count_nonzero(arrays["sizes_B"] == 1)
+        ),
         "charged_monomers": int(
             np.count_nonzero(arrays["TQA"]) + np.count_nonzero(arrays["TQB"])
         ),

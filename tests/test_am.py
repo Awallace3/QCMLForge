@@ -236,6 +236,40 @@ def test_am_architecture():
         hlist - hidden_list_v=}"
 
 
+def test_edgeless_atom_does_not_shift_multipoles():
+    """A monatomic monomer must not corrupt the rest of its batch.
+
+    An atom with no neighbor inside ``r_cut`` has no intramonomer edge. The
+    atom model used to drop such atoms before message passing and renumber the
+    edge indices, while the dipole and quadrupole accumulators kept the original
+    atom numbering -- so every atom after the lone one received another atom's
+    multipoles. Charges were unaffected, which is why the damage showed up as an
+    electrostatics-only error. The original TensorFlow AP-Net2 keeps the atom and
+    feeds its update layers a zero message instead.
+    """
+    torch.manual_seed(4201)
+    atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    atom_model.model.eval()
+
+    (alone,) = atom_model.predict_qcel_mols([mol_water], batch_size=1)
+    batched = atom_model.predict_qcel_mols([mon_element, mol_water], batch_size=2)
+    water = batched[1]
+
+    for name, ref, got in zip(
+        ("charge", "dipole", "qpole", "hlist"), alone, water
+    ):
+        assert torch.allclose(
+            torch.as_tensor(ref), torch.as_tensor(got), atol=1e-6
+        ), f"{name} changed when water was batched with a monatomic monomer"
+
+    # The lone atom itself still gets a prediction, not a dropped row.
+    assert torch.as_tensor(batched[0][1]).shape == (1, 3)
+
+
 @pytest.mark.pretrained_models("am")
 def test_am_element():
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
