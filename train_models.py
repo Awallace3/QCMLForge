@@ -3,6 +3,7 @@ from apnet_pt import AtomPairwiseModels
 from apnet_pt.training_tracking import WandbConfig
 import argparse
 import inspect
+import json
 import os
 import random
 from dataclasses import replace
@@ -39,6 +40,14 @@ def build_wandb_run_configs(args, environment=None):
 
     env = os.environ if environment is None else environment
 
+    run_config = {}
+    run_config_path = getattr(args, "wandb_run_config", None)
+    if run_config_path:
+        with open(run_config_path, "r", encoding="utf-8") as handle:
+            run_config = json.load(handle)
+        if not isinstance(run_config, dict):
+            raise ValueError("--wandb-run-config must contain a JSON object")
+
     base_config = WandbConfig(
         mode=args.wandb_mode,
         project=args.wandb_project,
@@ -49,6 +58,7 @@ def build_wandb_run_configs(args, environment=None):
         job_type=args.wandb_job_type,
         notes=args.wandb_notes,
         directory=args.wandb_dir,
+        run_config=run_config,
     )
     dual_run = args.train_am != "" and args.train_apnet != ""
     resolved_group = base_config.group or env.get("WANDB_RUN_GROUP")
@@ -233,6 +243,7 @@ def train_pairwise_model(
     atom_type_param_model_path="./models/ap_atomTypeParamModel/am_0.pt",
     atom_type_param_model_path2="./models/ap_atomTypeParamModel/am_0.pt",
     data_dir="./data_pairwise",
+    ds_max_size=None,
     n_epochs=50,
     lr=5e-4,
     end_lr=None,
@@ -264,6 +275,11 @@ def train_pairwise_model(
     build_dataset_only=False,
     include_total_mse=False,
     shard_locality_block_shards=0,
+    quadrupole_scale=1.0,
+    elst_include_uQ_QQ=False,
+    parameter_initialization="pytorch",
+    adam_eps=1e-8,
+    checkpoint_metric="component_mse",
     wandb_config=None,
 ):
     # Ensure param_start_mean and param_start_std are lists
@@ -406,6 +422,7 @@ def train_pairwise_model(
             r_cut_im=r_cut_im,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_atomic_batch_size=ds_atomic_batch_size,
             ds_num_devices=1,
@@ -458,6 +475,7 @@ def train_pairwise_model(
             elst_damping_type=elst_damping_type,
             n_params=n_params,
             model_type=DimerProp_model_type,
+            ds_max_size=ds_max_size,
         )
     elif apnet_model_type in ["APNet3-fused", "APNet3-fused-variant"]:
         print("Setting AtomTypeParams...")
@@ -496,6 +514,7 @@ def train_pairwise_model(
             r_cut=r_cut,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_atomic_batch_size=ds_atomic_batch_size,
             ds_num_devices=1,
@@ -549,6 +568,7 @@ def train_pairwise_model(
             r_cut=r_cut,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_atomic_batch_size=ds_atomic_batch_size,
             ds_num_devices=1,
@@ -604,6 +624,7 @@ def train_pairwise_model(
             r_cut=r_cut,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_atomic_batch_size=ds_atomic_batch_size,
             ds_num_devices=1,
@@ -629,6 +650,7 @@ def train_pairwise_model(
             r_cut=r_cut,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_in_memory=ds_in_memory,
             use_GPU=True,
@@ -644,8 +666,12 @@ def train_pairwise_model(
             n_embed=n_embed,
             r_cut=r_cut,
             r_cut_im=r_cut_im,
+            quadrupole_scale=quadrupole_scale,
+            elst_include_uQ_QQ=elst_include_uQ_QQ,
+            parameter_initialization=parameter_initialization,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_atomic_batch_size=ds_atomic_batch_size,
             ds_num_devices=1,
@@ -670,6 +696,8 @@ def train_pairwise_model(
         dataloader_num_workers=4,
         random_seed=random_seed,
         include_total_mse=include_total_mse,
+        adam_eps=adam_eps,
+        checkpoint_metric=checkpoint_metric,
         wandb_config=wandb_config,
     )
     if shard_locality_block_shards:
@@ -702,10 +730,23 @@ def train_pairwise_model(
     return
 
 
-def set_all_seeds(seed=42, cudnn_reproducibility=False):
+def set_all_seeds(seed=42, cudnn_reproducibility=False, deterministic=False):
     """
     Set all relevant random seeds for reproducibility.
+
+    Seeding alone is not enough on CUDA: ``scatter_add_`` in the message passing
+    sums in nondeterministic thread order, and the float32-epsilon divergence is
+    amplified by training. ``deterministic=True`` requests deterministic kernels.
     """
+    if deterministic:
+        # cuBLAS reads this at handle creation, so set it before touching CUDA.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        # Spawned DDP ranks start fresh interpreters; ``tracked_ddp_worker``
+        # re-applies the process-local setting from this inherited marker.
+        os.environ["QCMLFORGE_DETERMINISTIC"] = "1"
+        # warn_only so a missing deterministic kernel warns instead of aborting.
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        cudnn_reproducibility = True
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -806,6 +847,14 @@ def main():
         "--random_seed", type=int, default=0, help="Random seed for initialization"
     )
     args.add_argument(
+        "--deterministic",
+        action="store_true",
+        help=(
+            "Request deterministic CUDA kernels; without them the run-to-run "
+            "spread is comparable to the parity effects being measured"
+        ),
+    )
+    args.add_argument(
         "--spec_type_am",
         type=int,
         default=3,
@@ -839,6 +888,18 @@ def main():
         "--lr", type=float, default=5e-4, help="Learning Rate: (5e-4 is default)"
     )
     args.add_argument(
+        "--adam-eps",
+        type=float,
+        default=1e-8,
+        help="Adam epsilon (PyTorch default: 1e-8; TensorFlow default: 1e-7)",
+    )
+    args.add_argument(
+        "--checkpoint-metric",
+        choices=("component_mse", "total_mae"),
+        default="component_mse",
+        help="Validation metric used to choose the saved APNet2 checkpoint",
+    )
+    args.add_argument(
         "--end_lr",
         type=float,
         default=None,
@@ -867,6 +928,26 @@ def main():
     )
     args.add_argument(
         "--r_cut", type=float, default=5.0, help="specify AP r_cut (default: 5.0)"
+    )
+    args.add_argument(
+        "--quadrupole-scale",
+        type=float,
+        default=1.0,
+        help="Scale APNet2 quadrupoles before classical electrostatics (TF: 1.5)",
+    )
+    args.add_argument(
+        "--elst-include-uQ-QQ",
+        action="store_true",
+        help=(
+            "Include the dipole-quadrupole and quadrupole-quadrupole terms in "
+            "the analytic electrostatics (the published TensorFlow AP-Net2 omits both)"
+        ),
+    )
+    args.add_argument(
+        "--parameter-initialization",
+        choices=("pytorch", "tensorflow"),
+        default="pytorch",
+        help="Parameter initialization policy for newly trained APNet2 pair modules",
     )
     # create args for n_rbf, n_neuron, n_embed
     args.add_argument(
@@ -1049,12 +1130,17 @@ def main():
     args.add_argument("--wandb-job-type", default=None)
     args.add_argument("--wandb-notes", default=None)
     args.add_argument("--wandb-dir", default=None)
+    args.add_argument(
+        "--wandb-run-config",
+        default=None,
+        help="JSON object merged into the W&B run config for provenance",
+    )
     args = args.parse_args()
     # Parse param_start_mean and param_start_std
     args.param_start_mean = parse_param_list(args.param_start_mean)
     args.param_start_std = parse_param_list(args.param_start_std)
     pprint(args)
-    set_all_seeds(args.random_seed)
+    set_all_seeds(args.random_seed, deterministic=args.deterministic)
     atom_wandb_config, pairwise_wandb_config = build_wandb_run_configs(args)
     if args.train_am != "":
         train_atom_model(
@@ -1089,6 +1175,7 @@ def main():
             atom_type_param_model_path=args.atom_type_param_model_path,
             atom_type_param_model_path2=args.atom_type_param_model_path2,
             data_dir=args.data_dir,
+            ds_max_size=args.ds_max_size,
             n_epochs=args.n_epochs,
             lr=args.lr,
             end_lr=args.end_lr,
@@ -1120,6 +1207,11 @@ def main():
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
             shard_locality_block_shards=args.shard_locality_block_shards,
+            quadrupole_scale=args.quadrupole_scale,
+            elst_include_uQ_QQ=args.elst_include_uQ_QQ,
+            parameter_initialization=args.parameter_initialization,
+            adam_eps=args.adam_eps,
+            checkpoint_metric=args.checkpoint_metric,
             wandb_config=pairwise_wandb_config,
         )
     return

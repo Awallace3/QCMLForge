@@ -130,6 +130,11 @@ energies = pair_model.predict_qcel_mols([mol], batch_size=1)
 # Each result is [elst, exch, indu, disp] in kcal/mol.
 ```
 
+`model_id=` selects an ensemble member of the QCMLForge-trained weights. Pass
+`weights="ap2_tf_paper"` alongside it (on `AtomModel`, `APNet2Model`, or the
+`pretrained_models` routes) to use the ensemble published with the AP-Net2
+paper instead; see `docs/apnet2-tensorflow-weights.md`.
+
 ## Key Dependencies
 
 - PyTorch: model implementation and training

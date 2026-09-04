@@ -236,6 +236,66 @@ def test_am_architecture():
         hlist - hidden_list_v=}"
 
 
+def test_edgeless_atoms_are_batch_independent():
+    """An atom with no intramonomer edge must neither move nor shift its batch.
+
+    Filtering edgeless atoms renumbered the message indices while the multipole
+    accumulators did not, and the all-edgeless batch took an early return that
+    skipped the readouts; both made predictions batch-dependent.
+    """
+    torch.manual_seed(4201)
+    atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    atom_model.model.eval()
+
+    (water_alone,) = atom_model.predict_qcel_mols([mol_water], batch_size=1)
+    (ion_alone,) = atom_model.predict_qcel_mols([mon_element], batch_size=1)
+    mixed = atom_model.predict_qcel_mols([mon_element, mol_water], batch_size=2)
+    # Every atom edgeless: the batch shape that used to take the early return.
+    all_edgeless = atom_model.predict_qcel_mols(
+        [mon_element, mon_element], batch_size=2
+    )
+
+    assert torch.as_tensor(ion_alone[0]).shape == (1,)
+    assert torch.as_tensor(ion_alone[1]).shape == (1, 3)
+    for tag, ref, got in (
+        ("water in a mixed batch", water_alone, mixed[1]),
+        ("ion in a mixed batch", ion_alone, mixed[0]),
+        ("ion in an all-edgeless batch", ion_alone, all_edgeless[0]),
+    ):
+        for name, expected, value in zip(
+            ("charge", "dipole", "qpole", "hlist"), ref, got
+        ):
+            assert torch.allclose(
+                torch.as_tensor(expected), torch.as_tensor(value), atol=1e-6
+            ), f"{name} changed for {tag}"
+
+
+@pytest.mark.pretrained_models("am")
+def test_edgeless_atom_multipoles_are_small_readout_biases():
+    """A lone atom's multipoles are the readout biases, not exact zeros.
+
+    Fails if a retrain ever learns biases large enough to be visible physics.
+    """
+    atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
+        ds_root=None,
+        ignore_database_null=True,
+        use_GPU=False,
+    ).set_pretrained_model(model_id=0)
+    atom_model.model.eval()
+
+    charge, dipole, qpole, _ = atom_model.predict_qcel_mols(
+        [mon_element], batch_size=1
+    )[0]
+
+    assert torch.allclose(torch.as_tensor(charge), torch.tensor([1.0]), atol=1e-5)
+    assert torch.as_tensor(dipole).abs().max() < 1e-2
+    assert torch.as_tensor(qpole).abs().max() < 1e-2
+
+
 @pytest.mark.pretrained_models("am")
 def test_am_element():
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(

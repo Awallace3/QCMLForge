@@ -17,7 +17,11 @@ from ..training_tracking import (
     track_pretraining_from_locals,
     tracked_ddp_worker,
 )
-from ..hf_pretrained import resolve_pretrained_path
+from ..hf_pretrained import (
+    DEFAULT_APNET2_WEIGHTS,
+    apnet2_atom_weight_path,
+    resolve_pretrained_path,
+)
 import time
 from ..atomic_datasets import (
     atomic_module_dataset,
@@ -313,7 +317,9 @@ class AtomMPNN(MessagePassing):
         # [edges, 4 * n_embed, n_rbf]
         h_all_dot = torch.einsum("ez,er->ezr", h_all, rbf)
         # [edges, 4 * n_embed * n_rbf]
-        h_all_dot = h_all_dot.view(nedge, -1)
+        # Spell the trailing size out rather than inferring it: a batch with no
+        # edges at all -- a lone ion -- makes ``-1`` ambiguous and raises.
+        h_all_dot = h_all_dot.view(nedge, h_all.size(-1) * rbf.size(-1))
 
         # [edges,  n_embed * 4 * n_rbf + n_embed * 4 + n_rbf]
         m_ij = torch.cat([h_all, h_all_dot, rbf], dim=-1)
@@ -344,54 +350,14 @@ class AtomMPNN(MessagePassing):
         dipole = torch.zeros(natom, 3, dtype=torch.float32, device=Z.device)
         qpole = torch.zeros(natom, 3, 3, dtype=torch.float32, device=Z.device)
 
-        if edge_index.size(1) == 0:
-            # need h_list to have the same number of dimensions as the number of message passing layers
-            h_list = [h_list_0[0] for i in range(self.n_message + 1)]
-            h_list = torch.stack(h_list, dim=1)
-            molecule_ind.requires_grad_(False)
-            molecule_ind = molecule_ind.long()
-            num_mols = natom_per_mol.size(0)
-            total_charge_pred = scatter_sum_compile(
-                charge, molecule_ind, num_mols, reduce="sum"
-            )
-            total_charge_pred = total_charge_pred.squeeze()
-            total_charge_err = total_charge_pred - total_charge
-            charge_err = torch.repeat_interleave(
-                total_charge_err / natom_per_mol.float(), natom_per_mol
-            ).unsqueeze(1)
-            charge = charge - charge_err
-            return charge, dipole, qpole, h_list
+        # Edgeless atoms stay in place: the loop below hands them a zero message,
+        # as TensorFlow AP-Net2 does.  Filtering them renumbered the message
+        # indices while the multipole accumulators kept the original numbering,
+        # and the zero-edge early return skipped the readouts entirely.
+        h_list = [h_list_0[0]]
 
-        # 1) Filter out atoms that don't have edges
-        # Create keep_mask directly from edge_index without using torch.isin
-        # This is more compile-friendly than torch.isin with unbacked symbolic shapes
-        natom = len(molecule_ind)
-        keep_mask = torch.zeros(natom, dtype=torch.bool, device=molecule_ind.device)
-        if edge_index.size(1) > 0:
-            # Mark all atoms that appear in edge_index as True
-            keep_mask.scatter_(0, edge_index[0], True)
-            keep_mask.scatter_(0, edge_index[1], True)
-        filtered_charge = charge[keep_mask]
-
-        # Now `filtered_charge` contains only atoms from molecules that have >= 2 atoms and edges
-        h_list = [h_list_0[0][keep_mask]]
-
-        # Now we need to filter the edge_index to only include edges between
-        # atoms in molecules with >= 2 atoms.
         e_source = edge_index[0]
         e_target = edge_index[1]
-        edge_keep = keep_mask[e_source] & keep_mask[e_target]
-        e_source = e_source[edge_keep]
-        e_target = e_target[edge_keep]
-        idx_map = (
-            torch.cumsum(keep_mask, dim=0) - 1
-        )  # shape [N], each kept atom -> new index
-        idx_map = idx_map.long()  # ensure integer
-        e_source = idx_map[e_source]
-        e_target = idx_map[e_target]
-
-        R = R[keep_mask, :]
-        natom_filtered = R.size(0)
 
         #  [edges]
         dR, dR_xyz = get_distances(R, R, e_source, e_target)
@@ -411,13 +377,13 @@ class AtomMPNN(MessagePassing):
             # [atoms x message_embedding_dim]
             # m_i = unsorted_segment_sum_2d(m_ij, e_source, natom)
             # write unsorted_segment_sum_2d using scatter
-            m_i = scatter_sum_compile(m_ij, e_source, natom_filtered, reduce="sum")
+            m_i = scatter_sum_compile(m_ij, e_source, natom, reduce="sum")
 
             # [atomx x hidden_dim]
             h_next = self.charge_update_layers[i](m_i)
             h_list.append(h_next)
             charge_update = self.charge_readout_layers[i](h_list[i + 1])
-            filtered_charge += charge_update
+            charge = charge + charge_update
 
             #####################
             ### dipole update ###
@@ -470,7 +436,6 @@ class AtomMPNN(MessagePassing):
         ### enforce charge conservation ###
         ###################################
 
-        charge[keep_mask] = filtered_charge
         molecule_ind.requires_grad_(False)
         molecule_ind = molecule_ind.long()
         num_mols = natom_per_mol.size(0)
@@ -485,7 +450,9 @@ class AtomMPNN(MessagePassing):
             total_charge_err / natom_per_mol.float(), natom_per_mol
         ).unsqueeze(1)
         charge = charge - charge_err
-        charge = charge.squeeze()
+        # squeeze(-1), not squeeze(): a one-atom batch would otherwise collapse
+        # to a 0-dim tensor and break the per-molecule slicing downstream.
+        charge = charge.squeeze(-1)
         # changed to dim=0 from dim=1 for usage in Param fitting # AMW 8/20/25
         # Breaks test_apnet2_train_qcel_molecules_in_memory_transfer test,
         # dimensions no longer correct... figure out another way to fix this. reverting back to dim=1 # AMW 9/17/25
@@ -575,7 +542,7 @@ class AtomModel:
         self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             # print(f"Loading pre-trained AtomMPNN model from {pre_trained_model_path}")
-            checkpoint = torch.load(pre_trained_model_path, weights_only=False)
+            checkpoint = torch.load(pre_trained_model_path, weights_only=True)
             self.model = AtomMPNN(
                 n_message=checkpoint["config"]["n_message"],
                 n_rbf=checkpoint["config"]["n_rbf"],
@@ -674,7 +641,9 @@ class AtomModel:
             children=[child],
         )
 
-    def set_pretrained_model(self, model_path=None, model_id=None):
+    def set_pretrained_model(
+        self, model_path=None, model_id=None, weights=DEFAULT_APNET2_WEIGHTS
+    ):
         """
         Load a pretrained model from a checkpoint file.
 
@@ -685,7 +654,13 @@ class AtomModel:
         model_path : str, optional
             Path to a checkpoint file
         model_id : int, optional
-            ID of a bundled pretrained model (0-9)
+            Ensemble member of ``weights`` to load
+        weights : str, optional
+            Named weight set to take ``model_id`` from, one of
+            ``apnet_pt.hf_pretrained.apnet2_weight_sets()``. Defaults to the
+            QCMLForge-trained ensemble; pass ``"ap2_tf_paper"`` for the atom
+            models published with the AP-Net2 paper. Ignored when
+            ``model_path`` is given.
 
         Returns
         -------
@@ -693,7 +668,9 @@ class AtomModel:
             Returns self for method chaining
         """
         if model_id is not None:
-            model_path = resolve_pretrained_path(f"am_ensemble/am_{model_id}.pt")
+            model_path = resolve_pretrained_path(
+                apnet2_atom_weight_path(model_id, weights)
+            )
         elif model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 

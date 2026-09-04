@@ -978,8 +978,6 @@ class AtomTypeParamNN(nn.Module):
         overkill for some properties...
         """
         x = batch.x
-        edge_index = batch.edge_index
-        molecule_ind = batch.molecule_ind
         # current_model_device = next(self.parameters()).device
         # model_device = next(self.atom_model.parameters()).device
         am_out = self.atom_model(batch)
@@ -992,34 +990,20 @@ class AtomTypeParamNN(nn.Module):
         Z = x
         K_list = [self.guess_layer[p](Z) for p in range(self.n_params)]
         K = torch.cat(K_list, dim=-1)  # shape (n_atoms, n_params)
-        # print(f"{K = }")
-        atoms_with_edges = torch.cat([edge_index[0], edge_index[1]]).unique()
-        keep_mask = torch.isin(
-            torch.arange(len(molecule_ind), device=molecule_ind.device),
-            atoms_with_edges,
-        )
-        if not keep_mask.any():
-            return (
-                charge.squeeze(-1),
-                dipole,
-                qpole,
-                *am_out[3:],
-                K.squeeze(-1) if self.n_params == 1 else K,
-            )
-        K_filtered = K[keep_mask]  # shape (n_atoms_filtered, n_params)
+        # h_list carries a row for every atom, including atoms with no
+        # intramonomer edge (monatomic monomers, isolated ions), so the readout
+        # correction applies to all rows of K. This used to filter K down to
+        # edge-bearing atoms to line up with a pre-filtered h_list; AtomMPNN
+        # returns full-length outputs since the edgeless-atom fix.
         n_message_steps = min(self.n_message + 1, h_list.size(1))
+        updates = []
         for p in range(self.n_params):
+            update = K.new_zeros(K.size(0))
             for i in range(n_message_steps):
                 param_update = self.param_readout_layers[p][i](h_list[:, i, :])
-                K_filtered[:, p] += param_update.squeeze(-1)
-        # K[keep_mask] = torch.relu(K_filtered)  # + 1.00001
-        K[keep_mask] = K_filtered  # + 1.00001
-        # if K.isnan().any():
-        #     print("K has NaN values, debugging info:")
-        #     print(f"{K_filtered =}")
-        #     print(f"{Z =}")
-        #     print(f"{h_list=}")
-        #     raise ValueError("K has NaN values")
+                update = update + param_update.squeeze(-1)
+            updates.append(update)
+        K = K + torch.stack(updates, dim=-1)
         return (
             charge,
             dipole,

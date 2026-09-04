@@ -20,6 +20,14 @@ _PRETRAINED_MODEL_GROUPS = {
         *[f"am_ensemble/am_{index}.pt" for index in range(5)],
         *[f"ap2_ensemble/ap2_{index}.pt" for index in range(5)],
     ],
+    "ap2_tf_paper": [
+        "ap2_tf_paper/atom_models/atom0.pt",
+        "ap2_tf_paper/pair_models/pair0.pt",
+    ],
+    "ap2_tf_paper_ensemble": [
+        *[f"ap2_tf_paper/atom_models/atom{index}.pt" for index in range(5)],
+        *[f"ap2_tf_paper/pair_models/pair{index}.pt" for index in range(5)],
+    ],
     "ap2_fused_ensemble": [
         "ap2-fused_ensemble/ap2_1.pt",
         "ap2-fused_ensemble/ap2_2.pt",
