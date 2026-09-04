@@ -28,6 +28,7 @@ checkpoint = {
 }
 """
 
+import json
 import os
 import warnings
 from datetime import datetime
@@ -639,3 +640,83 @@ def load_train_state(
         )
 
     return int(payload["epochs_completed"]), float(payload["lowest_test_loss"])
+
+
+# ---------------------------------------------------------------------------
+# Best-MAE sidecar
+#
+# The primary checkpoint is starred on validation MSE, but every table these
+# models are read in -- the S66x8 gate, the per-component breakdowns -- is in
+# MAE, and the two selectors disagree often enough to matter. The l<=2 exchange
+# arm last starred epoch 3 of 11 while validation exchange kept improving
+# through epoch 10; with no sidecar configured those weights were unrecoverable.
+# This preserves the best-MAE epoch *beside* the primary artifact instead of
+# displacing it.
+BEST_MAE_SELECTOR = "val_total_MAE"
+
+
+def best_mae_sidecar_paths(model_save_path: str) -> tuple[str, str]:
+    """Checkpoint and record paths for the MAE-selected sidecar."""
+    base, _ = os.path.splitext(model_save_path)
+    return base + ".best-mae.pt", base + ".best-mae.json"
+
+
+def best_mae_sidecar_floor(model_save_path: str | None) -> float:
+    """Best validation MAE a previous chunk already banked at this path.
+
+    Long trainings run as a chain of warm-started chunks, and each chunk seeds
+    its selector from its own fresh pre-training eval. Without this floor a
+    later chunk would overwrite an earlier chunk's sidecar with a worse epoch,
+    because it only ever compares against where it happened to start. A
+    missing, unreadable, or foreign record returns ``inf``, which is exactly the
+    single-run behaviour.
+    """
+    if not model_save_path:
+        return float("inf")
+    checkpoint_path, record_path = best_mae_sidecar_paths(model_save_path)
+    if not os.path.exists(checkpoint_path):
+        return float("inf")
+    try:
+        with open(record_path) as f:
+            record = json.load(f)
+        if record.get("model_save_path") != model_save_path:
+            return float("inf")
+        return float(record[BEST_MAE_SELECTOR])
+    except (OSError, ValueError, TypeError, KeyError):
+        return float("inf")
+
+
+def save_best_mae_record(
+    path: str,
+    *,
+    model_save_path: str,
+    checkpoint: str,
+    val_total_MAE: float,
+    component_MAE: list[float],
+    epoch: int,
+) -> None:
+    """Write the sidecar's record file.
+
+    ``epoch`` is the *global* epoch counter the trainer is iterating, not a
+    chunk-local index: a chunk-local one cannot be compared across the chain,
+    which is a defect the earlier sidecar shipped with.
+
+    The caller must write the checkpoint first. A torn write then leaves the
+    floor pointing at the older, fully-written pair rather than at a fragment.
+    """
+    payload = {
+        "model_save_path": model_save_path,
+        "checkpoint": checkpoint,
+        "selector": BEST_MAE_SELECTOR,
+        BEST_MAE_SELECTOR: float(val_total_MAE),
+        "component_MAE": [float(v) for v in component_MAE],
+        "epoch": int(epoch),
+        "epoch_is_global": True,
+        "apnet_version": __version__,
+        "save_date": datetime.now().isoformat(),
+    }
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)

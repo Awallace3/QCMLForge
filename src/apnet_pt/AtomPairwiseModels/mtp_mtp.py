@@ -7560,6 +7560,65 @@ class AM_DimerParam_Model:
         )
         model_io.save_checkpoint(checkpoint, path)
 
+    def _save_best_mae_sidecar(
+        self,
+        val_total_MAE: float,
+        component_MAE: list[float],
+        epoch: int,
+        world_size: int,
+        rank_device,
+    ) -> None:
+        """Write the MAE-selected sidecar beside the primary checkpoint.
+
+        Deliberately additive: this touches neither ``best_model``,
+        ``self.model``'s weights, ``lowest_test_loss``, the primary checkpoint,
+        nor the optimizer trajectory, so a run with this code produces a
+        bit-identical primary artifact to one without it. The only thing it
+        borrows from the best-model branch is how the CPU copy is taken --
+        under DDP the live parameter storages must not be relocated, because
+        the reducer holds bucket views into them.
+        """
+        checkpoint_path, record_path = model_io.best_mae_sidecar_paths(
+            self.model_save_path
+        )
+        if world_size > 1:
+            cpu_model, cpu_atom_model = deepcopy(
+                (
+                    model_io.unwrap_model(self.model),
+                    model_io.unwrap_model(self.atom_model),
+                )
+            )
+            cpu_model = cpu_model.to("cpu")
+            cpu_atom_model = cpu_atom_model.to("cpu")
+        else:
+            cpu_model = model_io.unwrap_model(self.model).to("cpu")
+            cpu_atom_model = model_io.unwrap_model(self.atom_model).to("cpu")
+        try:
+            checkpoint = self._create_checkpoint(
+                model=cpu_model,
+                atom_model=cpu_atom_model,
+                embed_atom_model=True,
+                metadata={
+                    "selector": model_io.BEST_MAE_SELECTOR,
+                    model_io.BEST_MAE_SELECTOR: float(val_total_MAE),
+                    "component_MAE": [float(v) for v in component_MAE],
+                    "epoch": int(epoch),
+                    "epoch_is_global": True,
+                },
+            )
+            model_io.save_checkpoint(checkpoint, checkpoint_path)
+        finally:
+            if world_size == 1:
+                self.model.to(rank_device)
+        model_io.save_best_mae_record(
+            record_path,
+            model_save_path=self.model_save_path,
+            checkpoint=checkpoint_path,
+            val_total_MAE=val_total_MAE,
+            component_MAE=component_MAE,
+            epoch=epoch,
+        )
+
     def _qcel_example_input(
         self,
         mols,
@@ -8996,6 +9055,12 @@ units angstrom
         # )
         # lowest_test_loss = test_loss
         lowest_test_loss = float("inf")
+        # Seeded from the record a previous chunk left, not from +inf: a chunk
+        # that starts worse than where the chain already is must not overwrite
+        # the banked best-MAE weights with its own first epoch.
+        lowest_val_total_MAE = model_io.best_mae_sidecar_floor(
+            self.model_save_path
+        )
         # cpu_model = self.model.to("cpu")
         # self.model.to(rank_device)
 
@@ -9187,6 +9252,29 @@ units angstrom
                     model_io.save_checkpoint(checkpoint, self.model_save_path)
                 if world_size == 1:
                     self.model.to(rank_device)
+
+            # Best-MAE sidecar, additive and strictly downstream of the primary
+            # save above. `test_loss` is a component MSE, but the S66x8 gate and
+            # every per-component table read this model in MAE, and the two
+            # selectors disagree: the l<=2 exchange arm last starred epoch 3 of
+            # 11 while validation exchange kept improving through epoch 10, and
+            # without this those weights were gone. `total_MAE_v` is already
+            # global under DDP, so every rank agrees on the best epoch and only
+            # the primary writes.
+            component_MAE_v = torch.atleast_1d(
+                total_MAE_v.detach().reshape(-1)
+            ).tolist()
+            val_total_MAE = float(sum(component_MAE_v))
+            if val_total_MAE < lowest_val_total_MAE:
+                lowest_val_total_MAE = val_total_MAE
+                if self.model_save_path and is_primary:
+                    self._save_best_mae_sidecar(
+                        val_total_MAE=val_total_MAE,
+                        component_MAE=component_MAE_v,
+                        epoch=epoch,
+                        world_size=world_size,
+                        rank_device=rank_device,
+                    )
 
             # Written every epoch, improvement or not, and atomically: this is
             # the only thing standing between a preemption and re-running every
