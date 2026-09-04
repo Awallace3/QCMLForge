@@ -1201,6 +1201,12 @@ class APNet3D3_AtomType_Model:
             print("running on the CPU")
         self.device = device
         self.ds_spec_type = ds_spec_type
+        # Historical internal training helpers may be invoked directly before
+        # ``train()`` resolves an experimental loss configuration.
+        self.loss_mode = "mse"
+        self.huber_delta = 1.0
+        self.closest_contact_bin_edges = ()
+        self.closest_contact_bin_counts = ()
         self.atom_type_model = AtomTypeParamModel()
         self.dimer_prop_model = DimerProp(ATParam=self.atom_type_model.model)
         self.am_dimer_param_model = am_dimer_param_model
