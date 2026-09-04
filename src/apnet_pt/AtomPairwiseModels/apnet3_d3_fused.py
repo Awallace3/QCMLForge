@@ -306,6 +306,7 @@ READOUT_DECAY_MODES = (
     "legacy-r3",
     "exchange-overlap",
     "exchange-overlap-induction-r6",
+    "exchange-hybrid-r3-overlap",
 )
 
 
@@ -316,6 +317,8 @@ def build_readout_decay(
     exchange_overlap: torch.Tensor | None = None,
     exchange_scale: float = 1.0,
     induction_scale: float = 1.0,
+    hybrid_start: float = 2.5,
+    hybrid_end: float = 3.5,
 ) -> torch.Tensor:
     """Build per-edge, per-component AP3D3 readout envelopes.
 
@@ -333,6 +336,13 @@ def build_readout_decay(
         raise ValueError("readout exchange scale must be finite and > 0")
     if not np.isfinite(induction_scale) or induction_scale <= 0:
         raise ValueError("readout induction scale must be finite and > 0")
+    if (
+        not np.isfinite(hybrid_start)
+        or not np.isfinite(hybrid_end)
+        or hybrid_start <= 0
+        or hybrid_end <= hybrid_start
+    ):
+        raise ValueError("hybrid bounds must be finite and satisfy 0 < start < end")
 
     inverse_cube = distances.reciprocal().pow(3)
     decay = inverse_cube.unsqueeze(-1).expand(-1, n_components).clone()
@@ -341,7 +351,15 @@ def build_readout_decay(
     if exchange_overlap is None or exchange_overlap.shape != distances.shape:
         raise ValueError("exchange_overlap must match distances for overlap decay modes")
 
-    decay[:, 1] = exchange_scale * exchange_overlap
+    overlap_decay = exchange_scale * exchange_overlap
+    if mode == "exchange-hybrid-r3-overlap":
+        transition = ((distances - hybrid_start) / (hybrid_end - hybrid_start)).clamp(
+            0.0, 1.0
+        )
+        smoothstep = transition.square() * (3.0 - 2.0 * transition)
+        decay[:, 1] = torch.lerp(inverse_cube, overlap_decay, smoothstep)
+    else:
+        decay[:, 1] = overlap_decay
     if mode == "exchange-overlap-induction-r6":
         decay[:, 2] = induction_scale * distances.reciprocal().pow(6)
     return decay
@@ -491,6 +509,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         readout_decay_mode="legacy-r3",
         readout_exchange_scale=1.0,
         readout_induction_scale=1.0,
+        readout_hybrid_start=2.5,
+        readout_hybrid_end=3.5,
     ):
         super().__init__()
         self.dimer_prop_model = dimer_prop_model
@@ -517,9 +537,20 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             raise ValueError("readout exchange scale must be finite and > 0")
         if not np.isfinite(readout_induction_scale) or readout_induction_scale <= 0:
             raise ValueError("readout induction scale must be finite and > 0")
+        if (
+            not np.isfinite(readout_hybrid_start)
+            or not np.isfinite(readout_hybrid_end)
+            or readout_hybrid_start <= 0
+            or readout_hybrid_end <= readout_hybrid_start
+        ):
+            raise ValueError(
+                "readout hybrid bounds must satisfy 0 < start < end"
+            )
         self.readout_decay_mode = readout_decay_mode
         self.readout_exchange_scale = float(readout_exchange_scale)
         self.readout_induction_scale = float(readout_induction_scale)
+        self.readout_hybrid_start = float(readout_hybrid_start)
+        self.readout_hybrid_end = float(readout_hybrid_end)
 
         if self.freeze_dimer_prop_model:
             if self.dimer_prop_model is not None:
@@ -622,6 +653,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             "readout_decay_mode": self.readout_decay_mode,
             "readout_exchange_scale": self.readout_exchange_scale,
             "readout_induction_scale": self.readout_induction_scale,
+            "readout_hybrid_start": self.readout_hybrid_start,
+            "readout_hybrid_end": self.readout_hybrid_end,
         }
 
     def get_model_info(self):
@@ -936,6 +969,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             exchange_overlap=exchange_overlap,
             exchange_scale=self.readout_exchange_scale,
             induction_scale=self.readout_induction_scale,
+            hybrid_start=self.readout_hybrid_start,
+            hybrid_end=self.readout_hybrid_end,
         )
         E_sr *= cutoff
         E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
@@ -1146,6 +1181,8 @@ class APNet3D3_AtomType_Model:
         readout_decay_mode="legacy-r3",
         readout_exchange_scale=1.0,
         readout_induction_scale=1.0,
+        readout_hybrid_start=2.5,
+        readout_hybrid_end=3.5,
     ):
         """
         the path and all other parameters will be ignored except for dataset.
@@ -1286,6 +1323,8 @@ class APNet3D3_AtomType_Model:
                 readout_decay_mode=config.get("readout_decay_mode", "legacy-r3"),
                 readout_exchange_scale=config.get("readout_exchange_scale", 1.0),
                 readout_induction_scale=config.get("readout_induction_scale", 1.0),
+                readout_hybrid_start=config.get("readout_hybrid_start", 2.5),
+                readout_hybrid_end=config.get("readout_hybrid_end", 3.5),
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)
@@ -1313,6 +1352,8 @@ class APNet3D3_AtomType_Model:
                 readout_decay_mode=readout_decay_mode,
                 readout_exchange_scale=readout_exchange_scale,
                 readout_induction_scale=readout_induction_scale,
+                readout_hybrid_start=readout_hybrid_start,
+                readout_hybrid_end=readout_hybrid_end,
             )
         self.use_precomputed_classical = use_precomputed_classical
         self.d3_damping_parameters = deepcopy(resolved_d3_damping_parameters)

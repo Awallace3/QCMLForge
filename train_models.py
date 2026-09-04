@@ -440,6 +440,8 @@ def train_pairwise_model(
     readout_decay_mode="legacy-r3",
     readout_exchange_scale=1.0,
     readout_induction_scale=1.0,
+    readout_hybrid_start=2.5,
+    readout_hybrid_end=3.5,
     freeze_dimer_prop_model=True,
     freeze_atom_model=True,
     build_dataset_only=False,
@@ -520,6 +522,8 @@ def train_pairwise_model(
         readout_decay_mode (str): APNet3-fused-d3 readout envelope. legacy-r3 preserves the shared inverse cube; exchange-overlap uses the physical Slater overlap for exchange; exchange-overlap-induction-r6 additionally uses inverse-sixth induction.
         readout_exchange_scale (float): Fixed positive scale applied to the Slater exchange envelope.
         readout_induction_scale (float): Fixed positive scale applied to the inverse-sixth induction envelope.
+        readout_hybrid_start (float): Distance below which hybrid exchange uses exactly legacy inverse-cube decay.
+        readout_hybrid_end (float): Distance above which hybrid exchange uses exactly Slater-overlap decay.
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
         include_total_mse (bool): If true, add a matching total-energy term to the component loss. Historical MSE behavior is unchanged; Huber modes add total Huber. On a CLIFF route it is instead shorthand for component_gamma=0.5 and cannot be combined with an explicit component_gamma.
     loss_mode (str): APNet3-fused-d3 component objective: mse, huber, or closest-contact-macro-huber.
@@ -1148,6 +1152,8 @@ def train_pairwise_model(
             readout_decay_mode=readout_decay_mode,
             readout_exchange_scale=readout_exchange_scale,
             readout_induction_scale=readout_induction_scale,
+            readout_hybrid_start=readout_hybrid_start,
+            readout_hybrid_end=readout_hybrid_end,
         )
         if ap2_pretrained_model_only is not None:
             print(f"Loading AP2 pretrained weights from {ap2_pretrained_model_only}")
@@ -2022,7 +2028,9 @@ def main():
         help=(
             "APNet3-fused-d3 readout envelope. 'legacy-r3' preserves current "
             "behavior; 'exchange-overlap' changes exchange only; "
-            "'exchange-overlap-induction-r6' additionally changes induction."
+            "'exchange-overlap-induction-r6' additionally changes induction; "
+            "'exchange-hybrid-r3-overlap' smoothly joins legacy short range "
+            "to the Slater-overlap tail."
         ),
     )
     args.add_argument(
@@ -2036,6 +2044,18 @@ def main():
         type=float,
         default=1.0,
         help="Fixed positive scale on the inverse-sixth induction envelope (default: 1).",
+    )
+    args.add_argument(
+        "--readout_hybrid_start",
+        type=float,
+        default=2.5,
+        help="Hybrid mode: legacy exchange below this distance in Angstrom (default: 2.5).",
+    )
+    args.add_argument(
+        "--readout_hybrid_end",
+        type=float,
+        default=3.5,
+        help="Hybrid mode: overlap exchange above this distance in Angstrom (default: 3.5).",
     )
     args.add_argument(
         "--loss-mode",
@@ -2270,6 +2290,8 @@ def main():
             readout_decay_mode=args.readout_decay_mode,
             readout_exchange_scale=args.readout_exchange_scale,
             readout_induction_scale=args.readout_induction_scale,
+            readout_hybrid_start=args.readout_hybrid_start,
+            readout_hybrid_end=args.readout_hybrid_end,
             freeze_dimer_prop_model=not args.unfreeze_dimer_prop_model,
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,

@@ -192,6 +192,28 @@ def test_exchange_overlap_induction_r6_has_locked_asymptotics():
     assert decay[1, 3] / decay[0, 3] == pytest.approx((3.0 / 6.0) ** 3)
 
 
+def test_hybrid_readout_preserves_short_range_and_overlap_tail():
+    distances = torch.tensor([2.0, 2.5, 3.0, 3.5, 4.0])
+    overlap = torch.tensor([0.8, 0.7, 0.6, 0.5, 0.4])
+    legacy = build_readout_decay(distances, 3)
+    decay = build_readout_decay(
+        distances,
+        3,
+        mode="exchange-hybrid-r3-overlap",
+        exchange_overlap=overlap,
+        exchange_scale=2.0,
+        hybrid_start=2.5,
+        hybrid_end=3.5,
+    )
+
+    torch.testing.assert_close(decay[:, [0, 2]], legacy[:, [0, 2]])
+    torch.testing.assert_close(decay[:2, 1], legacy[:2, 1])
+    torch.testing.assert_close(decay[3:, 1], 2.0 * overlap[3:])
+    torch.testing.assert_close(
+        decay[2, 1], 0.5 * (legacy[2, 1] + 2.0 * overlap[2])
+    )
+
+
 def test_readout_decay_rejects_invalid_configuration():
     with pytest.raises(ValueError, match="mode"):
         build_readout_decay(torch.tensor([3.0]), 3, mode="unknown")
@@ -201,6 +223,13 @@ def test_readout_decay_rejects_invalid_configuration():
         build_readout_decay(torch.tensor([3.0]), 3, mode="exchange-overlap")
     with pytest.raises(ValueError, match="exchange scale"):
         build_readout_decay(torch.tensor([3.0]), 3, exchange_scale=0.0)
+    with pytest.raises(ValueError, match="hybrid bounds"):
+        build_readout_decay(
+            torch.tensor([3.0]),
+            3,
+            hybrid_start=3.5,
+            hybrid_end=2.5,
+        )
 
 
 def test_component_loss_default_preserves_historical_mse_exactly():
