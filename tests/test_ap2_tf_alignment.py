@@ -8,6 +8,7 @@ from apnet_pt.AtomModels.ap2_atom_model import AtomMPNN
 from apnet_pt.AtomPairwiseModels.apnet2 import APNet2_MPNN
 from apnet_pt.AtomPairwiseModels.apnet2_fused import APNet2_AM_MPNN
 from apnet_pt.AtomPairwiseModels.apnet2_parity import checkpoint_score
+from apnet_pt.training_tracking import tracked_ddp_worker
 
 
 @pytest.mark.parametrize(
@@ -150,6 +151,8 @@ def test_seeded_loader_generator_makes_batch_order_independent_of_init_policy():
 def test_set_all_seeds_can_request_deterministic_algorithms():
     import train_models
 
+    env_names = ("CUBLAS_WORKSPACE_CONFIG", "QCMLFORGE_DETERMINISTIC")
+    previous_env = {name: os.environ.get(name) for name in env_names}
     previously_enabled = torch.are_deterministic_algorithms_enabled()
     try:
         train_models.set_all_seeds(4201, deterministic=False)
@@ -158,8 +161,33 @@ def test_set_all_seeds_can_request_deterministic_algorithms():
         train_models.set_all_seeds(4201, deterministic=True)
         assert torch.are_deterministic_algorithms_enabled() is True
         assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+        assert os.environ["QCMLFORGE_DETERMINISTIC"] == "1"
     finally:
         torch.use_deterministic_algorithms(previously_enabled)
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_ddp_worker_enables_requested_deterministic_algorithms():
+    class DeterminismProbe:
+        def run(self, rank):
+            return rank, torch.are_deterministic_algorithms_enabled()
+
+    previous_env = os.environ.get("QCMLFORGE_DETERMINISTIC")
+    previously_enabled = torch.are_deterministic_algorithms_enabled()
+    try:
+        os.environ["QCMLFORGE_DETERMINISTIC"] = "1"
+        torch.use_deterministic_algorithms(False)
+        assert tracked_ddp_worker(3, DeterminismProbe().run) == (3, True)
+    finally:
+        torch.use_deterministic_algorithms(previously_enabled)
+        if previous_env is None:
+            os.environ.pop("QCMLFORGE_DETERMINISTIC", None)
+        else:
+            os.environ["QCMLFORGE_DETERMINISTIC"] = previous_env
 
 
 @pytest.mark.parametrize("saved_scale", [1.0, 1.5])

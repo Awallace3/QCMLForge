@@ -3,7 +3,7 @@
   "device": "cpu",
   "dimers": {
     "count": 26,
-    "npz": "/storage/scratch1/3/awallace43/ap2-fixture/parity_dimers.npz",
+    "npz": "parity_dimers.npz",
     "sha256": "1b5a91543b16f733a372b5f18ff38188de82cc80613c7f87761f9bbb469c7e85"
   },
   "max_angstrom_round_trip_error": 1.7763568394002505e-15,
@@ -17,7 +17,7 @@
         "r_cut": 5.0
       },
       "saved_model_pb_sha256": "a04d250c4bf00fe591f63bbb8a91160fff41937d6b1ad85578a931f1f63a509b",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom0"
+      "savedmodel_dir": "atom_models/atom0"
     },
     "atom1": {
       "config": {
@@ -28,7 +28,7 @@
         "r_cut": 5.0
       },
       "saved_model_pb_sha256": "a9ed335518c9d8e186f90ded7070d47c3f0dd7c27ee8d10beca8118869db9cbc",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom1"
+      "savedmodel_dir": "atom_models/atom1"
     },
     "atom2": {
       "config": {
@@ -39,7 +39,7 @@
         "r_cut": 5.0
       },
       "saved_model_pb_sha256": "fc84020ce5542a88c2d6cf18f79be89a20dc600bf2b2c01d47c17c054d9cc562",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom2"
+      "savedmodel_dir": "atom_models/atom2"
     },
     "atom3": {
       "config": {
@@ -50,7 +50,7 @@
         "r_cut": 5.0
       },
       "saved_model_pb_sha256": "ec3ea3df358942e8428619bb8f3448b27bd734bbbb1d586ca3ec2b73db0cd9ee",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom3"
+      "savedmodel_dir": "atom_models/atom3"
     },
     "atom4": {
       "config": {
@@ -61,7 +61,7 @@
         "r_cut": 5.0
       },
       "saved_model_pb_sha256": "fde5a6082a2a6e8b804dd494ad62222c44dd7215c2de96d98ee300bd3b0e2430",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/atom_models/atom4"
+      "savedmodel_dir": "atom_models/atom4"
     },
     "pair0": {
       "config": {
@@ -83,7 +83,7 @@
         "r_cut_im": 8.0
       },
       "saved_model_pb_sha256": "f997b02b4a20240294150edf92b66ddae1ff766fd398fc516e1eedaa8ad202ce",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair0"
+      "savedmodel_dir": "pair_models/pair0"
     },
     "pair1": {
       "config": {
@@ -105,7 +105,7 @@
         "r_cut_im": 8.0
       },
       "saved_model_pb_sha256": "5b5e24b2e7b4ccfad100bfdbf395ca6ea7cc2d862a21ee3549bd058beda11879",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair1"
+      "savedmodel_dir": "pair_models/pair1"
     },
     "pair2": {
       "config": {
@@ -127,7 +127,7 @@
         "r_cut_im": 8.0
       },
       "saved_model_pb_sha256": "4a7b87b03322354ed1f7e63948584a78c6c06cd2efcf9d1fe150bfea756cd975",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair2"
+      "savedmodel_dir": "pair_models/pair2"
     },
     "pair3": {
       "config": {
@@ -149,7 +149,7 @@
         "r_cut_im": 8.0
       },
       "saved_model_pb_sha256": "13733f0d7c43c650b9bb05ab704a6d488b51988682c1040977ed848be2de4fff",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair3"
+      "savedmodel_dir": "pair_models/pair3"
     },
     "pair4": {
       "config": {
@@ -171,12 +171,12 @@
         "r_cut_im": 8.0
       },
       "saved_model_pb_sha256": "4ab01c4c25edc562ac88db4a910bcaf51813f3073f57b1a122a5571eaba9d8ee",
-      "savedmodel_dir": "/storage/project/r-cs207-0/awallace43/gits/apnet/apnet/pair_models/pair4"
+      "savedmodel_dir": "pair_models/pair4"
     }
   },
   "outputs": {
     "npz": {
-      "path": "/storage/home/hcoda1/3/awallace43/scratch/ap2-fixture/tf_reference.npz",
+      "path": "tf_reference.npz",
       "sha256": "70ec7eac2eb7d6a254c04676de77109d953e696ce557a9418d7e4ffeb69198ca"
     }
   },

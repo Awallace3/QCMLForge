@@ -261,7 +261,10 @@ def load_checkpoint(
     """
     if map_location is None:
         map_location = "cpu"
-    return torch.load(path, map_location=map_location, weights_only=False)
+    with torch.serialization.safe_globals(
+        [torch.nn.parameter.UninitializedParameter]
+    ):
+        return torch.load(path, map_location=map_location, weights_only=True)
 
 
 def load_state_dict_from_checkpoint(

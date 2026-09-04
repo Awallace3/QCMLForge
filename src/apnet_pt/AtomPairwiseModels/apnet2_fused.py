@@ -818,7 +818,7 @@ class APNet2_AM_Model:
                 f"Loading pre-trained AtomMPNN model from {atom_model_pre_trained_path}"
             )
             checkpoint = torch.load(
-                atom_model_pre_trained_path, map_location=device, weights_only=False
+                atom_model_pre_trained_path, map_location=device, weights_only=True
             )
             self.atom_model = AtomMPNN(
                 n_message=checkpoint["config"]["n_message"],
@@ -848,7 +848,10 @@ class APNet2_AM_Model:
             print(
                 f"Loading pre-trained APNet2_MPNN model from {pre_trained_model_path}"
             )
-            checkpoint = torch.load(pre_trained_model_path, weights_only=False)
+            with torch.serialization.safe_globals(
+                [torch.nn.parameter.UninitializedParameter]
+            ):
+                checkpoint = torch.load(pre_trained_model_path, weights_only=True)
             # The pairwise state dict carries the atom_model.* weights, so the
             # embedded submodel config decides that architecture. Rebuilding
             # from it avoids atom_model.* shape mismatches when the checkpoint
@@ -1083,12 +1086,12 @@ class APNet2_AM_Model:
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 
-        # ``weights_only=False`` to match the constructor's loader above.
-        # torch 2.6 flipped the default, and the fused pair module keeps an
-        # ``APNetLazyLinear`` whose parameter is an ``UninitializedParameter``
-        # until the first forward pass, which the weights-only unpickler
-        # rejects outright.
-        checkpoint = torch.load(ap2_model_path, weights_only=False)
+        # Fused checkpoints contain one lazy ``UninitializedParameter``. It is
+        # safe-listed explicitly while arbitrary pickle globals remain blocked.
+        with torch.serialization.safe_globals(
+            [torch.nn.parameter.UninitializedParameter]
+        ):
+            checkpoint = torch.load(ap2_model_path, weights_only=True)
         if "_orig_mod" not in list(self.model.state_dict().keys())[0]:
             model_state_dict = {
                 k.replace("_orig_mod.", ""): v

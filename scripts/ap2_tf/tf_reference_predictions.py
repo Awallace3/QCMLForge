@@ -158,7 +158,7 @@ def main():
         ).astype(np.float64)
 
         model_provenance["atom%d" % index] = {
-            "savedmodel_dir": atom_dir,
+            "savedmodel_dir": os.path.relpath(atom_dir, savedmodel_root),
             "saved_model_pb_sha256": sha256_file(os.path.join(atom_dir, "saved_model.pb")),
             "config": {
                 k: (float(v) if isinstance(v, float) else v)
@@ -166,7 +166,7 @@ def main():
             },
         }
         model_provenance["pair%d" % index] = {
-            "savedmodel_dir": pair_dir,
+            "savedmodel_dir": os.path.relpath(pair_dir, savedmodel_root),
             "saved_model_pb_sha256": sha256_file(os.path.join(pair_dir, "saved_model.pb")),
             "config": {
                 k: (float(v) if isinstance(v, float) else v)
@@ -195,7 +195,7 @@ def main():
 
     manifest = {
         "dimers": {
-            "npz": os.path.realpath(args.dimers_npz),
+            "npz": os.path.basename(args.dimers_npz),
             "sha256": sha256_file(args.dimers_npz),
             "count": len(records),
         },
@@ -210,7 +210,12 @@ def main():
         },
         "source_repo": git_provenance(apnet_dir),
         "models": model_provenance,
-        "outputs": {"npz": {"path": str(args.out_npz), "sha256": sha256_file(args.out_npz)}},
+        "outputs": {
+            "npz": {
+                "path": os.path.basename(args.out_npz),
+                "sha256": sha256_file(args.out_npz),
+            }
+        },
     }
     if labels is not None:
         manifest["reference_total_mae_vs_labels"] = {

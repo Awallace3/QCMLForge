@@ -19,7 +19,7 @@ from ..training_tracking import (
 )
 from ..hf_pretrained import (
     DEFAULT_APNET2_WEIGHTS,
-    apnet2_weight_paths,
+    apnet2_atom_weight_path,
     resolve_pretrained_path,
 )
 import time
@@ -560,7 +560,7 @@ class AtomModel:
         self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             # print(f"Loading pre-trained AtomMPNN model from {pre_trained_model_path}")
-            checkpoint = torch.load(pre_trained_model_path, weights_only=False)
+            checkpoint = torch.load(pre_trained_model_path, weights_only=True)
             self.model = AtomMPNN(
                 n_message=checkpoint["config"]["n_message"],
                 n_rbf=checkpoint["config"]["n_rbf"],
@@ -687,7 +687,7 @@ class AtomModel:
         """
         if model_id is not None:
             model_path = resolve_pretrained_path(
-                apnet2_weight_paths(model_id, weights)["atom"]
+                apnet2_atom_weight_path(model_id, weights)
             )
         elif model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")

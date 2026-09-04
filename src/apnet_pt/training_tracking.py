@@ -67,7 +67,8 @@ class WandbConfig:
             raise ValueError("W&B job_type must not be empty")
         if not isinstance(self.run_config, Mapping):
             raise TypeError("W&B run_config must be a mapping")
-        _ensure_json_serializable(dict(self.run_config))
+        run_config = _ensure_json_serializable(dict(self.run_config))
+        object.__setattr__(self, "run_config", run_config)
 
     def resolved(
         self,
@@ -780,6 +781,16 @@ def configure_distributed_tracking(
 def tracked_ddp_worker(rank: int, ddp_callable: Callable[..., Any], *args: Any) -> Any:
     """Run one internal-spawn DDP rank with global-rank-zero tracking ownership."""
 
+    if os.getenv("QCMLFORGE_DETERMINISTIC", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }:
+        import torch
+
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
     harness = ddp_callable.__self__
     descriptor = getattr(harness, "_distributed_tracking_descriptor", None)
     if descriptor is None:
@@ -1449,8 +1460,9 @@ def _validated_aliases(aliases: Sequence[str]) -> tuple[str, ...]:
     return clean
 
 
-def _ensure_json_serializable(value: Any) -> None:
+def _ensure_json_serializable(value: Any) -> Any:
     try:
         json.dumps(value)
     except (TypeError, ValueError) as exc:
         raise TypeError("Tracking configuration must be JSON-serializable") from exc
+    return value

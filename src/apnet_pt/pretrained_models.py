@@ -179,14 +179,15 @@ def atom_model_predict(
     am = AtomModels.ap2_atom_model.AtomModel(
         pre_trained_model_path=model_paths[atom_rel_paths[0]],
     )
-    if compile:
-        print("Compiling models...")
-        am.compile_model()
     models = [copy.deepcopy(am) for _ in range(num_models)]
     for i in range(1, num_models):
         models[i].set_pretrained_model(
             model_path=model_paths[atom_rel_paths[i]],
         )
+    if compile:
+        print("Compiling models...")
+        for model in models:
+            model.compile_model()
     print("Processing mols...")
     data = [
         atomic_datasets.qcel_mon_to_pyg_data(mol, r_cut=am.model.r_cut) for mol in mols
@@ -283,9 +284,6 @@ def apnet2_model_predict(
             pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
             atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
         )
-    if compile:
-        print("Compiling models...")
-        ap2.compile_model()
     models = [copy.deepcopy(ap2) for _ in range(num_models)]
     for i in range(additional_models_start, num_models):
         if ap2_fused:
@@ -297,6 +295,10 @@ def apnet2_model_predict(
                 ap2_model_path=model_paths[rel_paths[i]["pair"]],
                 am_model_path=model_paths[rel_paths[i]["atom"]],
             )
+    if compile:
+        print("Compiling models...")
+        for model in models:
+            model.compile_model()
     pred_IEs = np.zeros((len(mols), 5))
     print("Processing mols...")
     for i in range(num_models):
@@ -390,9 +392,6 @@ def apnet2_model_predict_pairs(
             pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
             atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
         )
-    if compile:
-        print("Compiling models...")
-        ap2.compile_model()
     models = [copy.deepcopy(ap2) for _ in range(num_models)]
     for i in range(additional_models_start, num_models):
         if ap2_fused:
@@ -404,6 +403,10 @@ def apnet2_model_predict_pairs(
                 ap2_model_path=model_paths[rel_paths[i]["pair"]],
                 am_model_path=model_paths[rel_paths[i]["atom"]],
             )
+    if compile:
+        print("Compiling models...")
+        for model in models:
+            model.compile_model()
     pred_IEs = np.zeros((len(mols), 5))
     print("Processing mols...")
     IEs, pairwise_energies = models[0].predict_qcel_mols(

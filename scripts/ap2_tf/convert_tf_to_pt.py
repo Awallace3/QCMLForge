@@ -209,6 +209,14 @@ def main():
             % (args.kind, expected, len(entries))
         )
 
+    expected_npz_sha256 = manifest.get("npz_sha256")
+    actual_npz_sha256 = sha256_file(args.npz)
+    if expected_npz_sha256 != actual_npz_sha256:
+        raise SystemExit(
+            "NPZ does not match manifest: expected %s, got %s"
+            % (expected_npz_sha256, actual_npz_sha256)
+        )
+
     arrays = np.load(args.npz)
     cursor = Cursor(arrays, entries)
 
@@ -249,8 +257,8 @@ def main():
     provenance = {
         "converter": os.path.basename(__file__),
         "kind": args.kind,
-        "npz": os.path.realpath(args.npz),
-        "npz_sha256": manifest.get("npz_sha256"),
+        "npz": os.path.basename(args.npz),
+        "npz_sha256": actual_npz_sha256,
         "savedmodel_dir": manifest.get("savedmodel_dir"),
         "savedmodel_name": manifest.get("savedmodel_name"),
         "saved_model_pb_sha256": manifest.get("saved_model_pb_sha256"),

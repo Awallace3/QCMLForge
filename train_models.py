@@ -422,6 +422,7 @@ def train_pairwise_model(
             r_cut_im=r_cut_im,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_atomic_batch_size=ds_atomic_batch_size,
             ds_num_devices=1,
@@ -474,6 +475,7 @@ def train_pairwise_model(
             elst_damping_type=elst_damping_type,
             n_params=n_params,
             model_type=DimerProp_model_type,
+            ds_max_size=ds_max_size,
         )
     elif apnet_model_type in ["APNet3-fused", "APNet3-fused-variant"]:
         print("Setting AtomTypeParams...")
@@ -512,6 +514,7 @@ def train_pairwise_model(
             r_cut=r_cut,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_atomic_batch_size=ds_atomic_batch_size,
             ds_num_devices=1,
@@ -565,6 +568,7 @@ def train_pairwise_model(
             r_cut=r_cut,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_atomic_batch_size=ds_atomic_batch_size,
             ds_num_devices=1,
@@ -620,6 +624,7 @@ def train_pairwise_model(
             r_cut=r_cut,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_atomic_batch_size=ds_atomic_batch_size,
             ds_num_devices=1,
@@ -645,6 +650,7 @@ def train_pairwise_model(
             r_cut=r_cut,
             ds_spec_type=spec_type,
             ds_root=data_dir,
+            ds_max_size=ds_max_size,
             ignore_database_null=False,
             ds_in_memory=ds_in_memory,
             use_GPU=True,
@@ -740,6 +746,9 @@ def set_all_seeds(seed=42, cudnn_reproducibility=False, deterministic=False):
         # cuBLAS reads this when it first creates a handle, so set it before
         # anything can touch CUDA.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        # Spawned DDP ranks start fresh interpreters; this inherited marker lets
+        # ``tracked_ddp_worker`` enable the process-local PyTorch setting there.
+        os.environ["QCMLFORGE_DETERMINISTIC"] = "1"
         # warn_only keeps an op without a deterministic kernel from aborting a
         # long run; the warning names it so the gap is visible.
         torch.use_deterministic_algorithms(True, warn_only=True)

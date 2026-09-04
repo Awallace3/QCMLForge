@@ -17,6 +17,7 @@ meaningful, so genuine regressions in the conversion or in the forward pass are
 caught while float32 reduction-order differences across platforms are not.
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -36,6 +37,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts", "ap2_tf"))
 import parity_common  # noqa: E402  (needs the sys.path entry above)
 
 DIMERS_NPZ = os.path.join(FIXTURE_DIR, "parity_dimers.npz")
+DIMERS_MANIFEST = os.path.join(FIXTURE_DIR, "parity_dimers.manifest.json")
 REFERENCE_NPZ = os.path.join(FIXTURE_DIR, "tf_reference.npz")
 REFERENCE_MANIFEST = os.path.join(FIXTURE_DIR, "tf_reference.manifest.json")
 
@@ -102,8 +104,26 @@ def stack_multipoles(predictions):
     return np.concatenate(rows, axis=0)
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def test_reference_manifest_records_provenance():
     manifest = json.load(open(REFERENCE_MANIFEST))
+    dimers_manifest = json.load(open(DIMERS_MANIFEST))
+    assert sha256_file(DIMERS_NPZ) == manifest["dimers"]["sha256"]
+    assert sha256_file(REFERENCE_NPZ) == manifest["outputs"]["npz"]["sha256"]
+    portable_paths = [
+        dimers_manifest["source"]["processed_dir"],
+        dimers_manifest["outputs"]["npz"]["path"],
+        manifest["dimers"]["npz"],
+        manifest["outputs"]["npz"]["path"],
+    ] + [entry["savedmodel_dir"] for entry in manifest["models"].values()]
+    assert all(not os.path.isabs(path) for path in portable_paths)
     assert manifest["versions"]["tensorflow"].startswith("2.3")
     assert manifest["vintage"] == "new"
     assert manifest["device"] == "cpu"

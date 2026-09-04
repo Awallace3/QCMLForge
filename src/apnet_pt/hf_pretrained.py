@@ -175,6 +175,7 @@ APNET2_WEIGHT_SETS = {
         "atom": "am_ensemble/am_{model_id}.pt",
         "pair": "ap2_ensemble/ap2_{model_id}.pt",
         "n_models": 5,
+        "n_atom_models": 10,
         "description": "APNet2 ensemble trained by QCMLForge (default).",
     },
     "ap2_tf_paper": {
@@ -228,6 +229,26 @@ def apnet2_weight_set_size(weights: str = DEFAULT_APNET2_WEIGHTS) -> int:
         Count of ``model_id`` values the weight set provides.
     """
     return int(_apnet2_weight_set(weights)["n_models"])
+
+
+def apnet2_atom_weight_path(
+    model_id: int, weights: str = DEFAULT_APNET2_WEIGHTS
+) -> str:
+    """Repository-relative atom checkpoint path for a named weight set."""
+    weight_set = _apnet2_weight_set(weights)
+    n_models = int(weight_set.get("n_atom_models", weight_set["n_models"]))
+    try:
+        model_id = operator.index(model_id)
+    except TypeError:
+        raise TypeError(
+            f"model_id must be an integer, got {type(model_id).__name__}"
+        ) from None
+    if not 0 <= model_id < n_models:
+        raise ValueError(
+            f"atom model_id must be in [0, {n_models - 1}] for "
+            f"weights={weights!r}, got {model_id}"
+        )
+    return weight_set["atom"].format(model_id=model_id)
 
 
 def apnet2_weight_paths(

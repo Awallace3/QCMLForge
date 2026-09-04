@@ -10,7 +10,7 @@ import pickle
 import time
 from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -165,6 +165,14 @@ def _spawn_external_tracker(rank: int, world_size: int, event_directory: str) ->
         backend=TrackerBackend.FILE_EVENT,
         event_directory=event_directory,
     )
+
+
+def test_config_normalizes_mapping_to_pickle_safe_dict():
+    config = WandbConfig(run_config=MappingProxyType({"dataset.id": "fixture"}))
+
+    assert config.run_config == {"dataset.id": "fixture"}
+    assert isinstance(config.run_config, dict)
+    pickle.dumps(config)
 
 
 def test_config_is_pickle_safe_and_resolves_environment():

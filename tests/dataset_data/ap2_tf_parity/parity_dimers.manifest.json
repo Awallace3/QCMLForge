@@ -1,6 +1,6 @@
 {
   "source": {
-    "processed_dir": "/storage/home/hcoda1/3/awallace43/gits/qcmlforge/data_dir/processed",
+    "processed_dir": "processed",
     "prefix": "dimer_ap2_fused_test_spec_2_",
     "shards_read": [
       "dimer_ap2_fused_test_spec_2_0.pt",
@@ -36,7 +36,7 @@
   },
   "outputs": {
     "npz": {
-      "path": "/storage/home/hcoda1/3/awallace43/scratch/ap2-fixture/parity_dimers.npz",
+      "path": "parity_dimers.npz",
       "sha256": "1b5a91543b16f733a372b5f18ff38188de82cc80613c7f87761f9bbb469c7e85"
     }
   },

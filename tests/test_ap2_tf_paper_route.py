@@ -18,6 +18,7 @@ from apnet_pt.AtomModels.ap2_atom_model import AtomModel
 from apnet_pt.AtomPairwiseModels.apnet2 import APNet2Model
 from apnet_pt.hf_pretrained import (
     DEFAULT_APNET2_WEIGHTS,
+    apnet2_atom_weight_path,
     apnet2_weight_paths,
     apnet2_weight_set_size,
     apnet2_weight_sets,
@@ -51,6 +52,12 @@ def test_weight_set_registry():
         "atom": "ap2_tf_paper/atom_models/atom2.pt",
         "pair": "ap2_tf_paper/pair_models/pair2.pt",
     }
+
+
+def test_default_atom_weight_set_preserves_all_ten_members():
+    assert apnet2_atom_weight_path(9) == "am_ensemble/am_9.pt"
+    with pytest.raises(ValueError, match=r"atom model_id must be in \[0, 9\]"):
+        apnet2_atom_weight_path(10)
 
 
 def test_weight_set_paths_mirror_the_repository_layout():
@@ -132,7 +139,7 @@ def test_pair_route_matches_direct_path():
 def test_ensemble_route_averages_the_paper_models():
     """The ensemble route reproduces a hand-built average of all five members."""
     pred = pretrained_models.apnet2_model_predict(
-        [mol_water_dimer], compile=False, ap2_fused=False, weights="ap2_tf_paper"
+        [mol_water_dimer], compile=True, ap2_fused=False, weights="ap2_tf_paper"
     )
 
     members = []

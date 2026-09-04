@@ -93,7 +93,7 @@ def export(savedmodel_dir, out_dir):
 
     pb_path = os.path.join(savedmodel_dir, "saved_model.pb")
     manifest = {
-        "savedmodel_dir": os.path.realpath(savedmodel_dir),
+        "savedmodel_dir": os.path.basename(savedmodel_dir),
         "savedmodel_name": name,
         "saved_model_pb_sha256": sha256_file(pb_path) if os.path.exists(pb_path) else None,
         "source_repo": git_provenance(savedmodel_dir),

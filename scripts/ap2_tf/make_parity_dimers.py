@@ -34,6 +34,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch_geometric.data.data import DataEdgeAttr, DataTensorAttr
+from torch_geometric.data.storage import GlobalStorage
 
 COMPONENT_COLUMNS = ("Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug")
 
@@ -93,8 +95,10 @@ def collect(processed_dir, prefix, samples, ensure_monatomic=False):
             {"shard": path.name, "index_in_shard": position, "reason": reason}
         )
 
+    safe_globals = [DataEdgeAttr, DataTensorAttr, GlobalStorage]
     for path in paths:
-        objects = torch.load(str(path), map_location="cpu", weights_only=False)
+        with torch.serialization.safe_globals(safe_globals):
+            objects = torch.load(str(path), map_location="cpu", weights_only=True)
         shards_read.append(path.name)
         for position, data in enumerate(objects):
             if len(records) >= wanted and not hunting:
@@ -103,6 +107,9 @@ def collect(processed_dir, prefix, samples, ensure_monatomic=False):
             if len(records) < samples:
                 take(path, position, record, "leading")
                 if hunting and is_monatomic(record):
+                    # If the final leading record is monatomic, extend the
+                    # selection so its immediate successor is retained.
+                    wanted = max(wanted, len(records) + 1)
                     hunting = False
             elif len(records) < wanted:
                 take(path, position, record, "follows monatomic")
@@ -172,7 +179,7 @@ def main():
     elements = sorted(set(arrays["ZA"].tolist()) | set(arrays["ZB"].tolist()))
     manifest = {
         "source": {
-            "processed_dir": str(args.processed_dir),
+            "processed_dir": Path(args.processed_dir).name,
             "prefix": args.prefix,
             "shards_read": shards_read,
             "selection_rule": (
@@ -200,7 +207,12 @@ def main():
             c: float(arrays["labels"][:, i].mean())
             for i, c in enumerate(COMPONENT_COLUMNS)
         },
-        "outputs": {"npz": {"path": str(args.out_npz), "sha256": sha256_file(args.out_npz)}},
+        "outputs": {
+            "npz": {
+                "path": Path(args.out_npz).name,
+                "sha256": sha256_file(args.out_npz),
+            }
+        },
         "row_provenance": provenance,
     }
     with open(str(args.out_manifest), "w") as handle:
