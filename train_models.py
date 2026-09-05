@@ -2125,16 +2125,52 @@ def build_parser():
     args.add_argument("--train_atomic_heads", action="store_true", default=False)
     args.add_argument("--long_range_elst", type=str, default="damped-cliff")
     args.add_argument("--d3_params", type=str, default="default")
+    args.add_argument(
+        "--scf_tolerance",
+        type=float,
+        default=None,
+        help=(
+            "MACE/AP3D3 induction SCF stopping threshold. Unset keeps the "
+            "PhysicsConfig default of 1e-8."
+        ),
+    )
+    args.add_argument(
+        "--scf_max_iterations",
+        type=int,
+        default=None,
+        help=(
+            "MACE/AP3D3 induction SCF iteration cap. Unset keeps the "
+            "PhysicsConfig default of 200."
+        ),
+    )
+    args.add_argument(
+        "--scf_convergence_norm",
+        type=str,
+        default=None,
+        choices=["l2", "rms", "max"],
+        help=(
+            "how the induced-dipole change is reduced before the SCF threshold "
+            "test. 'l2' is the historical unnormalised batch-wide norm, so the "
+            "effective per-atom tolerance tightens as the batch grows; 'rms' "
+            "and 'max' are batch-size independent. Unset keeps 'l2'."
+        ),
+    )
+    args.add_argument(
+        "--induction_model",
+        type=str,
+        default=None,
+        choices=["ap3-no-correction", "cliff2-rackers"],
+        help=(
+            "which induction functional the MACE/AP3D3 classical spine solves. "
+            "'ap3-no-correction' is the historical AP3-D3 kernel; "
+            "'cliff2-rackers' is CLIFF2's Rackers/Thole induction with split "
+            "direct and mutual damping, run with the two PhysicsConfig Thole "
+            "scalars and without the overlap correction. Unset keeps "
+            "'ap3-no-correction'."
+        ),
+    )
     args.add_argument("--smoke_data_path", type=str, default=None)
     args.add_argument("--smoke_atom_data_path", type=str, default=None)
-    args.add_argument("--skip_compile", action="store_true", default=False)
-    args.add_argument("--dataloader_num_workers", type=int, default=None)
-    args.add_argument(
-        "--batch_size",
-        type=int,
-        default=16,
-        help="Pair smoke batch size; production dataset loaders retain their own defaults.",
-    )
     args.add_argument("--overwrite", action="store_true", default=False)
     args.add_argument("--resume", action="store_true", default=False)
     wandb_mode_default = os.getenv("WANDB_MODE", "disabled")
@@ -2164,6 +2200,17 @@ def build_parser():
 def dispatch_args(args, *, mace_dispatch=None):
     """Dispatch only after route-specific validation has completed."""
 
+    # `--batch_size` defaults to None so the CLIFF routes can tell "unset" from
+    # an explicit value: `train_pairwise_model` rejects the flag outright on the
+    # routes whose shape is fixed by their store. The MACE/AP3D3 smoke and
+    # factory routes have no such distinction and have always run at 16, so
+    # resolve the sentinel for them here rather than reintroducing a second
+    # `--batch_size` with a different default.
+    if args.batch_size is None and (
+        args.smoke_data_path or args.smoke_atom_data_path
+    ):
+        args.batch_size = 16
+
     if args.train_apnet == "APNet3-fused-d3" and args.smoke_data_path:
         from apnet_pt.training.smoke import run_matched_ap3d3_baseline_smoke
 
@@ -2183,6 +2230,8 @@ def dispatch_args(args, *, mace_dispatch=None):
     )
     is_mace_atom = bool(args.train_am) and looks_like_mace_option(args.train_am)
     if is_mace_pair or is_mace_atom:
+        if args.batch_size is None:
+            args.batch_size = 16
         if mace_dispatch is None:
             from apnet_pt.training.mace_ap3d3_factory import dispatch_mace_cli
 

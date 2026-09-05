@@ -18,9 +18,116 @@ from .schema import (
 )
 
 
-def _default_backends():
+def _ap3_no_correction_induction(*, valence_widths_A, valence_widths_B, **kwargs):
+    """AP3-D3's historical induction, adapted to the shared backend contract.
+
+    The kernel has no valence-width correction by construction, so the widths
+    the provider now supplies for the CLIFF2 backend are dropped here rather
+    than added to a signature shared with the pairwise routes.
+    """
+
     from ..AtomPairwiseModels.mtp_mtp import (
         induced_dipole_induction_optimized_no_correction,
+    )
+
+    del valence_widths_A, valence_widths_B
+    return induced_dipole_induction_optimized_no_correction(**kwargs)
+
+
+def _cliff2_rackers_induction(
+    *,
+    ZA,
+    RA,
+    qA,
+    muA,
+    quadA,
+    ZB,
+    RB,
+    qB,
+    muB,
+    quadB,
+    e_AB_source,
+    e_AB_target,
+    e_AA_source,
+    e_AA_target,
+    e_BB_source,
+    e_BB_target,
+    hirshfeld_volume_ratio_A,
+    hirshfeld_volume_ratio_B,
+    valence_widths_A,
+    valence_widths_B,
+    max_iterations,
+    convergence_threshold,
+    thole_damping_param_direct,
+    thole_damping_param_mutual,
+    convergence_norm,
+    return_diagnostics=False,
+):
+    """CLIFF2's Rackers/Thole induction, adapted to the same contract.
+
+    Two things differ from the CLIFF2 pairwise route, and both follow from what
+    the MACE atomic head predicts.  The Thole widths are the two scalars in
+    ``PhysicsConfig`` broadcast over atoms, not per-atom-type parameters from a
+    trained ``RackersTholeDampingNN``; and the overlap correction is off,
+    because its ``K^indu`` coefficients are learned parameters this route has
+    no predictor for.  The valence widths are real -- they come from the atomic
+    head -- so enabling overlap later is a matter of supplying ``K^indu``, not
+    of rewiring this adapter.
+
+    The diagnostics keys differ between the two kernels, which is the other
+    reason this is an adapter and not a direct binding.
+    """
+
+    from ..AtomPairwiseModels.mtp_mtp import rackers_thole_induction
+
+    def _per_atom(value, reference):
+        return torch.full_like(reference.reshape(-1), float(value))
+
+    result = rackers_thole_induction(
+        ZA=ZA,
+        RA=RA,
+        qA=qA,
+        muA=muA,
+        quadA=quadA,
+        ZB=ZB,
+        RB=RB,
+        qB=qB,
+        muB=muB,
+        quadB=quadB,
+        e_AB_source=e_AB_source,
+        e_AB_target=e_AB_target,
+        e_AA_source=e_AA_source,
+        e_AA_target=e_AA_target,
+        e_BB_source=e_BB_source,
+        e_BB_target=e_BB_target,
+        hirshfeld_volume_ratio_A=hirshfeld_volume_ratio_A,
+        hirshfeld_volume_ratio_B=hirshfeld_volume_ratio_B,
+        valence_widths_A=valence_widths_A,
+        valence_widths_B=valence_widths_B,
+        thole_direct_A=_per_atom(thole_damping_param_direct, hirshfeld_volume_ratio_A),
+        thole_direct_B=_per_atom(thole_damping_param_direct, hirshfeld_volume_ratio_B),
+        thole_mutual_A=_per_atom(thole_damping_param_mutual, hirshfeld_volume_ratio_A),
+        thole_mutual_B=_per_atom(thole_damping_param_mutual, hirshfeld_volume_ratio_B),
+        ind_overlap_A=torch.zeros_like(hirshfeld_volume_ratio_A.reshape(-1)),
+        ind_overlap_B=torch.zeros_like(hirshfeld_volume_ratio_B.reshape(-1)),
+        include_overlap=False,
+        max_iterations=max_iterations,
+        convergence_threshold=convergence_threshold,
+        convergence_norm=convergence_norm,
+        return_diagnostics=return_diagnostics,
+    )
+    if not return_diagnostics:
+        return result
+    pair_ind, diagnostics = result
+    return pair_ind, {
+        "converged": bool(diagnostics["scf_converged"]),
+        "iterations": int(diagnostics["scf_iterations"]),
+        "residual": float(diagnostics["scf_residual"]),
+    }
+
+
+def _default_backends():
+    from ..AtomPairwiseModels.mtp_mtp import (
         mtp_elst,
         mtp_elst_damping,
         mtp_elst_damping_AMOEBA,
@@ -33,7 +140,10 @@ def _default_backends():
             "damped-amoeba": mtp_elst_damping_AMOEBA,
             "undamped": mtp_elst,
         },
-        induced_dipole_induction_optimized_no_correction,
+        {
+            "ap3-no-correction": _ap3_no_correction_induction,
+            "cliff2-rackers": _cliff2_rackers_induction,
+        },
         d3,
     )
 
@@ -129,8 +239,13 @@ class LongRangeSAPTProvider(nn.Module):
             if electrostatics_kernels is not None
             else defaults[0]
         )
+        # An explicitly injected kernel wins outright: callers that pass one are
+        # substituting the whole backend, so honouring `induction_model` on top
+        # of it would silently ignore half of what they asked for.
         self.induction_kernel = (
-            induction_kernel if induction_kernel is not None else defaults[1]
+            induction_kernel
+            if induction_kernel is not None
+            else defaults[1][config.induction_model]
         )
         self.dispersion_kernel = (
             dispersion_kernel if dispersion_kernel is not None else defaults[2]
@@ -224,10 +339,13 @@ class LongRangeSAPTProvider(nn.Module):
             e_BB_target=batch.e_BB_target,
             hirshfeld_volume_ratio_A=torch.abs(a.hfvr).reshape(-1),
             hirshfeld_volume_ratio_B=torch.abs(b.hfvr).reshape(-1),
+            valence_widths_A=torch.abs(a.valence_width).reshape(-1),
+            valence_widths_B=torch.abs(b.valence_width).reshape(-1),
             max_iterations=self.config.scf_max_iterations,
             convergence_threshold=self.config.scf_tolerance,
             thole_damping_param_direct=self.config.thole_direct,
             thole_damping_param_mutual=self.config.thole_mutual,
+            convergence_norm=self.config.scf_convergence_norm,
             return_diagnostics=True,
         )
         if not isinstance(result, tuple) or len(result) != 2:

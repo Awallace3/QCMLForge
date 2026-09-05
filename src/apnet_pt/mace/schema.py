@@ -17,6 +17,10 @@ import torch
 
 COMPONENT_ORDER = ("elst", "exch", "indu", "disp")
 QUADRUPOLE_CONVENTION = "cartesian-symmetric-traceless-3x3"
+SCF_CONVERGENCE_NORMS = ("l2", "rms", "max")
+DEFAULT_SCF_CONVERGENCE_NORM = "l2"
+INDUCTION_MODELS = ("ap3-no-correction", "cliff2-rackers")
+DEFAULT_INDUCTION_MODEL = "ap3-no-correction"
 
 
 def _canonical_hash(value: object) -> str:
@@ -39,6 +43,10 @@ class PhysicsConfig:
     scf_tolerance: float = 1.0e-8
     scf_max_iterations: int = 200
     scf_nonconvergence: Literal["raise", "warn"] = "raise"
+    scf_convergence_norm: Literal["l2", "rms", "max"] = DEFAULT_SCF_CONVERGENCE_NORM
+    induction_model: Literal[
+        "ap3-no-correction", "cliff2-rackers"
+    ] = DEFAULT_INDUCTION_MODEL
     d3_parameters: tuple[float, ...] = ()
     neural_cutoff: float = 8.0
     component_order: tuple[str, ...] = COMPONENT_ORDER
@@ -106,6 +114,16 @@ class PhysicsConfig:
             raise ValueError("scf_max_iterations must be a positive integer")
         if self.scf_nonconvergence not in {"raise", "warn"}:
             raise ValueError("scf_nonconvergence must be 'raise' or 'warn'")
+        if self.scf_convergence_norm not in SCF_CONVERGENCE_NORMS:
+            raise ValueError(
+                "scf_convergence_norm must be one of "
+                f"{list(SCF_CONVERGENCE_NORMS)}, got {self.scf_convergence_norm!r}"
+            )
+        if self.induction_model not in INDUCTION_MODELS:
+            raise ValueError(
+                "induction_model must be one of "
+                f"{list(INDUCTION_MODELS)}, got {self.induction_model!r}"
+            )
         if len(self.d3_parameters) not in {0, 4}:
             raise ValueError("d3_parameters must be empty or (s6, s8, a1, a2)")
         if not all(math.isfinite(float(value)) for value in self.d3_parameters):
@@ -113,9 +131,27 @@ class PhysicsConfig:
 
     @property
     def physics_hash(self) -> str:
-        """Return a deterministic SHA-256 of every physics field."""
+        """Return a deterministic SHA-256 of every physics field.
 
-        return _canonical_hash(asdict(self))
+        ``scf_convergence_norm`` and ``induction_model`` are elided at their
+        defaults.  Each default reproduces exactly what the route did before
+        the control existed -- the ``"l2"`` branch of the solver is the op
+        sequence the loop used, and ``"ap3-no-correction"`` is the kernel
+        ``_default_backends`` has always bound -- so a default-configured
+        config is the same physics as one written before these fields, and
+        elision keeps the hashes stamped into existing manifests and v3
+        checkpoints valid.  Any non-default value is a different solver or a
+        different induction functional, so it changes the hash.
+        """
+
+        fields = asdict(self)
+        for name, default in (
+            ("scf_convergence_norm", DEFAULT_SCF_CONVERGENCE_NORM),
+            ("induction_model", DEFAULT_INDUCTION_MODEL),
+        ):
+            if fields[name] == default:
+                del fields[name]
+        return _canonical_hash(fields)
 
 
 @dataclass(frozen=True)

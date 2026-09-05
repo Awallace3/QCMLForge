@@ -582,3 +582,32 @@ def test_sapt_assembly_adds_d3_once_and_honors_no_disp_nn():
 
     assert full.tolist() == [[13.0, 20.0, 37.0, 51.0]]
     assert no_disp.tolist() == [[13.0, 20.0, 37.0, 11.0]]
+
+
+def test_scf_convergence_norm_is_forwarded_to_induction_backend():
+    # --scf_convergence_norm reaches the solver only by way of PhysicsConfig, so
+    # this is the seam that decides whether the flag does anything at all.
+    captured = {}
+
+    def induction_kernel(**kwargs):
+        captured.update(kwargs)
+        return torch.zeros(2), {
+            "converged": True,
+            "iterations": 1,
+            "residual": 0.0,
+        }
+
+    def _run(config):
+        captured.clear()
+        provider = LongRangeSAPTProvider(
+            config,
+            electrostatics_kernels={"damped-cliff": lambda **kwargs: torch.zeros(2)},
+            induction_kernel=induction_kernel,
+            dispersion_kernel=lambda batch, params: torch.zeros(2),
+        )
+        provider(_batch(), _props(), _props())
+        return captured["convergence_norm"]
+
+    assert _run(PhysicsConfig()) == "l2"
+    assert _run(PhysicsConfig(scf_convergence_norm="rms")) == "rms"
+    assert _run(PhysicsConfig(scf_convergence_norm="max")) == "max"

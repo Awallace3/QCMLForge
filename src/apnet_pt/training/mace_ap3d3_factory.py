@@ -112,6 +112,13 @@ class MACETrainingPlan:
     neural_cutoff: float
     batch_size: int
     device: str
+    # SCF controls default to the PhysicsConfig contract so a plan built without
+    # them -- which is every plan built before these flags existed -- describes
+    # the same solver it always did.
+    scf_tolerance: float = 1.0e-8
+    scf_max_iterations: int = 200
+    scf_convergence_norm: str = "l2"
+    induction_model: str = "ap3-no-correction"
 
 
 @dataclass
@@ -326,7 +333,14 @@ def _make_plan(args: Any, *, emit_warning: bool) -> MACETrainingPlan:
         raise ValueError("MACE atom and pair training cannot run simultaneously")
     if args.world_size_ddp < 1:
         raise ValueError("world_size_ddp must be positive")
-    if args.omp_num_threads < 1:
+    # `--omp_num_threads` defaults to None so each route can apply its own
+    # documented fallback (1 for atom models, 8 for pairwise).  The MACE routes
+    # split the same way, and the plan field is a plain int, so resolve here
+    # rather than letting None reach either the comparison or the plan.
+    omp_num_threads = args.omp_num_threads
+    if omp_num_threads is None:
+        omp_num_threads = 8 if args.train_apnet else 1
+    if omp_num_threads < 1:
         raise ValueError("omp_num_threads must be positive")
     selected_epochs = args.n_epochs if args.train_apnet else args.n_epochs_atom
     if selected_epochs < 1:
@@ -396,10 +410,24 @@ def _make_plan(args: Any, *, emit_warning: bool) -> MACETrainingPlan:
     d3_parameters = _resolve_d3_parameters(args.d3_params)
     from apnet_pt.mace.schema import PhysicsConfig
 
+    # `None` means "unset", which is not the same as "the default": passing the
+    # default explicitly would still be a deliberate choice a reader could see
+    # in the plan, so let PhysicsConfig own the fallback.
+    scf_overrides = {
+        name: value
+        for name, value in (
+            ("scf_tolerance", getattr(args, "scf_tolerance", None)),
+            ("scf_max_iterations", getattr(args, "scf_max_iterations", None)),
+            ("scf_convergence_norm", getattr(args, "scf_convergence_norm", None)),
+            ("induction_model", getattr(args, "induction_model", None)),
+        )
+        if value is not None
+    }
     physics = PhysicsConfig(
         electrostatics_mode=args.long_range_elst,
         d3_parameters=d3_parameters,
         neural_cutoff=args.r_cut_im,
+        **scf_overrides,
     )
     smoke_path = (
         args.smoke_data_path if args.train_apnet else args.smoke_atom_data_path
@@ -454,6 +482,10 @@ def _make_plan(args: Any, *, emit_warning: bool) -> MACETrainingPlan:
         freeze_mace_backbone=True,
         long_range_elst=args.long_range_elst,
         d3_parameters=d3_parameters,
+        scf_tolerance=physics.scf_tolerance,
+        scf_max_iterations=physics.scf_max_iterations,
+        scf_convergence_norm=physics.scf_convergence_norm,
+        induction_model=physics.induction_model,
         physics_hash=physics.physics_hash,
         data_hash=data_hash,
         preprocessing_hash=preprocessing_hash,
@@ -467,7 +499,7 @@ def _make_plan(args: Any, *, emit_warning: bool) -> MACETrainingPlan:
         overwrite=args.overwrite,
         resume=args.resume,
         world_size_ddp=args.world_size_ddp,
-        omp_num_threads=args.omp_num_threads,
+        omp_num_threads=omp_num_threads,
         no_disp_nn=args.no_disp_nn,
         include_total_mse=args.include_total_mse,
         use_precomputed_classical=args.use_precomputed_classical,
@@ -669,11 +701,38 @@ def _default_factory_dependencies(plan: MACETrainingPlan) -> MACEFactoryDependen
         if "physics" not in shared:
             from apnet_pt.mace.schema import PhysicsConfig
 
+            # A real MACETrainingPlan always carries the four solver controls,
+            # but this builder is also driven by lightweight stand-in plans that
+            # predate them.  Read the fallbacks off PhysicsConfig rather than
+            # repeating them as literals, so a stand-in reconstructs exactly the
+            # physics the hash-elision rules already call the default.
+            defaults = PhysicsConfig()
             shared["physics"] = PhysicsConfig(
                 electrostatics_mode=plan.long_range_elst,
                 d3_parameters=plan.d3_parameters,
                 neural_cutoff=plan.neural_cutoff,
+                scf_tolerance=getattr(
+                    plan, "scf_tolerance", defaults.scf_tolerance
+                ),
+                scf_max_iterations=getattr(
+                    plan, "scf_max_iterations", defaults.scf_max_iterations
+                ),
+                scf_convergence_norm=getattr(
+                    plan, "scf_convergence_norm", defaults.scf_convergence_norm
+                ),
+                induction_model=getattr(
+                    plan, "induction_model", defaults.induction_model
+                ),
             )
+            stamped = getattr(plan, "physics_hash", None)
+            if stamped is not None and shared["physics"].physics_hash != stamped:
+                # The plan's hash was stamped at validation time from the same
+                # four controls.  A mismatch here means a construction seam
+                # dropped one of them, which would silently train under a
+                # different solver than the manifest records.
+                raise ValueError(
+                    "reconstructed PhysicsConfig hash disagrees with the plan"
+                )
         return shared["physics"]
 
     def featurizer_builder(_plan):

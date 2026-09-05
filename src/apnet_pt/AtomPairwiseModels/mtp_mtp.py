@@ -6241,6 +6241,7 @@ def induced_dipole_induction_optimized_no_correction(
     return_diagnostics: bool = False,
     thole_damping_param_direct: float | None = None,
     thole_damping_param_mutual: float | None = None,
+    convergence_norm: str = DEFAULT_INDUCTION_CONVERGENCE_NORM,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, bool | int | float]]:
     """
     Compute induction energy from self-consistent induced dipoles for a dimer without overlap/valence-width correction.
@@ -6270,12 +6271,18 @@ def induced_dipole_induction_optimized_no_correction(
         return_diagnostics (bool): Return SCF convergence metadata with energies.
         thole_damping_param_direct (float, optional): Permanent-to-induced damping.
         thole_damping_param_mutual (float, optional): Induced-to-induced damping.
+        convergence_norm (str): How the induced-dipole change is reduced before
+            it is compared against ``convergence_threshold``. ``"l2"`` is the
+            historical unnormalised batch-wide norm, so it tightens the
+            effective per-atom tolerance as the batch grows; ``"rms"`` and
+            ``"max"`` are batch-size independent.
 
     Returns:
         Tensor: Induction energy per A–B interaction edge (n_edges,) in kcal/mol.
         When ``return_diagnostics`` is true, also returns convergence diagnostics.
     """
 
+    convergence_norm = _validate_induction_convergence_norm(convergence_norm)
     direct_damping = (
         thole_damping_param
         if thole_damping_param_direct is None
@@ -6423,10 +6430,14 @@ def induced_dipole_induction_optimized_no_correction(
         mu_induced_A = (1 - omega) * mu_induced_A_old + omega * mu_induced_A_new
         mu_induced_B = (1 - omega) * mu_induced_B_old + omega * mu_induced_B_new
 
-        # Check convergence
-        delta_A = torch.norm(mu_induced_A - mu_induced_A_old)
-        delta_B = torch.norm(mu_induced_B - mu_induced_B_old)
-        delta = max(delta_A, delta_B)
+        # Check convergence. `delta` only ever feeds the threshold test and
+        # the diagnostics float, so reducing it through `_scf_residual` costs
+        # nothing in the backward pass.
+        delta = _scf_residual(
+            mu_induced_A - mu_induced_A_old,
+            mu_induced_B - mu_induced_B_old,
+            convergence_norm,
+        )
         residual = delta
         if delta < convergence_threshold:
             converged = True

@@ -86,6 +86,11 @@ def _base_cli(tmp_path, option="MACE-AP3D3-H1"):
         "3",
         "--n_epochs",
         "1",
+        # `--batch_size` defaults to a None sentinel that `train_models.main`
+        # resolves to 16 for every MACE route before dispatching.  These tests
+        # call the factory directly, so they have to supply what main would.
+        "--batch_size",
+        "16",
         "--skip_compile",
     ]
     if option in {"MACE-AP3D3-H1", "MACE-AP3D3-H2"}:
@@ -392,3 +397,78 @@ def test_train_models_legacy_dispatch_is_unchanged(monkeypatch):
     train_models.main(["--train_apnet", "APNet2", "--world_size_ddp", "7"])
     assert calls[0]["apnet_model_type"] == "APNet2"
     assert calls[0]["model_out"] == "./models/ap_default.pt"
+
+
+def _induction_flag_action():
+    for action in train_models.build_parser()._actions:
+        if action.dest == "induction_model":
+            return action
+    raise AssertionError("--induction_model is not exposed by the parser")
+
+
+def test_induction_model_flag_is_unset_by_default():
+    # Unset is not the same as the default: PhysicsConfig has to remain the one
+    # place the fallback lives, so the plan for an untouched command line must
+    # be byte-identical to one built before the flag existed.
+    from apnet_pt.mace.schema import INDUCTION_MODELS, PhysicsConfig
+
+    action = _induction_flag_action()
+    assert action.default is None
+    assert set(action.choices) == set(INDUCTION_MODELS)
+    assert PhysicsConfig().induction_model in action.choices
+
+
+@pytest.mark.parametrize(
+    "model", ["ap3-no-correction", "cliff2-rackers"]
+)
+def test_induction_model_flag_reaches_the_training_plan(tmp_path, model):
+    from apnet_pt.mace.schema import PhysicsConfig
+
+    args, _ = _base_cli(tmp_path / model.replace("-", "_"))
+    assert args.induction_model is None
+    args.induction_model = model
+    plan = validate_mace_cli_args(args)
+    assert plan.induction_model == model
+    assert plan.physics_hash == PhysicsConfig(induction_model=model).physics_hash
+
+
+def test_untouched_command_line_keeps_the_historical_induction_physics(tmp_path):
+    from apnet_pt.mace.schema import PhysicsConfig
+
+    args, _ = _base_cli(tmp_path)
+    plan = validate_mace_cli_args(args)
+    assert plan.induction_model == PhysicsConfig().induction_model
+    assert plan.physics_hash == PhysicsConfig().physics_hash
+
+
+@pytest.mark.parametrize(
+    ("route", "expected"),
+    [("MACE-AP3D3-H1", 8), ("MACE-AP3D3-AtomHead", 1)],
+)
+def test_unset_omp_num_threads_falls_back_to_the_documented_route_default(
+    tmp_path, route, expected
+):
+    # `--omp_num_threads` is optional and documented as "1 for atom models, 8
+    # for pairwise".  The plan field is a plain int, so an unresolved None
+    # reaches both the positivity check and the plan itself.
+    args, _ = _base_cli(tmp_path / route.replace("-", "_"), route)
+    if route == "MACE-AP3D3-AtomHead":
+        args.train_apnet = ""
+        args.train_am = "MACE-AtomicProperties"
+        args.am_model_path = str(tmp_path / "atomic-output.pt")
+        args.smoke_atom_data_path = None
+    assert args.omp_num_threads is None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        plan = validate_mace_cli_args(args)
+    assert plan.omp_num_threads == expected
+
+
+def test_explicit_omp_num_threads_still_wins_and_is_still_validated(tmp_path):
+    args, _ = _base_cli(tmp_path)
+    args.omp_num_threads = 3
+    assert validate_mace_cli_args(args).omp_num_threads == 3
+
+    args.omp_num_threads = 0
+    with pytest.raises(ValueError, match="omp_num_threads must be positive"):
+        validate_mace_cli_args(args)
