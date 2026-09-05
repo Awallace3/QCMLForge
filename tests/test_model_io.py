@@ -39,6 +39,13 @@ class MockDDPWrapper:
         self.module = model
 
 
+class MockCompileWrapper:
+    """Mock torch.compile wrapper for recursive unwrapping tests."""
+
+    def __init__(self, model):
+        self._orig_mod = model
+
+
 class PrefixedModel(SimpleModel):
     """Model whose state dict mimics torch.compile prefixing."""
 
@@ -287,6 +294,34 @@ def test_unwrap_model_handles_ddp_wrapper(simple_model):
     assert model_io.unwrap_model(wrapped) is simple_model
 
 
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        lambda model: MockCompileWrapper(MockDDPWrapper(model)),
+        lambda model: MockDDPWrapper(MockCompileWrapper(model)),
+    ],
+)
+def test_unwrap_model_recursively_handles_compile_and_ddp(
+    simple_model, wrapped
+):
+    assert model_io.unwrap_model(wrapped(simple_model)) is simple_model
+
+
+def test_create_checkpoint_unwraps_actual_compiled_model(simple_model):
+    compiled = torch.compile(simple_model, backend="eager")
+    checkpoint = model_io.create_checkpoint(
+        model=compiled,
+        config=model_io.unwrap_model(compiled).get_config(),
+        model_type=type(model_io.unwrap_model(compiled)).__name__,
+    )
+
+    assert checkpoint["model_type"] == "SimpleModel"
+    assert all(
+        not key.startswith("_orig_mod.")
+        for key in checkpoint["model_state_dict"]
+    )
+
+
 def test_strip_prefix_from_state_dict_handles_mixed_keys():
     state_dict = {
         "_orig_mod.layer1.weight": torch.randn(10, 10),
@@ -417,3 +452,338 @@ def test_atom_model_save_model_writes_v2_checkpoint(tmp_path):
     assert checkpoint["config"]["n_message"] == 2
     assert checkpoint["config"]["r_cut"] == 4.0
     assert checkpoint["metadata"]["test"] == "value"
+
+
+# ---------------------------------------------------------------------------
+# Resumable training state
+#
+# These cover the sidecar that makes chunked training on a preemptible queue
+# safe. The property that matters most is not the happy path but the refusals:
+# every way a sidecar can be wrong has to end as "no resume information", with
+# the model left exactly as the checkpoint warm-start left it. A resume that
+# half-loads someone else's weights is worse than no resume at all.
+# ---------------------------------------------------------------------------
+
+
+def _stepped(model, lr=0.1):
+    """A model and its optimizer after one real Adam step.
+
+    One step is what makes the test meaningful: it moves the weights off their
+    initialization *and* populates `exp_avg`/`exp_avg_sq`, so a round trip that
+    silently dropped the optimizer state would compare unequal.
+    """
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss = model(torch.ones(3, 10)).pow(2).mean()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    return optimizer
+
+
+def _moments(optimizer):
+    return {
+        key: {k: v.clone() for k, v in value.items() if isinstance(v, torch.Tensor)}
+        for key, value in optimizer.state_dict()["state"].items()
+    }
+
+
+def test_train_state_path_is_a_sidecar_beside_the_checkpoint():
+    assert model_io.train_state_path("/models/cliff2-full.pt") == (
+        "/models/cliff2-full.pt.trainstate.pt"
+    )
+
+
+def test_train_state_roundtrip_restores_weights_moments_and_counters(tmp_path):
+    source = SimpleModel()
+    optimizer = _stepped(source)
+    path = str(tmp_path / "ckpt.pt.trainstate.pt")
+    model_io.save_train_state(
+        path,
+        model=source,
+        optimizer=optimizer,
+        epochs_completed=7,
+        lowest_test_loss=0.125,
+        identity={"dimer_eval_type": "cliff_classical_overlap"},
+    )
+
+    target = SimpleModel()
+    target_optimizer = torch.optim.Adam(target.parameters(), lr=0.1)
+    resumed = model_io.load_train_state(
+        path,
+        model=target,
+        optimizer=target_optimizer,
+        identity={"dimer_eval_type": "cliff_classical_overlap"},
+    )
+
+    assert resumed == (7, 0.125)
+    for key, value in source.state_dict().items():
+        assert torch.equal(target.state_dict()[key], value)
+    restored, expected = _moments(target_optimizer), _moments(optimizer)
+    assert restored.keys() == expected.keys()
+    assert all(
+        torch.equal(restored[index][name], tensor)
+        for index, tensors in expected.items()
+        for name, tensor in tensors.items()
+    )
+
+
+def test_absent_train_state_is_silently_no_resume_information(tmp_path, recwarn):
+    model = SimpleModel()
+    optimizer = torch.optim.Adam(model.parameters())
+    # The first chunk of every run hits this path, so it must not warn.
+    assert (
+        model_io.load_train_state(
+            str(tmp_path / "never-written.trainstate.pt"),
+            model=model,
+            optimizer=optimizer,
+        )
+        is None
+    )
+    assert model_io.load_train_state(None, model=model, optimizer=optimizer) is None
+    assert len(recwarn) == 0
+
+
+def test_train_state_with_an_unknown_version_is_refused(tmp_path):
+    model = SimpleModel()
+    optimizer = _stepped(model)
+    path = str(tmp_path / "state.pt")
+    model_io.save_train_state(
+        path,
+        model=model,
+        optimizer=optimizer,
+        epochs_completed=1,
+        lowest_test_loss=1.0,
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["train_state_version"] = model_io.TRAIN_STATE_VERSION + 1
+    torch.save(payload, path)
+
+    target = SimpleModel()
+    before = {k: v.clone() for k, v in target.state_dict().items()}
+    with pytest.warns(UserWarning, match="version"):
+        assert (
+            model_io.load_train_state(
+                path, model=target, optimizer=torch.optim.Adam(target.parameters())
+            )
+            is None
+        )
+    assert all(torch.equal(target.state_dict()[k], v) for k, v in before.items())
+
+
+def test_train_state_from_different_physics_is_refused(tmp_path):
+    """The pre-fix induction functional must not warm-start a corrected run."""
+    model = SimpleModel()
+    optimizer = _stepped(model)
+    path = str(tmp_path / "state.pt")
+    model_io.save_train_state(
+        path,
+        model=model,
+        optimizer=optimizer,
+        epochs_completed=3,
+        lowest_test_loss=0.5,
+        identity={
+            "dimer_eval_type": "cliff_classical_overlap",
+            "induction_functional_version": 1,
+        },
+    )
+
+    target = SimpleModel()
+    before = {k: v.clone() for k, v in target.state_dict().items()}
+    with pytest.warns(UserWarning, match="identity mismatch"):
+        assert (
+            model_io.load_train_state(
+                path,
+                model=target,
+                optimizer=torch.optim.Adam(target.parameters()),
+                identity={
+                    "dimer_eval_type": "cliff_classical_overlap",
+                    "induction_functional_version": 2,
+                },
+            )
+            is None
+        )
+    assert all(torch.equal(target.state_dict()[k], v) for k, v in before.items())
+
+
+def test_a_train_state_identity_matches_recorded_nulls(tmp_path):
+    """`None` is a real identity value for the non-induction modes."""
+    model = SimpleModel()
+    optimizer = _stepped(model)
+    path = str(tmp_path / "state.pt")
+    identity = {"dimer_eval_type": "cliff_exch", "induction_functional_version": None}
+    model_io.save_train_state(
+        path,
+        model=model,
+        optimizer=optimizer,
+        epochs_completed=2,
+        lowest_test_loss=0.25,
+        identity=identity,
+    )
+    target = SimpleModel()
+    assert model_io.load_train_state(
+        path,
+        model=target,
+        optimizer=torch.optim.Adam(target.parameters()),
+        identity=identity,
+    ) == (2, 0.25)
+
+
+def test_a_truncated_train_state_is_refused_rather_than_crashing(tmp_path):
+    model = SimpleModel()
+    optimizer = _stepped(model)
+    path = tmp_path / "state.pt"
+    model_io.save_train_state(
+        str(path),
+        model=model,
+        optimizer=optimizer,
+        epochs_completed=1,
+        lowest_test_loss=1.0,
+    )
+    raw = path.read_bytes()
+    path.write_bytes(raw[: len(raw) // 2])
+
+    target = SimpleModel()
+    with pytest.warns(UserWarning, match="unreadable"):
+        assert (
+            model_io.load_train_state(
+                str(path),
+                model=target,
+                optimizer=torch.optim.Adam(target.parameters()),
+            )
+            is None
+        )
+
+
+def test_a_train_state_that_does_not_fit_leaves_the_model_untouched(tmp_path):
+    """`load_state_dict` copies what fits before raising; this must not."""
+    path = str(tmp_path / "state.pt")
+    wide = SimpleModel(n_hidden=64)
+    model_io.save_train_state(
+        path,
+        model=wide,
+        optimizer=_stepped(wide),
+        epochs_completed=4,
+        lowest_test_loss=0.3,
+    )
+
+    narrow = SimpleModel(n_hidden=32)
+    before = {k: v.clone() for k, v in narrow.state_dict().items()}
+    with pytest.warns(UserWarning, match="does not fit"):
+        assert (
+            model_io.load_train_state(
+                path,
+                model=narrow,
+                optimizer=torch.optim.Adam(narrow.parameters()),
+            )
+            is None
+        )
+    assert all(torch.equal(narrow.state_dict()[k], v) for k, v in before.items())
+
+
+def test_an_unusable_optimizer_state_still_restores_the_weights(tmp_path):
+    """Losing the moments costs a re-warm; losing the weights costs the chunk."""
+    source = SimpleModel()
+    path = tmp_path / "state.pt"
+    model_io.save_train_state(
+        str(path),
+        model=source,
+        optimizer=_stepped(source),
+        epochs_completed=5,
+        lowest_test_loss=0.4,
+    )
+    payload = torch.load(str(path), map_location="cpu", weights_only=False)
+    # A group whose parameter count disagrees is what a changed
+    # `requires_grad` layout looks like to `Optimizer.load_state_dict`.
+    payload["optimizer_state_dict"]["param_groups"][0]["params"] = [0]
+    torch.save(payload, str(path))
+
+    target = SimpleModel()
+    target_optimizer = torch.optim.Adam(target.parameters(), lr=0.1)
+    with pytest.warns(UserWarning, match="Adam moments restart"):
+        resumed = model_io.load_train_state(
+            str(path), model=target, optimizer=target_optimizer
+        )
+    assert resumed == (5, 0.4)
+    for key, value in source.state_dict().items():
+        assert torch.equal(target.state_dict()[key], value)
+
+
+def test_the_sidecar_write_leaves_no_temporary_file(tmp_path):
+    model = SimpleModel()
+    path = tmp_path / "ckpt.pt.trainstate.pt"
+    model_io.save_train_state(
+        str(path),
+        model=model,
+        optimizer=_stepped(model),
+        epochs_completed=1,
+        lowest_test_loss=1.0,
+    )
+    assert path.exists()
+    assert not (tmp_path / "ckpt.pt.trainstate.pt.tmp").exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "ckpt.pt.trainstate.pt"
+    ]
+
+
+def test_a_crash_mid_write_keeps_the_previous_epochs_sidecar(tmp_path, monkeypatch):
+    """Per-epoch writes are only safe if a killed write cannot corrupt them."""
+    model = SimpleModel()
+    optimizer = _stepped(model)
+    path = str(tmp_path / "state.pt")
+    model_io.save_train_state(
+        path,
+        model=model,
+        optimizer=optimizer,
+        epochs_completed=1,
+        lowest_test_loss=1.0,
+    )
+
+    def killed(*args, **kwargs):
+        raise KeyboardInterrupt("preempted")
+
+    monkeypatch.setattr(model_io.os, "replace", killed)
+    with pytest.raises(KeyboardInterrupt):
+        model_io.save_train_state(
+            path,
+            model=model,
+            optimizer=optimizer,
+            epochs_completed=2,
+            lowest_test_loss=0.5,
+        )
+    monkeypatch.undo()
+
+    target = SimpleModel()
+    assert model_io.load_train_state(
+        path, model=target, optimizer=torch.optim.Adam(target.parameters())
+    ) == (1, 1.0)
+
+
+def test_a_resumed_best_loss_survives_into_the_next_chunk(tmp_path):
+    """The ratchet this sidecar exists to stop.
+
+    Chunk one reaches a validation loss of 0.10. Chunk two starts on a fresh
+    Adam state, so its first epoch is typically slightly worse -- 0.15 here.
+    With the best loss restored, 0.15 is not an improvement and the deliverable
+    checkpoint stands; without it the chunk would have started from `+inf` and
+    overwritten the better weights with the worse ones.
+    """
+    model = SimpleModel()
+    path = str(tmp_path / "state.pt")
+    model_io.save_train_state(
+        path,
+        model=model,
+        optimizer=_stepped(model),
+        epochs_completed=3,
+        lowest_test_loss=0.10,
+    )
+
+    resumed_model = SimpleModel()
+    epochs_completed, lowest_test_loss = model_io.load_train_state(
+        path,
+        model=resumed_model,
+        optimizer=torch.optim.Adam(resumed_model.parameters()),
+    )
+    assert epochs_completed == 3
+    assert not 0.15 < lowest_test_loss
+    # And the epoch numbering continues rather than restarting at zero.
+    assert list(range(epochs_completed, epochs_completed + 2)) == [3, 4]

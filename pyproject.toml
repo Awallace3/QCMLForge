@@ -35,6 +35,8 @@ mace = [
     "e3nn==0.4.4",
     "graph-longrange @ git+https://github.com/WillBaldwin0/graph_electrostatics.git@0e21d5546c482d08388a08eb4d948e833227ce47",
 ]
+mcp = ["mcp>=1,<2"]
+tracking = ["wandb>=0.19.9,<1"]
 
 [project.urls]
 "Homepage" = "https://github.com/Awallace3/QCMLForge"
@@ -48,6 +50,9 @@ dirty_template = "{tag}.{ccount}+git.{sha}.dirty"
 [tool.pytest.ini_options]
 markers = [
     "mace_integration: requires a local digest-verified PolarMACE checkpoint",
+    "mcp: tests requiring the optional MCP server dependency",
+    "pretrained_models(*groups): tests requiring downloadable pretrained models",
+    "slow: tests with long-running model or integration workloads",
 ]
 filterwarnings = [
     'ignore:To copy construct from a tensor, it is recommended to use sourceTensor.detach\(\)\.clone\(\):UserWarning',

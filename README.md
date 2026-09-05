@@ -1,3 +1,5 @@
+
+
 # QCMLForge
 
 [![Tests](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml/badge.svg)](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml)
@@ -16,6 +18,21 @@ conda env create -f environment.yml
 conda activate qcml
 pip install -e .
 ```
+
+### Running tests
+
+Some tests require pretrained model artifacts from the QCMLForge Hugging Face
+repository. Enable downloads before running pytest:
+
+```bash
+export QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED=1
+python -m pytest tests/
+```
+
+Pretrained-model tests are skipped when this environment variable is not
+enabled or when their required artifacts cannot be resolved. Tests that do not
+need pretrained models still run normally.
+
 ### Common Issues
 If you get an OS.Error when running qcml related to torch-geometric, you likely need
 to install a specific version through the following example:
@@ -23,7 +40,7 @@ to install a specific version through the following example:
 # If you want the CUDA version
 pip uninstall torch-geometric
 export TORCH=2.10.0
-export CUDA=cu126 # for cuda version 12.8
+export CUDA=cu126 # for cuda version 12.6
 pip install torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
 
 # If you want the CPU version
@@ -116,6 +133,23 @@ print(interaction_energies)
 #  [-1.45428585 -2.25829129  2.25395064 -0.49102129 -0.95892391]]
 ```
 
+By default this uses the APNet2 ensemble trained by QCMLForge. Pass
+`weights="ap2_tf_paper"` to use the ensemble published with the AP-Net2 paper
+instead, converted from TensorFlow and verified against the original
+predictions:
+
+```py
+interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
+    mols,
+    compile=False,
+    batch_size=2,
+    weights="ap2_tf_paper",
+)
+```
+
+See [docs/apnet2-tensorflow-weights.md](docs/apnet2-tensorflow-weights.md) for
+the parity data and the loading caveats.
+
 ## Training
 To train the model, run the following command:
 ```bash
@@ -124,6 +158,18 @@ python3 ./train_models.py \
     --ap_model_path ./models/example/ap2_example.pt \
     --n_epochs 5 
 ```
+
+## Experiment tracking
+
+Optional experiment tracking is documented in
+[Training with Weights & Biases](docs/training-with-wandb.md).
+
+## Reproducing the original TensorFlow AP-Net2
+
+`models/ap2_tf_paper/` holds the published TensorFlow ensemble converted to PyTorch
+checkpoints, which reproduce the original model's predictions to float32
+accumulation noise. See
+[Running APNet2 with the original TensorFlow weights](docs/apnet2-tensorflow-weights.md).
 
 # PyTorch AtomicModule 
 Code re-implemented from TensorFlow version located [here](https://github.com/zachglick/apnet)

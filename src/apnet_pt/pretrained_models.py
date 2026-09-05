@@ -13,10 +13,19 @@ from apnet_pt.pt_datasets.dapnet_ds import clean_str_for_filename
 from . import AtomModels
 from . import AtomPairwiseModels
 from . import atomic_datasets
+from .hf_pretrained import (
+    DEFAULT_APNET2_WEIGHTS,
+    apnet2_weight_paths,
+    apnet2_weight_set_size,
+)
 
 # model_dir = os.path.dirname(os.path.realpath(__file__)) + "/models/"
 model_dir = resources.files("apnet_pt").joinpath("models")
 HF_REPO_ID = "awallace3/qcmlforge"
+DAPNET2_BACKBONE_PATHS = {
+    "atom": "dapnet2/backbone/am_0.pt",
+    "apnet2": "dapnet2/backbone/ap2_0.pt",
+}
 _DOWNLOAD_APPROVED = None
 LOGGER = logging.getLogger(__name__)
 
@@ -134,27 +143,47 @@ def _resolve_pretrained_paths(rel_paths: list[str]) -> dict[str, str]:
     return resolved
 
 
+def _reject_fused_weights(weights: str) -> None:
+    """Refuse named weight sets that ship no single fused state dict."""
+    if weights != DEFAULT_APNET2_WEIGHTS:
+        raise ValueError(
+            f"weights={weights!r} has no fused ensemble; the fused "
+            "APNet2_AM_MPNN state dict is incompatible with the separate "
+            "atom/pair checkpoints. Pass ap2_fused=False."
+        )
+
+
 def atom_model_predict(
     mols: list[Molecule],
     compile: bool = True,
     batch_size: int = 3,
     return_mol_arrays: bool = True,
+    weights: str = DEFAULT_APNET2_WEIGHTS,
 ):
-    num_models = 5
-    model_paths = _resolve_pretrained_paths(
-        [f"am_ensemble/am_{i}.pt" for i in range(num_models)]
-    )
+    """Ensemble-average atomic multipoles over a pretrained atom-model ensemble.
+
+    ``weights`` names the ensemble: QCMLForge-trained by default, or
+    ``"ap2_tf_paper"`` for the atom models published with the AP-Net2 paper.
+    """
+    num_models = apnet2_weight_set_size(weights)
+    atom_rel_paths = [
+        apnet2_weight_paths(i, weights)["atom"] for i in range(num_models)
+    ]
+    model_paths = _resolve_pretrained_paths(atom_rel_paths)
     am = AtomModels.ap2_atom_model.AtomModel(
-        pre_trained_model_path=model_paths["am_ensemble/am_0.pt"],
+        pre_trained_model_path=model_paths[atom_rel_paths[0]],
     )
-    if compile:
-        print("Compiling models...")
-        am.compile_model()
     models = [copy.deepcopy(am) for _ in range(num_models)]
     for i in range(1, num_models):
         models[i].set_pretrained_model(
-            model_path=model_paths[f"am_ensemble/am_{i}.pt"],
+            model_path=model_paths[atom_rel_paths[i]],
         )
+    if compile:
+        # Compile after loading: state dicts have no ``_orig_mod.`` prefix, so
+        # loading into an already-compiled module fails on missing keys.
+        print("Compiling models...")
+        for model in models:
+            model.compile_model()
     print("Processing mols...")
     data = [
         atomic_datasets.qcel_mon_to_pyg_data(mol, r_cut=am.model.r_cut) for mol in mols
@@ -218,8 +247,15 @@ def apnet2_model_predict(
     batch_size: int = 16,
     ensemble_model_dir: str = model_dir,
     ap2_fused: bool = False,
+    weights: str = DEFAULT_APNET2_WEIGHTS,
 ):
+    """Ensemble-average APNet2 interaction energies for ``mols``.
+
+    ``weights`` names the ensemble, as in :func:`atom_model_predict`. Returns an
+    ``(N, 5)`` array: total, elst, exch, indu, disp, all in kcal/mol.
+    """
     if ap2_fused:
+        _reject_fused_weights(weights)
         num_models = 4
         additional_models_start = 2
         model_paths = _resolve_pretrained_paths(
@@ -230,19 +266,17 @@ def apnet2_model_predict(
             pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
         )
     else:
-        num_models = 5
+        num_models = apnet2_weight_set_size(weights)
         additional_models_start = 1
+        rel_paths = [apnet2_weight_paths(i, weights) for i in range(num_models)]
         model_paths = _resolve_pretrained_paths(
-            [f"ap2_ensemble/ap2_{i}.pt" for i in range(num_models)]
-            + [f"am_ensemble/am_{i}.pt" for i in range(num_models)]
+            [rel["pair"] for rel in rel_paths]
+            + [rel["atom"] for rel in rel_paths]
         )
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
-            pre_trained_model_path=model_paths["ap2_ensemble/ap2_0.pt"],
-            atom_model_pre_trained_path=model_paths["am_ensemble/am_0.pt"],
+            pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
+            atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
         )
-    if compile:
-        print("Compiling models...")
-        ap2.compile_model()
     models = [copy.deepcopy(ap2) for _ in range(num_models)]
     for i in range(additional_models_start, num_models):
         if ap2_fused:
@@ -251,9 +285,15 @@ def apnet2_model_predict(
             )
         else:
             models[i].set_pretrained_model(
-                ap2_model_path=model_paths[f"ap2_ensemble/ap2_{i}.pt"],
-                am_model_path=model_paths[f"am_ensemble/am_{i}.pt"],
+                ap2_model_path=model_paths[rel_paths[i]["pair"]],
+                am_model_path=model_paths[rel_paths[i]["atom"]],
             )
+    if compile:
+        # Compile after loading: state dicts have no ``_orig_mod.`` prefix, so
+        # loading into an already-compiled module fails on missing keys.
+        print("Compiling models...")
+        for model in models:
+            model.compile_model()
     pred_IEs = np.zeros((len(mols), 5))
     print("Processing mols...")
     for i in range(num_models):
@@ -276,6 +316,7 @@ def apnet2_model_predict_pairs(
     fBs: list[dict[str, list[int]]] | None = None,
     print_results: bool = False,
     ap2_fused: bool = True,
+    weights: str = DEFAULT_APNET2_WEIGHTS,
 ):
     """
     Compute ensemble-averaged APNet2 pairwise interaction energies for specified fragment pairs and return per-molecule energies, per-atom pairwise arrays, and a fragment-pair breakdown DataFrame.
@@ -297,6 +338,10 @@ def apnet2_model_predict_pairs(
             If True, print a formatted per-fragment summary to stdout.
         ap2_fused: bool, optional
             If True, use the fused APNet2 variant; otherwise use the standard APNet2 ensemble.
+        weights: str, optional
+            Named weight set from ``apnet_pt.hf_pretrained.apnet2_weight_sets()``.
+            Defaults to the QCMLForge-trained ensemble; ``"ap2_tf_paper"`` selects
+            the ensemble published with the AP-Net2 paper and requires ap2_fused=False.
 
     Returns:
         pred_IEs (numpy.ndarray):
@@ -306,6 +351,8 @@ def apnet2_model_predict_pairs(
         df (pandas.DataFrame):
             Fragment-pair breakdown with columns ["fA-fB", "total", "elst", "exch", "indu", "disp"], one row per fragment-A/fragment-B pair.
     """
+    if ap2_fused:
+        _reject_fused_weights(weights)
     assert fAs is not None, (
         "fAs must be provided. Example: [{'Methyl1_A': [1, 2, 7, 8], 'Methyl2_A': [3, 4, 5, 6]}...]"
     )
@@ -324,19 +371,19 @@ def apnet2_model_predict_pairs(
             pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
         )
     else:
-        additional_models_start = 2
-        num_models = 5
+        # models[0] is member 0, so loading must start at 1; starting at 2
+        # double-counted member 0 and dropped member 1.
+        additional_models_start = 1
+        num_models = apnet2_weight_set_size(weights)
+        rel_paths = [apnet2_weight_paths(i, weights) for i in range(num_models)]
         model_paths = _resolve_pretrained_paths(
-            [f"ap2_ensemble/ap2_{i}.pt" for i in range(num_models)]
-            + [f"am_ensemble/am_{i}.pt" for i in range(num_models)]
+            [rel["pair"] for rel in rel_paths]
+            + [rel["atom"] for rel in rel_paths]
         )
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
-            pre_trained_model_path=model_paths["ap2_ensemble/ap2_0.pt"],
-            atom_model_pre_trained_path=model_paths["am_ensemble/am_0.pt"],
+            pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
+            atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
         )
-    if compile:
-        print("Compiling models...")
-        ap2.compile_model()
     models = [copy.deepcopy(ap2) for _ in range(num_models)]
     for i in range(additional_models_start, num_models):
         if ap2_fused:
@@ -345,9 +392,15 @@ def apnet2_model_predict_pairs(
             )
         else:
             models[i].set_pretrained_model(
-                ap2_model_path=model_paths[f"ap2_ensemble/ap2_{i}.pt"],
-                am_model_path=model_paths[f"am_ensemble/am_{i}.pt"],
+                ap2_model_path=model_paths[rel_paths[i]["pair"]],
+                am_model_path=model_paths[rel_paths[i]["atom"]],
             )
+    if compile:
+        # Compile after loading: state dicts have no ``_orig_mod.`` prefix, so
+        # loading into an already-compiled module fails on missing keys.
+        print("Compiling models...")
+        for model in models:
+            model.compile_model()
     pred_IEs = np.zeros((len(mols), 5))
     print("Processing mols...")
     IEs, pairwise_energies = models[0].predict_qcel_mols(
@@ -646,13 +699,54 @@ DAPNET2_PRETRAINED_MODEL_FILENAMES = [
 ]
 
 
-def dapnet2_levels_of_theory_pretrained():
+_DAPNET2_BASIS_NAMES = (
+    "aug-cc-pVDTZ",
+    "aug-cc-pVTQZ",
+    "aug-cc-pVDZ",
+    "aug-cc-pVTZ",
+    "aug-cc-pVQZ",
+    "jun-cc-pVDZ",
+    "cc-pVQZ",
+)
+_DAPNET2_CP_LABELS = ("unCP", "CP", "SA")
+_DAPNET2_TARGET_SUFFIX = f"_{clean_str_for_filename('CCSD(T)/CBS/CP')}.pt"
+
+
+def _decode_dapnet2_method(method: str) -> str:
+    return method.replace("_LP_", "(").replace("_RP_", ")")
+
+
+def _format_dapnet2_level_of_theory(filename: str) -> str:
+    level = filename.removesuffix(_DAPNET2_TARGET_SUFFIX)
+    if level.endswith("_adz"):
+        return f"{_decode_dapnet2_method(level.removesuffix('_adz'))}/adz"
+
+    for basis in _DAPNET2_BASIS_NAMES:
+        basis_start = level.rfind(basis)
+        if basis_start < 1:
+            continue
+        cp_label = level[basis_start + len(basis) :]
+        if cp_label in _DAPNET2_CP_LABELS:
+            method = _decode_dapnet2_method(level[:basis_start])
+            return f"{method}/{basis}/{cp_label}"
+
+    raise ValueError(f"Cannot parse dAPNet2 level from checkpoint {filename!r}")
+
+
+DAPNET2_PRETRAINED_LEVELS = {
+    _format_dapnet2_level_of_theory(name): name
+    for name in DAPNET2_PRETRAINED_MODEL_FILENAMES
+}
+
+
+def dapnet2_levels_of_theory_pretrained() -> list[str]:
+    """Return user-facing source levels with pretrained dAPNet2 models.
+
+    Each value uses ``method/basis/correction`` notation and can be passed
+    directly as ``m1`` to :func:`dapnet2_model_predict`. All models predict a
+    correction to ``CCSD(T)/CBS/CP``.
     """
-    Returns a list of possible m1 levels of theory with pretrained dAPNet2
-    models. These pretrained models predict E=(m1-CCSD(T)/CBS/CP).
-    """
-    target = f"_{clean_str_for_filename('CCSD(T)/CBS/CP')}.pt"
-    return [name.removesuffix(target) for name in DAPNET2_PRETRAINED_MODEL_FILENAMES]
+    return list(DAPNET2_PRETRAINED_LEVELS)
 
 
 def _resolve_dapnet2_pretrained_path(m1: str, m2: str) -> str:
@@ -663,9 +757,10 @@ def _resolve_dapnet2_pretrained_path(m1: str, m2: str) -> str:
         f"dapnet2/{m1_clean}_{m2_clean}.pt",
     ]
     rel_paths.extend(
-        f"dapnet2/{name}"
-        for name in DAPNET2_PRETRAINED_MODEL_FILENAMES
-        if name == f"{m1_clean}_{m2_clean}.pt"
+        f"dapnet2/{filename}"
+        for level, filename in DAPNET2_PRETRAINED_LEVELS.items()
+        if m1 == level
+        or m1_clean == filename.removesuffix(_DAPNET2_TARGET_SUFFIX)
     )
 
     errors = []
@@ -692,19 +787,21 @@ def dapnet2_model_predict(
     use_GPU: bool = None,
 ) -> np.ndarray:
     base_model_paths = _resolve_pretrained_paths(
-        ["am_ensemble/am_0.pt", "ap2_ensemble/ap2_0.pt"]
+        list(DAPNET2_BACKBONE_PATHS.values())
     )
+    atom_model_path = base_model_paths[DAPNET2_BACKBONE_PATHS["atom"]]
+    apnet2_model_path = base_model_paths[DAPNET2_BACKBONE_PATHS["apnet2"]]
     atom_model = AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
         ignore_database_null=True,
         use_GPU=use_GPU,
-    ).set_pretrained_model(model_path=base_model_paths["am_ensemble/am_0.pt"])
+    ).set_pretrained_model(model_path=atom_model_path)
     apnet2 = AtomPairwiseModels.apnet2.APNet2Model(
         atom_model=atom_model.model,
         use_GPU=use_GPU,
     ).set_pretrained_model(
-        ap2_model_path=base_model_paths["ap2_ensemble/ap2_0.pt"],
-        am_model_path=base_model_paths["am_ensemble/am_0.pt"],
+        ap2_model_path=apnet2_model_path,
+        am_model_path=atom_model_path,
     )
     apnet2.model.return_hidden_states = True
     if pre_trained_model_path is None:

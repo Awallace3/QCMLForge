@@ -21,6 +21,15 @@ import os
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
+    tracked_ddp_worker,
+)
 
 max_Z = 118
 
@@ -284,6 +293,7 @@ class AtomTypeParamModel:
         if monomer_eval_type in ["hirshfeld_volume_ratio__valence_width"]:
             self.n_params = 2
 
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(f"Loading pre-trained MTP-MTP model from {pre_trained_model_path}")
             checkpoint = torch.load(pre_trained_model_path, weights_only=False)
@@ -477,6 +487,7 @@ class AtomTypeParamModel:
                 f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f}",
                 flush=True,
             )
+        track_pretraining_from_locals(self, locals())
         return test_loss
 
     def train_batches_single_proc(
@@ -554,9 +565,11 @@ class AtomTypeParamModel:
         total_vw_error = torch.tensor(
             total_vw_error, dtype=torch.float32, device=rank_device
         )
+        total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         # All-reduce across processes
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_hfvr_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_vw_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
@@ -726,20 +739,32 @@ class AtomTypeParamModel:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         criterion = torch.nn.MSELoss()
 
-        test_loss = self.pretrain_statistics(train_loader, test_loader, criterion)
+        with torch.no_grad():
+            train_loss, hfvr_MAE_t, vw_MAE_t = self.evaluate_batches(
+                rank, train_loader, criterion, rank_device
+            )
+            test_loss, hfvr_MAE_v, vw_MAE_v = self.evaluate_batches(
+                rank, test_loader, criterion, rank_device
+            )
+        if rank == 0:
+            print(
+                "  (Pre-training)  MAE: "
+                f"{hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} "
+                f"{vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f}",
+                flush=True,
+            )
+        track_pretraining_from_locals(self, locals())
 
         lowest_test_loss = test_loss
 
         for epoch in range(n_epochs):
             t1 = time.time()
             test_lowered = False
-            train_loss, charge_MAE_t, dipole_MAE_t, qpole_MAE_t, hfvr_MAE_t = (
-                self.train_batches(
-                    rank, train_loader, criterion, optimizer, rank_device
-                )
+            train_loss, hfvr_MAE_t, vw_MAE_t = self.train_batches(
+                rank, train_loader, criterion, optimizer, rank_device
             )
-            test_loss, charge_MAE_v, dipole_MAE_v, qpole_MAE_v, hfvr_MAE_v = (
-                self.evaluate_batches(rank, test_loader, criterion, rank_device)
+            test_loss, hfvr_MAE_v, vw_MAE_v = self.evaluate_batches(
+                rank, test_loader, criterion, rank_device
             )
 
             if rank == 0:
@@ -767,10 +792,11 @@ class AtomTypeParamModel:
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 # if (world_size==1 or rank == 0):
                 print(
-                    f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {test_lowered}",
+                    f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f} {test_lowered}",
                     flush=True,
                 )
         if world_size > 1:
@@ -836,6 +862,7 @@ class AtomTypeParamModel:
             f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f}",
             flush=True,
         )
+        track_pretraining_from_locals(self, locals())
         for epoch in range(n_epochs):
             t1 = time.time()
             test_lowered = False
@@ -876,6 +903,7 @@ class AtomTypeParamModel:
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {hfvr_MAE_t:>7.4f}/{hfvr_MAE_v:<7.4f} {vw_MAE_t:>7.4f}/{vw_MAE_v:<7.4f} {test_lowered}",
@@ -897,6 +925,8 @@ class AtomTypeParamModel:
         batch_size=16,
         lr=5e-4,
         split_percent=0.9,
+        train_indices=None,
+        test_indices=None,
         model_path=None,
         skip_compile=True,
         shuffle=True,
@@ -904,6 +934,9 @@ class AtomTypeParamModel:
         world_size=1,  # Default to 1 for single-core operation
         omp_num_threads_per_process=None,
         random_seed=42,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         self.model_save_path = model_path
         if self.model_save_path is not None:
@@ -919,12 +952,56 @@ class AtomTypeParamModel:
 
         np.random.seed(42)
         torch.manual_seed(42)
-        random_indices = np.random.permutation(len(self.dataset))
-        train_indices = random_indices[: int(len(self.dataset) * split_percent)]
-        test_indices = random_indices[int(len(self.dataset) * split_percent) :]
+        explicit_split = train_indices is not None or test_indices is not None
+        if explicit_split:
+            # A designed split, e.g. element- and charge-stratified so that
+            # rare-element held-out coverage is a property of the split rather
+            # than of the seed. Both sides are required: supplying one and
+            # letting the other fall back to a random draw would overlap them.
+            if train_indices is None or test_indices is None:
+                raise ValueError(
+                    "train_indices and test_indices must be supplied together"
+                )
+            train_indices = np.asarray(train_indices, dtype=np.int64)
+            test_indices = np.asarray(test_indices, dtype=np.int64)
+            if train_indices.size == 0 or test_indices.size == 0:
+                raise ValueError(
+                    f"explicit split has {train_indices.size} train and "
+                    f"{test_indices.size} test indices; both must be non-empty"
+                )
+            overlap = np.intersect1d(train_indices, test_indices)
+            if overlap.size:
+                raise ValueError(
+                    f"explicit split leaks {overlap.size} indices into both "
+                    f"train and test, first {overlap[:5].tolist()}"
+                )
+            n_data = len(self.dataset)
+            for name, arr in (("train", train_indices), ("test", test_indices)):
+                if arr.min() < 0 or arr.max() >= n_data:
+                    raise ValueError(
+                        f"explicit {name} indices fall outside [0, {n_data}) "
+                        f"(min {int(arr.min())}, max {int(arr.max())})"
+                    )
+            print(
+                f"Using explicit split: {train_indices.size} train, "
+                f"{test_indices.size} test "
+                f"({100.0 * test_indices.size / n_data:.2f}% of the dataset "
+                f"held out)",
+                flush=True,
+            )
+        else:
+            random_indices = np.random.permutation(len(self.dataset))
+            train_indices = random_indices[
+                : int(len(self.dataset) * split_percent)
+            ]
+            test_indices = random_indices[
+                int(len(self.dataset) * split_percent) :
+            ]
         if random_seed:
             np.random.seed(random_seed)
             torch.manual_seed(random_seed)
+            # Shuffles the order within the training set only; the split itself
+            # is untouched, so an explicit split stays exactly as designed.
             train_indices = np.random.permutation(train_indices)
         train_dataset = self.dataset[train_indices]
         test_dataset = self.dataset[test_indices]
@@ -951,13 +1028,32 @@ class AtomTypeParamModel:
             torch.jit.enable_onednn_fusion(True)
             torch.autograd.set_detect_anomaly(False)
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+            # Recorded so a stratified run is distinguishable from a uniform
+            # one on the dashboard. Without it the two look identical.
+            "data/split_kind": "explicit" if explicit_split else "uniform",
+            "data/split_percent": None if explicit_split else split_percent,
+        }
         if world_size > 1:
             # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="parameter",
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -974,17 +1070,29 @@ class AtomTypeParamModel:
             # Run single-process training directly
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
-                rank=0,
-                world_size=world_size,
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    rank=0,
+                    world_size=world_size,
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    skip_compile=skip_compile,
+                ),
+                wandb_config,
+                model_family="parameter",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                skip_compile=skip_compile,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
 
         return

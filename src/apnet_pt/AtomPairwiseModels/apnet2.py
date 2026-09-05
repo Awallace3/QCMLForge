@@ -6,9 +6,23 @@ import warnings
 import time
 from ..AtomModels.ap2_atom_model import AtomMPNN, isolate_atomic_property_predictions
 from .. import atomic_datasets
-from ..hf_pretrained import resolve_pretrained_paths
+from ..hf_pretrained import (
+    DEFAULT_APNET2_WEIGHTS,
+    resolve_apnet2_weights,
+)
 from .. import pairwise_datasets
 from .. import model_io
+from ..distributed_metrics import globally_reduced_mae
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    stage_final_weights,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
+    tracked_ddp_worker,
+)
 from ..pairwise_datasets import (
     apnet2_module_dataset,
     APNet2_DataLoader,
@@ -27,6 +41,13 @@ import qcelemental as qcel
 from copy import deepcopy
 from apnet_pt.torch_util import set_weights_to_value
 from apnet_pt.util import scatter_sum_compile
+from .apnet2_parity import (
+    APNetLazyLinear,
+    checkpoint_score,
+    elst_uQ_QQ,
+    initialize_tensorflow_defaults,
+    validate_parameter_initialization,
+)
 
 
 def inverse_time_decay(step, initial_lr, decay_steps, decay_rate, staircase=True):
@@ -159,6 +180,9 @@ class APNet2_MPNN(nn.Module):
         r_cut_im=8.0,
         r_cut=5.0,
         return_hidden_states=False,
+        quadrupole_scale=1.0,
+        elst_include_uQ_QQ=False,
+        parameter_initialization="pytorch",
     ):
         # super().__init__(aggr="add")
         super().__init__()
@@ -171,6 +195,11 @@ class APNet2_MPNN(nn.Module):
         self.r_cut_im = r_cut_im
         self.r_cut = r_cut
         self.return_hidden_states = return_hidden_states
+        self.quadrupole_scale = float(quadrupole_scale)
+        self.elst_include_uQ_QQ = bool(elst_include_uQ_QQ)
+        self.parameter_initialization = validate_parameter_initialization(
+            parameter_initialization
+        )
 
         layer_nodes_hidden = [
             # input_layer_size,
@@ -224,6 +253,8 @@ class APNet2_MPNN(nn.Module):
             self.directional_layers.append(
                 self._make_layers(layer_nodes_hidden, layer_activations)
             )
+        if self.parameter_initialization == "tensorflow":
+            self.apply(initialize_tensorflow_defaults)
 
     def get_config(self) -> dict:
         """
@@ -242,6 +273,9 @@ class APNet2_MPNN(nn.Module):
             "n_embed": self.n_embed,
             "r_cut_im": self.r_cut_im,
             "r_cut": self.r_cut,
+            "quadrupole_scale": self.quadrupole_scale,
+            "elst_include_uQ_QQ": self.elst_include_uQ_QQ,
+            "parameter_initialization": self.parameter_initialization,
         }
 
     def get_model_info(self):
@@ -267,8 +301,10 @@ class APNet2_MPNN(nn.Module):
 
     def _make_layers(self, layer_nodes, activations):
         layers = []
-        # Start with a LazyLinear so we don't have to fix input dim
-        layers.append(nn.LazyLinear(layer_nodes[0]))
+        # Start with a LazyLinear so we don't have to fix input dim.
+        layers.append(
+            APNetLazyLinear(layer_nodes[0], self.parameter_initialization)
+        )
         layers.append(activations[0])
         for i in range(len(layer_nodes) - 1):
             layers.append(nn.Linear(layer_nodes[i], layer_nodes[i + 1]))
@@ -303,11 +339,12 @@ class APNet2_MPNN(nn.Module):
         muA_source = muA.index_select(0, e_ABsr_source)
         muB_source = muB.index_select(0, e_ABsr_target)
 
-        # TF implementation uses 3/2 factor for quadrupoles
-        # quadA_source = (3.0 / 2.0) * quadA.index_select(0, e_ABsr_source)
-        # quadB_source = (3.0 / 2.0) * quadB.index_select(0, e_ABsr_target)
-        quadA_source = quadA.index_select(0, e_ABsr_source)
-        quadB_source = quadB.index_select(0, e_ABsr_target)
+        quadA_source = self.quadrupole_scale * quadA.index_select(
+            0, e_ABsr_source
+        )
+        quadB_source = self.quadrupole_scale * quadB.index_select(
+            0, e_ABsr_target
+        )
 
         E_qq = torch.einsum("x,x,x->x", qA_source, qB_source, oodR)
 
@@ -328,7 +365,20 @@ class APNet2_MPNN(nn.Module):
         qB_quadA_source = torch.einsum("x,xyz->xyz", qB_source, quadA_source)
         E_qQ = torch.einsum("xyz,xyz->x", T2, qA_quadB_source + qB_quadA_source) / 3.0
 
-        E_elst = 627.509 * (E_qq + E_qu + E_qQ + E_uu)
+        E_multipole = E_qq + E_qu + E_qQ + E_uu
+        if self.elst_include_uQ_QQ:
+            E_multipole = E_multipole + elst_uQ_QQ(
+                dR,
+                dR_xyz,
+                oodR,
+                delta,
+                muA_source,
+                muB_source,
+                quadA_source,
+                quadB_source,
+            )
+
+        E_elst = 627.509 * E_multipole
         return E_elst
 
     def get_messages(self, h0, h, rbf, e_source, e_target):
@@ -716,6 +766,9 @@ class APNet2Model:
         print_lvl=0,
         ds_qcel_molecules=None,
         ds_energy_labels=None,
+        quadrupole_scale=1.0,
+        elst_include_uQ_QQ=False,
+        parameter_initialization="pytorch",
     ):
         """
         If pre_trained_model_path is provided, the model will be loaded from
@@ -735,6 +788,7 @@ class APNet2Model:
         # Track whether we loaded the atom_model from an embedded submodel
         atom_model_loaded_from_embed = False
 
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(
                 f"Loading pre-trained APNet2_MPNN model from {pre_trained_model_path}"
@@ -780,6 +834,11 @@ class APNet2Model:
                 n_embed=config.get("n_embed", n_embed),
                 r_cut_im=config.get("r_cut_im", r_cut_im),
                 r_cut=config.get("r_cut", r_cut),
+                quadrupole_scale=config.get("quadrupole_scale", 1.0),
+                elst_include_uQ_QQ=config.get("elst_include_uQ_QQ", False),
+                parameter_initialization=config.get(
+                    "parameter_initialization", "pytorch"
+                ),
             )
             state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(state_dict)
@@ -792,6 +851,9 @@ class APNet2Model:
                 n_embed=n_embed,
                 r_cut_im=r_cut_im,
                 r_cut=r_cut,
+                quadrupole_scale=quadrupole_scale,
+                elst_include_uQ_QQ=elst_include_uQ_QQ,
+                parameter_initialization=parameter_initialization,
             )
 
         # Load atom_model from external path if not already loaded from embedded
@@ -879,7 +941,16 @@ class APNet2Model:
                 )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
         elif not ignore_database_null and self.dataset is None and ds_split_db:
@@ -935,7 +1006,16 @@ class APNet2Model:
                 ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset[0] = self.dataset[0][:ds_max_size]
                 self.dataset[1] = self.dataset[1][:ds_max_size]
@@ -992,7 +1072,11 @@ class APNet2Model:
         return
 
     def set_pretrained_model(
-        self, ap2_model_path=None, am_model_path=None, model_id=None
+        self,
+        ap2_model_path=None,
+        am_model_path=None,
+        model_id=None,
+        weights=DEFAULT_APNET2_WEIGHTS,
     ):
         """
         Load pretrained weights for the APNet2 and AtomMPNN models.
@@ -1008,8 +1092,16 @@ class APNet2Model:
             Path to AtomMPNN checkpoint file. Ignored if ap2_model_path is a v2
             checkpoint with embedded atom_model.
         model_id : int, optional
-            If provided, loads from bundled ensemble models (am_{model_id}.pt
-            and ap2_{model_id}.pt).
+            If provided, loads ensemble member ``model_id`` of ``weights``:
+            the pair model together with the atom model it was trained
+            against.
+        weights : str, optional
+            Named weight set to take ``model_id`` from, one of
+            ``apnet_pt.hf_pretrained.apnet2_weight_sets()``. Defaults to the
+            QCMLForge-trained ensemble; pass ``"ap2_tf_paper"`` for the
+            ensemble published with the AP-Net2 paper (see
+            docs/apnet2-tensorflow-weights.md).
+            Ignored when explicit paths are given.
 
         Returns
         -------
@@ -1017,14 +1109,9 @@ class APNet2Model:
             Returns self for method chaining.
         """
         if model_id is not None:
-            model_paths = resolve_pretrained_paths(
-                [
-                    f"am_ensemble/am_{model_id}.pt",
-                    f"ap2_ensemble/ap2_{model_id}.pt",
-                ]
-            )
-            am_model_path = model_paths[f"am_ensemble/am_{model_id}.pt"]
-            ap2_model_path = model_paths[f"ap2_ensemble/ap2_{model_id}.pt"]
+            model_paths = resolve_apnet2_weights(model_id, weights)
+            am_model_path = model_paths["atom"]
+            ap2_model_path = model_paths["pair"]
         elif ap2_model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 
@@ -1060,6 +1147,17 @@ class APNet2Model:
         # Load APNet2 weights
         ap2_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
         self.model.load_state_dict(ap2_state_dict)
+
+        # ``quadrupole_scale`` is a forward-pass constant, not a state-dict
+        # entry, so a checkpoint needing 1.5 (models/ap2_tf_paper) would
+        # otherwise load cleanly and predict the wrong electrostatics.
+        ap2_config = model_io.load_config_from_checkpoint(checkpoint) or {}
+        if "quadrupole_scale" in ap2_config:
+            self.model.quadrupole_scale = float(ap2_config["quadrupole_scale"])
+        if "elst_include_uQ_QQ" in ap2_config:
+            self.model.elst_include_uQ_QQ = bool(
+                ap2_config["elst_include_uQ_QQ"]
+            )
 
         # Load external atom_model if not loaded from embedded
         if not atom_model_loaded_from_embed and am_model_path is not None:
@@ -1999,29 +2097,23 @@ units angstrom
             exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
             indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
             disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-            count += preds.numel()
+            count += preds.shape[0]
         if scheduler is not None:
             scheduler.step()
 
         total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
-        total_error = torch.tensor(total_error, dtype=torch.float32, device=rank_device)
-        elst_error = torch.tensor(elst_error, dtype=torch.float32, device=rank_device)
-        exch_error = torch.tensor(exch_error, dtype=torch.float32, device=rank_device)
-        indu_error = torch.tensor(indu_error, dtype=torch.float32, device=rank_device)
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
-        total_MAE_t = (total_error / count).cpu()
-        elst_MAE_t = (elst_error / count).cpu()
-        exch_MAE_t = (exch_error / count).cpu()
-        indu_MAE_t = (indu_error / count).cpu()
-        disp_MAE_t = (disp_error / count).cpu()
+        (
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+        ) = globally_reduced_mae(
+            (total_error, elst_error, exch_error, indu_error, disp_error),
+            count,
+            device=rank_device,
+        )
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     # @torch.inference_mode()
@@ -2056,27 +2148,21 @@ units angstrom
                 exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
                 indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
                 disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-                count += preds.numel()
+                count += preds.shape[0]
 
         total_loss = torch.tensor(total_loss, device=rank_device)
-        total_error = torch.tensor(total_error, device=rank_device)
-        elst_error = torch.tensor(elst_error, device=rank_device)
-        exch_error = torch.tensor(exch_error, device=rank_device)
-        indu_error = torch.tensor(indu_error, device=rank_device)
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
-        total_MAE_t = (total_error / count).cpu()
-        elst_MAE_t = (elst_error / count).cpu()
-        exch_MAE_t = (exch_error / count).cpu()
-        indu_MAE_t = (indu_error / count).cpu()
-        disp_MAE_t = (disp_error / count).cpu()
+        (
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+        ) = globally_reduced_mae(
+            (total_error, elst_error, exch_error, indu_error, disp_error),
+            count,
+            device=rank_device,
+        )
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     def ddp_train(
@@ -2092,6 +2178,8 @@ units angstrom
         num_workers,
         lr_decay=None,
         include_total_mse=False,
+        adam_eps=1e-8,
+        checkpoint_metric="component_mse",
     ):
         print(f"{self.device.type=}")
         if self.device.type == "cpu":
@@ -2164,7 +2252,7 @@ units angstrom
         if rank == 0:
             print("Loaders setup\n")
 
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, eps=adam_eps)
         if lr_decay:
             scheduler = InverseTimeDecayLR(
                 optimizer, lr, len(train_loader) * 60, lr_decay
@@ -2206,6 +2294,7 @@ units angstrom
                     f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                     flush=True,
                 )
+        track_pretraining_from_locals(self, locals())
         for epoch in range(n_epochs):
             t1 = time.time()
             test_lowered = False
@@ -2231,8 +2320,11 @@ units angstrom
             )
 
             if rank == 0:
-                if test_loss < lowest_test_loss:
-                    lowest_test_loss = test_loss
+                validation_score = checkpoint_score(
+                    checkpoint_metric, test_loss, total_MAE_v
+                )
+                if validation_score < lowest_test_loss:
+                    lowest_test_loss = validation_score
                     test_lowered = "*"
                     if self.model_save_path:
                         print("Saving model")
@@ -2250,6 +2342,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f} {test_lowered}",
@@ -2276,6 +2369,9 @@ units angstrom
         skip_compile=False,
         transfer_learning=False,
         include_total_mse=False,
+        adam_eps=1e-8,
+        checkpoint_metric="component_mse",
+        random_seed=42,
     ):
         # (1) Compile Model
         rank_device = self.device
@@ -2295,6 +2391,11 @@ units angstrom
             collate_fn = apnet2_collate_update_prebatched
         else:
             collate_fn = apnet2_collate_update
+        # Give the shuffling sampler its own generator: RandomSampler otherwise
+        # reseeds from the global torch RNG each epoch, so anything that draws
+        # from it first (e.g. the init policy) also reorders batches.
+        train_loader_generator = torch.Generator()
+        train_loader_generator.manual_seed(int(random_seed))
         train_loader = APNet2_DataLoader(
             dataset=train_dataset,
             batch_size=batch_size,
@@ -2303,6 +2404,7 @@ units angstrom
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=collate_fn,
+            generator=train_loader_generator,
         )
         test_loader = APNet2_DataLoader(
             dataset=test_dataset,
@@ -2314,7 +2416,7 @@ units angstrom
         )
 
         # (3) Optim/Scheduler
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, eps=adam_eps)
         # scheduler = ModLambdaDecayLR(optimizer, lr_decay, lr) if lr_decay else None
         scheduler = (
             InverseTimeDecayLR(optimizer, lr, len(train_loader) * 2, lr_decay)
@@ -2377,9 +2479,12 @@ units angstrom
                 f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f}",
                 flush=True,
             )
+        track_pretraining_from_locals(self, locals())
 
         # (6) Main training loop
-        lowest_test_loss = test_loss
+        lowest_test_loss = checkpoint_score(
+            checkpoint_metric, test_loss, total_MAE_v
+        )
         for epoch in range(n_epochs):
             t1 = time.time()
             t_out = __train_batch(
@@ -2417,10 +2522,14 @@ units angstrom
                 train_loss, total_MAE_t = t_out
                 test_loss, total_MAE_v = v_out
 
-            # Track best model
+            # Track best model using either native component MSE or the
+            # TensorFlow implementation's total-energy validation MAE.
             star_marker = " "
-            if test_loss < lowest_test_loss:
-                lowest_test_loss = test_loss
+            validation_score = checkpoint_score(
+                checkpoint_metric, test_loss, total_MAE_v
+            )
+            if validation_score < lowest_test_loss:
+                lowest_test_loss = validation_score
                 star_marker = "*"
                 cpu_model = model_io.unwrap_model(self.model).to("cpu")
                 best_model = deepcopy(cpu_model)
@@ -2434,6 +2543,8 @@ units angstrom
                     model_io.save_checkpoint(checkpoint, self.model_save_path)
                 self.model.to(rank_device)
 
+            dt = time.time() - t1
+            track_epoch_from_locals(self, locals())
             if not transfer_learning:
                 print(
                     f"  EPOCH: {epoch:4d} ({time.time() - t1:<7.2f}s)  MAE: "
@@ -2450,6 +2561,8 @@ units angstrom
                 )
             if not self.device == "CPU":
                 torch.cuda.empty_cache()
+        # Publish the real final-epoch weights before restoring the best ones.
+        stage_final_weights(self)
         self.model = best_model
         self.model.to(rank_device)
         return
@@ -2470,6 +2583,11 @@ units angstrom
         skip_compile=False,
         transfer_learning=False,
         include_total_mse=False,
+        adam_eps=1e-8,
+        checkpoint_metric="component_mse",
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         """
         Train the APNet2Model on a dataset using single-process or multi-process (DDP) execution.
@@ -2543,8 +2661,10 @@ units angstrom
         print("\nTraining Hyperparameters:", flush=True)
         print(f"  {n_epochs=}", flush=True)
         print(f"  {lr=}\n", flush=True)
-        print(f"  {lr_decay=}\n", flush=True)
-        print(f"  {include_total_mse=}\n", flush=True)
+        print(f"  {lr_decay=}", flush=True)
+        print(f"  {include_total_mse=}", flush=True)
+        print(f"  {adam_eps=}", flush=True)
+        print(f"  {checkpoint_metric=}", flush=True)
         if self.prebatched:
             print(f"  Prebatched training data: setting batch_size=1", flush=True)
             batch_size = 1
@@ -2557,12 +2677,32 @@ units angstrom
 
         self.shuffle = shuffle
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/learning_rate_decay": lr_decay,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+            "training/transfer_learning": transfer_learning,
+            "training/include_total_mse": include_total_mse,
+            "training/adam_eps": adam_eps,
+            "training/checkpoint_metric": checkpoint_metric,
+        }
         if world_size > 1:
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="pairwise",
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -2573,6 +2713,8 @@ units angstrom
                     dataloader_num_workers,
                     lr_decay,
                     include_total_mse,
+                    adam_eps,
+                    checkpoint_metric,
                 ),
                 nprocs=world_size,
                 join=True,
@@ -2580,17 +2722,32 @@ units angstrom
         else:
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    lr_decay=lr_decay,
+                    skip_compile=skip_compile,
+                    transfer_learning=transfer_learning,
+                    include_total_mse=include_total_mse,
+                    adam_eps=adam_eps,
+                    checkpoint_metric=checkpoint_metric,
+                    random_seed=random_seed,
+                ),
+                wandb_config,
+                model_family="pairwise",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                lr_decay=lr_decay,
-                skip_compile=skip_compile,
-                transfer_learning=transfer_learning,
-                include_total_mse=include_total_mse,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
         return

@@ -1,4 +1,6 @@
 import os
+import json
+import warnings
 import qcelemental as qcel
 from typing import List, Optional, Sequence, Union
 from torch_geometric.data.data import BaseData
@@ -6,6 +8,7 @@ from torch_geometric.data.datapipes import DatasetAdapter
 from torch_geometric.data.on_disk_dataset import OnDiskDataset
 from torch_geometric.data import Data
 from torch_geometric.data import Dataset
+from collections import OrderedDict
 import os.path as osp
 import torch
 from torch_geometric.data import download_url
@@ -250,7 +253,8 @@ def ap2_fused_collate_update(batch):
             - ZA, RA, ZB, RB: concatenated atomic numbers and coordinates for monomers A and B.
             - e_AA_source, e_AA_target, e_BB_source, e_BB_target: concatenated intramonomer edge index lists with per-item offsets applied.
             - e_ABsr_source, e_ABsr_target, e_ABlr_source, e_ABlr_target: concatenated short- and long-range inter-monomer edge lists with atom-index offsets applied so every atom in the batch has a unique index.
-            - dimer_ind, dimer_ind_lr: per-edge tensors indicating the originating dimer index for short- and long-range AB edges.
+            - e_ABfull_source, e_ABfull_target: concatenated full inter-monomer edge lists (short-range followed by long-range).
+            - dimer_ind, dimer_ind_lr, dimer_ind_full: per-edge tensors indicating the originating dimer index for short-, long-, and full-range AB edges. dimer_ind_full is aligned element-wise with e_ABfull_source/target.
             - molecule_ind_A, molecule_ind_B: concatenated per-atom molecule indices for A and B.
             - natom_per_mol_A, natom_per_mol_B: number of atoms per molecule for A and B.
             - total_charge_A, total_charge_B: per-dimer total charges for A and B.
@@ -311,6 +315,25 @@ def ap2_fused_collate_update(batch):
     e_AA_target_cat = torch.cat(local_e_AA_target, dim=0)
     e_BB_source_cat = torch.cat(local_e_BB_source, dim=0)
     e_BB_target_cat = torch.cat(local_e_BB_target, dim=0)
+    e_ABsr_source_cat = torch.cat(local_e_ABsr_source, dim=0)
+    e_ABsr_target_cat = torch.cat(local_e_ABsr_target, dim=0)
+    e_ABlr_source_cat = torch.cat(local_e_ABlr_source, dim=0)
+    e_ABlr_target_cat = torch.cat(local_e_ABlr_target, dim=0)
+
+    e_ABfull_source = torch.cat(
+        (e_ABsr_source_cat, e_ABlr_source_cat), dim=0
+    )
+    e_ABfull_target = torch.cat(
+        (e_ABsr_target_cat, e_ABlr_target_cat), dim=0
+    )
+
+    dimer_ind_cat = torch.cat([data.dimer_ind for data in batch], dim=0)
+    dimer_ind_lr_cat = torch.cat(
+        [data.dimer_ind_lr for data in batch], dim=0
+    )
+    dimer_ind_full = torch.cat(
+        (dimer_ind_cat, dimer_ind_lr_cat), dim=0
+    )
     total_charge_A_tensor = torch.tensor(
         [data.total_charge_A for data in batch], dtype=batch[0].total_charge_A.dtype
     )
@@ -350,12 +373,15 @@ def ap2_fused_collate_update(batch):
         molecule_ind_B=molecule_ind_B,
         natom_per_mol_A=natom_per_mol_A,
         natom_per_mol_B=natom_per_mol_B,
-        e_ABsr_source=torch.cat(local_e_ABsr_source, dim=0),
-        e_ABsr_target=torch.cat(local_e_ABsr_target, dim=0),
-        e_ABlr_source=torch.cat(local_e_ABlr_source, dim=0),
-        e_ABlr_target=torch.cat(local_e_ABlr_target, dim=0),
-        dimer_ind=torch.cat([data.dimer_ind for data in batch], dim=0),
-        dimer_ind_lr=torch.cat([data.dimer_ind_lr for data in batch], dim=0),
+        e_ABsr_source=e_ABsr_source_cat,
+        e_ABsr_target=e_ABsr_target_cat,
+        e_ABlr_source=e_ABlr_source_cat,
+        e_ABlr_target=e_ABlr_target_cat,
+        e_ABfull_source=e_ABfull_source,
+        e_ABfull_target=e_ABfull_target,
+        dimer_ind=dimer_ind_cat,
+        dimer_ind_lr=dimer_ind_lr_cat,
+        dimer_ind_full=dimer_ind_full,
         total_charge_A=total_charge_A_tensor,
         total_charge_B=total_charge_B_tensor,
         batch_atomic_A=batch_atomic_A,
@@ -376,7 +402,7 @@ def ap2_fused_collate_update_no_target(batch):
             - e_AA_source/target, e_BB_source/target: concatenated intra-monomer edge indices
             - e_ABsr_source/target, e_ABlr_source/target: concatenated short- and long-range AB edge indices
             - e_ABfull_source/target: concatenated full AB edge indices (short + long)
-            - dimer_ind, dimer_ind_lr, dimer_ind_full: dimer index vectors for AB edges
+            - dimer_ind, dimer_ind_lr, dimer_ind_full: dimer index vectors for AB edges; dimer_ind_full is aligned element-wise with e_ABfull_source/target
             - molecule_ind_A, molecule_ind_B: per-atom molecule indices for A and B
             - natom_per_mol_A, natom_per_mol_B: atom counts per molecule for A and B
             - total_charge_A, total_charge_B: per-dimer total charges for A and B
@@ -624,154 +650,6 @@ def ap2_fused_collate_update_no_target_monomer_indices(batch):
     return batched_data
 
 
-def ap3_fused_collate_update(batch):
-    """
-    Batch-collate a list of fused dimer Data objects into a single batched Data with adjusted intra- and inter-monomer indices.
-
-    Parameters:
-        batch (list[Data]): List of per-dimer PyG Data objects containing atom features, coordinates, intra-monomer edges (e_AA*, e_BB*), inter-monomer edges (e_ABsr_*, e_ABlr_*), dimer index fields, charges, and target `y`.
-
-    Returns:
-        Data: A single PyG Data object that contains:
-            - concatenated atom features and coordinates for monomers A and B (ZA, RA, ZB, RB)
-            - adjusted intra-monomer edge lists (e_AA_source/target, e_BB_source/target)
-            - concatenated short- and long-range inter-monomer edge lists (e_ABsr_*, e_ABlr_*)
-            - full inter-monomer edge lists (e_ABfull_source, e_ABfull_target)
-            - per-edge dimer indices (dimer_ind, dimer_ind_lr, dimer_ind_full)
-            - per-monomer molecule indices and counts (molecule_ind_A/B, natom_per_mol_A/B)
-            - total charges per monomer (total_charge_A/B)
-            - stacked targets `y`
-            - nested batch_atomic_A and batch_atomic_B Data objects for the A and B atom pools
-    """
-    monA_edge_offset, monB_edge_offset = 0, 0
-    local_e_ABsr_source = []
-    local_e_ABsr_target = []
-    local_e_ABlr_source = []
-    local_e_ABlr_target = []
-    local_e_AA_source = []
-    local_e_AA_target = []
-    local_e_BB_source = []
-    local_e_BB_target = []
-    for i, data in enumerate(batch):
-        data.dimer_ind = (
-            torch.ones(data.e_ABsr_source.size(0), dtype=data.dimer_ind.dtype) * i
-        )
-        data.dimer_ind_lr = (
-            torch.ones(data.e_ABlr_source.size(0), dtype=data.dimer_ind_lr.dtype) * i
-        )
-        data.dimer_ind_full = (
-            torch.ones(
-                data.e_ABsr_source.size(0) + data.e_ABlr_source.size(0),
-                dtype=data.dimer_ind_lr.dtype,
-            )
-            * i
-        )
-        local_e_ABsr_source.append(data.e_ABsr_source.clone() + monA_edge_offset)
-        local_e_ABsr_target.append(data.e_ABsr_target.clone() + monB_edge_offset)
-        local_e_ABlr_source.append(data.e_ABlr_source.clone() + monA_edge_offset)
-        local_e_ABlr_target.append(data.e_ABlr_target.clone() + monB_edge_offset)
-        local_e_AA_source.append(data.e_AA_source.clone() + monA_edge_offset)
-        local_e_AA_target.append(data.e_AA_target.clone() + monA_edge_offset)
-        local_e_BB_source.append(data.e_BB_source.clone() + monB_edge_offset)
-        local_e_BB_target.append(data.e_BB_target.clone() + monB_edge_offset)
-        monA_edge_offset += data.RA.size(0)
-        monB_edge_offset += data.RB.size(0)
-    ZA_cat = torch.cat([data.ZA for data in batch], dim=0)
-    RA_cat = torch.cat([data.RA for data in batch], dim=0)
-    ZB_cat = torch.cat([data.ZB for data in batch], dim=0)
-    RB_cat = torch.cat([data.RB for data in batch], dim=0)
-    e_AA_source_cat = torch.cat(local_e_AA_source, dim=0)
-    e_AA_target_cat = torch.cat(local_e_AA_target, dim=0)
-    e_BB_source_cat = torch.cat(local_e_BB_source, dim=0)
-    e_BB_target_cat = torch.cat(local_e_BB_target, dim=0)
-    total_charge_A_tensor = torch.tensor(
-        [data.total_charge_A for data in batch], dtype=batch[0].total_charge_A.dtype
-    )
-    total_charge_B_tensor = torch.tensor(
-        [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
-    )
-    molecule_ind_A = torch.cat(
-        [
-            torch.ones(data.RA.size(0), dtype=torch.long) * i
-            for i, data in enumerate(batch)
-        ],
-        dim=0,
-    )
-    molecule_ind_B = torch.cat(
-        [
-            torch.ones(data.RB.size(0), dtype=torch.long) * i
-            for i, data in enumerate(batch)
-        ],
-        dim=0,
-    )
-    natom_per_mol_A = torch.tensor(
-        [data.RA.size(0) for data in batch], dtype=torch.long
-    )
-    natom_per_mol_B = torch.tensor(
-        [data.RB.size(0) for data in batch], dtype=torch.long
-    )
-
-    batch_atomic_A = Data(
-        x=ZA_cat,
-        edge_index=torch.vstack((e_AA_source_cat, e_AA_target_cat)),
-        R=RA_cat,
-        molecule_ind=molecule_ind_A,
-        total_charge=total_charge_A_tensor,
-        natom_per_mol=natom_per_mol_A,
-    )
-
-    batch_atomic_B = Data(
-        x=ZB_cat,
-        edge_index=torch.vstack((e_BB_source_cat, e_BB_target_cat)),
-        R=RB_cat,
-        molecule_ind=molecule_ind_B,
-        total_charge=total_charge_B_tensor,
-        natom_per_mol=natom_per_mol_B,
-    )
-
-    e_ABsr_source_cat = torch.cat(local_e_ABsr_source, dim=0)
-    e_ABsr_target_cat = torch.cat(local_e_ABsr_target, dim=0)
-    e_ABlr_source_cat = torch.cat(local_e_ABlr_source, dim=0)
-    e_ABlr_target_cat = torch.cat(local_e_ABlr_target, dim=0)
-
-    e_ABfull_source = torch.cat([e_ABsr_source_cat, e_ABlr_source_cat], dim=0)
-    e_ABfull_target = torch.cat([e_ABsr_target_cat, e_ABlr_target_cat], dim=0)
-
-    dimer_ind_cat = torch.cat([data.dimer_ind for data in batch], dim=0)
-    dimer_ind_lr_cat = torch.cat([data.dimer_ind_lr for data in batch], dim=0)
-    dimer_ind_full = torch.cat([data.dimer_ind_full for data in batch], dim=0)
-
-    batched_data = Data(
-        ZA=ZA_cat,
-        RA=RA_cat,
-        ZB=ZB_cat,
-        RB=RB_cat,
-        e_AA_source=e_AA_source_cat,
-        e_AA_target=e_AA_target_cat,
-        e_BB_source=e_BB_source_cat,
-        e_BB_target=e_BB_target_cat,
-        molecule_ind_A=molecule_ind_A,
-        molecule_ind_B=molecule_ind_B,
-        natom_per_mol_A=natom_per_mol_A,
-        natom_per_mol_B=natom_per_mol_B,
-        e_ABsr_source=e_ABsr_source_cat,
-        e_ABsr_target=e_ABsr_target_cat,
-        e_ABlr_source=e_ABlr_source_cat,
-        e_ABlr_target=e_ABlr_target_cat,
-        e_ABfull_source=e_ABfull_source,
-        e_ABfull_target=e_ABfull_target,
-        dimer_ind=dimer_ind_cat,
-        dimer_ind_lr=dimer_ind_lr_cat,
-        dimer_ind_full=dimer_ind_full,
-        total_charge_A=total_charge_A_tensor,
-        total_charge_B=total_charge_B_tensor,
-        y=torch.stack([data.y for data in batch], dim=0),
-        batch_atomic_A=batch_atomic_A,
-        batch_atomic_B=batch_atomic_B,
-    )
-    return batched_data
-
-
 class APNet2_fused_DataLoader(torch.utils.data.DataLoader):
     r"""A data loader which merges data objects from a
     :class:`torch_geometric.data.Dataset` to a mini-batch.
@@ -1012,6 +890,7 @@ class ap2_fused_module_dataset(Dataset):
         random_seed=42,
         check_monomer_validity=True,
         storage_type="pt",  # "pt" or "h5" for storage format
+        shard_cache_size=1,
     ):
         """
         spec_type definitions:
@@ -1101,17 +980,42 @@ class ap2_fused_module_dataset(Dataset):
                     self.atom_model.model, dynamic=True
                 )
         print(f"{root=}, {self.spec_type=}, {self.in_memory=}")
+        # PyG assigns self.root inside its own __init__, which has not run
+        # yet, but the shortfall check below needs processed_dir. This is the
+        # same normalisation PyG applies, and it re-assigns the identical
+        # value moments later.
+        self.root = (
+            osp.expanduser(osp.normpath(root)) if isinstance(root, str) else root
+        )
+        # An on-disk store that is smaller than max_size asks for has to be
+        # grown before PyG is allowed to conclude that nothing needs doing.
+        if not self.force_reprocess and not self.in_memory:
+            self._request_extension_if_store_is_short()
         super(ap2_fused_module_dataset, self).__init__(root, transform, pre_transform)
         if self.force_reprocess:
             self.force_reprocess = False
             super(ap2_fused_module_dataset, self).__init__(
                 root, transform, pre_transform
             )
+        if not self.in_memory:
+            self._warn_if_store_is_smaller_than_requested()
         if self.in_memory:
             self.get = self.get_in_memory
         self.batch_size = batch_size
         self.active_idx_data = None
         self.active_data = None
+        # Multi-shard LRU, off by default.  `active_data` above already caches
+        # the most recent shard, which is all a sequential pass needs; a
+        # shuffled pass touches a different shard on nearly every sample and
+        # re-reads it -- 16x read amplification on a 16-dimer shard.  With
+        # `shard_cache_size > 1` and a shard-locality sampler feeding the
+        # loader, a worker reads each shard of its block once and serves the
+        # rest of the block from here.  Size 1 leaves the cache unallocated so
+        # the default path is exactly the one that was here before.
+        self.shard_cache_size = max(1, int(shard_cache_size))
+        self._shard_cache = (
+            OrderedDict() if self.shard_cache_size > 1 else None
+        )
 
     @property
     def file_extension(self):
@@ -1168,6 +1072,206 @@ class ap2_fused_module_dataset(Dataset):
                 "splinter_spec1.pkl",
             ]
 
+    def _store_extent_path(self):
+        """Sidecar recording how far the raw source could actually fill this store.
+
+        Only the "the source ran out" case is load-bearing.  Without a record
+        of it, asking for more dimers than the raw source can supply would
+        re-trigger a full raw rescan on every instantiation: the shard list
+        would stay permanently short of what ``MAX_SIZE`` implies, and nothing
+        else on disk says "this is as big as it gets".
+        """
+        return osp.join(
+            self.processed_dir,
+            f"dimer_ap2_fused{self.split_name}_spec_{
+                self.spec_type
+            }.store_extent.json",
+        )
+
+    def _existing_shard_paths(self):
+        """Shard files for this split that are on disk right now, in index order.
+
+        Deliberately the same glob shape ``reprocess_file_names`` uses, so the
+        two can never disagree about what "present" means.
+        """
+        pattern = osp.join(
+            self.processed_dir,
+            f"dimer_ap2_fused{self.split_name}_spec_{self.spec_type}_*{
+                self.file_extension
+            }",
+        )
+        return sorted(glob(pattern), key=natural_key)
+
+    def _shards_implied_by_max_size(self):
+        """Shard count ``MAX_SIZE`` asks for, matching reprocess_file_names' floor."""
+        if self.MAX_SIZE is None:
+            return None
+        return int(self.MAX_SIZE / self.datapoint_storage_n_objects)
+
+    def _recorded_source_extent(self):
+        """Shard count at which the raw source was observed to run out, or None."""
+        path = self._store_extent_path()
+        if not osp.exists(path):
+            return None
+        try:
+            with open(path) as fh:
+                recorded = json.load(fh)
+        except Exception as exc:
+            warnings.warn(f"Ignoring unreadable store extent {path}: {exc}")
+            return None
+        if not recorded.get("source_exhausted"):
+            return None
+        shards = recorded.get("shards")
+        if not isinstance(shards, (int, float)) or isinstance(shards, bool):
+            return None
+        return int(shards)
+
+    def _source_was_exhausted(self, *, reached_max_size, n_raw):
+        """Whether the raw source, not the request, is what ended the pass.
+
+        ``load_dimer_dataset`` truncates the frame with ``head(max_size)``, so
+        ``n_raw == MAX_SIZE`` means the request was the binding constraint and
+        the pass learned nothing about what lies beyond it. Only a frame
+        strictly shorter than the request proves the source has no more to
+        give. Recording exhaustion on equality would cap every later, larger
+        request at whatever the first run happened to ask for.
+        """
+        if reached_max_size:
+            return False
+        if self.MAX_SIZE is None:
+            return True
+        return n_raw < self.MAX_SIZE
+
+    def _record_store_extent(self, *, source_exhausted):
+        """Write the extent sidecar after a processing pass."""
+        payload = {
+            "shards": len(self._existing_shard_paths()),
+            "datapoint_storage_n_objects": self.datapoint_storage_n_objects,
+            "requested_max_size": self.MAX_SIZE,
+            "source_exhausted": bool(source_exhausted),
+        }
+        path = self._store_extent_path()
+        tmp = f"{path}.tmp"
+        try:
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError as exc:
+            warnings.warn(f"Could not record store extent at {path}: {exc}")
+
+    def _prefix_is_index_aligned(self):
+        """Whether shard k holds exactly dimers [k*n, (k+1)*n) of the raw order.
+
+        ``process()``'s fast-forward advances its write index once per raw
+        dimer, so it only lands on the right resume point if the two indices
+        never diverged -- and they diverge the moment a dimer in the prefix
+        was dropped for being invalid.  Each stored object carries the raw
+        index it came from, so the last shard settles the question outright
+        and cheaply.
+        """
+        if self.storage_type != "pt":
+            # Only the torch store is this cheap to check; leave anything
+            # else to the safe full rebuild.
+            return False
+        shards = self._existing_shard_paths()
+        if not shards:
+            return False
+        expected = len(shards) * self.datapoint_storage_n_objects - 1
+        try:
+            tail = torch.load(shards[-1], weights_only=False)
+        except Exception as exc:
+            warnings.warn(
+                f"Could not read {osp.basename(shards[-1])} to check whether "
+                f"the store lines up with the raw order: {exc}"
+            )
+            return False
+        if len(tail) != self.datapoint_storage_n_objects:
+            return False
+        dimer_ind = getattr(tail[-1], "dimer_ind", None)
+        if dimer_ind is None:
+            return False
+        try:
+            return int(dimer_ind) == expected
+        except (TypeError, ValueError):
+            return False
+
+    def _request_extension_if_store_is_short(self):
+        """Trigger a build when the store holds fewer dimers than MAX_SIZE asks for.
+
+        ``processed_file_names`` is built by globbing the shards that already
+        exist and then only ever truncating that list down, so PyG's "is
+        processing needed?" check is satisfied by construction and
+        ``process()`` never runs once any shard is present.  The store could
+        therefore never grow: a run asking for 1.5M dimers silently trained on
+        whatever happened to be on disk.  Routing through ``force_reprocess``
+        reuses the incremental path ``process()`` already implements -- with
+        ``skip_processed`` the existing shards are skipped, not rebuilt.
+        """
+        wanted_shards = self._shards_implied_by_max_size()
+        if not wanted_shards or wanted_shards <= 0:
+            return
+        have_shards = len(self._existing_shard_paths())
+        if have_shards == 0 or have_shards >= wanted_shards:
+            # Nothing on disk yet, in which case the pre-existing
+            # "dimer_missing" marker already forces a build, or the store
+            # already covers the request.
+            return
+        exhausted_at = self._recorded_source_extent()
+        if exhausted_at is not None and have_shards >= exhausted_at:
+            warnings.warn(
+                f"spec_{self.spec_type} {self.split_name or 'all'} store: "
+                f"max_size asked for {self.MAX_SIZE} dimers "
+                f"({wanted_shards} shards) but the raw source only ever "
+                f"yielded {exhausted_at} shards, as recorded in "
+                f"{osp.basename(self._store_extent_path())}. Using the "
+                f"{have_shards} shards on disk rather than rescanning a "
+                "source that cannot produce more.",
+                stacklevel=3,
+            )
+            return
+        # Without this the extension re-derives the prefix it already has,
+        # and a preempted build restarts from the first dimer every time.
+        aligned = self._prefix_is_index_aligned()
+        if aligned:
+            self.skip_processed = True
+        print(
+            f"Extending the spec_{self.spec_type} "
+            f"{self.split_name or 'all'} store: {have_shards} of "
+            f"{wanted_shards} shards present "
+            f"({have_shards * self.datapoint_storage_n_objects} of "
+            f"{self.MAX_SIZE} dimers). "
+            + (
+                "Processing the remainder; existing shards are skipped, "
+                "not rebuilt."
+                if aligned
+                else "The shards on disk do not line up with the raw dimer "
+                "order, so the store is rebuilt from the first dimer rather "
+                "than resumed."
+            ),
+            flush=True,
+        )
+        self.force_reprocess = True
+
+    def _warn_if_store_is_smaller_than_requested(self):
+        """Say so out loud when the store cannot satisfy ``MAX_SIZE``.
+
+        The silent version of this is how a "1.5M dimer" training run spent
+        GPU-hours on 100k dimers without a single line of output saying so.
+        """
+        wanted_shards = self._shards_implied_by_max_size()
+        if not wanted_shards or wanted_shards <= 0:
+            return
+        have_shards = len(self._existing_shard_paths())
+        if have_shards >= wanted_shards:
+            return
+        warnings.warn(
+            f"spec_{self.spec_type} {self.split_name or 'all'} store holds "
+            f"{have_shards * self.datapoint_storage_n_objects} dimers but "
+            f"max_size asked for {self.MAX_SIZE}. Proceeding with the "
+            "smaller store.",
+            stacklevel=3,
+        )
+
     def reprocess_file_names(self):
         """
         Determine which processed file names should be used (or signal that reprocessing is required).
@@ -1212,9 +1316,37 @@ class ap2_fused_module_dataset(Dataset):
                 # Forces a re-processing of the dataset
                 return [f"dimer_missing{self.file_extension}"]
 
+    def _invalidate_store_listing(self):
+        """Drop the cached shard listing and length.
+
+        Called wherever the set of shards on disk can have changed under us --
+        i.e. after ``process()`` writes one.
+        """
+        self.__dict__.pop("_store_listing_cache", None)
+
+    def _store_listing_key(self):
+        return (bool(self.force_reprocess), self.MAX_SIZE, self.split_name)
+
     @property
     def processed_file_names(self):
-        return self.reprocess_file_names()
+        """The shard listing, globbed once per (force_reprocess, MAX_SIZE).
+
+        ``reprocess_file_names`` globs a directory holding 206k entries and
+        natural-sorts the 93,750 that match: 4.7 s per call against the
+        project NFS mount.  PyG reads this property on every
+        ``processed_paths`` access and ``len()`` read it twice, which put ~14 s
+        into a single length query and ran once per dataset construction --
+        and the model constructs each split twice.  The listing only changes
+        when ``process()`` writes a shard or ``force_reprocess`` flips; the
+        first invalidates the cache explicitly and the second is in the key.
+        """
+        key = self._store_listing_key()
+        cached = self.__dict__.get("_store_listing_cache")
+        if cached is not None and cached["key"] == key:
+            return cached["names"]
+        names = self.reprocess_file_names()
+        self.__dict__["_store_listing_cache"] = {"key": key, "names": names}
+        return names
 
     def download(self):
         if self.energy_labels and self.qcel_molecules:
@@ -1248,6 +1380,18 @@ class ap2_fused_module_dataset(Dataset):
         return
 
     def process(self):
+        """Build the store, then drop anything memoised about its shape.
+
+        ``processed_file_names``/``len`` cache the shard listing; writing a
+        shard is the one thing that invalidates it. try/finally so a partial
+        or failed process leaves no stale listing behind either.
+        """
+        try:
+            return self._process_shards()
+        finally:
+            self._invalidate_store_listing()
+
+    def _process_shards(self):
         """
         Builds fused PyG Data objects from raw dimers or provided QCElemental molecules and writes them to disk or stores them in memory.
 
@@ -1337,6 +1481,10 @@ class ap2_fused_module_dataset(Dataset):
         t1 = time()
         t2 = time()
         print(f"{len(RAs)=}, {self.atomic_batch_size=}, {self.batch_size=}")
+        # Distinguishes "stopped because max_size was satisfied" from
+        # "stopped because the raw source ran out"; only the latter is worth
+        # recording, and only it must never be inferred by accident.
+        reached_max_size = False
         for i in range(len(RAs)):
             if self.skip_processed:
                 datapath = osp.join(
@@ -1394,6 +1542,7 @@ class ap2_fused_module_dataset(Dataset):
                         torch.save(data_objects, datapath)
                 data_objects = []
                 if self.MAX_SIZE is not None and idx > self.MAX_SIZE:
+                    reached_max_size = True
                     break
             idx += 1
         if self.print_level >= 2:
@@ -1420,30 +1569,113 @@ class ap2_fused_module_dataset(Dataset):
                     save_hdf5_data_objects(data_objects, datapath)
                 else:
                     torch.save(data_objects, datapath)
+        if not self.in_memory:
+            self._record_store_extent(
+                source_exhausted=self._source_was_exhausted(
+                    reached_max_size=reached_max_size, n_raw=len(RAs)
+                )
+            )
         return
 
     def len(self):
+        """Dimer count, memoised alongside the shard listing.
+
+        Every call used to re-glob the store and deserialise the tail shard to
+        find out how short it was -- 9.2 s on the 93,750-shard store.  The
+        answer cannot change unless the listing does, so it is cached in the
+        same slot and dropped by the same invalidation.
+        """
         if self.in_memory:
             return len(self.data)
 
+        key = self._store_listing_key()
+        cached = self.__dict__.get("_store_listing_cache")
+        if cached is not None and cached["key"] == key and "length" in cached:
+            return cached["length"]
+
+        names = self.processed_file_names
         if self.storage_type == "h5":
-            d = load_hdf5_data_objects(
-                osp.join(self.processed_dir, self.processed_file_names[-1])
-            )
+            d = load_hdf5_data_objects(osp.join(self.processed_dir, names[-1]))
         else:
             d = torch.load(
-                osp.join(self.processed_dir, self.processed_file_names[-1]),
-                weights_only=False,
+                osp.join(self.processed_dir, names[-1]), weights_only=False
             )
-        return (
-            len(self.processed_file_names) - 1
-        ) * self.datapoint_storage_n_objects + len(d)
+        length = (len(names) - 1) * self.datapoint_storage_n_objects + len(d)
+        cached = self.__dict__.get("_store_listing_cache")
+        if cached is not None and cached["key"] == key:
+            cached["length"] = length
+        return length
+
+    def _load_shard(self, datapath: str):
+        """Deserialise one shard from disk.
+
+        Parameters
+        ----------
+        datapath : str
+            Absolute path to the shard file.
+
+        Returns
+        -------
+        list
+            The shard's data objects, in store order.
+
+        Notes
+        -----
+        The one seam between the cache bookkeeping in ``get`` and the actual
+        read, so a subclass can count or redirect reads without restating the
+        storage-type branch or reaching into the module.
+        """
+        if self.storage_type == "h5":
+            return load_hdf5_data_objects(datapath)
+        return torch.load(datapath, weights_only=False)
+
+    def set_shard_cache_size(self, n: int) -> "ap2_fused_module_dataset":
+        """Resize the multi-shard LRU in place.
+
+        Parameters
+        ----------
+        n : int
+            Shards to keep resident.  Clamped to at least 1; anything at or
+            below 1 drops the cache entirely and restores the single
+            most-recent-shard behaviour.
+
+        Returns
+        -------
+        ap2_fused_module_dataset
+            ``self``, so the call can be chained where the loader is built.
+
+        Notes
+        -----
+        The cache is sized where the loader is built rather than where the
+        dataset is constructed, because the size that makes sense is the
+        sampler's block size and only the loader knows that.  Attributes set
+        here are inherited by the fork that starts each loader worker, which is
+        where the cache actually earns anything.
+        """
+        n = max(1, int(n))
+        self.shard_cache_size = n
+        if n > 1:
+            if self._shard_cache is None:
+                self._shard_cache = OrderedDict()
+            while len(self._shard_cache) > n:
+                self._shard_cache.popitem(last=False)
+        else:
+            self._shard_cache = None
+        return self
 
     def get(self, idx):
         idx_datapath = idx // self.datapoint_storage_n_objects
         obj_ind = idx % self.datapoint_storage_n_objects
         if self.active_idx_data == idx_datapath:
             return self.active_data[obj_ind]
+        cache = self._shard_cache
+        if cache is not None:
+            hit = cache.get(idx_datapath)
+            if hit is not None:
+                cache.move_to_end(idx_datapath)
+                self.active_data = hit
+                self.active_idx_data = idx_datapath
+                return hit[obj_ind]
         split_name = ""
         if self.split_db:
             split_name = self.split_name
@@ -1451,10 +1683,18 @@ class ap2_fused_module_dataset(Dataset):
             self.processed_dir,
             f"dimer_ap2_fused{split_name}_spec_{self.spec_type}_{idx_datapath}{self.file_extension}",
         )
-        if self.storage_type == "h5":
-            self.active_data = load_hdf5_data_objects(datapath)
-        else:
-            self.active_data = torch.load(datapath, weights_only=False)
+        self.active_data = self._load_shard(datapath)
+        # Arming the guard above. Without this assignment `active_idx_data`
+        # stayed at its `__init__` value of None for the life of the dataset,
+        # the `==` check could never be true, and every sample deserialised a
+        # whole 16-dimer shard to return one dimer -- 16x read amplification on
+        # a sequential pass. The read that just happened is the one the guard
+        # is meant to skip next time.
+        self.active_idx_data = idx_datapath
+        if cache is not None:
+            cache[idx_datapath] = self.active_data
+            while len(cache) > self.shard_cache_size:
+                cache.popitem(last=False)
         try:
             self.active_data[obj_ind]
         except Exception:

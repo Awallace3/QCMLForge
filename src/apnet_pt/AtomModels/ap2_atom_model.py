@@ -7,7 +7,21 @@ import numpy as np
 import warnings
 from .. import multipole
 from .. import model_io
-from ..hf_pretrained import resolve_pretrained_path
+from ..distributed_metrics import globally_reduced_mae
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
+    tracked_ddp_worker,
+)
+from ..hf_pretrained import (
+    DEFAULT_APNET2_WEIGHTS,
+    apnet2_atom_weight_path,
+    resolve_pretrained_path,
+)
 import time
 from ..atomic_datasets import (
     atomic_module_dataset,
@@ -303,7 +317,9 @@ class AtomMPNN(MessagePassing):
         # [edges, 4 * n_embed, n_rbf]
         h_all_dot = torch.einsum("ez,er->ezr", h_all, rbf)
         # [edges, 4 * n_embed * n_rbf]
-        h_all_dot = h_all_dot.view(nedge, -1)
+        # Spell the trailing size out rather than inferring it: a batch with no
+        # edges at all -- a lone ion -- makes ``-1`` ambiguous and raises.
+        h_all_dot = h_all_dot.view(nedge, h_all.size(-1) * rbf.size(-1))
 
         # [edges,  n_embed * 4 * n_rbf + n_embed * 4 + n_rbf]
         m_ij = torch.cat([h_all, h_all_dot, rbf], dim=-1)
@@ -334,54 +350,14 @@ class AtomMPNN(MessagePassing):
         dipole = torch.zeros(natom, 3, dtype=torch.float32, device=Z.device)
         qpole = torch.zeros(natom, 3, 3, dtype=torch.float32, device=Z.device)
 
-        if edge_index.size(1) == 0:
-            # need h_list to have the same number of dimensions as the number of message passing layers
-            h_list = [h_list_0[0] for i in range(self.n_message + 1)]
-            h_list = torch.stack(h_list, dim=1)
-            molecule_ind.requires_grad_(False)
-            molecule_ind = molecule_ind.long()
-            num_mols = natom_per_mol.size(0)
-            total_charge_pred = scatter_sum_compile(
-                charge, molecule_ind, num_mols, reduce="sum"
-            )
-            total_charge_pred = total_charge_pred.squeeze()
-            total_charge_err = total_charge_pred - total_charge
-            charge_err = torch.repeat_interleave(
-                total_charge_err / natom_per_mol.float(), natom_per_mol
-            ).unsqueeze(1)
-            charge = charge - charge_err
-            return charge, dipole, qpole, h_list
+        # Edgeless atoms stay in place: the loop below hands them a zero message,
+        # as TensorFlow AP-Net2 does.  Filtering them renumbered the message
+        # indices while the multipole accumulators kept the original numbering,
+        # and the zero-edge early return skipped the readouts entirely.
+        h_list = [h_list_0[0]]
 
-        # 1) Filter out atoms that don't have edges
-        # Create keep_mask directly from edge_index without using torch.isin
-        # This is more compile-friendly than torch.isin with unbacked symbolic shapes
-        natom = len(molecule_ind)
-        keep_mask = torch.zeros(natom, dtype=torch.bool, device=molecule_ind.device)
-        if edge_index.size(1) > 0:
-            # Mark all atoms that appear in edge_index as True
-            keep_mask.scatter_(0, edge_index[0], True)
-            keep_mask.scatter_(0, edge_index[1], True)
-        filtered_charge = charge[keep_mask]
-
-        # Now `filtered_charge` contains only atoms from molecules that have >= 2 atoms and edges
-        h_list = [h_list_0[0][keep_mask]]
-
-        # Now we need to filter the edge_index to only include edges between
-        # atoms in molecules with >= 2 atoms.
         e_source = edge_index[0]
         e_target = edge_index[1]
-        edge_keep = keep_mask[e_source] & keep_mask[e_target]
-        e_source = e_source[edge_keep]
-        e_target = e_target[edge_keep]
-        idx_map = (
-            torch.cumsum(keep_mask, dim=0) - 1
-        )  # shape [N], each kept atom -> new index
-        idx_map = idx_map.long()  # ensure integer
-        e_source = idx_map[e_source]
-        e_target = idx_map[e_target]
-
-        R = R[keep_mask, :]
-        natom_filtered = R.size(0)
 
         #  [edges]
         dR, dR_xyz = get_distances(R, R, e_source, e_target)
@@ -401,13 +377,13 @@ class AtomMPNN(MessagePassing):
             # [atoms x message_embedding_dim]
             # m_i = unsorted_segment_sum_2d(m_ij, e_source, natom)
             # write unsorted_segment_sum_2d using scatter
-            m_i = scatter_sum_compile(m_ij, e_source, natom_filtered, reduce="sum")
+            m_i = scatter_sum_compile(m_ij, e_source, natom, reduce="sum")
 
             # [atomx x hidden_dim]
             h_next = self.charge_update_layers[i](m_i)
             h_list.append(h_next)
             charge_update = self.charge_readout_layers[i](h_list[i + 1])
-            filtered_charge += charge_update
+            charge = charge + charge_update
 
             #####################
             ### dipole update ###
@@ -460,7 +436,6 @@ class AtomMPNN(MessagePassing):
         ### enforce charge conservation ###
         ###################################
 
-        charge[keep_mask] = filtered_charge
         molecule_ind.requires_grad_(False)
         molecule_ind = molecule_ind.long()
         num_mols = natom_per_mol.size(0)
@@ -475,7 +450,9 @@ class AtomMPNN(MessagePassing):
             total_charge_err / natom_per_mol.float(), natom_per_mol
         ).unsqueeze(1)
         charge = charge - charge_err
-        charge = charge.squeeze()
+        # squeeze(-1), not squeeze(): a one-atom batch would otherwise collapse
+        # to a 0-dim tensor and break the per-molecule slicing downstream.
+        charge = charge.squeeze(-1)
         # changed to dim=0 from dim=1 for usage in Param fitting # AMW 8/20/25
         # Breaks test_apnet2_train_qcel_molecules_in_memory_transfer test,
         # dimensions no longer correct... figure out another way to fix this. reverting back to dim=1 # AMW 9/17/25
@@ -562,9 +539,10 @@ class AtomModel:
             device = torch.device("cpu")
             print("running on the CPU")
 
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             # print(f"Loading pre-trained AtomMPNN model from {pre_trained_model_path}")
-            checkpoint = torch.load(pre_trained_model_path, weights_only=False)
+            checkpoint = torch.load(pre_trained_model_path, weights_only=True)
             self.model = AtomMPNN(
                 n_message=checkpoint["config"]["n_message"],
                 n_rbf=checkpoint["config"]["n_rbf"],
@@ -609,7 +587,16 @@ class AtomModel:
                 )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
         elif (
             not ignore_database_null
             and self.dataset is None
@@ -640,7 +627,16 @@ class AtomModel:
                 ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
         print(f"{self.dataset = }")
         self.rank = None
         self.world_size = None
@@ -663,7 +659,9 @@ class AtomModel:
             children=[child],
         )
 
-    def set_pretrained_model(self, model_path=None, model_id=None):
+    def set_pretrained_model(
+        self, model_path=None, model_id=None, weights=DEFAULT_APNET2_WEIGHTS
+    ):
         """
         Load a pretrained model from a checkpoint file.
 
@@ -674,7 +672,13 @@ class AtomModel:
         model_path : str, optional
             Path to a checkpoint file
         model_id : int, optional
-            ID of a bundled pretrained model (0-9)
+            Ensemble member of ``weights`` to load
+        weights : str, optional
+            Named weight set to take ``model_id`` from, one of
+            ``apnet_pt.hf_pretrained.apnet2_weight_sets()``. Defaults to the
+            QCMLForge-trained ensemble; pass ``"ap2_tf_paper"`` for the atom
+            models published with the AP-Net2 paper. Ignored when
+            ``model_path`` is given.
 
         Returns
         -------
@@ -682,7 +686,9 @@ class AtomModel:
             Returns self for method chaining
         """
         if model_id is not None:
-            model_path = resolve_pretrained_path(f"am_ensemble/am_{model_id}.pt")
+            model_path = resolve_pretrained_path(
+                apnet2_atom_weight_path(model_id, weights)
+            )
         elif model_path is None and model_id is None:
             raise ValueError("Either model_path or model_id must be provided.")
 
@@ -884,6 +890,7 @@ units angstrom
                 f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f}",
                 flush=True,
             )
+        track_pretraining_from_locals(self, locals())
         return test_loss
 
     def train_batches_single_proc(
@@ -959,28 +966,14 @@ units angstrom
             total_dipole_error += torch.sum(torch.abs(d_error)).item()
             total_qpole_error += torch.sum(torch.abs(qp_error)).item()
 
-        # Converting to tensors for all-reduce
-        total_charge_error = torch.tensor(
-            total_charge_error, dtype=torch.float32, device=rank_device
+        total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        charge_mae, dipole_mae, qpole_mae = globally_reduced_mae(
+            (total_charge_error, total_dipole_error, total_qpole_error),
+            count,
+            component_widths=(1, 3, 9),
+            device=rank_device,
         )
-        total_dipole_error = torch.tensor(
-            total_dipole_error, dtype=torch.float32, device=rank_device
-        )
-        total_qpole_error = torch.tensor(
-            total_qpole_error, dtype=torch.float32, device=rank_device
-        )
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
-        # All-reduce across processes
-        dist.all_reduce(total_charge_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_dipole_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_qpole_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
-        # Calculating MAEs
-        charge_mae = total_charge_error.item() / count.item()
-        dipole_mae = total_dipole_error.item() / (count.item() * 3)
-        qpole_mae = total_qpole_error.item() / (count.item() * 9)
 
         return total_loss, charge_mae, dipole_mae, qpole_mae
 
@@ -1050,31 +1043,14 @@ units angstrom
                 total_loss += charge_loss + dipole_loss + qpole_loss
                 count += q_error.numel()
 
-        # Converting to tensors for all-reduce
-        total_charge_error = torch.tensor(
-            total_charge_error, dtype=torch.float32, device=rank_device
-        )
-        total_dipole_error = torch.tensor(
-            total_dipole_error, dtype=torch.float32, device=rank_device
-        )
-        total_qpole_error = torch.tensor(
-            total_qpole_error, dtype=torch.float32, device=rank_device
-        )
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
-        # All-reduce across processes
-        dist.all_reduce(total_charge_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_dipole_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_qpole_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
         total_loss = torch.tensor(total_loss.item(), device=rank_device)
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-
-        # Calculating MAEs
-        charge_mae = total_charge_error.item() / count.item()
-        dipole_mae = total_dipole_error.item() / (count.item() * 3)
-        qpole_mae = total_qpole_error.item() / (count.item() * 9)
+        charge_mae, dipole_mae, qpole_mae = globally_reduced_mae(
+            (total_charge_error, total_dipole_error, total_qpole_error),
+            count,
+            component_widths=(1, 3, 9),
+            device=rank_device,
+        )
 
         return total_loss, charge_mae, dipole_mae, qpole_mae
 
@@ -1155,7 +1131,22 @@ units angstrom
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         criterion = torch.nn.MSELoss()
 
-        test_loss = self.pretrain_statistics(train_loader, test_loader, criterion)
+        with torch.no_grad():
+            train_loss, charge_MAE_t, dipole_MAE_t, qpole_MAE_t = (
+                self.evaluate_batches(rank, train_loader, criterion, rank_device)
+            )
+            test_loss, charge_MAE_v, dipole_MAE_v, qpole_MAE_v = (
+                self.evaluate_batches(rank, test_loader, criterion, rank_device)
+            )
+        if rank == 0:
+            print(
+                "  (Pre-training)  MAE: "
+                f"{charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} "
+                f"{dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} "
+                f"{qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f}",
+                flush=True,
+            )
+        track_pretraining_from_locals(self, locals())
 
         lowest_test_loss = test_loss
 
@@ -1186,6 +1177,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 # if (world_size==1 or rank == 0):
                 print(
@@ -1275,6 +1267,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)     MAE: {charge_MAE_t:>7.4f}/{charge_MAE_v:<7.4f} {dipole_MAE_t:>7.4f}/{dipole_MAE_v:<7.4f} {qpole_MAE_t:>7.4f}/{qpole_MAE_v:<7.4f} {test_lowered}",
@@ -1298,6 +1291,9 @@ units angstrom
         world_size=1,  # Default to 1 for single-core operation
         omp_num_threads_per_process=None,
         random_seed=42,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         self.model_save_path = model_path
         if self.model_save_path is not None:
@@ -1362,13 +1358,28 @@ units angstrom
             torch.jit.enable_onednn_fusion(True)
             torch.autograd.set_detect_anomaly(False)
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+        }
         if world_size > 1:
             # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="atomic",
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -1386,17 +1397,29 @@ units angstrom
             # Run single-process training directly
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
-                rank=0,
-                world_size=world_size,
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    rank=0,
+                    world_size=world_size,
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    skip_compile=skip_compile,
+                ),
+                wandb_config,
+                model_family="atomic",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                skip_compile=skip_compile,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
 
         return

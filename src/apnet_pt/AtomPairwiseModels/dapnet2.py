@@ -9,6 +9,16 @@ from .. import atomic_datasets
 from ..hf_pretrained import resolve_pretrained_paths
 from .. import pairwise_datasets
 from .. import model_io
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    stage_final_weights,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
+    tracked_ddp_worker,
+)
 from ..pairwise_datasets import (
     APNet2_DataLoader,
     apnet2_collate_update,
@@ -416,6 +426,7 @@ class APNet2_dAPNet2Model:
     pre-computed and passes as input to the model.
 """
             )
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(
                 f"Loading pre-trained APNet2_MPNN model from {pre_trained_model_path}"
@@ -474,7 +485,16 @@ class APNet2_dAPNet2Model:
                 )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
         elif (
@@ -525,7 +545,16 @@ class APNet2_dAPNet2Model:
                 ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset[0] = self.dataset[0][:ds_max_size]
                 self.dataset[1] = self.dataset[1][:ds_max_size]
@@ -1066,7 +1095,7 @@ units angstrom
             exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
             indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
             disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-            count += preds.numel()
+            count += preds.shape[0]
         if scheduler is not None:
             scheduler.step()
 
@@ -1075,6 +1104,7 @@ units angstrom
         elst_error = torch.tensor(elst_error, dtype=torch.float32, device=rank_device)
         exch_error = torch.tensor(exch_error, dtype=torch.float32, device=rank_device)
         indu_error = torch.tensor(indu_error, dtype=torch.float32, device=rank_device)
+        disp_error = torch.tensor(disp_error, dtype=torch.float32, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -1082,6 +1112,7 @@ units angstrom
         dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
+        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
 
         total_MAE_t = (total_error / count).cpu()
@@ -1120,13 +1151,14 @@ units angstrom
                 exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
                 indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
                 disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-                count += preds.numel()
+                count += preds.shape[0]
 
         total_loss = torch.tensor(total_loss, device=rank_device)
         total_error = torch.tensor(total_error, device=rank_device)
         elst_error = torch.tensor(elst_error, device=rank_device)
         exch_error = torch.tensor(exch_error, device=rank_device)
         indu_error = torch.tensor(indu_error, device=rank_device)
+        disp_error = torch.tensor(disp_error, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -1134,6 +1166,7 @@ units angstrom
         dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
+        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
 
         total_MAE_t = (total_error / count).cpu()
@@ -1257,6 +1290,7 @@ units angstrom
                     f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                     flush=True,
                 )
+        track_pretraining_from_locals(self, locals())
         for epoch in range(n_epochs):
             t1 = time.time()
             test_lowered = False
@@ -1287,6 +1321,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f} {test_lowered}",
@@ -1375,6 +1410,7 @@ units angstrom
             f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f}",
             flush=True,
         )
+        track_pretraining_from_locals(self, locals())
 
         # (6) Main training loop
         lowest_test_loss = test_loss
@@ -1404,11 +1440,15 @@ units angstrom
                     )
                 self.model.to(rank_device)
 
+            dt = time.time() - t1
+            track_epoch_from_locals(self, locals())
             print(
                 f"  EPOCH: {epoch:4d} ({time.time() - t1:<7.2f}s)  MAE: "
                 f"{total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {star_marker}",
                 flush=True,
             )
+        # Publish the real final-epoch weights before restoring the best ones.
+        stage_final_weights(self)
         self.model = best_model
 
     def train(
@@ -1426,6 +1466,9 @@ units angstrom
         lr_decay=None,
         random_seed=42,
         skip_compile=False,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         """
         hyperparameters match the defaults in the original code:
@@ -1495,12 +1538,28 @@ units angstrom
 
         self.shuffle = shuffle
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/learning_rate_decay": lr_decay,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+        }
         if world_size > 1:
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="pairwise",
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -1517,16 +1576,28 @@ units angstrom
         else:
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    lr_decay=lr_decay,
+                    skip_compile=skip_compile,
+                ),
+                wandb_config,
+                model_family="pairwise",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                lr_decay=lr_decay,
-                skip_compile=skip_compile,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
         return
 
@@ -1605,6 +1676,7 @@ class dAPNet2Model:
     pre-computed and passes as input to the model.
 """
             )
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(
                 f"Loading pre-trained APNet2_MPNN model from {pre_trained_model_path}"
@@ -1650,7 +1722,16 @@ class dAPNet2Model:
                 )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
         elif (
@@ -1701,7 +1782,16 @@ class dAPNet2Model:
                 ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset[0] = self.dataset[0][:ds_max_size]
                 self.dataset[1] = self.dataset[1][:ds_max_size]
@@ -2096,7 +2186,7 @@ units angstrom
             exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
             indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
             disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-            count += preds.numel()
+            count += preds.shape[0]
         if scheduler is not None:
             scheduler.step()
 
@@ -2105,6 +2195,7 @@ units angstrom
         elst_error = torch.tensor(elst_error, dtype=torch.float32, device=rank_device)
         exch_error = torch.tensor(exch_error, dtype=torch.float32, device=rank_device)
         indu_error = torch.tensor(indu_error, dtype=torch.float32, device=rank_device)
+        disp_error = torch.tensor(disp_error, dtype=torch.float32, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -2112,6 +2203,7 @@ units angstrom
         dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
+        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
 
         total_MAE_t = (total_error / count).cpu()
@@ -2150,13 +2242,14 @@ units angstrom
                 exch_error += torch.sum(torch.abs(comp_errors[:, 1])).item()
                 indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
                 disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-                count += preds.numel()
+                count += preds.shape[0]
 
         total_loss = torch.tensor(total_loss, device=rank_device)
         total_error = torch.tensor(total_error, device=rank_device)
         elst_error = torch.tensor(elst_error, device=rank_device)
         exch_error = torch.tensor(exch_error, device=rank_device)
         indu_error = torch.tensor(indu_error, device=rank_device)
+        disp_error = torch.tensor(disp_error, device=rank_device)
         count = torch.tensor(count, dtype=torch.int, device=rank_device)
 
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -2164,6 +2257,7 @@ units angstrom
         dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
+        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
 
         total_MAE_t = (total_error / count).cpu()
@@ -2287,6 +2381,7 @@ units angstrom
                     f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                     flush=True,
                 )
+        track_pretraining_from_locals(self, locals())
         for epoch in range(n_epochs):
             t1 = time.time()
             test_lowered = False
@@ -2317,6 +2412,7 @@ units angstrom
                 else:
                     test_lowered = " "
                 dt = time.time() - t1
+                track_epoch_from_locals(self, locals())
                 test_loss = 0.0
                 print(
                     f"  EPOCH: {epoch:4d} ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f} {test_lowered}",
@@ -2405,6 +2501,7 @@ units angstrom
             f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f}",
             flush=True,
         )
+        track_pretraining_from_locals(self, locals())
 
         # (6) Main training loop
         lowest_test_loss = test_loss
@@ -2431,6 +2528,8 @@ units angstrom
                         },
                     )
 
+            dt = time.time() - t1
+            track_epoch_from_locals(self, locals())
             print(
                 f"  EPOCH: {epoch:4d} ({time.time() - t1:<7.2f}s)  MAE: "
                 f"{total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {star_marker}",
@@ -2452,6 +2551,9 @@ units angstrom
         lr_decay=None,
         random_seed=42,
         skip_compile=False,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         """
         hyperparameters match the defaults in the original code:
@@ -2517,12 +2619,28 @@ units angstrom
 
         self.shuffle = shuffle
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/learning_rate_decay": lr_decay,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+        }
         if world_size > 1:
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="pairwise",
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -2539,15 +2657,27 @@ units angstrom
         else:
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    lr_decay=lr_decay,
+                    skip_compile=skip_compile,
+                ),
+                wandb_config,
+                model_family="pairwise",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                lr_decay=lr_decay,
-                skip_compile=skip_compile,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
         return

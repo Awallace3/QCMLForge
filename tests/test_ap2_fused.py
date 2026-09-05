@@ -11,6 +11,7 @@ from apnet_pt.pt_datasets.ap2_fused_ds import (
 from apnet_pt.AtomPairwiseModels.apnet2_fused import APNet2_AM_Model
 from glob import glob
 import pandas as pd
+import pytest
 
 torch.manual_seed(42)
 spec_type = 5
@@ -161,6 +162,7 @@ def test_ap2_fused_dataset_size():
     assert ds_labels == cnt, f"Expected {len(ds)} points, but got {cnt} points"
 
 
+@pytest.mark.pretrained_models("am")
 def test_ap2_fused_train_qcel_molecules_in_memory():
     batch_size = 2
     atomic_batch_size = 4
@@ -242,6 +244,7 @@ def test_ap2_fused_architecture():
     assert np.allclose(output[0], target_energies, atol=1e-6)
 
 
+@pytest.mark.pretrained_models("ap2_fused_ensemble")
 def test_ap2_fused_ensemble_water_dimer():
     import torch
     import pandas as pd
@@ -282,6 +285,56 @@ def test_ap2_fused_ensemble_water_dimer():
             f"TOTAL = {sapt0_total:.6f}\n ELST = {sapt0_elst:.6f}\n EXCH = {sapt0_exch:.6f}\n DISP = {sapt0_disp:.6f}\n IND = {sapt0_ind:.6f}"
         )
         print(interaction_energies)
+
+
+def test_ap2_fused_reload_restores_nondefault_atom_model(tmp_path):
+    """A staged checkpoint must rebuild its embedded, non-default AtomMPNN.
+
+    APNet2_AM_MPNN holds atom_model as a submodule, so the pairwise
+    model_state_dict carries atom_model.* weights. Loading with a default
+    AtomMPNN would raise a shape mismatch.
+    """
+    from apnet_pt.AtomModels.ap2_atom_model import AtomMPNN
+    from apnet_pt.training_tracking import _create_fallback_harness_checkpoint
+
+    atom_model = AtomMPNN(n_message=2, n_rbf=4, n_neuron=16, n_embed=4, r_cut=4.5)
+    harness = APNet2_AM_Model(
+        atom_model=atom_model,
+        n_message=2,
+        n_rbf=4,
+        n_neuron=16,
+        n_embed=4,
+        r_cut_im=7.0,
+        r_cut=4.5,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    checkpoint = _create_fallback_harness_checkpoint(harness, metadata={})
+    assert "atom_model" in checkpoint["submodels"]
+
+    checkpoint_path = tmp_path / "ap2_fused_nondefault.pt"
+    torch.save(checkpoint, checkpoint_path)
+
+    reloaded = APNet2_AM_Model(
+        pre_trained_model_path=str(checkpoint_path),
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+
+    for name in ("n_message", "n_rbf", "n_neuron", "n_embed", "r_cut"):
+        assert getattr(reloaded.atom_model, name) == getattr(atom_model, name), name
+
+    # Lazy layers stay uninitialized until the first forward pass, so only the
+    # materialized weights (which include every atom_model.* entry) compare.
+    original = harness.model.state_dict()
+    compared = 0
+    for key, value in reloaded.model.state_dict().items():
+        if isinstance(value, torch.nn.parameter.UninitializedParameter):
+            continue
+        assert torch.equal(value, original[key]), key
+        compared += 1
+    assert any(key.startswith("atom_model.") for key in original)
+    assert compared > 0
 
 
 if __name__ == "__main__":

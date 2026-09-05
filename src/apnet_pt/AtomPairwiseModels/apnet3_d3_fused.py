@@ -24,14 +24,29 @@ from ..pt_datasets.ap3_fused_fsapt_ds import (
 from .. import constants
 from ..hf_pretrained import resolve_pretrained_path
 from .. import model_io
+from ..distributed_metrics import globally_reduced_mae
+from ..training_tracking import (
+    TrackerBackend,
+    WandbConfig,
+    configure_distributed_tracking,
+    run_tracked_single_process,
+    stage_final_weights,
+    track_epoch_from_locals,
+    track_pretraining_from_locals,
+    tracked_ddp_worker,
+)
 from ..util import scatter_sum_compile
+from ..pt_datasets.shard_locality import ShardBlockSampler
+from typing import Optional
 import os
+import json
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 import qcelemental as qcel
 from importlib import resources
 from copy import deepcopy
+
 from apnet_pt.torch_util import set_weights_to_value
 from qcml_dftd3.d3 import resolve_d3_damping_parameters
 from .mtp_mtp import (
@@ -41,6 +56,100 @@ from .mtp_mtp import (
     isolate_atom_parameter_predictions_ap3,
     load_dimer_prop_from_checkpoint,
 )
+
+
+def _omitted_metrics(harness) -> tuple[str, ...]:
+    """Names in the standard metric set that this model does not predict."""
+
+    model = model_io.unwrap_model(harness.model)
+    return ("dispersion",) if getattr(model, "no_disp_nn", False) else ()
+
+
+def _best_mae_sidecar_paths(model_save_path: str) -> tuple[str, str]:
+    """Checkpoint and record paths for the MAE-selected sidecar.
+
+    The primary checkpoint is starred on validation MSE, but every table this
+    model is read in -- the S66x8 gate, the per-component breakdowns -- is in
+    MAE, and the two selectors have repeatedly disagreed about which epoch was
+    best.  The sidecar preserves the best-MAE epoch beside the primary artifact
+    instead of displacing it.
+    """
+
+    base, _ = os.path.splitext(model_save_path)
+    return base + ".best-mae.pt", base + ".best-mae.json"
+
+
+def _best_mae_sidecar_floor(model_save_path: str) -> float:
+    """Best validation MAE a previous chunk already banked at this path.
+
+    Long trainings run as a chain of warm-started chunks, and each chunk seeds
+    its selector from its own fresh pre-training eval.  Without this floor a
+    later chunk would overwrite an earlier chunk's sidecar with a worse epoch,
+    because it only ever compares against where it happened to start.  A
+    missing, unreadable, or foreign record returns +inf, which is exactly the
+    single-run behaviour.
+    """
+
+    checkpoint_path, record_path = _best_mae_sidecar_paths(model_save_path)
+    if not os.path.exists(checkpoint_path):
+        return float("inf")
+    try:
+        with open(record_path) as f:
+            record = json.load(f)
+        if record.get("model_save_path") != model_save_path:
+            return float("inf")
+        return float(record["val_total_MAE"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return float("inf")
+
+
+def _save_best_mae_sidecar(harness, value, epoch, training_mode, device) -> None:
+    """Write the MAE-selected sidecar and its record.
+
+    Deliberately additive: this touches neither ``best_model``, ``self.model``,
+    ``model_saved``, the primary checkpoint, nor the optimizer trajectory, so a
+    run with this code produces a bit-identical primary artifact to one without
+    it.  The record is written after the checkpoint so a torn write leaves the
+    floor pointing at the older, fully-written pair.
+    """
+
+    checkpoint_path, record_path = _best_mae_sidecar_paths(harness.model_save_path)
+    cpu_model = model_io.unwrap_model(harness.model).to("cpu")
+    try:
+        harness.save_model(
+            checkpoint_path,
+            metadata={
+                "training_mode": training_mode,
+                "epoch": epoch,
+                "selector": "val_total_MAE",
+                "val_total_MAE": value,
+            },
+        )
+    finally:
+        del cpu_model
+        harness.model.to(device)
+    with open(record_path, "w") as f:
+        json.dump(
+            {
+                "model_save_path": harness.model_save_path,
+                "checkpoint": checkpoint_path,
+                "selector": "val_total_MAE",
+                "val_total_MAE": value,
+                "epoch": epoch,
+                "training_mode": training_mode,
+            },
+            f,
+            indent=2,
+        )
+
+
+def _as_scalar(value):
+    """Return ``value`` as a float, or None when it is not a single number."""
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def inverse_time_decay(step, initial_lr, decay_steps, decay_rate, staircase=True):
@@ -737,6 +846,128 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         return E_output, E_sr, E_elst, E_ind, E_disp, hAB, hBA
 
 
+def _build_shard_block_sampler(
+    harness,
+    train_dataset,
+    batch_size: int,
+    num_workers: int,
+    world_size: int = 1,
+    rank: int = 0,
+) -> Optional[ShardBlockSampler]:
+    """Shard-locality sampling for the ap3d3 route -- opt-in, off by default.
+
+    Parameters
+    ----------
+    harness : APNet3_D3_Model
+        Read only for ``shard_locality_block_shards``; absent or 0 disables.
+    train_dataset : torch.utils.data.Dataset
+        The training dataset.  Must expose ``datapoint_storage_n_objects`` and
+        ``set_shard_cache_size``; anything else declines with a reason.
+    batch_size : int
+        Per-rank batch size, needed to cut the emission order on batch
+        boundaries.
+    num_workers : int
+        The loader's ``num_workers``.
+    world_size : int, default 1
+        DDP world size.
+    rank : int, default 0
+        DDP rank; also gates the diagnostic prints to one process.
+
+    Returns
+    -------
+    ShardBlockSampler or None
+        ``None`` whenever the feature is off or the dataset cannot support it,
+        in which case the caller keeps its existing ``shuffle=True`` loader.
+
+    Notes
+    -----
+    `ap3_fused_ds.get()` deserialises an entire shard to return one dimer, and
+    `shard_cache_size` defaults to 1, so a globally shuffled epoch reads each
+    16-dimer shard about 16 times.  Job 12391962 measured what that costs on
+    this route: 89 % of all dataloader-worker CPU is inside `torch.load`, at
+    ~1.66 ms per call and one call per sample -- 20,480 loads per epoch to
+    deliver 20,480 samples.  The store-I/O microbenchmark (job 12379500) puts
+    the same effect at 79.4 samples/s shuffled against 1301.6 sequential.
+
+    `ShardBlockSampler` shuffles shards instead of dimers, hands each loader
+    worker a disjoint block of them, and shuffles within the block; the LRU
+    sized to match the block then serves that whole block off one read per
+    shard.  This is a genuinely different sample distribution -- a dimer's
+    batch-mates come from `block_shards * shard_size` neighbours in the
+    shuffled-shard order rather than from the whole store -- so it must never
+    switch itself on.  `block_shards = 0`, the default, returns None here and
+    leaves the epoch ordering bit-identical to what it was.
+
+    It lives in a function because the ap3d3 route builds its loaders in two
+    places (`ddp_train`, `single_proc_train`) and the two must not drift
+    apart.
+    """
+    block_shards = int(getattr(harness, "shard_locality_block_shards", 0) or 0)
+    if block_shards <= 0 or getattr(train_dataset, "in_memory", False):
+        return None
+    # `single_proc_train` below unwraps a `Subset` before sniffing the dataset
+    # type, so the same wrapper can reach here.  Decline it rather than index
+    # through it: `ShardBlockSampler` maps positions to shard ids via a
+    # *callable* `indices()`, and a `Subset`'s `indices` is a plain list, so
+    # blocking a wrapped dataset would silently address the wrong shards.
+    if not hasattr(train_dataset, "set_shard_cache_size") and hasattr(
+        train_dataset, "dataset"
+    ):
+        if rank == 0:
+            print(
+                "  shard-locality sampling requested but the training dataset is "
+                f"a {type(train_dataset).__name__} wrapper around "
+                f"{type(getattr(train_dataset, 'dataset', None)).__name__}; "
+                "ignoring",
+                flush=True,
+            )
+        return None
+    shard_size = int(getattr(train_dataset, "datapoint_storage_n_objects", 0) or 0)
+    if shard_size <= 1 or not hasattr(train_dataset, "set_shard_cache_size"):
+        # Name what was actually missing.  Job 12394768 printed the older,
+        # vaguer form of this message on three arms and it read as "your
+        # dataset is the wrong kind" when the truth was "this tree's
+        # ap3_fused_ds.py predates the multi-shard LRU" -- so the sweep looked
+        # like a null result instead of a stale checkout.
+        if rank == 0:
+            missing = []
+            if shard_size <= 1:
+                missing.append(
+                    f"datapoint_storage_n_objects={shard_size or 'absent'}"
+                )
+            if not hasattr(train_dataset, "set_shard_cache_size"):
+                missing.append("no set_shard_cache_size (no multi-shard LRU)")
+            print(
+                "  shard-locality sampling requested but the training dataset "
+                f"({type(train_dataset).__name__}) cannot support it: "
+                f"{'; '.join(missing)}; ignoring",
+                flush=True,
+            )
+        return None
+    # Cache and block must match: a block bigger than the cache is evicted
+    # before it is reused and every read comes back.
+    train_dataset.set_shard_cache_size(block_shards)
+    sampler = ShardBlockSampler(
+        train_dataset,
+        shard_size=shard_size,
+        batch_size=batch_size,
+        block_shards=block_shards,
+        num_workers=num_workers,
+        seed=43,
+        num_replicas=world_size if world_size > 1 else None,
+        rank=rank if world_size > 1 else None,
+    )
+    if rank == 0:
+        print(
+            f"  shard-locality sampling ON: shard_size={shard_size} "
+            f"block_shards={block_shards} "
+            f"(mixing window {block_shards * shard_size} dimers/worker, "
+            f"shard cache {block_shards} shards/worker)",
+            flush=True,
+        )
+    return sampler
+
+
 class APNet3D3_AtomType_Model:
     def __init__(
         self,
@@ -858,6 +1089,7 @@ class APNet3D3_AtomType_Model:
 """
             )
         self.use_precomputed_classical = use_precomputed_classical
+        self.pre_trained_model_path = pre_trained_model_path
         if pre_trained_model_path:
             print(
                 f"Loading pre-trained APNet3D3_AtomType_MPNN model from {pre_trained_model_path}"
@@ -1067,7 +1299,16 @@ class APNet3D3_AtomType_Model:
                     )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
         elif not ignore_database_null and self.dataset is None and ds_split_db:
@@ -1171,7 +1412,16 @@ class APNet3D3_AtomType_Model:
                     ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset[0] = self.dataset[0][:ds_max_size]
                 self.dataset[1] = self.dataset[1][:ds_max_size]
@@ -2644,33 +2894,25 @@ units angstrom
             indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
             if not self.model.no_disp_nn:
                 disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-            count += preds.numel()
+            count += preds.shape[0]
         if scheduler is not None:
             scheduler.step()
 
         total_loss = torch.tensor(total_loss, dtype=torch.float32, device=rank_device)
-        total_error = torch.tensor(total_error, dtype=torch.float32, device=rank_device)
-        elst_error = torch.tensor(elst_error, dtype=torch.float32, device=rank_device)
-        exch_error = torch.tensor(exch_error, dtype=torch.float32, device=rank_device)
-        indu_error = torch.tensor(indu_error, dtype=torch.float32, device=rank_device)
-        disp_error = torch.tensor(disp_error, dtype=torch.float32, device=rank_device)
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
-        total_MAE_t = (total_error / count).cpu()
-        elst_MAE_t = (elst_error / count).cpu()
-        exch_MAE_t = (exch_error / count).cpu()
-        indu_MAE_t = (indu_error / count).cpu()
-        disp_MAE_t = (
-            torch.tensor(0.0) if self.model.no_disp_nn else (disp_error / count).cpu()
+        (
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+        ) = globally_reduced_mae(
+            (total_error, elst_error, exch_error, indu_error, disp_error),
+            count,
+            device=rank_device,
         )
+        if self.model.no_disp_nn:
+            disp_MAE_t = 0.0
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     # @torch.inference_mode()
@@ -2713,31 +2955,23 @@ units angstrom
                 indu_error += torch.sum(torch.abs(comp_errors[:, 2])).item()
                 if not self.model.no_disp_nn:
                     disp_error += torch.sum(torch.abs(comp_errors[:, 3])).item()
-                count += preds.numel()
+                count += preds.shape[0]
 
         total_loss = torch.tensor(total_loss, device=rank_device)
-        total_error = torch.tensor(total_error, device=rank_device)
-        elst_error = torch.tensor(elst_error, device=rank_device)
-        exch_error = torch.tensor(exch_error, device=rank_device)
-        indu_error = torch.tensor(indu_error, device=rank_device)
-        disp_error = torch.tensor(disp_error, device=rank_device)
-        count = torch.tensor(count, dtype=torch.int, device=rank_device)
-
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(elst_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(exch_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(indu_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(disp_error, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-
-        total_MAE_t = (total_error / count).cpu()
-        elst_MAE_t = (elst_error / count).cpu()
-        exch_MAE_t = (exch_error / count).cpu()
-        indu_MAE_t = (indu_error / count).cpu()
-        disp_MAE_t = (
-            torch.tensor(0.0) if self.model.no_disp_nn else (disp_error / count).cpu()
+        (
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+        ) = globally_reduced_mae(
+            (total_error, elst_error, exch_error, indu_error, disp_error),
+            count,
+            device=rank_device,
         )
+        if self.model.no_disp_nn:
+            disp_MAE_t = 0.0
         return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
 
     def ddp_train(
@@ -2789,13 +3023,22 @@ units angstrom
         if rank == 0:
             print("Model DDP wrapped")
 
-        train_sampler = (
-            torch.utils.data.distributed.DistributedSampler(
-                train_dataset, num_replicas=world_size, rank=rank
-            )
-            if world_size > 1
-            else None
+        train_sampler = _build_shard_block_sampler(
+            self,
+            train_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            world_size=world_size,
+            rank=rank,
         )
+        if train_sampler is None:
+            train_sampler = (
+                torch.utils.data.distributed.DistributedSampler(
+                    train_dataset, num_replicas=world_size, rank=rank
+                )
+                if world_size > 1
+                else None
+            )
         test_sampler = (
             torch.utils.data.distributed.DistributedSampler(
                 test_dataset, num_replicas=world_size, rank=rank, shuffle=False
@@ -2889,8 +3132,25 @@ units angstrom
                         f"  (Pre-training) ({dt:<7.2f} sec)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} {elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} {indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                         flush=True,
                     )
+        track_pretraining_from_locals(
+            self, locals(), exclude=_omitted_metrics(self)
+        )
         model_saved = False
+        lowest_val_mae = (
+            _best_mae_sidecar_floor(self.model_save_path)
+            if self.model_save_path
+            else float("inf")
+        )
         for epoch in range(n_epochs):
+            # Re-draw which shards share a block, so a dimer's batch-mates
+            # change from epoch to epoch instead of being frozen at the epoch-0
+            # permutation.  Guarded on the type on purpose: `DistributedSampler`
+            # has never had `set_epoch` called on this route either, and adding
+            # it here would silently change the sample order of every existing
+            # DDP chain.  That is a real defect but it is not this change's to
+            # make.
+            if isinstance(train_sampler, ShardBlockSampler):
+                train_sampler.set_epoch(epoch)
             t1 = time.time()
             test_lowered = False
             train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
@@ -2927,7 +3187,20 @@ units angstrom
                         model_saved = True
                 else:
                     test_lowered = " "
+                mae_v = _as_scalar(total_MAE_v)
+                if (
+                    self.model_save_path
+                    and mae_v is not None
+                    and mae_v < lowest_val_mae
+                ):
+                    lowest_val_mae = mae_v
+                    _save_best_mae_sidecar(
+                        self, mae_v, epoch, "ddp", rank_device
+                    )
                 dt = time.time() - t1
+                track_epoch_from_locals(
+                    self, locals(), exclude=_omitted_metrics(self)
+                )
                 test_loss = 0.0
                 if self.model.no_disp_nn:
                     print(
@@ -3015,14 +3288,58 @@ units angstrom
                 else ap3_fused_collate_update
             )
 
+        # Worker lifetime and read-ahead depth, set from this route's own
+        # measurement rather than from a general rule -- a deeper prefetch is
+        # the wrong call on a CPU-bound loader and the right one here.
+        #
+        # Job 12391962 sampled this route live: 11 workers and the consumer
+        # together burn 1.01 cores of the 12 allocated, the workers are busy
+        # ~9 % of wall each, and 98 % of what worker CPU there is sits inside
+        # a single `Dataset.get` -> `torch.load`.  This loader is latency-
+        # bound on the shard store, not CPU-bound.  That is the reverse of
+        # the CLIFF2 route, whose step profile puts the loader at 1.4 % of
+        # main-thread time and therefore has no read latency left to hide;
+        # the depth chosen below does not transfer between the two.
+        #
+        # With the defaults every epoch forks `num_workers` fresh processes,
+        # each re-importing torch and re-materialising its view of the store
+        # before the first batch can land -- paid twice per epoch, train and
+        # validation.  The shm watcher in the same job shows exactly that as a
+        # sawtooth: live /dev/shm segments climb to ~217 inside an epoch and
+        # return to zero at every boundary.
+        #
+        # That boundary is also where every observed
+        #     RuntimeError: unable to allocate shared memory(shm) ... (11)
+        # in this route has fired -- in a worker's `_feed` on the first batch
+        # of a new epoch, at W=2, W=7 and W=11 alike, with 188 GB of /dev/shm
+        # free and 677 segments live at the instant of the failure.  It is the
+        # respawn burst that is being refused, not any ceiling.  Keeping the
+        # cohort alive deletes the burst.
+        #
+        # `prefetch_factor` stays at torch's default here and is opt-in only:
+        # a deeper queue is the right lever for a latency-bound loader, but it
+        # multiplies in-flight segments per worker, and until an arm has run
+        # with `persistent_workers` alone the two changes would be confounded.
+        train_sampler = _build_shard_block_sampler(
+            self, train_dataset, batch_size=batch_size, num_workers=num_workers
+        )
+
+        loader_kwargs = {}
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            prefetch = getattr(self, "dataloader_prefetch_factor", None)
+            if prefetch:
+                loader_kwargs["prefetch_factor"] = int(prefetch)
+
         train_loader = APNet2_fused_DataLoader(
             dataset=train_dataset,
             batch_size=batch_size,
-            shuffle=True,
-            # shuffle=False,
+            shuffle=train_sampler is None,
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=collate_fn,
+            sampler=train_sampler,
+            **loader_kwargs,
         )
         test_loader = APNet2_fused_DataLoader(
             dataset=test_dataset,
@@ -3031,6 +3348,7 @@ units angstrom
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=collate_fn,
+            **loader_kwargs,
         )
 
         # (3) Optim/Scheduler
@@ -3138,11 +3456,28 @@ units angstrom
                     total_MAE_t: > 7.3f}/{total_MAE_v: < 7.3f}",
                 flush=True,
             )
+        track_pretraining_from_locals(
+            self, locals(), exclude=_omitted_metrics(self)
+        )
 
         # (6) Main training loop
         lowest_test_loss = test_loss
         model_saved = False
+        lowest_val_mae = (
+            _best_mae_sidecar_floor(self.model_save_path)
+            if self.model_save_path
+            else float("inf")
+        )
         for epoch in range(n_epochs):
+            # Re-draw which shards share a block, so a dimer's batch-mates
+            # change from epoch to epoch instead of being frozen at the epoch-0
+            # permutation.  Guarded on the type on purpose: `DistributedSampler`
+            # has never had `set_epoch` called on this route either, and adding
+            # it here would silently change the sample order of every existing
+            # DDP chain.  That is a real defect but it is not this change's to
+            # make.
+            if isinstance(train_sampler, ShardBlockSampler):
+                train_sampler.set_epoch(epoch)
             t1 = time.time()
             t_out = __train_batch(
                 train_loader,
@@ -3197,6 +3532,15 @@ units angstrom
                     model_saved = True
                 self.model.to(rank_device)
 
+            mae_v = _as_scalar(total_MAE_v)
+            if self.model_save_path and mae_v is not None and mae_v < lowest_val_mae:
+                lowest_val_mae = mae_v
+                _save_best_mae_sidecar(
+                    self, mae_v, epoch, "single_proc", rank_device
+                )
+
+            dt = time.time() - t1
+            track_epoch_from_locals(self, locals(), exclude=_omitted_metrics(self))
             if is_fsapt or not transfer_learning:
                 if self.model.no_disp_nn:
                     print(
@@ -3237,6 +3581,8 @@ units angstrom
             cpu_model = model_io.unwrap_model(self.model).to("cpu")
             best_model = deepcopy(cpu_model)
             self.model.to(rank_device)
+        # Publish the real final-epoch weights before restoring the best ones.
+        stage_final_weights(self)
         self.model = best_model
         self.model.to(rank_device)
         return
@@ -3258,6 +3604,10 @@ units angstrom
         skip_compile=True,
         transfer_learning=False,
         include_total_mse=False,
+        shard_locality_block_shards=0,
+        wandb_config: WandbConfig | None = None,
+        _tracker_backend=TrackerBackend.WANDB,
+        _tracker_event_directory=None,
     ):
         """
         hyperparameters match the defaults in the original code:
@@ -3319,6 +3669,11 @@ units angstrom
         print(f"  {lr_decay=}\n", flush=True)
         print(f"  {end_lr=}\n", flush=True)
         print(f"  {include_total_mse=}\n", flush=True)
+        # Read back off `self` by both training paths.  `ddp_train` is handed
+        # to `mp.spawn` as a bound method, so `self` is pickled to every rank
+        # and this travels with it -- no signature change on either worker.
+        self.shard_locality_block_shards = int(shard_locality_block_shards or 0)
+        print(f"  {shard_locality_block_shards=}", flush=True)
         print(f"  {batch_size=}", flush=True)
 
         if self.device.type == "cuda":
@@ -3334,12 +3689,32 @@ units angstrom
             self.dimer_prop_model.set_forward("ap3_atomMPNN")
             self.dimer_prop_model.to(self.device)
 
+        tracking_config = {
+            "training/epochs": n_epochs,
+            "training/learning_rate_initial": lr,
+            "training/learning_rate_decay": lr_decay,
+            "training/learning_rate_final": end_lr,
+            "training/random_seed": random_seed,
+            "training/skip_compile": skip_compile,
+            "training/transfer_learning": transfer_learning,
+            "training/include_total_mse": include_total_mse,
+            "training/shard_locality_block_shards": self.shard_locality_block_shards,
+        }
         if world_size > 1:
             print("Running multi-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            configure_distributed_tracking(
+                self,
+                wandb_config,
+                model_family="pairwise",
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
+            )
             mp.spawn(
-                self.ddp_train,
+                tracked_ddp_worker,
                 args=(
+                    self.ddp_train,
                     world_size,
                     train_dataset,
                     test_dataset,
@@ -3358,19 +3733,31 @@ units angstrom
         else:
             print("Running single-process training", flush=True)
             os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
-            self.single_proc_train(
+            run_tracked_single_process(
+                self,
+                lambda: self.single_proc_train(
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
+                    n_epochs=n_epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    pin_memory=pin_memory,
+                    num_workers=dataloader_num_workers,
+                    lr_decay=lr_decay,
+                    end_lr=end_lr,
+                    skip_compile=skip_compile,
+                    transfer_learning=transfer_learning,
+                    include_total_mse=include_total_mse,
+                ),
+                wandb_config,
+                model_family="pairwise",
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                pin_memory=pin_memory,
-                num_workers=dataloader_num_workers,
-                lr_decay=lr_decay,
-                end_lr=end_lr,
-                skip_compile=skip_compile,
-                transfer_learning=transfer_learning,
-                include_total_mse=include_total_mse,
+                validation_dataset=test_dataset,
+                effective_batch_size=batch_size,
+                world_size=world_size,
+                initial_config=tracking_config,
+                backend=_tracker_backend,
+                event_directory=_tracker_event_directory,
             )
         return
 

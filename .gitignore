@@ -220,6 +220,9 @@ GEMINI.md
 .opencode
 OpenCode.md
 data/
+!src/qcml_mcp/data/
+src/qcml_mcp/data/*
+!src/qcml_mcp/data/polynomial_coefficients.pkl
 data_dimer*
 tests/dataset_data/ap2_ensemble_test.pt
 tests/dataset_data/ap2_fused_ensemble_test.pt
@@ -242,3 +245,16 @@ tmp.xyz
 train_saptdft.py
 tests/dataset_data/ap2_fused_ensemble_test.pt
 
+.github/hooks/workmux-status
+.sweep/
+
+# Local diagnostics, not part of the package
+scripts/monomer_dataset.py
+scripts/extract_atp_from_ap3d3.py
+
+# CLIFF run output: trained checkpoints and W&B run state, not deliverables.
+# models/cliff/atp_from_ap3d3_1.pt in particular is a byte-for-byte duplicate
+# of the already-tracked models/ap3_saptpbe0/1/atp_hfvr_1.pt.
+models/cliff/
+wandb/
+cliff.pdf
