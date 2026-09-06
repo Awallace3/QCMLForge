@@ -17,6 +17,7 @@ import torch
 
 from apnet_pt.constants import ALLOWED_ELEMENTS
 
+from ._graph_longrange_compat import patch_realspace_scatter_dim_size
 from .schema import (
     MACEAtomicFeatures,
     MACEFeatureCacheKey,
@@ -233,6 +234,11 @@ def load_verified_polar_mace(
             f"Local MACE artifact is required{qualifier}: {artifact}"
         )
     verify_artifact(artifact, expected_sha256)
+
+    # The backbone's real-space Coulomb term truncates its per-node scatter
+    # when the last graph of a batch has no edges, which a monatomic monomer
+    # guarantees.  Correct it before any forward can hit that path.
+    patch_realspace_scatter_dim_size()
 
     load = loader or _default_polar_loader
     model = load(
