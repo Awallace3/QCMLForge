@@ -7978,8 +7978,24 @@ units angstrom
         dist.all_reduce(staged, op=reduce_op)
         return staged.to(tensor.device)
 
-    def _ddp_reduce_epoch_sums(self, total_loss_t, error_sum, n_dimers):
-        """Global ``(total_loss, MAE)`` from this rank's running sums.
+    def _record_component_mse(self, split, component_MSE) -> None:
+        """Publish this epoch's per-component MSE under ``split``.
+
+        Published on the harness rather than returned so that no caller's
+        unpack changes.  It is recorded because the primary checkpoint is
+        selected on a SUM of component MSEs while every table this campaign is
+        read in -- the printed per-component figures, the S66x8 gate, CLIFF's
+        published values -- is MAE.  When the two selectors disagree, and they
+        have, the per-column MSE is the only thing that says WHICH column drove
+        the star.  It was not recorded before, so for a run already finished
+        that question cannot be answered at all.
+        """
+        if getattr(self, "last_component_MSE", None) is None:
+            self.last_component_MSE = {}
+        self.last_component_MSE[split] = [float(v) for v in component_MSE]
+
+    def _ddp_reduce_epoch_sums(self, total_loss_t, error_sum, sq_sum, n_dimers):
+        """Global ``(total_loss, MAE, per-component MSE)`` from running sums.
 
         Same reduction as :meth:`_ddp_reduce_epoch_metrics` -- SUM of absolute
         errors over SUM of dimer counts, so the quotient is the true global MAE
@@ -7987,12 +8003,17 @@ units angstrom
         epoch loop kept on the GPU instead of from a materialised per-dimer
         error tensor. Doing it this way is what lets the loop avoid a
         device-to-host copy on every batch.
+
+        The squared sums ride in the same ``all_reduce`` as the absolute ones:
+        one extra row in an already-packed tensor, so the per-component MSE
+        costs no additional collective.
         """
         counts = torch.full_like(error_sum, float(n_dimers))
-        packed = self._ddp_all_reduce(torch.stack((error_sum, counts)))
-        total_MAE = (packed[0] / packed[1]).to(torch.float32).cpu()
+        packed = self._ddp_all_reduce(torch.stack((error_sum, sq_sum, counts)))
+        total_MAE = (packed[0] / packed[2]).to(torch.float32).cpu()
+        component_MSE = (packed[1] / packed[2]).to(torch.float32).cpu()
         total_loss = float(self._ddp_all_reduce(total_loss_t.clone()).item())
-        return total_loss, total_MAE
+        return total_loss, total_MAE, component_MSE
 
     def _ddp_reduce_epoch_metrics(self, total_loss, comp_errors_t, world_size):
         """Global ``(total_loss, MAE)`` from this rank's shard.
@@ -8472,6 +8493,7 @@ units angstrom
         # epoch. float64 because these accumulate thousands of terms.
         total_loss_t = torch.zeros((), dtype=torch.float64, device=rank_device)
         error_sum = None
+        sq_sum = None
         n_dimers = 0
         n_skipped = 0
         for n, batch in enumerate(dataloader):
@@ -8535,8 +8557,11 @@ units angstrom
                     continue
             optimizer.step()
             total_loss_t += batch_loss.detach().double()
-            batch_abs = comp_errors.detach().abs().sum(dim=0, dtype=torch.float64)
+            comp_detached = comp_errors.detach()
+            batch_abs = comp_detached.abs().sum(dim=0, dtype=torch.float64)
+            batch_sq = comp_detached.square().sum(dim=0, dtype=torch.float64)
             error_sum = batch_abs if error_sum is None else error_sum + batch_abs
+            sq_sum = batch_sq if sq_sum is None else sq_sum + batch_sq
             n_dimers += comp_errors.shape[0]
         if scheduler is not None:
             scheduler.step()
@@ -8556,10 +8581,15 @@ units angstrom
                 "or every batch was skipped on a non-finite gradient norm"
             )
         if world_size > 1:
-            return self._ddp_reduce_epoch_sums(total_loss_t, error_sum, n_dimers)
-        return float(total_loss_t.item()), (
-            (error_sum / n_dimers).to(torch.float32).cpu()
-        )
+            total_loss, total_MAE, component_MSE = self._ddp_reduce_epoch_sums(
+                total_loss_t, error_sum, sq_sum, n_dimers
+            )
+        else:
+            total_loss = float(total_loss_t.item())
+            total_MAE = (error_sum / n_dimers).to(torch.float32).cpu()
+            component_MSE = (sq_sum / n_dimers).to(torch.float32).cpu()
+        self._record_component_mse("train", component_MSE)
+        return total_loss, total_MAE
 
     # @torch.inference_mode()
     def __evaluate_batches_single_proc(
@@ -8576,6 +8606,7 @@ units angstrom
         # Same device-side accumulation as the training loop; see there.
         total_loss_t = torch.zeros((), dtype=torch.float64, device=rank_device)
         error_sum = None
+        sq_sum = None
         n_dimers = 0
         # Recorded once per epoch on the first validation batch rather than the
         # whole split: one extra forward is negligible, and a trend only needs a
@@ -8604,22 +8635,28 @@ units angstrom
                     preds, ref, comp_errors, batch, loss_fn
                 )
                 total_loss_t += batch_loss.detach().double()
-                batch_abs = comp_errors.detach().abs().sum(
-                    dim=0, dtype=torch.float64
-                )
+                comp_detached = comp_errors.detach()
+                batch_abs = comp_detached.abs().sum(dim=0, dtype=torch.float64)
+                batch_sq = comp_detached.square().sum(dim=0, dtype=torch.float64)
                 error_sum = (
                     batch_abs if error_sum is None else error_sum + batch_abs
                 )
+                sq_sum = batch_sq if sq_sum is None else sq_sum + batch_sq
                 n_dimers += comp_errors.shape[0]
         if error_sum is None:
             raise RuntimeError(
                 "validation epoch ran zero batches: the loader yielded nothing"
             )
         if world_size > 1:
-            return self._ddp_reduce_epoch_sums(total_loss_t, error_sum, n_dimers)
-        return float(total_loss_t.item()), (
-            (error_sum / n_dimers).to(torch.float32).cpu()
-        )
+            total_loss, total_MAE, component_MSE = self._ddp_reduce_epoch_sums(
+                total_loss_t, error_sum, sq_sum, n_dimers
+            )
+        else:
+            total_loss = float(total_loss_t.item())
+            total_MAE = (error_sum / n_dimers).to(torch.float32).cpu()
+            component_MSE = (sq_sum / n_dimers).to(torch.float32).cpu()
+        self._record_component_mse("val", component_MSE)
+        return total_loss, total_MAE
 
     def __evaluate_batches_single_proc_elst_no_damping(
         self, dataloader, loss_fn, rank_device
@@ -9296,6 +9333,32 @@ units angstrom
                 f"{mae_string} {star_marker}",
                 flush=True,
             )
+            component_MSE = getattr(self, "last_component_MSE", None) or {}
+            if is_primary and len(component_MSE.get("val", ())) > 1:
+                # A separate line, deliberately: `slurm-*.out` scrapers key on
+                # the EPOCH line's shape, and one of them already has to dedupe
+                # a re-printed block. Widening EPOCH would break them silently.
+                #
+                # This is what the star is chosen on. The MAEs above are what
+                # the S66x8 gate and every published table are read in, and the
+                # two disagree often enough that "the best epoch" has meant two
+                # different epochs in this campaign. The printed sum is the
+                # component-MSE term of the selector, not the selector itself:
+                # under component_gamma < 1 the loss also carries a total-MSE
+                # term, and it is accumulated per batch rather than per dimer.
+                # It still says which column moved.
+                mse_string = " ".join(
+                    f"{mse_t: > 8.4f}/{mse_v: < 8.4f}"
+                    for mse_t, mse_v in zip(
+                        component_MSE.get("train", component_MSE["val"]),
+                        component_MSE["val"],
+                    )
+                )
+                print(
+                    f"  COMPONENT MSE: {mse_string} "
+                    f"sum {sum(component_MSE['val']):.4f}",
+                    flush=True,
+                )
             if not self.device == "CPU":
                 torch.cuda.empty_cache()
             nan_detected = bool(

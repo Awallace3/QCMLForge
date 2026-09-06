@@ -707,3 +707,77 @@ def test_synthetic_split_is_picklable_into_a_spawned_rank():
     train, test = _tiny_split()
     assert len(pickle.loads(pickle.dumps(train))) == len(train)
     assert len(pickle.loads(pickle.dumps(test))) == len(test)
+
+
+# ---------------------------------------------------------------------------
+# Contract: per-component MSE, which is what the primary checkpoint is chosen on
+# ---------------------------------------------------------------------------
+
+
+def test_component_mse_costs_no_extra_collective():
+    """The squared sums must ride in the tensor the absolute sums already use.
+
+    A second ``_ddp_all_reduce`` for the squares would be a per-epoch
+    collective added to buy a diagnostic, and -- worse -- a rank-divergent one
+    if it ever landed inside a branch. Stacking them is what keeps the cost at
+    one extra row.
+    """
+    source = inspect.getsource(AM_DimerParam_Model._ddp_reduce_epoch_sums)
+    assert "torch.stack((error_sum, sq_sum, counts))" in source
+    # The loss reduction is the only other one; nothing reduces sq_sum alone.
+    assert source.count("_ddp_all_reduce") == 2
+
+
+def test_reduce_epoch_sums_divides_squares_by_the_same_count():
+    """MAE and MSE come out of one packed reduction, so the arithmetic is worth
+    asserting on directly: a row swap would silently report MSE as MAE."""
+    model = AM_DimerParam_Model.__new__(AM_DimerParam_Model)
+    model._ddp_all_reduce = lambda t, **kwargs: t
+    error_sum = torch.tensor([6.0, 12.0], dtype=torch.float64)
+    sq_sum = torch.tensor([20.0, 80.0], dtype=torch.float64)
+    total_loss, total_MAE, component_MSE = model._ddp_reduce_epoch_sums(
+        torch.tensor(3.5, dtype=torch.float64), error_sum, sq_sum, n_dimers=4
+    )
+    assert total_loss == pytest.approx(3.5)
+    assert total_MAE.tolist() == pytest.approx([1.5, 3.0])
+    assert component_MSE.tolist() == pytest.approx([5.0, 20.0])
+
+
+def test_both_epoch_loops_accumulate_squares_and_record_a_distinct_split():
+    """Train and val each publish under their own key.
+
+    They share the accumulation shape, so a copy-paste that left ``"train"`` in
+    the validation loop would overwrite the column the star is read from with
+    the one it is not, and the printed line would still look plausible.
+    """
+    for source, split in (
+        (_train_batches_source(), "train"),
+        (_evaluate_batches_source(), "val"),
+    ):
+        assert "sq_sum = None" in source
+        assert "comp_detached.square().sum(dim=0, dtype=torch.float64)" in source
+        assert f'self._record_component_mse("{split}", component_MSE)' in source
+
+
+def test_component_mse_is_printed_on_its_own_line():
+    """Not appended to ``EPOCH:``.
+
+    ``analysis/`` scrapes ``slurm-*.out`` by the EPOCH line's shape, and one of
+    them already has to dedupe a re-printed end-of-chunk block. Widening that
+    line breaks them with no error.
+    """
+    source = _loop_source()
+    epoch_print = source.index('f"  EPOCH: {epoch:4d}')
+    epoch_print_end = source.index("flush=True", epoch_print)
+    mse_print = source.index('f"  COMPONENT MSE: ')
+    assert epoch_print_end < mse_print
+    assert "COMPONENT MSE" not in source[epoch_print:epoch_print_end]
+
+
+def test_component_mse_print_is_rank_zero_only_and_survives_a_missing_split():
+    """It reads an attribute the loop may never have set on this rank."""
+    source = _loop_source()
+    guard = source.index('if is_primary and len(component_MSE.get("val"')
+    assert 'getattr(self, "last_component_MSE", None) or {}' in source[:guard]
+    # train is optional: a validation-only epoch still prints one column.
+    assert 'component_MSE.get("train", component_MSE["val"])' in source
