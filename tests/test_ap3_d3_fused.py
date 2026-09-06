@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 from glob import glob
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -1830,6 +1831,47 @@ def test_best_mae_floor_ignores_a_record_written_for_another_path(tmp_path):
     open(ckpt, "wb").close()
     with open(record, "w") as f:
         json.dump({"model_save_path": "/somewhere/else.pt", "val_total_MAE": 0.1}, f)
+    assert _best_mae_sidecar_floor(target) == float("inf")
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        pytest.param(Path, id="pathlib"),
+        pytest.param(lambda p: p.replace("/model.pt", "//model.pt"), id="double-slash"),
+        pytest.param(lambda p: p.replace("/model.pt", "/./model.pt"), id="dot-segment"),
+    ],
+)
+def test_best_mae_floor_survives_an_equivalent_spelling(tmp_path, spelling):
+    # The floor keys on path identity, not on how the caller spelled it.  The
+    # trainer hands through ``harness.model_save_path``, which is a ``Path``
+    # whenever the caller built it with pathlib, while the record stores ``str``
+    # of it -- so before this was normalised a Path-valued caller took floor
+    # ``inf`` on every chunk, and a chunk starting worse than the chain's banked
+    # best silently overwrote it with its own first epoch.  This route trains
+    # the ap3d3-ff arms, which are chained, so the bug was live there.
+    target = str(tmp_path / "model.pt")
+    ckpt, record = _best_mae_sidecar_paths(target)
+    open(ckpt, "wb").close()
+    with open(record, "w") as f:
+        json.dump({"model_save_path": target, "val_total_MAE": 0.584}, f)
+    assert _best_mae_sidecar_floor(spelling(target)) == pytest.approx(0.584)
+
+
+def test_best_mae_floor_normalisation_still_rejects_a_foreign_record(tmp_path):
+    # The normalisation must not widen the ownership check into a no-op: two
+    # different files under one directory stay two different paths.
+    target = str(tmp_path / "model.pt")
+    ckpt, record = _best_mae_sidecar_paths(target)
+    open(ckpt, "wb").close()
+    with open(record, "w") as f:
+        json.dump(
+            {
+                "model_save_path": str(tmp_path / "sub" / ".." / "else.pt"),
+                "val_total_MAE": 0.1,
+            },
+            f,
+        )
     assert _best_mae_sidecar_floor(target) == float("inf")
 
 

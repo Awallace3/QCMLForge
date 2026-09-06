@@ -244,3 +244,55 @@ def test_the_epoch_loop_selects_on_summed_component_mae():
     assert source.index("model_io.save_checkpoint(checkpoint, self.model_save_path)") < (
         source.index("if val_total_MAE < lowest_val_total_MAE:")
     )
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        pytest.param(lambda p: Path(p), id="pathlib"),
+        pytest.param(lambda p: p.replace("/cliff2.pt", "//cliff2.pt"), id="double-slash"),
+        pytest.param(lambda p: p.replace("/cliff2.pt", "/./cliff2.pt"), id="dot-segment"),
+    ],
+)
+def test_floor_survives_an_equivalent_spelling_of_its_own_path(tmp_path, spelling):
+    """The floor must key on path identity, not on how the caller spelled it.
+
+    The trainer hands through ``self.model_save_path``, which is a ``Path``
+    whenever the caller built it with pathlib, and the record stores ``str`` of
+    it.  Before this was normalised, a Path-valued caller took floor ``inf`` on
+    every chunk of a chain -- so a chunk that started worse than the chain's
+    banked best would overwrite it with its own first epoch, silently, which is
+    exactly what the sidecar was added to prevent.
+    """
+    target = str(tmp_path / "cliff2.pt")
+    ckpt, record = model_io.best_mae_sidecar_paths(target)
+    Path(ckpt).write_bytes(b"weights")
+    model_io.save_best_mae_record(
+        record,
+        model_save_path=target,
+        checkpoint=ckpt,
+        val_total_MAE=0.5,
+        component_MAE=[0.2, 0.2, 0.1],
+        epoch=7,
+    )
+    assert model_io.best_mae_sidecar_floor(spelling(target)) == pytest.approx(0.5)
+
+
+def test_normalising_the_floor_still_rejects_a_foreign_record(tmp_path):
+    """The normalisation must not turn the ownership check into a no-op.
+
+    Two different files under one directory normalise to two different paths;
+    if this ever passes, the fix has been widened into a hole.
+    """
+    target = str(tmp_path / "cliff2.pt")
+    ckpt, record = model_io.best_mae_sidecar_paths(target)
+    Path(ckpt).write_bytes(b"weights")
+    model_io.save_best_mae_record(
+        record,
+        model_save_path=str(tmp_path / "sub" / ".." / "somebody_elses.pt"),
+        checkpoint=ckpt,
+        val_total_MAE=0.1,
+        component_MAE=[0.1],
+        epoch=3,
+    )
+    assert model_io.best_mae_sidecar_floor(target) == float("inf")

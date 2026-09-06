@@ -664,6 +664,22 @@ def best_mae_sidecar_paths(model_save_path: str) -> tuple[str, str]:
     return base + ".best-mae.pt", base + ".best-mae.json"
 
 
+def _canonical_save_path(model_save_path) -> str:
+    """Compare save paths by identity rather than by spelling.
+
+    Both sides of the floor's ownership check go through this.  The write side
+    stringifies its argument because ``json.dump`` raises on a ``Path``; with no
+    matching normalisation on the read side a ``pathlib``-valued caller compares
+    ``PosixPath('/x/y.pt')`` against ``'/x/y.pt'``, never matches, and silently
+    takes floor ``inf`` on every chunk -- restoring the exact
+    overwrite-with-a-worse-epoch behaviour the sidecar exists to prevent.  ``//``,
+    ``/./`` and a trailing slash fail identically.  Normalising at comparison
+    time rather than at write time keeps records written before this fix
+    readable.
+    """
+    return os.path.realpath(str(model_save_path))
+
+
 def best_mae_sidecar_floor(model_save_path: str | None) -> float:
     """Best validation MAE a previous chunk already banked at this path.
 
@@ -682,7 +698,9 @@ def best_mae_sidecar_floor(model_save_path: str | None) -> float:
     try:
         with open(record_path) as f:
             record = json.load(f)
-        if record.get("model_save_path") != model_save_path:
+        if _canonical_save_path(record.get("model_save_path")) != _canonical_save_path(
+            model_save_path
+        ):
             return float("inf")
         return float(record[BEST_MAE_SELECTOR])
     except (OSError, ValueError, TypeError, KeyError):
