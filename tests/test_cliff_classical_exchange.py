@@ -4242,39 +4242,57 @@ def test_train_models_help_exits_zero_and_advertises_the_cliff_routes():
 # `positivity_epsilon` and inflated the fifth to ~90x its seed.  The mechanism
 # is that `K = softplus(raw) + eps` has `dK/draw = sigmoid(raw)`, so a column
 # driven toward zero loses the very gradient that would bring it back.  These
-# tests pin the two properties that fix it: the bound is enforced on the value,
-# and the gradient survives being outside it.
+# tests pin the three properties that fix it: the bound is enforced on the
+# value, the *inward* gradient survives being outside it, and -- since the
+# 18-epoch CLIFF2 run `12871934` pinned 100% of its `ind_overlap` column with
+# raw values out to 8.8e9 -- the *outward* gradient does not, so the pre-image
+# cannot walk away behind a bound that is holding its value fixed.
 # ---------------------------------------------------------------------------
 
 
-def test_ste_clamp_bounds_value_and_passes_gradient():
+def test_bounded_clamp_bounds_value_and_restores_inward():
     lower = torch.tensor([[-2.0]])
     upper = torch.tensor([[3.0]])
     raw = torch.tensor(
         [[-40.0], [-2.5], [-2.0], [0.0], [3.0], [3.5], [40.0]],
         requires_grad=True,
     )
-    clamped = mtp_mtp._ste_clamp(raw, lower, upper)
+    clamped = mtp_mtp._bounded_clamp(raw, lower, upper)
     assert torch.all(clamped >= lower)
     assert torch.all(clamped <= upper)
     # Inside the interval the clamp is the identity, not merely close to it.
     inside = (raw.detach() >= lower) & (raw.detach() <= upper)
     assert torch.equal(clamped.detach()[inside], raw.detach()[inside])
 
+    # `sum()` makes every incoming gradient `+1`.  Descent moves `x` the other
+    # way, so `+1` is inward at the ceiling and outward at the floor: the two
+    # entries below the floor are the only ones silenced.  A parameter sitting
+    # exactly *on* a bound is not out of range and keeps its gradient.
     clamped.sum().backward()
-    # The whole point: an out-of-range parameter still receives gradient 1, so
-    # it can climb back in.  A plain `clamp` would give 0 here and freeze it.
-    assert torch.equal(raw.grad, torch.ones_like(raw))
+    assert raw.grad.flatten().tolist() == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+    # The mirror image, and the half the old straight-through form got wrong:
+    # `-1` is inward at the floor and outward at the ceiling.
+    raw.grad = None
+    (-mtp_mtp._bounded_clamp(raw, lower, upper).sum()).backward()
+    assert raw.grad.flatten().tolist() == [
+        -1.0, -1.0, -1.0, -1.0, -1.0, 0.0, 0.0
+    ]
 
 
-def test_ste_clamp_accepts_one_sided_bounds():
+@pytest.mark.parametrize("mode", mtp_mtp.CLIFF_BOUND_GRADIENT_MODES)
+def test_bounded_clamp_accepts_one_sided_bounds(mode):
     raw = torch.tensor([[-5.0], [5.0]], requires_grad=True)
-    lower_only = mtp_mtp._ste_clamp(raw, torch.tensor([[0.0]]), None)
+    lower_only = mtp_mtp._bounded_clamp(
+        raw, torch.tensor([[0.0]]), None, mode
+    )
     assert lower_only.detach().tolist() == [[0.0], [5.0]]
-    upper_only = mtp_mtp._ste_clamp(raw, None, torch.tensor([[0.0]]))
+    upper_only = mtp_mtp._bounded_clamp(
+        raw, None, torch.tensor([[0.0]]), mode
+    )
     assert upper_only.detach().tolist() == [[-5.0], [0.0]]
     assert torch.equal(
-        mtp_mtp._ste_clamp(raw, None, None).detach(), raw.detach()
+        mtp_mtp._bounded_clamp(raw, None, None, mode).detach(), raw.detach()
     )
 
 
@@ -4332,9 +4350,15 @@ def test_cliff_head_survives_saturating_readout_with_live_gradient(
 
     This is the exact failure that killed the first run, reproduced in one
     forward pass: drive the correction MLP hard negative and check both that
-    the emitted parameter stops at the floor and that gradient still flows back
-    into the readout weights.  Without the bound the parameter reaches
-    ``positivity_epsilon`` and the gradient underflows to ~1e-13.
+    the emitted parameter stops at the floor and that the gradient that would
+    bring it *back* still reaches the readout weights.  Without the bound the
+    parameter reaches ``positivity_epsilon`` and that gradient underflows to
+    ~1e-13.
+
+    The outward direction is checked too, and the answer is the opposite: it
+    must arrive as exactly zero.  Passing it was the pre-fix behaviour and it
+    is what let run ``12871934`` hold ``ind_overlap`` on its floor while the
+    pre-image walked out to ``-2.3e7``.
     """
     bounded = _build_head(model_type, nested_hfvr_vw_model)
     unbounded = _build_head(
@@ -4348,22 +4372,29 @@ def test_cliff_head_survives_saturating_readout_with_live_gradient(
     )
 
     grads = {}
+    outward = {}
     for label, model in (("bounded", bounded), ("unbounded", unbounded)):
         with torch.no_grad():
             for head in model.param_readout_layers:
                 for readout in head:
                     for parameter in readout.parameters():
                         parameter.fill_(-25.0)
+
+        def readout_grad_max(model=model):
+            return max(
+                parameter.grad.abs().max().item()
+                for head in model.param_readout_layers
+                for readout in head
+                for parameter in readout.parameters()
+                if parameter.grad is not None
+            )
+
         parameters = model(atomic_batch)[-1]
         assert torch.isfinite(parameters).all()
-        parameters.sum().backward()
-        grads[label] = max(
-            parameter.grad.abs().max().item()
-            for head in model.param_readout_layers
-            for readout in head
-            for parameter in readout.parameters()
-            if parameter.grad is not None
-        )
+        # Ask the loss to *raise* the parameter: the restoring direction for a
+        # head sitting on its floor.
+        (-parameters.sum()).backward()
+        grads[label] = readout_grad_max()
         if label == "bounded":
             assert torch.allclose(
                 parameters, floor.expand_as(parameters), atol=1e-5
@@ -4371,9 +4402,14 @@ def test_cliff_head_survives_saturating_readout_with_live_gradient(
         else:
             assert torch.all(parameters < 1e-3)
 
+        model.zero_grad(set_to_none=True)
+        model(atomic_batch)[-1].sum().backward()
+        outward[label] = readout_grad_max()
+
     assert grads["unbounded"] < 1e-6, grads["unbounded"]
     assert grads["bounded"] > 1e-3 * (1.0 + grads["unbounded"]), grads
     assert grads["bounded"] > 1e6 * grads["unbounded"]
+    assert outward["bounded"] == 0.0, outward
 
 
 @pytest.mark.parametrize(
@@ -4589,7 +4625,8 @@ def test_validate_bound_scale_allows_none_and_coerces_ints():
         )
 
 
-def test_ste_clamp_is_exact_at_large_magnitudes():
+@pytest.mark.parametrize("mode", mtp_mtp.CLIFF_BOUND_GRADIENT_MODES)
+def test_bounded_clamp_is_exact_at_large_magnitudes(mode):
     """Regression: the bound must hold when `|x|` dwarfs it.
 
     The first implementation used `x - (x - upper).clamp_min(0).detach()`,
@@ -4597,17 +4634,163 @@ def test_ste_clamp_is_exact_at_large_magnitudes():
     `x - upper` rounds back toward `x` and the "clamped" result came out at 32
     instead of 25.  `test_cliff_head_ceiling_caps_a_runaway_readout` is what
     caught it; this pins the helper directly.
+
+    Magnitudes like these are not hypothetical -- run `12871934` reached
+    `+8.8e9` on `ind_overlap` -- so both modes are held to the same value.
     """
     lower = torch.tensor([[-25.0]])
     upper = torch.tensor([[25.0]])
     raw = torch.tensor(
         [[-3.0e7], [-1.0e10], [3.0e7], [1.0e10], [3.4e7]], requires_grad=True
     )
-    clamped = mtp_mtp._ste_clamp(raw, lower, upper)
+    clamped = mtp_mtp._bounded_clamp(raw, lower, upper, mode)
     expected = raw.detach().clamp(min=-25.0, max=25.0)
     assert torch.equal(clamped.detach(), expected)
     clamped.sum().backward()
-    assert torch.equal(raw.grad, torch.ones_like(raw))
+    if mode == "straight-through":
+        assert torch.equal(raw.grad, torch.ones_like(raw))
+    else:
+        # `+1` drives the two below-floor entries further down; only they are
+        # silenced.  The three above the ceiling are being pulled back in.
+        assert raw.grad.flatten().tolist() == [0.0, 0.0, 1.0, 1.0, 1.0]
+
+
+def test_bounded_clamp_rejects_an_unknown_mode():
+    raw = torch.tensor([[0.0]], requires_grad=True)
+    with pytest.raises(ValueError, match="bound_gradient_mode"):
+        mtp_mtp._bounded_clamp(raw, torch.tensor([[-1.0]]), None, "clip")
+    with pytest.raises(ValueError, match="bound_gradient_mode"):
+        mtp_mtp._validate_bound_gradient_mode("clip")
+
+
+@pytest.mark.parametrize("side", ["floor", "ceiling"])
+def test_bounded_clamp_stops_the_preimage_runaway(side):
+    """The defect itself: a bounded value whose pre-image escapes anyway.
+
+    The loss asks for a `K` the band forbids, so the clamp pins the emitted
+    value and the residual never shrinks.  Under `"straight-through"` that
+    constant residual is integrated forever, so the distance `raw` travels
+    grows with the *number of steps* -- which is how run `12871934` put 100%
+    of `ind_overlap` on a bound with raw values from `-2.3e7` to `+8.8e9`.
+    Under `"restoring"` the walk stops on the far side of the bound within one
+    step of it, and stays there no matter how long training runs.
+    """
+    lower = torch.tensor([-2.0])
+    upper = torch.tensor([2.0])
+    step = 1.0e-3
+    # A target the clamp can never reach, on the side under test.
+    target = torch.tensor([-50.0 if side == "floor" else 50.0])
+    bound = lower.item() if side == "floor" else upper.item()
+
+    def run(mode, steps):
+        raw = torch.zeros(1, requires_grad=True)
+        optimizer = torch.optim.SGD([raw], lr=step)
+        for _ in range(steps):
+            optimizer.zero_grad()
+            loss = (
+                mtp_mtp._bounded_clamp(raw, lower, upper, mode) - target
+            ).pow(2).sum()
+            loss.backward()
+            optimizer.step()
+        return raw.detach().item()
+
+    # Ten times the steps, ten times the escape: nothing is holding it.
+    short = run("straight-through", 200)
+    long = run("straight-through", 2000)
+    assert abs(short - bound) > 10.0
+    assert abs(long - bound) > 9.0 * abs(short - bound)
+    assert (short < bound) if side == "floor" else (short > bound)
+
+    # The fix: the overshoot is one optimizer step, and it does not accumulate.
+    parked_short = run("restoring", 200)
+    parked_long = run("restoring", 2000)
+    assert parked_short == parked_long
+    assert abs(parked_short - bound) <= 2.0 * step * abs(2.0 * (bound - target.item()))
+
+    # And it is still live: point the loss the other way and the gradient that
+    # brings it back inside arrives at full strength.
+    raw = torch.tensor([parked_short], requires_grad=True)
+    (
+        mtp_mtp._bounded_clamp(raw, lower, upper, "restoring")
+        - torch.tensor([0.0])
+    ).pow(2).sum().backward()
+    assert raw.grad.item() == pytest.approx(2.0 * bound)
+
+
+@pytest.mark.parametrize(
+    "model_type,_name,_parameter_names,_values,_stds",
+    _HEAD_CASES,
+    ids=_HEAD_IDS,
+)
+def test_cliff_head_defaults_to_the_restoring_bound_gradient(
+    model_type, _name, _parameter_names, _values, _stds, nested_hfvr_vw_model
+):
+    head = _build_head(model_type, copy.deepcopy(nested_hfvr_vw_model))
+    assert head.bound_gradient_mode == "restoring"
+    # Recorded so a checkpoint says how it was trained.  It is deliberately not
+    # replayed on load: the mode belongs to the run, not to the weights, so
+    # resuming a saturated checkpoint picks up the fix.
+    assert head.get_config()["bound_gradient_mode"] == "restoring"
+
+
+@pytest.mark.parametrize("bad", ["clip", "ste", None, 0])
+def test_cliff_head_rejects_an_unknown_bound_gradient_mode(
+    bad, nested_hfvr_vw_model
+):
+    with pytest.raises(ValueError, match="bound_gradient_mode"):
+        _build_head(
+            mtp_mtp.CliffExchangeNN,
+            copy.deepcopy(nested_hfvr_vw_model),
+            bound_gradient_mode=bad,
+        )
+
+
+@pytest.mark.parametrize(
+    "model_type,_name,_parameter_names,_values,_stds",
+    _HEAD_CASES,
+    ids=_HEAD_IDS,
+)
+def test_bound_gradient_mode_leaves_the_forward_value_untouched(
+    model_type, _name, _parameter_names, _values, _stds,
+    nested_hfvr_vw_model, atomic_batch,
+):
+    """No checkpoint is invalidated by the fix: only the backward pass moved.
+
+    Worth pinning explicitly.  The atom-model correction that preceded this one
+    *did* change predictions and silently invalidated every checkpoint trained
+    through it; this one cannot, and the guarantee should fail loudly if
+    someone later folds a value change into the same switch.
+    """
+    torch.manual_seed(11)
+    restoring = _build_head(model_type, copy.deepcopy(nested_hfvr_vw_model))
+    legacy = _build_head(
+        model_type,
+        copy.deepcopy(nested_hfvr_vw_model),
+        bound_gradient_mode="straight-through",
+    )
+    legacy.load_state_dict(restoring.state_dict())
+    # Drive the readouts hard enough that atoms actually leave the band; two
+    # unclamped forwards agreeing would say nothing at all.
+    with torch.no_grad():
+        for head in (restoring, legacy):
+            for stack in head.param_readout_layers:
+                for readout in stack:
+                    for parameter in readout.parameters():
+                        parameter.mul_(50.0)
+        emitted = restoring(atomic_batch)[-1]
+        assert torch.equal(emitted, legacy(atomic_batch)[-1])
+
+    floor = (
+        F.softplus(restoring.raw_parameter_floor) + restoring.positivity_epsilon
+    )
+    ceiling = (
+        F.softplus(restoring.raw_parameter_ceiling)
+        + restoring.positivity_epsilon
+    )
+    assert bool(
+        (emitted <= floor * 1.000001).any()
+        or (emitted >= ceiling * 0.999999).any()
+    )
 
 
 # ---------------------------------------------------------------------------

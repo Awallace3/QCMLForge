@@ -197,17 +197,18 @@ CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z = {
     "exch": CLIFF_EXCH_INITIAL_VALUES_BY_Z,
 }
 
-# Straight-through bounds on the *raw* (pre-softplus) per-atom parameters,
-# expressed relative to each column's scalar seed: ``[fraction * seed,
-# multiple * seed]``.
+# Bounds on the *raw* (pre-softplus) per-atom parameters, expressed relative to
+# each column's scalar seed: ``[fraction * seed, multiple * seed]``.  What the
+# gradient does at a bound is a separate choice; see
+# :data:`CLIFF_BOUND_GRADIENT_MODE`.
 #
 # These exist because ``K = softplus(raw) + epsilon`` cannot recover from
 # collapse.  ``dK/draw = sigmoid(raw)``, so as ``K -> 0`` the gradient that
 # would lift it back vanishes too; a head driven to ``raw ~ -18`` is dead for
 # the rest of training no matter what the loss wants.  Clamping ``raw`` in the
-# *raw* domain with a straight-through gradient (see :func:`_ste_clamp`) parks a
-# collapsing head at ``fraction * seed`` -- where ``sigmoid(raw)`` is still
-# order 0.1, not 1e-8 -- so it stays trainable and can climb back out.
+# *raw* domain (see :func:`_bounded_clamp`) parks a collapsing head at
+# ``fraction * seed`` -- where ``sigmoid(raw)`` is still order 0.1, not 1e-8 --
+# so it stays trainable and can climb back out.
 #
 # The ceiling is the mirror image: the same 100-epoch run drove the ``elst``
 # damping column to a mean of 22.2 and a maximum of 164.7 from a seed of 1.8,
@@ -216,6 +217,41 @@ CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z = {
 # runaway.
 CLIFF_PARAM_FLOOR_FRACTION = 0.05
 CLIFF_PARAM_CEILING_MULTIPLE = 10.0
+
+# What gradient a bounded raw parameter receives once it is *outside* its band.
+#
+#   ``"restoring"``        the bound pushes back.  Below the floor only the
+#                          upward (inward) component survives; above the ceiling
+#                          only the downward one.  Inside the band, and on
+#                          either bound exactly, the gradient is untouched.
+#   ``"straight-through"`` the historical rule: an identity Jacobian everywhere,
+#                          so the bound constrains the *value* and nothing at
+#                          all constrains the pre-image.
+#
+# ``"straight-through"`` was the original and it does not work.  The clamp holds
+# the emitted ``K`` at the band edge, so ``dL/dK`` keeps reporting the very
+# direction that pushed the atom out, and an identity Jacobian lets gradient
+# descent integrate it forever.  Nothing turns the parameter around.  Measured
+# on the 18-epoch CLIFF2 run ``12871934`` over all 536,242 test atoms, the
+# ``ind_overlap`` column was 74.36% on its floor and 25.64% on its ceiling --
+# 100.00% pinned -- with unclamped raw values spanning ``-2.27e7`` to
+# ``+8.80e9`` against a band ``[-4.6002, +1.8546]`` that is 6.45 wide.  Widening
+# the band cannot help: a ``100x`` ceiling moves the wall from 1.855 to ~4.15,
+# which is nothing against 8.8e9.  The escape is already visible after one epoch
+# and is present on the pre-fix base stack too, so it belongs to this clamp and
+# not to any one arm.  Because the readout stack is shared across atoms, a
+# saturated atom drags unsaturated ones out with it, which is the monotone
+# 3.3% -> 100% cascade the occupancy sweeps recorded over eight epochs.
+#
+# ``"restoring"`` keeps the promise the straight-through form was written to
+# make.  The *inward* gradient passes at full strength, so a parameter parked on
+# a bound leaves it the instant the loss asks; only the component that would
+# drive it further out is dropped.  The forward value is identical under both
+# modes, so no existing checkpoint changes a single prediction -- only what
+# training does next.  ``"straight-through"`` is retained so the pre-fix
+# dynamics stay runnable as a control arm.
+CLIFF_BOUND_GRADIENT_MODES = ("restoring", "straight-through")
+CLIFF_BOUND_GRADIENT_MODE = "restoring"
 
 # Multiplier applied to the *output* layer of each per-message readout MLP at
 # construction, shrinking the random correction so the per-element seed actually
@@ -2382,34 +2418,84 @@ def _validate_model_width_floor(width_floor) -> float:
     return value
 
 
-def _ste_clamp(
+class _RestoringClamp(torch.autograd.Function):
+    """``clamp`` whose gradient outside the band only ever points back into it.
+
+    Gradient descent takes ``x -= lr * grad``, so below the floor only a
+    negative gradient is restoring and above the ceiling only a positive one
+    is.  The opposite sign -- the one that drove the parameter out and would
+    keep driving it -- is dropped.  Everything else passes through unchanged,
+    including the gradient of a parameter sitting exactly on a bound.
+    """
+
+    @staticmethod
+    def forward(ctx, x, lower, upper):
+        ctx.save_for_backward(x, lower, upper)
+        return x.clamp(min=lower, max=upper)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, lower, upper = ctx.saved_tensors
+        grad = grad_output
+        if lower is not None:
+            grad = torch.where(
+                (x < lower) & (grad > 0), torch.zeros_like(grad), grad
+            )
+        if upper is not None:
+            grad = torch.where(
+                (x > upper) & (grad < 0), torch.zeros_like(grad), grad
+            )
+        return grad, None, None
+
+
+def _bounded_clamp(
     x: torch.Tensor,
     lower: torch.Tensor | None,
     upper: torch.Tensor | None,
+    mode: str = CLIFF_BOUND_GRADIENT_MODE,
 ) -> torch.Tensor:
-    """Clamp ``x`` to ``[lower, upper]`` while passing gradient through as 1.
-
-    A plain ``clamp`` would zero the gradient outside the interval, which is
-    precisely the failure this is meant to prevent: a parameter that has been
-    pushed out of range would then be frozen there permanently.  Adding a
-    *detached* correction gives ``max``/``min`` semantics on the value and an
-    identity Jacobian, so a clamped parameter keeps receiving the full gradient
-    signal and moves back inside as soon as the loss asks it to.
+    """Clamp ``x`` to ``[lower, upper]`` with a gradient that lets it come back.
 
     ``lower`` and ``upper`` broadcast against ``x``; either may be ``None``.
+    The returned *value* is a plain ``clamp`` under every mode -- the modes
+    differ only in what ``backward`` hands a parameter that is out of range.
+    See :data:`CLIFF_BOUND_GRADIENT_MODE` for which one to use and why.
 
-    The value is clamped on a *detached* copy and the gradient is reattached
-    through ``x - x.detach()``, which is exactly ``0.0`` in floating point
-    because both terms are bit-identical.  Writing it the obvious way instead --
-    ``x + (bound - x).detach()`` -- is algebraically the same but loses the
-    bound to catastrophic cancellation once ``|x|`` is large enough that
-    ``bound - x`` rounds back to ``-x``: a readout driven to ``raw = 3e7`` came
-    out of that form at ``32`` rather than the requested ``25``.
+    ``"restoring"`` (the default) drops only the outward component, so a
+    clamped parameter parks on its bound instead of walking away behind it.
+
+    ``"straight-through"`` reproduces the pre-fix dynamics for control arms: an
+    identity Jacobian, which bounds the value and lets the pre-image run away.
+    It is written as ``clamped + (x - x.detach())`` -- exactly ``0.0`` in
+    floating point, because both terms are bit-identical -- rather than the
+    obvious ``x + (bound - x).detach()``, which is algebraically the same but
+    loses the bound to catastrophic cancellation once ``|x|`` is large enough
+    that ``bound - x`` rounds back to ``-x``: a readout driven to ``raw = 3e7``
+    came out of that form at ``32`` rather than the requested ``25``.  That
+    readout was the runaway itself, worked around numerically; ``"restoring"``
+    is the fix for whatever produced it.
     """
     if lower is None and upper is None:
         return x
+    if mode == "restoring":
+        return _RestoringClamp.apply(x, lower, upper)
+    if mode != "straight-through":
+        raise ValueError(
+            "bound_gradient_mode must be one of "
+            f"{CLIFF_BOUND_GRADIENT_MODES}, got {mode!r}"
+        )
     clamped = x.detach().clamp(min=lower, max=upper)
     return clamped + (x - x.detach())
+
+
+def _validate_bound_gradient_mode(value) -> str:
+    """Validate the gradient rule applied outside the raw-parameter bounds."""
+    if value not in CLIFF_BOUND_GRADIENT_MODES:
+        raise ValueError(
+            "bound_gradient_mode must be one of "
+            f"{CLIFF_BOUND_GRADIENT_MODES}, got {value!r}"
+        )
+    return value
 
 
 def _validate_bound_scale(value, name: str, *, allow_none: bool = True):
@@ -2766,6 +2852,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         param_start_mean_by_Z=None,
         param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        bound_gradient_mode=CLIFF_BOUND_GRADIENT_MODE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
@@ -2803,6 +2890,9 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         readout_init_scale = _validate_bound_scale(
             readout_init_scale, "readout_init_scale"
         )
+        bound_gradient_mode = _validate_bound_gradient_mode(
+            bound_gradient_mode
+        )
         if param_floor_fraction is not None and param_ceiling_multiple is not None:
             # Compared per column, since either may now differ across them.
             floors = _broadcast_bound_scale(param_floor_fraction, n_columns)
@@ -2828,6 +2918,12 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         self.param_floor_fraction = param_floor_fraction
         self.param_ceiling_multiple = param_ceiling_multiple
         self.readout_init_scale = readout_init_scale
+        # Not part of the weights and deliberately not replayed from a
+        # checkpoint's config: which gradient rule trains a run is a property of
+        # that run, so resuming a checkpoint saturated under
+        # ``"straight-through"`` picks up the current default and can unwind.
+        # `get_config` still records it, so a checkpoint says how it was made.
+        self.bound_gradient_mode = bound_gradient_mode
         self._seed_guess_layer_by_Z(param_start_mean_by_Z, positivity_epsilon)
         self._scale_readout_output_layers(readout_init_scale)
         if any(
@@ -2977,7 +3073,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         param_floor_fraction,
         param_ceiling_multiple,
     ):
-        """Precompute the raw-domain bounds handed to :func:`_ste_clamp`.
+        """Precompute the raw-domain bounds handed to :func:`_bounded_clamp`.
 
         The bounds are specified in the *positive* domain (a fraction and a
         multiple of each column's scalar seed) because that is where they are
@@ -3032,11 +3128,11 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         # branch is folded away under `torch.compile`.
         if raw_parameters.dim() == 1:
             raw_parameters = raw_parameters.unsqueeze(-1)
-        # Bound the raw parameter *before* softplus, with gradient passed
-        # through.  Clamping the positive output instead would leave a
-        # collapsing head sitting at ``sigmoid(raw) ~ 0`` and unable to
-        # recover; see :func:`_ste_clamp` and
-        # :data:`CLIFF_PARAM_FLOOR_FRACTION`.
+        # Bound the raw parameter *before* softplus.  Clamping the positive
+        # output instead would leave a collapsing head sitting at
+        # ``sigmoid(raw) ~ 0`` and unable to recover; see
+        # :func:`_bounded_clamp`, :data:`CLIFF_PARAM_FLOOR_FRACTION` and
+        # :data:`CLIFF_BOUND_GRADIENT_MODE`.
         shared = getattr(self, "_shared_damping_indices", ())
         if shared:
             # Overwrite the shared columns with the one learnable scalar before
@@ -3048,10 +3144,11 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
                     columns[index]
                 )
             raw_parameters = torch.stack(columns, dim=-1)
-        raw_parameters = _ste_clamp(
+        raw_parameters = _bounded_clamp(
             raw_parameters,
             self.raw_parameter_floor,
             self.raw_parameter_ceiling,
+            self.bound_gradient_mode,
         )
         parameters = F.softplus(raw_parameters) + self.positivity_epsilon
         return (*output[:-1], parameters)
@@ -3135,6 +3232,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
             "param_floor_fraction": self.param_floor_fraction,
             "param_ceiling_multiple": self.param_ceiling_multiple,
             "readout_init_scale": self.readout_init_scale,
+            "bound_gradient_mode": self.bound_gradient_mode,
             "positivity_epsilon": self.positivity_epsilon,
             "width_floor": self.width_floor,
             "frozen_parameters": list(self.frozen_parameters),
@@ -3175,6 +3273,7 @@ class CliffExchangeNN(_CliffPositiveParamNN):
         param_start_mean_by_Z=None,
         param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        bound_gradient_mode=CLIFF_BOUND_GRADIENT_MODE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
@@ -3194,6 +3293,7 @@ class CliffExchangeNN(_CliffPositiveParamNN):
             param_start_mean_by_Z=param_start_mean_by_Z,
             param_floor_fraction=param_floor_fraction,
             param_ceiling_multiple=param_ceiling_multiple,
+            bound_gradient_mode=bound_gradient_mode,
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
             shared_damping_parameters=shared_damping_parameters,
@@ -3242,6 +3342,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         param_start_mean_by_Z=None,
         param_floor_fraction=CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        bound_gradient_mode=CLIFF_BOUND_GRADIENT_MODE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
@@ -3266,6 +3367,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
             param_start_mean_by_Z=param_start_mean_by_Z,
             param_floor_fraction=param_floor_fraction,
             param_ceiling_multiple=param_ceiling_multiple,
+            bound_gradient_mode=bound_gradient_mode,
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
             shared_damping_parameters=shared_damping_parameters,
@@ -3480,6 +3582,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         param_start_mean_by_Z=None,
         param_floor_fraction=CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        bound_gradient_mode=CLIFF_BOUND_GRADIENT_MODE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
@@ -3527,6 +3630,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             param_start_mean_by_Z=param_start_mean_by_Z,
             param_floor_fraction=param_floor_fraction,
             param_ceiling_multiple=param_ceiling_multiple,
+            bound_gradient_mode=bound_gradient_mode,
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
             shared_damping_parameters=shared_damping_parameters,
