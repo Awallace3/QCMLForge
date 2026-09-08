@@ -18,6 +18,7 @@ from apnet_pt.atomic_datasets import (
     atomic_hirshfeld_valencewdith_only_module_dataset,
 )
 import os
+from .. import ddp_launch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -1041,7 +1042,7 @@ class AtomTypeParamModel:
         if world_size > 1:
             # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)
             print("Running multi-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             configure_distributed_tracking(
                 self,
                 wandb_config,
@@ -1069,7 +1070,7 @@ class AtomTypeParamModel:
         else:
             # Run single-process training directly
             print("Running single-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             run_tracked_single_process(
                 self,
                 lambda: self.single_proc_train(

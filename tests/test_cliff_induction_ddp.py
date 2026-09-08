@@ -24,11 +24,14 @@ import inspect
 import os
 import pickle
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+import apnet_pt
 from apnet_pt import ddp_launch, model_io
 from apnet_pt.AtomModels.ap2_atom_model import AtomMPNN
 from apnet_pt.AtomPairwiseModels import mtp_mtp
@@ -150,6 +153,72 @@ def test_export_rendezvous_publishes_env_for_downstream_init(clean_ddp_env):
     assert os.environ["MASTER_PORT"] == "7777"
     assert os.environ["OMP_NUM_THREADS"] == "3"
     assert rv.rank == 1
+
+
+def test_set_omp_num_threads_leaves_the_variable_unset_for_none(clean_ddp_env):
+    """``None`` means "caller did not ask", which is not the string ``"None"``.
+
+    The unguarded form every training entry point used --
+    ``os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)`` --
+    stringifies the default straight into the environment.  OpenMP answers
+    ``Warning #234: Invalid symbols found. Check the value "None"`` and falls
+    back to its own default, and the poisoned value is inherited by every
+    child the run spawns afterwards.  In this suite that surfaced as a
+    ``--help`` shell-out dying on ``Error #101: Out of heap memory``; in a
+    training run it silently discards the pinning the caller configured.
+    """
+    os.environ.pop("OMP_NUM_THREADS", None)
+    ddp_launch.set_omp_num_threads(None)
+    assert "OMP_NUM_THREADS" not in os.environ
+
+
+def test_set_omp_num_threads_does_not_clobber_an_inherited_value(clean_ddp_env):
+    """``srun``/SLURM already exports one; an unasked-for default must not win.
+
+    Unsetting on ``None`` would be just as wrong as writing ``"None"`` -- it
+    would override the allocation's own pinning with OpenMP's guess.  The guard
+    has to be a no-op, not a delete.
+    """
+    os.environ["OMP_NUM_THREADS"] = "6"
+    ddp_launch.set_omp_num_threads(None)
+    assert os.environ["OMP_NUM_THREADS"] == "6"
+    ddp_launch.set_omp_num_threads(2)
+    assert os.environ["OMP_NUM_THREADS"] == "2"
+
+
+def test_export_rendezvous_without_a_thread_count_publishes_no_omp(clean_ddp_env):
+    """The rendezvous keys still land; the thread count stays the caller's."""
+    os.environ.pop("OMP_NUM_THREADS", None)
+    ddp_launch.export_rendezvous(
+        ddp_launch.resolve_rendezvous(
+            rank=0, local_rank=0, world_size=1, master_addr="h", master_port=7778
+        )
+    )
+    assert os.environ["MASTER_ADDR"] == "h"
+    assert "OMP_NUM_THREADS" not in os.environ
+
+
+def test_no_training_path_writes_omp_num_threads_directly():
+    """One guarded writer, twenty-five former call sites.
+
+    The bug was not in any one module -- the same unguarded line had been
+    copied into every model's ``train_model``.  Fixing them one at a time is
+    what let it spread, so assert the property across the package instead:
+    nothing under ``src`` assigns ``OMP_NUM_THREADS`` except
+    :func:`apnet_pt.ddp_launch.set_omp_num_threads` itself.
+    """
+    src = Path(apnet_pt.__file__).parent
+    offenders = []
+    for path in sorted(src.rglob("*.py")):
+        if path.name == "ddp_launch.py":
+            continue
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if 'os.environ["OMP_NUM_THREADS"]' in stripped and "=" in stripped:
+                offenders.append(f"{path.relative_to(src)}:{lineno}: {stripped}")
+    assert not offenders, "use ddp_launch.set_omp_num_threads:\n" + "\n".join(offenders)
 
 
 def test_train_ddp_slurm_and_train_models_share_one_resolver():
