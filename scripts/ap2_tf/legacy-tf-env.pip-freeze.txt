@@ -1,0 +1,71 @@
+# As-built `pip freeze` of the legacy TensorFlow AP-Net2 environment produced by
+# scripts/ap2_tf/make_legacy_tf_env.sh, captured 2026-09-03 from
+# /storage/project/r-cs207-0/awallace43/conda-envs/apnet-tf-legacy
+# on Georgia Tech PACE Phoenix (linux-64, python 3.8.20).
+#
+# This is a record of what was actually used to generate
+# tests/dataset_data/ap2_tf_parity/tf_reference.npz and the models/ap2_tf_paper/**
+# conversions -- not an install target.  Transitive versions here are whatever
+# pip resolved on that date and will drift; the pins that matter are the
+# explicit ones in make_legacy_tf_env.sh.
+#
+# conda-level packages (python 3.8.20, cudatoolkit 10.1.243, cudnn 7.6.5.32)
+# come from the conda create/install steps in the same script.
+absl-py==2.3.1
+annotated-types==0.7.0
+-e git+https://github.com/zachglick/apnet.git@f093e00bf64190ac30a7706d2a90e66871347b76#egg=apnet
+appdirs==1.4.4
+astunparse==1.6.3
+certifi==2026.7.22
+cffi==1.17.1
+charset-normalizer==3.5.1
+click==8.1.8
+cryptography==47.0.0
+docker-pycreds==0.4.0
+gast==0.3.3
+gitdb==4.0.12
+GitPython==3.1.61
+google-auth==2.50.0
+google-auth-oauthlib==1.0.0
+google-pasta==0.2.0
+grpcio==1.70.0
+h5py==2.10.0
+idna==3.15
+importlib_metadata==8.5.0
+Keras-Preprocessing==1.1.2
+Markdown==3.7
+MarkupSafe==2.1.5
+numpy==1.18.5
+oauthlib==3.3.1
+opt_einsum==3.4.0
+pandas==1.1.5
+Pint==0.21.1
+protobuf==3.19.6
+psutil==7.2.2
+pyasn1==0.6.4
+pyasn1_modules==0.4.2
+pycparser==2.23
+pydantic==1.10.21
+pydantic_core==2.27.2
+python-dateutil==2.9.0.post0
+pytz==2026.3.post1
+PyYAML==6.0.3
+qcelemental==0.25.1
+requests==2.32.4
+requests-oauthlib==2.0.0
+scipy==1.5.4
+sentry-sdk==2.68.1
+setproctitle==1.3.7
+six==1.17.0
+smmap==5.0.3
+tensorboard==2.14.0
+tensorboard-data-server==0.7.2
+tensorflow==2.3.4
+tensorflow-estimator==2.3.0
+termcolor==2.4.0
+typing_extensions==4.13.2
+urllib3==2.2.3
+wandb==0.16.6
+Werkzeug==3.0.6
+wrapt==2.0.1
+zipp==3.20.2

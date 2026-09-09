@@ -5,38 +5,36 @@ import math
 import numpy as np
 import pandas as pd
 import qcelemental as qcel
-import apnet_pt                                                          
+import apnet_pt
 from qcml_mcp.timings.polynomial_fit_data import polynomial_expressions
 from importlib import resources
 from pprint import pprint as pp
 
 
-def load_coeffs() -> pd.DataFrame:
-    """
-    Load the packaged restricted-reference timing-fit coefficients.
+def load_coeffs(
+    restricted: bool
+    ) -> pd.DataFrame:
 
-    UHF (unrestricted) references are not supported, so only the restricted
-    fit is shipped. The returned frame is indexed by method and carries a
-    ``fit_label`` column that splits fits into "Augmented", "Non-augmented",
-    and "All data" basis-set families.
-    """
+    un = "" if restricted else "un"
     ref_path = resources.files("qcml_mcp.data").joinpath(
-        "time_fit_inference_df_restricted.pkl"
+        f"polynomial_coefficients.pkl"
     )
     with ref_path.open("rb") as handle:
         return pd.read_pickle(handle).set_index("method")
 
 
+# _res_coeffs: pd.DataFrame = load_coeffs(1)
 print("Warning, I have removed UHF functionality for now")
 _coeffs: pd.DataFrame | None = None
 
 
 def parse_geoms(
     path: str,
+    cp: bool,
     ) -> pd.DataFrame:
     """
     Parses through a folder containing geometries in QCElemental recognized
-    string format (xyz, xyz+, psi4, psi4+). Note that behaviour is largely undefined 
+    string format (xyz, xyz+, psi4, psi4+). Note that behaviour is largely undefined
     if the provided molecular geometries are NOT in the Psi4 format (charge, multiplicity,
     atomic symbols, coordinates, and units specified):
     '''
@@ -50,9 +48,9 @@ def parse_geoms(
 
     Returns a pd.DataFrame with the following columns:
 
-    id:           filename string 
+    id:           filename string
     n_atoms:      numpy.ndarray specifiying total number of atoms
-    qcel_dimer:   qcelemental.models.Molecule representation of dimer 
+    qcel_dimer:   qcelemental.models.Molecule representation of dimer
     qcel_monA:    qcelemental.models.Molecule representation of first monomer
     qcel_monB:    qcelemental.models.Molecule representation of second monomer
     """
@@ -70,17 +68,17 @@ def parse_geoms(
             with open(filepath, "r", errors="ignore") as f:
                 raw_geom_str = f.read()
 
-                chgmult = 0 # will not catch 
+                chgmult = 0 # will not catch
                 for line in raw_geom_str.splitlines():
                     if chgmult_pattern.match(line):
-                        chgmult = 1 
+                        chgmult = 1
                         break
-                
+
                 units = 0
                 for line in reversed(raw_geom_str.splitlines()):
                     if "units" in line:
                         units = 1
-                        break                    
+                        break
 
                 if not units:
                     print("Warning: units may not be specified, assuming Angstroms by default")
@@ -95,22 +93,21 @@ def parse_geoms(
                     print(f"Error converting raw string to qcelemental.models.Molecule: \n {e}")
                     continue
 
-                # Keep invalid entries isolated so one bad file does not abort
-                # the rest of the directory.
-                fragments = mol_qcel.fragments
-                if len(fragments) != 2:
-                    print(
-                        f"Error processing file at {filepath}: \n "
-                        f"input geometry must be a dimer (found {len(fragments)} fragments)"
-                    )
-                    continue
-
                 id.append(file.strip().split(".")[0])
                 n_atoms.append(len(mol_qcel.atomic_numbers))
 
+
+                fragments = mol_qcel.fragments
+                if len(fragments) != 2:
+                    raise ValueError("input geometry must be a dimer")
+
                 qcel_dimer.append(mol_qcel)
-                qcel_monA.append(mol_qcel.get_fragment(0))
-                qcel_monB.append(mol_qcel.get_fragment(1))
+                if cp:
+                    qcel_monA.append(mol_qcel.get_fragment(0, 1))
+                    qcel_monB.append(mol_qcel.get_fragment(1, 0))
+                else:
+                    qcel_monA.append(mol_qcel.get_fragment(0))
+                    qcel_monB.append(mol_qcel.get_fragment(1))
                 print(f"succesfully built molecule and fragments for geometry found at {filepath}")
 
     return pd.DataFrame({
@@ -123,8 +120,8 @@ def parse_geoms(
 
 
 def compute_psi4_time_estimation_variables(
-        mol_qcel: qcel.models.Molecule, 
-        basis_set: str, 
+        mol_qcel: qcel.models.Molecule,
+        basis_set: str,
     ) -> np.array:
     """
     Builds the wavefunction for mol_qcel at the given basis_set
@@ -137,7 +134,7 @@ def compute_psi4_time_estimation_variables(
     """
     try:
         mol = psi4.core.Molecule.from_schema(mol_qcel.dict())
-    
+
     except Exception as e:
         print(f"Error when creating the Psi4 molecule object from QCElemental Schema: \n {e}")
         return np.array([np.nan] * 4)
@@ -147,41 +144,31 @@ def compute_psi4_time_estimation_variables(
         "dft_pruning_scheme": "robust",
     })
 
-    try:
-        wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
-        bs = wfn.basisset()
-        grid = psi4.core.DFTGrid.build(mol, bs)
-        print("compute vars: built wfn & grid")
-
-    except Exception as e:
-        print(f"Error when building grid or wavefunction: \n {e}")
-        return np.array([np.nan] * 4)
+    wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
+    bs = wfn.basisset()
+    grid = psi4.core.DFTGrid.build(mol, bs)
+    print("compute vars: built wfn & grid")
 
     n_occupied = math.ceil((wfn.nalpha() + wfn.nbeta()) / 2)
     n_virtual = bs.nbf() - n_occupied
     np_total = grid.npoints()
 
-    try:
-        aux_basis = psi4.core.BasisSet.build(
-            wfn.molecule(),
-            "DF_BASIS_SCF",
-            psi4.core.get_option("SCF", "DF_BASIS_SCF"),
-            "JKFIT",
-            psi4.core.get_global_option("BASIS"),
-        )
-        print("compute vars: built aux basis")
-
-    except Exception as e:
-        print(f"Error when building the auxillary basis: \n {e}")
-        return np.array([np.nan] * 4)
+    aux_basis = psi4.core.BasisSet.build(
+        wfn.molecule(),
+        "DF_BASIS_SCF",
+        psi4.core.get_option("SCF", "DF_BASIS_SCF"),
+        "JKFIT",
+        psi4.core.get_global_option("BASIS"),
+    )
+    print("compute vars: built aux basis")
 
     nbf_aux = aux_basis.nbf()
     psi4.core.clean()
 
     return np.array((
-        n_occupied, 
-        n_virtual, 
-        np_total, 
+        n_occupied,
+        n_virtual,
+        np_total,
         nbf_aux))
 
 def build_inference_table(
@@ -191,14 +178,14 @@ def build_inference_table(
         cp: bool
     ) -> pd.DataFrame:
     """
-    Modifies a pandas.Dataframe for batch prediction of (supermolecular) 
+    Modifies a pandas.Dataframe for batch prediction of (supermolecular)
     interaction energy errors & timings. Timing variables are calculated
-    per molecular system/basis-set pair and copied over to all LOTs considered. 
+    per molecular system/basis-set pair and copied over to all LOTs considered.
     """
     cp_str = "/unCP"
 
     if cp:
-        print("Warning: using un-counterpoise corrected models for counterpoise corrected timing predictions")
+        # print("Warning: using un-counterpoise corrected models for counterpoise corrected timing predictions")
         cp_str = "/CP"
 
     lotr_strings = [m + "/" + b + cp_str for b in bases for m in methods] # pretty sure everything I ran was not CP-corrected
@@ -226,17 +213,17 @@ def build_inference_table(
     print("Warning: using a JK auxiliary basis for MP2 and B2PLYP-D3 timing predictions")
 
     for idx in sorted(df_copy.index.unique()):
-        rows = df_copy.loc[[idx]]   
-        row = rows.iloc[0]          
+        rows = df_copy.loc[[idx]]
+        row = rows.iloc[0]
 
         for basis in bases:
             dimer_tvars.append(compute_psi4_time_estimation_variables(row["qcel_dimer"], basis))
             monA_tvars.append(compute_psi4_time_estimation_variables(row["qcel_monA"], basis))
             monB_tvars.append(compute_psi4_time_estimation_variables(row["qcel_monB"], basis))
- 
+
     df_copy[["dimer_tvars", "monA_tvars", "monB_tvars"]] = list(zip(dimer_tvars, monA_tvars, monB_tvars))
 
-    # explode again and insert lotr strings 
+    # explode again and insert lotr strings
     df_copy = df_copy.iloc[np.repeat(np.arange(len(df_copy)), len(methods))].copy()
     df_copy["Level of Theory"] = lotr_strings
 
@@ -253,7 +240,7 @@ def build_inference_table(
 
 def predict_ie_errors_batch(
     df: pd.DataFrame,
-) -> None: 
+) -> None:
     """
     Predict error estimates for multiple molecular complexes.
 
@@ -262,17 +249,8 @@ def predict_ie_errors_batch(
     multiple molecular complexes. Each p4_string defines a molecular geometry
     in Psi4 format.
 
-    Acceptable starting_level_of_theory values currently only include:
+    NOTE Check acceptable starting_level_of_theory values at pretrain_models/dapnet2/
 
-    ***NOTE: THIS LIST MAY NOT BE UP TO DATE***
-    [
-    "B3LYP-D3/aug-cc-pVTZ/unCP",
-    "B2PLYP-D3/aug-cc-pVTZ/unCP",
-    "wB97X-V/aug-cc-pVTZ/CP",
-    "SAPT0/aug-cc-pVDZ/SA",
-    "MP2/aug-cc-pVTZ/CP",
-    "HF/aug-cc-pVDZ/CP",
-    ]
 
     Input dataframe must contain dimer geometries as qcelemental.models.Molecule
     objects.
@@ -283,7 +261,7 @@ def predict_ie_errors_batch(
         rows = df.loc[[idx]]
         mols = rows["qcel_dimer"].to_list()
         lotr = rows.iloc[0]["Level of Theory"]
-        
+
         try:
             IE_pred = apnet_pt.pretrained_models.dapnet2_model_predict(
                 mols,
@@ -314,10 +292,12 @@ def predict_timing(
         return np.nan
 
     polynomial_lambda_expr = polynomial_expressions[method]["poly"]
-    
+
     global _coeffs
     if _coeffs is None:
-        _coeffs = load_coeffs()
+        _coeffs = load_coeffs(0)
+        # print(_coeffs.columns)
+        # print(_coeffs.index.name)
 
     fit_label = "Augmented" if "aug" in basis else "Non-augmented"
     mask = (_coeffs.index == method) & (_coeffs["fit_label"] == fit_label)
@@ -332,11 +312,11 @@ def predict_timing(
 
 def predict_timings_batch(
     df: pd.DataFrame,
-) -> None: 
+) -> None:
     """
     Predict timing for multiple data points using a pd.Dataframe.
 
-    Returns the original Dataframe with added 'predicted_log_time' column 
+    Returns the original Dataframe with added 'predicted_log_time' column
     """
     # df_copy = df.copy()
     supermolecular_times = []
@@ -344,7 +324,7 @@ def predict_timings_batch(
     for _, row in df.iterrows():
         method = row["Level of Theory"].split("/")[0]
         basis = row["Level of Theory"].split("/")[1]
-        
+
         d_tvars = row["dimer_tvars"]
         a_tvars = row["monA_tvars"]
         b_tvars = row["monB_tvars"]
@@ -416,7 +396,7 @@ def main(
     psi4.core.be_quiet()
     psi4.set_num_threads(n_threads)
 
-    df1 = parse_geoms(geom_path)
+    df1 = parse_geoms(geom_path, using_cp)
 
     df2 = build_inference_table(df1, methods, bases, using_cp)
 

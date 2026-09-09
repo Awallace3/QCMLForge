@@ -6,7 +6,7 @@ and equal-length, and the ordering moves when the epoch does.  The second is
 the reason it exists -- that with the LRU sized to the block, an epoch reads
 each shard about once instead of once per dimer drawn from it.  That claim is
 about I/O, so it is checked by counting reads through the real ``get``, with a
-stubbed loader standing in for the disk.
+subclass standing in for the disk at the one seam the dataset exposes for it.
 
 The default path is checked too, and is the strictest of these: at
 ``block_shards=0`` nothing is constructed and the shard cache is never
@@ -111,6 +111,64 @@ def test_ddp_ranks_are_disjoint_equal_and_cover_the_dataset():
             assert not sets[a] & sets[b]
 
 
+def _ddp_ranks(n, world, **kw):
+    kw.setdefault("block_shards", 4)
+    kw.setdefault("num_workers", 2)
+    return [
+        ShardBlockSampler(
+            _FakeDataset(n), shard_size=SHARD_SIZE, batch_size=8,
+            num_replicas=world, rank=r, **kw
+        )
+        for r in range(world)
+    ]
+
+
+@pytest.mark.parametrize(
+    "n, world",
+    [
+        (100, 2),      # 6 full shards and a 4-dimer remainder
+        (40961, 4),    # one item past a shard boundary
+        (SHARD_SIZE, 2),   # fewer shards than ranks: one shard, two ranks
+        (3, 4),        # fewer items than ranks
+    ],
+)
+def test_every_sample_trains_every_epoch_under_ddp(n, world):
+    """Ranks are cut on item count, so nothing is dropped to equalise them.
+
+    Splitting the *shard* permutation by rank hands equal shard counts, which
+    is equal item counts only on a store whose shards are all full.  When they
+    are not, a heavier rank has to discard the overflow to match the others'
+    length and those samples never train.  100 items in 16-dimer shards across
+    two ranks used to lose 14 of them per epoch.
+    """
+    ranks = _ddp_ranks(n, world)
+    emitted = [list(r) for r in ranks]
+
+    assert len({len(e) for e in emitted}) == 1, "unequal lengths deadlock DDP"
+    assert [len(e) for e in emitted] == [len(r) for r in ranks], (
+        "__len__ must match what __iter__ actually yields"
+    )
+    assert set().union(*map(set, emitted)) == set(range(n)), "samples dropped"
+
+    # Duplication is the price of equal lengths, and it is bounded by the
+    # global remainder -- never by how unevenly the shards happened to fall.
+    duplicated = sum(len(e) for e in emitted) - n
+    assert duplicated == len(ranks[0]) * world - n
+    assert duplicated < world
+
+
+def test_ddp_shard_splitting_stays_rare():
+    """At most one shard per rank boundary is read twice."""
+    n, world = 40960, 4
+    ranks = _ddp_ranks(n, world, block_shards=64, num_workers=4)
+    owners = {}
+    for r, sampler in enumerate(ranks):
+        for i in sampler:
+            owners.setdefault(i // SHARD_SIZE, set()).add(r)
+    shared = [sh for sh, rs in owners.items() if len(rs) > 1]
+    assert len(shared) <= world - 1, f"{len(shared)} shards split across ranks"
+
+
 def test_subset_indices_are_mapped_to_underlying_shards():
     """A sliced dataset addresses samples by position, not by store index."""
     underlying = list(range(1000, 1000 + 320))
@@ -185,41 +243,51 @@ def test_batch_mates_are_redrawn_every_epoch():
 # --- the multi-shard LRU, through the real get() -----------------------------
 
 
-def _stub_store(tmp_path, monkeypatch, n_shards, cache_size):
-    """An ``ap2_fused_module_dataset`` whose shards are counters, not files."""
-    ds = ap2_fused_module_dataset.__new__(ap2_fused_module_dataset)
-    ds.root = str(tmp_path)
-    ds.datapoint_storage_n_objects = SHARD_SIZE
-    ds.spec_type = 2
-    ds.split_db = False
-    ds.split = "all"
-    ds.storage_type = "pt"
-    ds.active_idx_data = None
-    ds.active_data = None
-    ds.shard_cache_size = 1
-    ds._shard_cache = None
-    ds.set_shard_cache_size(cache_size)
-    assert ds.split_name == "" and ds.file_extension == ".pt"
+class _CountingStore(ap2_fused_module_dataset):
+    """An ``ap2_fused_module_dataset`` whose shards are counters, not files.
 
-    reads = []
-    prefix = "dimer_ap2_fused_spec_2_"
+    Overrides the one seam the dataset exposes for the read, so ``get`` and
+    the LRU under test are the production ones and nothing outside this class
+    is altered.  Replacing ``torch.load`` module-wide would have reached far
+    past the read being counted, and the repo rules that style out.
+    """
 
-    def fake_load(path, **kwargs):
-        name = osp.basename(path)
-        assert name.startswith(prefix) and name.endswith(".pt"), name
-        shard = int(name[len(prefix):-3])
-        assert 0 <= shard < n_shards
-        reads.append(shard)
+    PREFIX = "dimer_ap2_fused_spec_2_"
+
+    def __init__(self, root, n_shards, cache_size):
+        # Deliberately not calling ``super().__init__``: that processes a
+        # dataset onto disk, and the point here is that nothing is on disk.
+        self.root = str(root)
+        self.datapoint_storage_n_objects = SHARD_SIZE
+        self.spec_type = 2
+        self.split_db = False
+        self.split = "all"
+        self.storage_type = "pt"
+        self.active_idx_data = None
+        self.active_data = None
+        self.shard_cache_size = 1
+        self._shard_cache = None
+        self._n_shards = n_shards
+        self.reads = []
+        self.set_shard_cache_size(cache_size)
+        assert self.split_name == "" and self.file_extension == ".pt"
+
+    def _load_shard(self, datapath):
+        name = osp.basename(datapath)
+        assert name.startswith(self.PREFIX) and name.endswith(".pt"), name
+        shard = int(name[len(self.PREFIX):-3])
+        assert 0 <= shard < self._n_shards
+        self.reads.append(shard)
         return [(shard, j) for j in range(SHARD_SIZE)]
 
-    monkeypatch.setattr(
-        "apnet_pt.pt_datasets.ap2_fused_ds.torch.load", fake_load
-    )
-    return ds, reads
+
+def _stub_store(tmp_path, n_shards, cache_size):
+    ds = _CountingStore(tmp_path, n_shards, cache_size)
+    return ds, ds.reads
 
 
-def test_lru_is_absent_by_default_and_get_is_unchanged(tmp_path, monkeypatch):
-    ds, reads = _stub_store(tmp_path, monkeypatch, 8, cache_size=1)
+def test_lru_is_absent_by_default_and_get_is_unchanged(tmp_path):
+    ds, reads = _stub_store(tmp_path, 8, cache_size=1)
     assert ds._shard_cache is None
     # Alternating between two shards with no cache re-reads on every switch --
     # this is the behaviour the default must keep.
@@ -228,8 +296,8 @@ def test_lru_is_absent_by_default_and_get_is_unchanged(tmp_path, monkeypatch):
     assert reads == [0, 1, 0, 1, 0, 1]
 
 
-def test_lru_serves_repeat_shards_and_respects_capacity(tmp_path, monkeypatch):
-    ds, reads = _stub_store(tmp_path, monkeypatch, 8, cache_size=4)
+def test_lru_serves_repeat_shards_and_respects_capacity(tmp_path):
+    ds, reads = _stub_store(tmp_path, 8, cache_size=4)
     for i in [0, 16, 1, 17, 2, 18]:
         assert ds.get(i) == (i // SHARD_SIZE, i % SHARD_SIZE)
     assert reads == [0, 1], "a cached shard must not be re-read"
@@ -242,8 +310,8 @@ def test_lru_serves_repeat_shards_and_respects_capacity(tmp_path, monkeypatch):
     assert list(ds._shard_cache) == [2, 3, 4, 5]
 
 
-def test_set_shard_cache_size_shrinks_in_place(tmp_path, monkeypatch):
-    ds, _ = _stub_store(tmp_path, monkeypatch, 8, cache_size=4)
+def test_set_shard_cache_size_shrinks_in_place(tmp_path):
+    ds, _ = _stub_store(tmp_path, 8, cache_size=4)
     for shard in range(4):
         ds.get(shard * SHARD_SIZE)
     assert len(ds._shard_cache) == 4

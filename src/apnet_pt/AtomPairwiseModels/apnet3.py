@@ -32,6 +32,7 @@ from ..training_tracking import (
     tracked_ddp_worker,
 )
 import os
+from .. import ddp_launch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -1931,7 +1932,7 @@ units angstrom
         }
         if world_size > 1:
             print("Running multi-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             configure_distributed_tracking(
                 self,
                 wandb_config,
@@ -1959,7 +1960,7 @@ units angstrom
             )
         else:
             print("Running single-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             run_tracked_single_process(
                 self,
                 lambda: self.single_proc_train(

@@ -1,0 +1,175 @@
+{
+  "source": {
+    "processed_dir": "processed",
+    "prefix": "dimer_ap2_fused_test_spec_2_",
+    "shards_read": [
+      "dimer_ap2_fused_test_spec_2_0.pt",
+      "dimer_ap2_fused_test_spec_2_1.pt",
+      "dimer_ap2_fused_test_spec_2_2.pt",
+      "dimer_ap2_fused_test_spec_2_3.pt",
+      "dimer_ap2_fused_test_spec_2_4.pt",
+      "dimer_ap2_fused_test_spec_2_5.pt",
+      "dimer_ap2_fused_test_spec_2_6.pt"
+    ],
+    "selection_rule": "first `samples` dimers in naturally sorted shard order, plus the first dimer with a monatomic monomer and its successor when none of those has one"
+  },
+  "samples": 26,
+  "atoms_A_total": 300,
+  "atoms_B_total": 340,
+  "elements_present": [
+    1,
+    6,
+    7,
+    8,
+    9,
+    15,
+    16,
+    17
+  ],
+  "monatomic_monomers": 1,
+  "charged_monomers": 14,
+  "label_means": {
+    "Elst_aug": -0.75607228365082,
+    "Exch_aug": 5.489634809196245,
+    "Ind_aug": -2.97600818081544,
+    "Disp_aug": -2.385093071569617
+  },
+  "outputs": {
+    "npz": {
+      "path": "parity_dimers.npz",
+      "sha256": "1b5a91543b16f733a372b5f18ff38188de82cc80613c7f87761f9bbb469c7e85"
+    }
+  },
+  "row_provenance": [
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 0,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 1,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 2,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 3,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 4,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 5,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 6,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 7,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 8,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 9,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 10,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 11,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 12,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 13,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 14,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_0.pt",
+      "index_in_shard": 15,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 0,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 1,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 2,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 3,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 4,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 5,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 6,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_1.pt",
+      "index_in_shard": 7,
+      "reason": "leading"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_6.pt",
+      "index_in_shard": 9,
+      "reason": "monatomic"
+    },
+    {
+      "shard": "dimer_ap2_fused_test_spec_2_6.pt",
+      "index_in_shard": 10,
+      "reason": "follows monatomic"
+    }
+  ]
+}

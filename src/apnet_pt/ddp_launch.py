@@ -165,6 +165,24 @@ def resolve_rendezvous(
     )
 
 
+def set_omp_num_threads(omp_num_threads: int | None) -> None:
+    """Export ``OMP_NUM_THREADS`` only when a thread count was actually asked for.
+
+    The unguarded form -- ``os.environ["OMP_NUM_THREADS"] = str(value)`` -- writes
+    the literal string ``"None"`` when the caller left the option at its default.
+    OpenMP then rejects it (``OMP: Warning #234: Invalid symbols found``) and
+    falls back to its own default, so the run loses whatever pinning the caller
+    *did* want on the ranks that set it, silently.  Worse, the bad value is
+    inherited by every subprocess the run later spawns, which is how a training
+    process poisons its own dataloader workers and helper shell-outs.  Given the
+    measured cost of getting OMP affinity wrong on these routes, an unset
+    variable -- letting OpenMP choose -- is the correct no-op, not ``"None"``.
+    """
+    if omp_num_threads is None:
+        return
+    os.environ["OMP_NUM_THREADS"] = str(omp_num_threads)
+
+
 def export_rendezvous(
     rendezvous: Rendezvous, *, omp_num_threads: int | None = None
 ) -> Rendezvous:
@@ -179,8 +197,7 @@ def export_rendezvous(
     os.environ["WORLD_SIZE"] = str(rendezvous.world_size)
     os.environ["MASTER_ADDR"] = rendezvous.master_addr
     os.environ["MASTER_PORT"] = str(rendezvous.master_port)
-    if omp_num_threads is not None:
-        os.environ["OMP_NUM_THREADS"] = str(omp_num_threads)
+    set_omp_num_threads(omp_num_threads)
     return rendezvous
 
 

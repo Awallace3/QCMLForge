@@ -826,7 +826,9 @@ CLIFF Fig. 5 to 2-4% (H 0.373 / C 0.521 / N 0.443 / O 0.406 against 0.36 / 0.50 
   `_ste_clamp`, which bounds the value on a detached copy and reattaches an
   identity gradient. A collapsing column therefore parks where `sigmoid(raw)` is
   still order 0.1 rather than 1e-8, and stays able to climb back out; the ceiling
-  catches the `elst` runaway. Both are config-recorded and both accept `None`
+  catches the `elst` runaway. (The identity gradient does not hold: it bounds the
+  value and leaves the pre-image free, so the column parks nowhere. Amendment 3
+  replaces it, and `_ste_clamp` is now `_bounded_clamp`.) Both are config-recorded and both accept `None`
   to reproduce the pre-bound forward exactly, which is what a checkpoint
   predating them loads as.
 - **`CLIFF_READOUT_INIT_SCALE = 0.1`** scales the *output* layer of each readout
@@ -859,7 +861,9 @@ baseline 18.555:
 - The obvious way to write a straight-through clamp,
   `x + (bound - x).detach()`, is algebraically right but loses the bound to
   catastrophic cancellation once `|x|` is large: a readout at `raw = 3e7` came
-  out at 32 rather than the requested 25. Clamp a detached copy instead.
+  out at 32 rather than the requested 25. Clamp a detached copy instead. That
+  `raw = 3e7` was not a stress test anybody constructed; it was the runaway of
+  Amendment 3 showing up as a numerics bug a year early.
 
 ## Amendment 2: the exchange error was out-of-domain valence widths (2026-08-21)
 
@@ -980,6 +984,88 @@ Normalizing to a mean would be more legible but renames a metric shared with
 every other model family, so it is left as a documented follow-up rather than
 changed here.
 
+## Amendment 3: the straight-through clamp bounded the value, not the parameter (2026-09-08)
+
+Amendment 1 added the `[0.05x, 10x]` bounds so that "no parameter column can be
+driven to a state with no usable gradient". Measured on a real run, they do not
+deliver that. This records why and what replaces them.
+
+### What was measured
+
+The 18-epoch CLIFF2 fit on the corrected base stack (Phoenix job `12871934`),
+profiled over all **536,242** test atoms:
+
+| column | on floor | on ceiling | unclamped raw range | band |
+|---|---|---|---|---|
+| `ind_overlap` | 74.36% | 25.64% | `-2.2695e7` to `+8.8011e9` | `[-4.6002, +1.8546]` |
+
+**100.00% of atoms pinned.** The column emits two values and is a classifier,
+not a regression. Occupancy over training on the same arm rises monotonically
+from a few percent at epoch 0 to 100% by epoch 18, and is already visible after
+one epoch. The pre-fix legacy-stack control `12540961` shows it too (3.64% /
+3.77%, raw max 4170.6), so this is a property of the clamp and not of any one
+arm or base stack.
+
+Widening the band cannot fix it. A `100x` ceiling moves the wall from 1.855 to
+about 4.15, which is nothing against `8.8e9`.
+
+### Why
+
+`_ste_clamp` bounds the *value* and leaves the *pre-image* completely free. The
+identity Jacobian supplies no restoring force at all. Once an atom is outside
+the band the clamp holds the emitted `K` at the edge, so `dL/dK` keeps reporting
+the same direction that pushed it out -- the loss never sees the parameter move,
+so it never stops asking -- and gradient descent integrates that request
+forever. Nothing in the construction ever turns the parameter around.
+
+The readout stack is shared across atoms, so this is contagious: a saturated
+atom's gradient moves weights that serve unsaturated ones. That is the mechanism
+behind the monotone cascade to 100%, which no per-atom argument explains.
+
+### Changes
+
+- **`_bounded_clamp(x, lower, upper, mode)`** replaces `_ste_clamp` and takes
+  the gradient rule as an argument. The forward value is a plain `clamp` under
+  every mode.
+- **`CLIFF_BOUND_GRADIENT_MODE = "restoring"`** is the new default, implemented
+  by the `_RestoringClamp` autograd `Function`. Descent takes `x -= lr * grad`,
+  so below the floor only a negative gradient is restoring and above the ceiling
+  only a positive one is; the opposite sign is zeroed. Inward gradient passes at
+  full strength, and a parameter sitting exactly on a bound is untouched, so a
+  parked column leaves its bound the instant the loss asks.
+- **`"straight-through"`** is retained, so the pre-fix dynamics remain runnable
+  as a control arm. It keeps the detached-copy form for the cancellation reason
+  in Amendment 1's notes.
+- **`bound_gradient_mode`** is a constructor kwarg on all four heads, validated
+  by `_validate_bound_gradient_mode` and recorded in `get_config`. There is no
+  CLI flag, matching `readout_init_scale` and `param_floor_fraction`, which are
+  also constructor-level only.
+
+### What this does and does not change
+
+**No checkpoint is invalidated.** The forward value is bit-identical under both
+modes, so no existing checkpoint changes a single prediction; only what training
+does next moves. This is the opposite of the atom-model correction, which did
+change predictions and silently invalidated every checkpoint trained through it.
+A test asserts the equality directly so that guarantee fails loudly if a value
+change is ever folded into the same switch.
+
+**`bound_gradient_mode` is deliberately not replayed from a checkpoint's
+config.** Which gradient rule trains a run is a property of that run, so
+resuming a checkpoint that saturated under `"straight-through"` picks up the
+current default and can unwind. `get_config` still records it, so a checkpoint
+says how it was made.
+
+**Restoring stops escape; it does not pull back.** A parameter parks where it
+landed on first crossing -- at most one optimizer step past the bound -- and that
+displacement does not accumulate with step count. The distinction is what the
+runaway test asserts: under `"straight-through"` the displacement grows with the
+number of steps, under `"restoring"` it is identical at 200 and 2000.
+
+**Out of scope, deliberately.** `thole_lr` and the `CLIFF_PARAM_*` band constants
+are untouched. Both are separate arms and moving them here would destroy the
+attribution.
+
 ## Incidental findings (documented, not addressed here)
 
 These were found while mapping the existing code. None is in scope; each is
@@ -1040,3 +1126,8 @@ The feature is accepted when:
     `K_exch` is seeded per element, the readout correction is scaled so that
     seed governs the initial prediction, and `grad_clip_norm` defaults to `None`
     so every pre-existing route is bitwise unchanged.
+14. (Amendment 3) A bounded parameter cannot walk away behind its own bound: the
+    outward gradient is zeroed outside the band while the inward one passes at
+    full strength, the displacement past a bound does not grow with step count,
+    and the emitted value is bit-identical to the straight-through form, so no
+    checkpoint is invalidated.

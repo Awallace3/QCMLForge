@@ -11,6 +11,7 @@ from apnet_pt.pt_datasets.ap2_fused_ds import (
 from apnet_pt.AtomPairwiseModels.apnet2_fused import APNet2_AM_Model
 from glob import glob
 import pandas as pd
+import pytest
 
 torch.manual_seed(42)
 spec_type = 5
@@ -161,6 +162,7 @@ def test_ap2_fused_dataset_size():
     assert ds_labels == cnt, f"Expected {len(ds)} points, but got {cnt} points"
 
 
+@pytest.mark.pretrained_models("am")
 def test_ap2_fused_train_qcel_molecules_in_memory():
     batch_size = 2
     atomic_batch_size = 4
@@ -242,6 +244,7 @@ def test_ap2_fused_architecture():
     assert np.allclose(output[0], target_energies, atol=1e-6)
 
 
+@pytest.mark.pretrained_models("ap2_fused_ensemble")
 def test_ap2_fused_ensemble_water_dimer():
     import torch
     import pandas as pd

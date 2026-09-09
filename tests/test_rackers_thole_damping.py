@@ -2752,7 +2752,7 @@ def test_cli_resolves_unset_parameter_defaults_by_route(
         "argv",
         ["train_models.py", "--train_apnet", model_identifier],
     )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
+    monkeypatch.setattr(train_models, "set_all_seeds", lambda *_a, **_k: None)
     monkeypatch.setattr(
         train_models,
         "train_pairwise_model",
@@ -2780,7 +2780,7 @@ def test_pairwise_cli_omitted_omp_threads_uses_legacy_default(
             str(tmp_path / "rackers.pt"),
         ],
     )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
+    monkeypatch.setattr(train_models, "set_all_seeds", lambda *_a, **_k: None)
 
     train_models.main()
 
@@ -2796,7 +2796,7 @@ def test_atom_cli_omitted_omp_threads_uses_atom_default(monkeypatch):
         "argv",
         ["train_models.py", "--train_am", "AtomModel"],
     )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
+    monkeypatch.setattr(train_models, "set_all_seeds", lambda *_a, **_k: None)
     monkeypatch.setattr(
         train_models,
         "train_atom_model",
@@ -2821,7 +2821,7 @@ def test_cli_forwards_omp_threads_to_pairwise_training(monkeypatch):
             "23",
         ],
     )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda seed: None)
+    monkeypatch.setattr(train_models, "set_all_seeds", lambda *_a, **_k: None)
     monkeypatch.setattr(
         train_models,
         "train_pairwise_model",

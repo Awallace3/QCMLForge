@@ -198,17 +198,18 @@ CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z = {
     "exch": CLIFF_EXCH_INITIAL_VALUES_BY_Z,
 }
 
-# Straight-through bounds on the *raw* (pre-softplus) per-atom parameters,
-# expressed relative to each column's scalar seed: ``[fraction * seed,
-# multiple * seed]``.
+# Bounds on the *raw* (pre-softplus) per-atom parameters, expressed relative to
+# each column's scalar seed: ``[fraction * seed, multiple * seed]``.  What the
+# gradient does at a bound is a separate choice; see
+# :data:`CLIFF_BOUND_GRADIENT_MODE`.
 #
 # These exist because ``K = softplus(raw) + epsilon`` cannot recover from
 # collapse.  ``dK/draw = sigmoid(raw)``, so as ``K -> 0`` the gradient that
 # would lift it back vanishes too; a head driven to ``raw ~ -18`` is dead for
 # the rest of training no matter what the loss wants.  Clamping ``raw`` in the
-# *raw* domain with a straight-through gradient (see :func:`_ste_clamp`) parks a
-# collapsing head at ``fraction * seed`` -- where ``sigmoid(raw)`` is still
-# order 0.1, not 1e-8 -- so it stays trainable and can climb back out.
+# *raw* domain (see :func:`_bounded_clamp`) parks a collapsing head at
+# ``fraction * seed`` -- where ``sigmoid(raw)`` is still order 0.1, not 1e-8 --
+# so it stays trainable and can climb back out.
 #
 # The ceiling is the mirror image: the same 100-epoch run drove the ``elst``
 # damping column to a mean of 22.2 and a maximum of 164.7 from a seed of 1.8,
@@ -217,6 +218,41 @@ CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z = {
 # runaway.
 CLIFF_PARAM_FLOOR_FRACTION = 0.05
 CLIFF_PARAM_CEILING_MULTIPLE = 10.0
+
+# What gradient a bounded raw parameter receives once it is *outside* its band.
+#
+#   ``"restoring"``        the bound pushes back.  Below the floor only the
+#                          upward (inward) component survives; above the ceiling
+#                          only the downward one.  Inside the band, and on
+#                          either bound exactly, the gradient is untouched.
+#   ``"straight-through"`` the historical rule: an identity Jacobian everywhere,
+#                          so the bound constrains the *value* and nothing at
+#                          all constrains the pre-image.
+#
+# ``"straight-through"`` was the original and it does not work.  The clamp holds
+# the emitted ``K`` at the band edge, so ``dL/dK`` keeps reporting the very
+# direction that pushed the atom out, and an identity Jacobian lets gradient
+# descent integrate it forever.  Nothing turns the parameter around.  Measured
+# on the 18-epoch CLIFF2 run ``12871934`` over all 536,242 test atoms, the
+# ``ind_overlap`` column was 74.36% on its floor and 25.64% on its ceiling --
+# 100.00% pinned -- with unclamped raw values spanning ``-2.27e7`` to
+# ``+8.80e9`` against a band ``[-4.6002, +1.8546]`` that is 6.45 wide.  Widening
+# the band cannot help: a ``100x`` ceiling moves the wall from 1.855 to ~4.15,
+# which is nothing against 8.8e9.  The escape is already visible after one epoch
+# and is present on the pre-fix base stack too, so it belongs to this clamp and
+# not to any one arm.  Because the readout stack is shared across atoms, a
+# saturated atom drags unsaturated ones out with it, which is the monotone
+# 3.3% -> 100% cascade the occupancy sweeps recorded over eight epochs.
+#
+# ``"restoring"`` keeps the promise the straight-through form was written to
+# make.  The *inward* gradient passes at full strength, so a parameter parked on
+# a bound leaves it the instant the loss asks; only the component that would
+# drive it further out is dropped.  The forward value is identical under both
+# modes, so no existing checkpoint changes a single prediction -- only what
+# training does next.  ``"straight-through"`` is retained so the pre-fix
+# dynamics stay runnable as a control arm.
+CLIFF_BOUND_GRADIENT_MODES = ("restoring", "straight-through")
+CLIFF_BOUND_GRADIENT_MODE = "restoring"
 
 # Multiplier applied to the *output* layer of each per-message readout MLP at
 # construction, shrinking the random correction so the per-element seed actually
@@ -2170,8 +2206,6 @@ class AtomTypeParamNN(nn.Module):
         parameters it returns.
         """
         x = batch.x
-        edge_index = batch.edge_index
-        molecule_ind = batch.molecule_ind
         # current_model_device = next(self.parameters()).device
         # model_device = next(self.atom_model.parameters()).device
         am_out = self.atom_model(batch)
@@ -2184,39 +2218,26 @@ class AtomTypeParamNN(nn.Module):
         Z = x
         K_list = [self.guess_layer[p](Z) for p in range(self.n_params)]
         K = torch.cat(K_list, dim=-1)  # shape (n_atoms, n_params)
-        # print(f"{K = }")
-        atoms_with_edges = torch.cat([edge_index[0], edge_index[1]]).unique()
-        keep_mask = torch.isin(
-            torch.arange(len(molecule_ind), device=molecule_ind.device),
-            atoms_with_edges,
-        )
-        if not keep_mask.any():
-            return (
-                charge.squeeze(-1),
-                dipole,
-                qpole,
-                *am_out[3:],
-                K.squeeze(-1) if self.n_params == 1 else K,
-            )
-        K_filtered = K[keep_mask]  # shape (n_atoms_filtered, n_params)
+        # h_list carries a row for every atom, including atoms with no
+        # intramonomer edge (monatomic monomers, isolated ions), so the readout
+        # correction applies to all rows of K. This used to filter K down to
+        # edge-bearing atoms to line up with a pre-filtered h_list; AtomMPNN
+        # returns full-length outputs since the edgeless-atom fix.
         n_message_steps = min(self.n_message + 1, h_list.size(1))
         frozen = getattr(self, "_frozen_parameter_indices", ())
+        updates = []
         for p in range(self.n_params):
-            if p in frozen:
-                # Held at its per-element seed: no correction, and __init__ has
-                # already detached this column's parameters from the graph.
-                continue
-            for i in range(n_message_steps):
-                param_update = self.param_readout_layers[p][i](h_list[:, i, :])
-                K_filtered[:, p] += param_update.squeeze(-1)
-        # K[keep_mask] = torch.relu(K_filtered)  # + 1.00001
-        K[keep_mask] = K_filtered  # + 1.00001
-        # if K.isnan().any():
-        #     print("K has NaN values, debugging info:")
-        #     print(f"{K_filtered =}")
-        #     print(f"{Z =}")
-        #     print(f"{h_list=}")
-        #     raise ValueError("K has NaN values")
+            update = K.new_zeros(K.size(0))
+            # A frozen column is held at its per-element seed: no correction,
+            # and __init__ has already detached its parameters from the graph.
+            if p not in frozen:
+                for i in range(n_message_steps):
+                    param_update = self.param_readout_layers[p][i](
+                        h_list[:, i, :]
+                    )
+                    update = update + param_update.squeeze(-1)
+            updates.append(update)
+        K = K + torch.stack(updates, dim=-1)
         return (
             charge,
             dipole,
@@ -2450,34 +2471,84 @@ def _validate_model_width_floor(width_floor) -> float:
     return value
 
 
-def _ste_clamp(
+class _RestoringClamp(torch.autograd.Function):
+    """``clamp`` whose gradient outside the band only ever points back into it.
+
+    Gradient descent takes ``x -= lr * grad``, so below the floor only a
+    negative gradient is restoring and above the ceiling only a positive one
+    is.  The opposite sign -- the one that drove the parameter out and would
+    keep driving it -- is dropped.  Everything else passes through unchanged,
+    including the gradient of a parameter sitting exactly on a bound.
+    """
+
+    @staticmethod
+    def forward(ctx, x, lower, upper):
+        ctx.save_for_backward(x, lower, upper)
+        return x.clamp(min=lower, max=upper)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, lower, upper = ctx.saved_tensors
+        grad = grad_output
+        if lower is not None:
+            grad = torch.where(
+                (x < lower) & (grad > 0), torch.zeros_like(grad), grad
+            )
+        if upper is not None:
+            grad = torch.where(
+                (x > upper) & (grad < 0), torch.zeros_like(grad), grad
+            )
+        return grad, None, None
+
+
+def _bounded_clamp(
     x: torch.Tensor,
     lower: torch.Tensor | None,
     upper: torch.Tensor | None,
+    mode: str = CLIFF_BOUND_GRADIENT_MODE,
 ) -> torch.Tensor:
-    """Clamp ``x`` to ``[lower, upper]`` while passing gradient through as 1.
-
-    A plain ``clamp`` would zero the gradient outside the interval, which is
-    precisely the failure this is meant to prevent: a parameter that has been
-    pushed out of range would then be frozen there permanently.  Adding a
-    *detached* correction gives ``max``/``min`` semantics on the value and an
-    identity Jacobian, so a clamped parameter keeps receiving the full gradient
-    signal and moves back inside as soon as the loss asks it to.
+    """Clamp ``x`` to ``[lower, upper]`` with a gradient that lets it come back.
 
     ``lower`` and ``upper`` broadcast against ``x``; either may be ``None``.
+    The returned *value* is a plain ``clamp`` under every mode -- the modes
+    differ only in what ``backward`` hands a parameter that is out of range.
+    See :data:`CLIFF_BOUND_GRADIENT_MODE` for which one to use and why.
 
-    The value is clamped on a *detached* copy and the gradient is reattached
-    through ``x - x.detach()``, which is exactly ``0.0`` in floating point
-    because both terms are bit-identical.  Writing it the obvious way instead --
-    ``x + (bound - x).detach()`` -- is algebraically the same but loses the
-    bound to catastrophic cancellation once ``|x|`` is large enough that
-    ``bound - x`` rounds back to ``-x``: a readout driven to ``raw = 3e7`` came
-    out of that form at ``32`` rather than the requested ``25``.
+    ``"restoring"`` (the default) drops only the outward component, so a
+    clamped parameter parks on its bound instead of walking away behind it.
+
+    ``"straight-through"`` reproduces the pre-fix dynamics for control arms: an
+    identity Jacobian, which bounds the value and lets the pre-image run away.
+    It is written as ``clamped + (x - x.detach())`` -- exactly ``0.0`` in
+    floating point, because both terms are bit-identical -- rather than the
+    obvious ``x + (bound - x).detach()``, which is algebraically the same but
+    loses the bound to catastrophic cancellation once ``|x|`` is large enough
+    that ``bound - x`` rounds back to ``-x``: a readout driven to ``raw = 3e7``
+    came out of that form at ``32`` rather than the requested ``25``.  That
+    readout was the runaway itself, worked around numerically; ``"restoring"``
+    is the fix for whatever produced it.
     """
     if lower is None and upper is None:
         return x
+    if mode == "restoring":
+        return _RestoringClamp.apply(x, lower, upper)
+    if mode != "straight-through":
+        raise ValueError(
+            "bound_gradient_mode must be one of "
+            f"{CLIFF_BOUND_GRADIENT_MODES}, got {mode!r}"
+        )
     clamped = x.detach().clamp(min=lower, max=upper)
     return clamped + (x - x.detach())
+
+
+def _validate_bound_gradient_mode(value) -> str:
+    """Validate the gradient rule applied outside the raw-parameter bounds."""
+    if value not in CLIFF_BOUND_GRADIENT_MODES:
+        raise ValueError(
+            "bound_gradient_mode must be one of "
+            f"{CLIFF_BOUND_GRADIENT_MODES}, got {value!r}"
+        )
+    return value
 
 
 def _validate_bound_scale(value, name: str, *, allow_none: bool = True):
@@ -2834,6 +2905,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         param_start_mean_by_Z=None,
         param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        bound_gradient_mode=CLIFF_BOUND_GRADIENT_MODE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
@@ -2871,6 +2943,9 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         readout_init_scale = _validate_bound_scale(
             readout_init_scale, "readout_init_scale"
         )
+        bound_gradient_mode = _validate_bound_gradient_mode(
+            bound_gradient_mode
+        )
         if param_floor_fraction is not None and param_ceiling_multiple is not None:
             # Compared per column, since either may now differ across them.
             floors = _broadcast_bound_scale(param_floor_fraction, n_columns)
@@ -2896,6 +2971,12 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         self.param_floor_fraction = param_floor_fraction
         self.param_ceiling_multiple = param_ceiling_multiple
         self.readout_init_scale = readout_init_scale
+        # Not part of the weights and deliberately not replayed from a
+        # checkpoint's config: which gradient rule trains a run is a property of
+        # that run, so resuming a checkpoint saturated under
+        # ``"straight-through"`` picks up the current default and can unwind.
+        # `get_config` still records it, so a checkpoint says how it was made.
+        self.bound_gradient_mode = bound_gradient_mode
         self._seed_guess_layer_by_Z(param_start_mean_by_Z, positivity_epsilon)
         self._scale_readout_output_layers(readout_init_scale)
         if any(
@@ -3045,7 +3126,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         param_floor_fraction,
         param_ceiling_multiple,
     ):
-        """Precompute the raw-domain bounds handed to :func:`_ste_clamp`.
+        """Precompute the raw-domain bounds handed to :func:`_bounded_clamp`.
 
         The bounds are specified in the *positive* domain (a fraction and a
         multiple of each column's scalar seed) because that is where they are
@@ -3100,11 +3181,11 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
         # branch is folded away under `torch.compile`.
         if raw_parameters.dim() == 1:
             raw_parameters = raw_parameters.unsqueeze(-1)
-        # Bound the raw parameter *before* softplus, with gradient passed
-        # through.  Clamping the positive output instead would leave a
-        # collapsing head sitting at ``sigmoid(raw) ~ 0`` and unable to
-        # recover; see :func:`_ste_clamp` and
-        # :data:`CLIFF_PARAM_FLOOR_FRACTION`.
+        # Bound the raw parameter *before* softplus.  Clamping the positive
+        # output instead would leave a collapsing head sitting at
+        # ``sigmoid(raw) ~ 0`` and unable to recover; see
+        # :func:`_bounded_clamp`, :data:`CLIFF_PARAM_FLOOR_FRACTION` and
+        # :data:`CLIFF_BOUND_GRADIENT_MODE`.
         shared = getattr(self, "_shared_damping_indices", ())
         if shared:
             # Overwrite the shared columns with the one learnable scalar before
@@ -3116,10 +3197,11 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
                     columns[index]
                 )
             raw_parameters = torch.stack(columns, dim=-1)
-        raw_parameters = _ste_clamp(
+        raw_parameters = _bounded_clamp(
             raw_parameters,
             self.raw_parameter_floor,
             self.raw_parameter_ceiling,
+            self.bound_gradient_mode,
         )
         parameters = F.softplus(raw_parameters) + self.positivity_epsilon
         return (*output[:-1], parameters)
@@ -3203,6 +3285,7 @@ class _CliffPositiveParamNN(AtomTypeParamNN):
             "param_floor_fraction": self.param_floor_fraction,
             "param_ceiling_multiple": self.param_ceiling_multiple,
             "readout_init_scale": self.readout_init_scale,
+            "bound_gradient_mode": self.bound_gradient_mode,
             "positivity_epsilon": self.positivity_epsilon,
             "width_floor": self.width_floor,
             "frozen_parameters": list(self.frozen_parameters),
@@ -3243,6 +3326,7 @@ class CliffExchangeNN(_CliffPositiveParamNN):
         param_start_mean_by_Z=None,
         param_floor_fraction=CLIFF_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        bound_gradient_mode=CLIFF_BOUND_GRADIENT_MODE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
@@ -3262,6 +3346,7 @@ class CliffExchangeNN(_CliffPositiveParamNN):
             param_start_mean_by_Z=param_start_mean_by_Z,
             param_floor_fraction=param_floor_fraction,
             param_ceiling_multiple=param_ceiling_multiple,
+            bound_gradient_mode=bound_gradient_mode,
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
             shared_damping_parameters=shared_damping_parameters,
@@ -3312,6 +3397,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         param_start_mean_by_Z=None,
         param_floor_fraction=CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        bound_gradient_mode=CLIFF_BOUND_GRADIENT_MODE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
@@ -3338,6 +3424,7 @@ class CliffClassicalNN(_CliffPositiveParamNN):
             param_start_mean_by_Z=param_start_mean_by_Z,
             param_floor_fraction=param_floor_fraction,
             param_ceiling_multiple=param_ceiling_multiple,
+            bound_gradient_mode=bound_gradient_mode,
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
             shared_damping_parameters=shared_damping_parameters,
@@ -3674,6 +3761,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         param_start_mean_by_Z=None,
         param_floor_fraction=CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
         param_ceiling_multiple=CLIFF_PARAM_CEILING_MULTIPLE,
+        bound_gradient_mode=CLIFF_BOUND_GRADIENT_MODE,
         readout_init_scale=CLIFF_READOUT_INIT_SCALE,
         frozen_parameters=(),
         shared_damping_parameters=(),
@@ -3721,6 +3809,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             param_start_mean_by_Z=param_start_mean_by_Z,
             param_floor_fraction=param_floor_fraction,
             param_ceiling_multiple=param_ceiling_multiple,
+            bound_gradient_mode=bound_gradient_mode,
             readout_init_scale=readout_init_scale,
             frozen_parameters=frozen_parameters,
             shared_damping_parameters=shared_damping_parameters,
@@ -3803,10 +3892,14 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             ],
             dim=-1,
         )
-        h_all_dot = torch.einsum("ez,er->ezr", h_all, rbf).reshape(nedge, -1)
+        # Trailing size spelled out, not inferred: an edgeless batch makes
+        # ``-1`` ambiguous and raises.  Same reason as ``AtomMPNN``.
+        h_all_dot = torch.einsum("ez,er->ezr", h_all, rbf).reshape(
+            nedge, h_all.size(-1) * rbf.size(-1)
+        )
         return torch.cat([h_all, h_all_dot, rbf], dim=-1)
 
-    def _node_features(self, charge, dipole, qpole, nested_params, h_list, keep_mask):
+    def _node_features(self, charge, dipole, qpole, nested_params, h_list):
         """Concatenate the nested representation with the physical scalars."""
         q = charge.reshape(charge.size(0), -1)[:, :1]
         mu = torch.sqrt(
@@ -3821,7 +3914,7 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         valence_width = nested_params[:, 1:2]
         scalars = torch.cat([q, mu, quad, hfvr, valence_width], dim=-1)
         return torch.cat(
-            [h_list.reshape(h_list.size(0), -1), scalars[keep_mask]], dim=-1
+            [h_list.reshape(h_list.size(0), -1), scalars], dim=-1
         )
 
     def _raw_head_output(self, batch):
@@ -3838,44 +3931,32 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
         K = torch.cat(
             [self.guess_layer[p](Z) for p in range(self.n_params)], dim=-1
         )
-        if edge_index.size(1) == 0:
-            # No graph, so no message passing and no correction: the seed is
-            # the answer. Returned unsqueezed, unlike `AtomTypeParamNN`'s
-            # no-edge branch, so this head's output rank does not depend on
-            # whether the monomer had edges.
-            return (charge, dipole, qpole, *am_out[3:], K)
-
-        keep_mask = torch.zeros(natom, dtype=torch.bool, device=Z.device)
-        keep_mask.scatter_(0, edge_index[0], True)
-        keep_mask.scatter_(0, edge_index[1], True)
-
+        # Every atom keeps its row, including one with no intramonomer edge:
+        # the loop below hands it a zero message, exactly as ``AtomMPNN`` does
+        # since the edgeless-atom fix.  Filtering here renumbered the message
+        # indices out of step with the full-length ``h_list`` this head is
+        # handed, and made an atom's parameters depend on what else shared its
+        # batch.
         e_source, e_target = edge_index[0], edge_index[1]
-        edge_keep = keep_mask[e_source] & keep_mask[e_target]
-        e_source = e_source[edge_keep]
-        e_target = e_target[edge_keep]
-        idx_map = (torch.cumsum(keep_mask, dim=0) - 1).long()
-        e_source = idx_map[e_source]
-        e_target = idx_map[e_target]
 
-        R = batch.R[keep_mask, :]
-        n_kept = R.size(0)
+        R = batch.R
         dR, _ = get_distances(R, R, e_source, e_target)
         rbf = self.param_distance_layer(dR)
 
         features = self._node_features(
-            charge, dipole, qpole, nested_params, h_list, keep_mask
+            charge, dipole, qpole, nested_params, h_list
         )
         h_states = [
             self.param_hidden_norms[0](
                 self.param_input_layer(features)
-                + self.param_type_embed(Z[keep_mask])
+                + self.param_type_embed(Z)
             )
         ]
         for i in range(self.param_n_message):
             m_ij = self._param_messages(
                 h_states[0], h_states[-1], rbf, e_source, e_target
             )
-            m_i = scatter_sum_compile(m_ij, e_source, n_kept, reduce="sum")
+            m_i = scatter_sum_compile(m_ij, e_source, natom, reduce="sum")
             # Normalized before it is stored, so both the next message step and
             # every readout see an O(1) state regardless of depth or how many
             # neighbours were summed into it.
@@ -3904,16 +3985,9 @@ class CliffClassicalMPNN(_CliffPositiveParamNN):
             columns.append(column)
         correction = torch.cat(columns, dim=-1)
 
-        # Scatter the per-kept-atom correction back onto every atom without a
-        # boolean-mask write. `idx_map` already maps each atom to its row in the
-        # filtered arrays; clamping makes the leading -1 a valid gather index and
-        # `where` discards those rows along with every other unkept one. The
-        # equivalent `K[keep_mask] = ...` is what makes Inductor fall back on
-        # `aten.nonzero`, and this form is static-shaped instead.
-        gathered = correction.index_select(0, idx_map.clamp(min=0))
-        K = K + torch.where(
-            keep_mask.unsqueeze(-1), gathered, torch.zeros_like(gathered)
-        )
+        # One row per atom on both sides, so this is a plain add: no masked
+        # write, and nothing for Inductor to fall back on `aten.nonzero` for.
+        K = K + correction
         return (charge, dipole, qpole, *am_out[3:], K)
 
     def get_config(self) -> dict:
@@ -7827,6 +7901,65 @@ class AM_DimerParam_Model:
         )
         model_io.save_checkpoint(checkpoint, path)
 
+    def _save_best_mae_sidecar(
+        self,
+        val_total_MAE: float,
+        component_MAE: list[float],
+        epoch: int,
+        world_size: int,
+        rank_device,
+    ) -> None:
+        """Write the MAE-selected sidecar beside the primary checkpoint.
+
+        Deliberately additive: this touches neither ``best_model``,
+        ``self.model``'s weights, ``lowest_test_loss``, the primary checkpoint,
+        nor the optimizer trajectory, so a run with this code produces a
+        bit-identical primary artifact to one without it. The only thing it
+        borrows from the best-model branch is how the CPU copy is taken --
+        under DDP the live parameter storages must not be relocated, because
+        the reducer holds bucket views into them.
+        """
+        checkpoint_path, record_path = model_io.best_mae_sidecar_paths(
+            self.model_save_path
+        )
+        if world_size > 1:
+            cpu_model, cpu_atom_model = deepcopy(
+                (
+                    model_io.unwrap_model(self.model),
+                    model_io.unwrap_model(self.atom_model),
+                )
+            )
+            cpu_model = cpu_model.to("cpu")
+            cpu_atom_model = cpu_atom_model.to("cpu")
+        else:
+            cpu_model = model_io.unwrap_model(self.model).to("cpu")
+            cpu_atom_model = model_io.unwrap_model(self.atom_model).to("cpu")
+        try:
+            checkpoint = self._create_checkpoint(
+                model=cpu_model,
+                atom_model=cpu_atom_model,
+                embed_atom_model=True,
+                metadata={
+                    "selector": model_io.BEST_MAE_SELECTOR,
+                    model_io.BEST_MAE_SELECTOR: float(val_total_MAE),
+                    "component_MAE": [float(v) for v in component_MAE],
+                    "epoch": int(epoch),
+                    "epoch_is_global": True,
+                },
+            )
+            model_io.save_checkpoint(checkpoint, checkpoint_path)
+        finally:
+            if world_size == 1:
+                self.model.to(rank_device)
+        model_io.save_best_mae_record(
+            record_path,
+            model_save_path=self.model_save_path,
+            checkpoint=checkpoint_path,
+            val_total_MAE=val_total_MAE,
+            component_MAE=component_MAE,
+            epoch=epoch,
+        )
+
     def _qcel_example_input(
         self,
         mols,
@@ -8216,8 +8349,30 @@ units angstrom
         dist.all_reduce(staged, op=reduce_op)
         return staged.to(tensor.device)
 
-    def _ddp_reduce_epoch_sums(self, total_loss_t, error_sum, n_dimers):
-        """Global ``(total_loss, MAE)`` from this rank's running sums.
+    def _record_component_mse(self, split, component_MSE) -> None:
+        """Publish this epoch's per-component MSE under ``split``.
+
+        Published on the harness rather than returned so that no caller's
+        unpack changes.  It is recorded because the primary checkpoint is
+        selected on a SUM of component MSEs while every table this campaign is
+        read in -- the printed per-component figures, the S66x8 gate, CLIFF's
+        published values -- is MAE.  When the two selectors disagree, and they
+        have, the per-column MSE is the only thing that says WHICH column drove
+        the star.  It was not recorded before, so for a run already finished
+        that question cannot be answered at all.
+        """
+        if getattr(self, "last_component_MSE", None) is None:
+            self.last_component_MSE = {}
+        # ``atleast_1d`` because a single-target route (the ind-only
+        # AtomTypeParamModel head, for one) reduces ``sq_sum / n_dimers`` to a
+        # 0-d tensor, and iterating one of those raises rather than yielding
+        # the single value.
+        self.last_component_MSE[split] = [
+            float(v) for v in torch.atleast_1d(component_MSE)
+        ]
+
+    def _ddp_reduce_epoch_sums(self, total_loss_t, error_sum, sq_sum, n_dimers):
+        """Global ``(total_loss, MAE, per-component MSE)`` from running sums.
 
         Same reduction as :meth:`_ddp_reduce_epoch_metrics` -- SUM of absolute
         errors over SUM of dimer counts, so the quotient is the true global MAE
@@ -8225,12 +8380,17 @@ units angstrom
         epoch loop kept on the GPU instead of from a materialised per-dimer
         error tensor. Doing it this way is what lets the loop avoid a
         device-to-host copy on every batch.
+
+        The squared sums ride in the same ``all_reduce`` as the absolute ones:
+        one extra row in an already-packed tensor, so the per-component MSE
+        costs no additional collective.
         """
         counts = torch.full_like(error_sum, float(n_dimers))
-        packed = self._ddp_all_reduce(torch.stack((error_sum, counts)))
-        total_MAE = (packed[0] / packed[1]).to(torch.float32).cpu()
+        packed = self._ddp_all_reduce(torch.stack((error_sum, sq_sum, counts)))
+        total_MAE = (packed[0] / packed[2]).to(torch.float32).cpu()
+        component_MSE = (packed[1] / packed[2]).to(torch.float32).cpu()
         total_loss = float(self._ddp_all_reduce(total_loss_t.clone()).item())
-        return total_loss, total_MAE
+        return total_loss, total_MAE, component_MSE
 
     def _ddp_reduce_epoch_metrics(self, total_loss, comp_errors_t, world_size):
         """Global ``(total_loss, MAE)`` from this rank's shard.
@@ -8810,6 +8970,7 @@ units angstrom
         # epoch. float64 because these accumulate thousands of terms.
         total_loss_t = torch.zeros((), dtype=torch.float64, device=rank_device)
         error_sum = None
+        sq_sum = None
         n_dimers = 0
         n_skipped = 0
         for n, batch in enumerate(dataloader):
@@ -8873,8 +9034,11 @@ units angstrom
                     continue
             optimizer.step()
             total_loss_t += batch_loss.detach().double()
-            batch_abs = comp_errors.detach().abs().sum(dim=0, dtype=torch.float64)
+            comp_detached = comp_errors.detach()
+            batch_abs = comp_detached.abs().sum(dim=0, dtype=torch.float64)
+            batch_sq = comp_detached.square().sum(dim=0, dtype=torch.float64)
             error_sum = batch_abs if error_sum is None else error_sum + batch_abs
+            sq_sum = batch_sq if sq_sum is None else sq_sum + batch_sq
             n_dimers += comp_errors.shape[0]
         if scheduler is not None:
             scheduler.step()
@@ -8894,10 +9058,15 @@ units angstrom
                 "or every batch was skipped on a non-finite gradient norm"
             )
         if world_size > 1:
-            return self._ddp_reduce_epoch_sums(total_loss_t, error_sum, n_dimers)
-        return float(total_loss_t.item()), (
-            (error_sum / n_dimers).to(torch.float32).cpu()
-        )
+            total_loss, total_MAE, component_MSE = self._ddp_reduce_epoch_sums(
+                total_loss_t, error_sum, sq_sum, n_dimers
+            )
+        else:
+            total_loss = float(total_loss_t.item())
+            total_MAE = (error_sum / n_dimers).to(torch.float32).cpu()
+            component_MSE = (sq_sum / n_dimers).to(torch.float32).cpu()
+        self._record_component_mse("train", component_MSE)
+        return total_loss, total_MAE
 
     # @torch.inference_mode()
     def __evaluate_batches_single_proc(
@@ -8914,6 +9083,7 @@ units angstrom
         # Same device-side accumulation as the training loop; see there.
         total_loss_t = torch.zeros((), dtype=torch.float64, device=rank_device)
         error_sum = None
+        sq_sum = None
         n_dimers = 0
         # Recorded once per epoch on the first validation batch rather than the
         # whole split: one extra forward is negligible, and a trend only needs a
@@ -8942,22 +9112,28 @@ units angstrom
                     preds, ref, comp_errors, batch, loss_fn
                 )
                 total_loss_t += batch_loss.detach().double()
-                batch_abs = comp_errors.detach().abs().sum(
-                    dim=0, dtype=torch.float64
-                )
+                comp_detached = comp_errors.detach()
+                batch_abs = comp_detached.abs().sum(dim=0, dtype=torch.float64)
+                batch_sq = comp_detached.square().sum(dim=0, dtype=torch.float64)
                 error_sum = (
                     batch_abs if error_sum is None else error_sum + batch_abs
                 )
+                sq_sum = batch_sq if sq_sum is None else sq_sum + batch_sq
                 n_dimers += comp_errors.shape[0]
         if error_sum is None:
             raise RuntimeError(
                 "validation epoch ran zero batches: the loader yielded nothing"
             )
         if world_size > 1:
-            return self._ddp_reduce_epoch_sums(total_loss_t, error_sum, n_dimers)
-        return float(total_loss_t.item()), (
-            (error_sum / n_dimers).to(torch.float32).cpu()
-        )
+            total_loss, total_MAE, component_MSE = self._ddp_reduce_epoch_sums(
+                total_loss_t, error_sum, sq_sum, n_dimers
+            )
+        else:
+            total_loss = float(total_loss_t.item())
+            total_MAE = (error_sum / n_dimers).to(torch.float32).cpu()
+            component_MSE = (sq_sum / n_dimers).to(torch.float32).cpu()
+        self._record_component_mse("val", component_MSE)
+        return total_loss, total_MAE
 
     def __evaluate_batches_single_proc_elst_no_damping(
         self, dataloader, loss_fn, rank_device
@@ -9371,6 +9547,12 @@ units angstrom
         # )
         # lowest_test_loss = test_loss
         lowest_test_loss = float("inf")
+        # Seeded from the record a previous chunk left, not from +inf: a chunk
+        # that starts worse than where the chain already is must not overwrite
+        # the banked best-MAE weights with its own first epoch.
+        lowest_val_total_MAE = model_io.best_mae_sidecar_floor(
+            self.model_save_path
+        )
         # cpu_model = self.model.to("cpu")
         # self.model.to(rank_device)
 
@@ -9563,6 +9745,29 @@ units angstrom
                 if world_size == 1:
                     self.model.to(rank_device)
 
+            # Best-MAE sidecar, additive and strictly downstream of the primary
+            # save above. `test_loss` is a component MSE, but the S66x8 gate and
+            # every per-component table read this model in MAE, and the two
+            # selectors disagree: the l<=2 exchange arm last starred epoch 3 of
+            # 11 while validation exchange kept improving through epoch 10, and
+            # without this those weights were gone. `total_MAE_v` is already
+            # global under DDP, so every rank agrees on the best epoch and only
+            # the primary writes.
+            component_MAE_v = torch.atleast_1d(
+                total_MAE_v.detach().reshape(-1)
+            ).tolist()
+            val_total_MAE = float(sum(component_MAE_v))
+            if val_total_MAE < lowest_val_total_MAE:
+                lowest_val_total_MAE = val_total_MAE
+                if self.model_save_path and is_primary:
+                    self._save_best_mae_sidecar(
+                        val_total_MAE=val_total_MAE,
+                        component_MAE=component_MAE_v,
+                        epoch=epoch,
+                        world_size=world_size,
+                        rank_device=rank_device,
+                    )
+
             # Written every epoch, improvement or not, and atomically: this is
             # the only thing standing between a preemption and re-running every
             # epoch since the last improvement. At full-dataset scale one epoch
@@ -9613,6 +9818,32 @@ units angstrom
                 f"{mae_string} {star_marker}",
                 flush=True,
             )
+            component_MSE = getattr(self, "last_component_MSE", None) or {}
+            if is_primary and len(component_MSE.get("val", ())) > 1:
+                # A separate line, deliberately: `slurm-*.out` scrapers key on
+                # the EPOCH line's shape, and one of them already has to dedupe
+                # a re-printed block. Widening EPOCH would break them silently.
+                #
+                # This is what the star is chosen on. The MAEs above are what
+                # the S66x8 gate and every published table are read in, and the
+                # two disagree often enough that "the best epoch" has meant two
+                # different epochs in this campaign. The printed sum is the
+                # component-MSE term of the selector, not the selector itself:
+                # under component_gamma < 1 the loss also carries a total-MSE
+                # term, and it is accumulated per batch rather than per dimer.
+                # It still says which column moved.
+                mse_string = " ".join(
+                    f"{mse_t: > 8.4f}/{mse_v: < 8.4f}"
+                    for mse_t, mse_v in zip(
+                        component_MSE.get("train", component_MSE["val"]),
+                        component_MSE["val"],
+                    )
+                )
+                print(
+                    f"  COMPONENT MSE: {mse_string} "
+                    f"sum {sum(component_MSE['val']):.4f}",
+                    flush=True,
+                )
             if not self.device == "CPU":
                 torch.cuda.empty_cache()
             nan_detected = bool(
@@ -10148,7 +10379,7 @@ units angstrom
                 f"{batch_size * max(world_size, 1)}",
                 flush=True,
             )
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             ddp_config = dict(tracking_config)
             ddp_config["training/external_ddp"] = _external_rank is not None
             ddp_args = (
@@ -10209,7 +10440,7 @@ units angstrom
                 )
         else:
             print("Running single-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             run_tracked_single_process(
                 self,
                 lambda: self.single_proc_train(
@@ -11364,7 +11595,7 @@ class AtomTypeParamModel:
         if world_size > 1:
             # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)
             print("Running multi-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             configure_distributed_tracking(
                 self,
                 wandb_config,
@@ -11392,7 +11623,7 @@ class AtomTypeParamModel:
         else:
             # Run single-process training directly
             print("Running single-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             run_tracked_single_process(
                 self,
                 lambda: self.single_proc_train(

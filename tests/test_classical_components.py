@@ -36,6 +36,7 @@ at_elst_path = f"{current_file_path}/test_models/ap3_ensemble_0/am_elst_h+1_3.pt
 ap3_path = f"{current_file_path}/test_models/ap3_ensemble_0/ap3_.pt"
 
 
+@pytest.mark.pretrained_models("am")
 def test_elst_multipoles_AP2():
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
@@ -272,6 +273,7 @@ def test_elst_multipoles_MTP_torch_damping():
     return
 
 
+@pytest.mark.pretrained_models("am")
 def test_elst_charge_dipole_qpole():
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
@@ -306,6 +308,7 @@ def test_elst_charge_dipole_qpole():
     assert abs(E_qpole - E_qpole_ref) < 1e-5, f"Expected {E_qpole_ref}, got {E_qpole}"
 
 
+@pytest.mark.pretrained_models("am")
 def test_elst_charge_dipole_qpole_pairwise():
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
@@ -341,6 +344,7 @@ def test_elst_charge_dipole_qpole_pairwise():
     return
 
 
+@pytest.mark.pretrained_models(local=["models/am_hf_ensemble/am_0.pt"])
 def test_elst_multipoles_am_hirshfeld():
     atom_model = apnet_pt.AtomModels.ap2_hirshfeld_atom_model.AtomHirshfeldModel(
         ds_root=None,

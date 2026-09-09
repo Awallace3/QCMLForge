@@ -144,7 +144,7 @@ def _parse_recorded_calls(calls, monkeypatch):
         "train_pairwise_model",
         lambda **kwargs: parsed_calls.append(kwargs),
     )
-    monkeypatch.setattr(train_models, "set_all_seeds", lambda _seed: None)
+    monkeypatch.setattr(train_models, "set_all_seeds", lambda *_a, **_k: None)
 
     for call in calls:
         assert call[:2] == ["-u", "./train_models.py"]
@@ -342,3 +342,49 @@ def test_run_script_defaults(tmp_path):
     # The default MODEL_DIR is relative, so it must be created under the
     # scratch working directory rather than inside the repository.
     assert (tmp_path / "workdir" / "models" / "ap3_saptpbe0" / "1").is_dir()
+
+
+@pytest.mark.parametrize(
+    "flag, constant_name",
+    [
+        ("--param_start_mean", "CLIFF_CLASSICAL_INITIAL_VALUES"),
+        ("--param_start_std", "CLIFF_CLASSICAL_INITIAL_STDS"),
+    ],
+)
+def test_cliff_classical_seed_help_matches_the_constants(flag, constant_name):
+    """The documented default must be the default.
+
+    Both help strings had drifted: the mean claimed
+    ``[1.8, 0.34, 0.39, 1.8, 2.5]`` when both Thole columns are CLIFF's refit
+    smearing and ind_overlap seeds at 0.2, and the std claimed "five 0.01
+    values" when the exchange column is 0.25 -- 25x the others.  Anyone reading
+    ``--help`` to reproduce a run would have reproduced a different one, and
+    nothing would have told them.  Asserting against the constants rather than
+    against a copied literal is what keeps this from drifting a second time.
+    """
+    from apnet_pt.AtomPairwiseModels import mtp_mtp
+
+    expected = "[" + ", ".join(str(v) for v in getattr(mtp_mtp, constant_name)) + "]"
+    parser = train_models.build_parser() if hasattr(train_models, "build_parser") else None
+    if parser is None:
+        help_text = _help_for(flag)
+    else:
+        help_text = next(
+            a.help for a in parser._actions if flag in a.option_strings
+        )
+    assert expected in help_text, f"{flag} help does not document {expected}"
+
+
+def _help_for(flag):
+    """Pull one option's help out of ``--help`` when there is no parser factory."""
+    out = subprocess.run(
+        [sys.executable, str(Path(train_models.__file__)), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        # Asserted below instead, so a non-zero exit reports argparse's own
+        # stderr rather than a CalledProcessError that hides it.
+        check=False,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    return " ".join(out.stdout.split())

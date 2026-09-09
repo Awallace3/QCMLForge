@@ -99,6 +99,7 @@ def test_elst_multipoles_MTP_torch_damping_AM_DimerParam():
     return
 
 
+@pytest.mark.pretrained_models("am")
 def test_elst_multipoles_MTP_torch_AM_DimerParam():
     df = pd.read_pickle(
         file_dir + os.sep + os.path.join("dataset_data", "water_dimer_pes3.pkl")
@@ -167,6 +168,7 @@ def test_elst_multipoles_MTP_torch_AM_DimerParam():
 @pytest.mark.skip(
     reason="AtomHirshfeldModel is deprecated. To be removed in future after confirming no future use desired."
 )
+@pytest.mark.pretrained_models(local=["models/am_hf_ensemble/am_0.pt"])
 def test_AM_hirshfeld_induction_DimerParam():
     df = pd.read_pickle(
         file_dir + os.sep + os.path.join("dataset_data", "water_dimer_pes3.pkl")

@@ -24,11 +24,14 @@ import inspect
 import os
 import pickle
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+import apnet_pt
 from apnet_pt import ddp_launch, model_io
 from apnet_pt.AtomModels.ap2_atom_model import AtomMPNN
 from apnet_pt.AtomPairwiseModels import mtp_mtp
@@ -150,6 +153,72 @@ def test_export_rendezvous_publishes_env_for_downstream_init(clean_ddp_env):
     assert os.environ["MASTER_PORT"] == "7777"
     assert os.environ["OMP_NUM_THREADS"] == "3"
     assert rv.rank == 1
+
+
+def test_set_omp_num_threads_leaves_the_variable_unset_for_none(clean_ddp_env):
+    """``None`` means "caller did not ask", which is not the string ``"None"``.
+
+    The unguarded form every training entry point used --
+    ``os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)`` --
+    stringifies the default straight into the environment.  OpenMP answers
+    ``Warning #234: Invalid symbols found. Check the value "None"`` and falls
+    back to its own default, and the poisoned value is inherited by every
+    child the run spawns afterwards.  In this suite that surfaced as a
+    ``--help`` shell-out dying on ``Error #101: Out of heap memory``; in a
+    training run it silently discards the pinning the caller configured.
+    """
+    os.environ.pop("OMP_NUM_THREADS", None)
+    ddp_launch.set_omp_num_threads(None)
+    assert "OMP_NUM_THREADS" not in os.environ
+
+
+def test_set_omp_num_threads_does_not_clobber_an_inherited_value(clean_ddp_env):
+    """``srun``/SLURM already exports one; an unasked-for default must not win.
+
+    Unsetting on ``None`` would be just as wrong as writing ``"None"`` -- it
+    would override the allocation's own pinning with OpenMP's guess.  The guard
+    has to be a no-op, not a delete.
+    """
+    os.environ["OMP_NUM_THREADS"] = "6"
+    ddp_launch.set_omp_num_threads(None)
+    assert os.environ["OMP_NUM_THREADS"] == "6"
+    ddp_launch.set_omp_num_threads(2)
+    assert os.environ["OMP_NUM_THREADS"] == "2"
+
+
+def test_export_rendezvous_without_a_thread_count_publishes_no_omp(clean_ddp_env):
+    """The rendezvous keys still land; the thread count stays the caller's."""
+    os.environ.pop("OMP_NUM_THREADS", None)
+    ddp_launch.export_rendezvous(
+        ddp_launch.resolve_rendezvous(
+            rank=0, local_rank=0, world_size=1, master_addr="h", master_port=7778
+        )
+    )
+    assert os.environ["MASTER_ADDR"] == "h"
+    assert "OMP_NUM_THREADS" not in os.environ
+
+
+def test_no_training_path_writes_omp_num_threads_directly():
+    """One guarded writer, twenty-five former call sites.
+
+    The bug was not in any one module -- the same unguarded line had been
+    copied into every model's ``train_model``.  Fixing them one at a time is
+    what let it spread, so assert the property across the package instead:
+    nothing under ``src`` assigns ``OMP_NUM_THREADS`` except
+    :func:`apnet_pt.ddp_launch.set_omp_num_threads` itself.
+    """
+    src = Path(apnet_pt.__file__).parent
+    offenders = []
+    for path in sorted(src.rglob("*.py")):
+        if path.name == "ddp_launch.py":
+            continue
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if 'os.environ["OMP_NUM_THREADS"]' in stripped and "=" in stripped:
+                offenders.append(f"{path.relative_to(src)}:{lineno}: {stripped}")
+    assert not offenders, "use ddp_launch.set_omp_num_threads:\n" + "\n".join(offenders)
 
 
 def test_train_ddp_slurm_and_train_models_share_one_resolver():
@@ -707,3 +776,77 @@ def test_synthetic_split_is_picklable_into_a_spawned_rank():
     train, test = _tiny_split()
     assert len(pickle.loads(pickle.dumps(train))) == len(train)
     assert len(pickle.loads(pickle.dumps(test))) == len(test)
+
+
+# ---------------------------------------------------------------------------
+# Contract: per-component MSE, which is what the primary checkpoint is chosen on
+# ---------------------------------------------------------------------------
+
+
+def test_component_mse_costs_no_extra_collective():
+    """The squared sums must ride in the tensor the absolute sums already use.
+
+    A second ``_ddp_all_reduce`` for the squares would be a per-epoch
+    collective added to buy a diagnostic, and -- worse -- a rank-divergent one
+    if it ever landed inside a branch. Stacking them is what keeps the cost at
+    one extra row.
+    """
+    source = inspect.getsource(AM_DimerParam_Model._ddp_reduce_epoch_sums)
+    assert "torch.stack((error_sum, sq_sum, counts))" in source
+    # The loss reduction is the only other one; nothing reduces sq_sum alone.
+    assert source.count("_ddp_all_reduce") == 2
+
+
+def test_reduce_epoch_sums_divides_squares_by_the_same_count():
+    """MAE and MSE come out of one packed reduction, so the arithmetic is worth
+    asserting on directly: a row swap would silently report MSE as MAE."""
+    model = AM_DimerParam_Model.__new__(AM_DimerParam_Model)
+    model._ddp_all_reduce = lambda t, **kwargs: t
+    error_sum = torch.tensor([6.0, 12.0], dtype=torch.float64)
+    sq_sum = torch.tensor([20.0, 80.0], dtype=torch.float64)
+    total_loss, total_MAE, component_MSE = model._ddp_reduce_epoch_sums(
+        torch.tensor(3.5, dtype=torch.float64), error_sum, sq_sum, n_dimers=4
+    )
+    assert total_loss == pytest.approx(3.5)
+    assert total_MAE.tolist() == pytest.approx([1.5, 3.0])
+    assert component_MSE.tolist() == pytest.approx([5.0, 20.0])
+
+
+def test_both_epoch_loops_accumulate_squares_and_record_a_distinct_split():
+    """Train and val each publish under their own key.
+
+    They share the accumulation shape, so a copy-paste that left ``"train"`` in
+    the validation loop would overwrite the column the star is read from with
+    the one it is not, and the printed line would still look plausible.
+    """
+    for source, split in (
+        (_train_batches_source(), "train"),
+        (_evaluate_batches_source(), "val"),
+    ):
+        assert "sq_sum = None" in source
+        assert "comp_detached.square().sum(dim=0, dtype=torch.float64)" in source
+        assert f'self._record_component_mse("{split}", component_MSE)' in source
+
+
+def test_component_mse_is_printed_on_its_own_line():
+    """Not appended to ``EPOCH:``.
+
+    ``analysis/`` scrapes ``slurm-*.out`` by the EPOCH line's shape, and one of
+    them already has to dedupe a re-printed end-of-chunk block. Widening that
+    line breaks them with no error.
+    """
+    source = _loop_source()
+    epoch_print = source.index('f"  EPOCH: {epoch:4d}')
+    epoch_print_end = source.index("flush=True", epoch_print)
+    mse_print = source.index('f"  COMPONENT MSE: ')
+    assert epoch_print_end < mse_print
+    assert "COMPONENT MSE" not in source[epoch_print:epoch_print_end]
+
+
+def test_component_mse_print_is_rank_zero_only_and_survives_a_missing_split():
+    """It reads an attribute the loop may never have set on this rank."""
+    source = _loop_source()
+    guard = source.index('if is_primary and len(component_MSE.get("val"')
+    assert 'getattr(self, "last_component_MSE", None) or {}' in source[:guard]
+    # train is optional: a validation-only epoch still prints one column.
+    assert 'component_MSE.get("train", component_MSE["val"])' in source

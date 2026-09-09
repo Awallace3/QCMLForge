@@ -448,6 +448,7 @@ def test_ap3d3_fused_fsapt_training():
 
 
 @pytest.mark.skip("data analysis")
+@pytest.mark.pretrained_models("ap2_fused_ensemble")
 def test_ap2_ap3_fused_fsapt_energies():
     """Test training AP3 fused model on FSAPT fragment energy data"""
     df = pd.read_pickle(f"{data_path}/raw/fsapt_full_data.pkl")

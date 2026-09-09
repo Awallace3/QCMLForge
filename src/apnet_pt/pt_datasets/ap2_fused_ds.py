@@ -1606,9 +1606,46 @@ class ap2_fused_module_dataset(Dataset):
             cached["length"] = length
         return length
 
-    def set_shard_cache_size(self, n):
+    def _load_shard(self, datapath: str):
+        """Deserialise one shard from disk.
+
+        Parameters
+        ----------
+        datapath : str
+            Absolute path to the shard file.
+
+        Returns
+        -------
+        list
+            The shard's data objects, in store order.
+
+        Notes
+        -----
+        The one seam between the cache bookkeeping in ``get`` and the actual
+        read, so a subclass can count or redirect reads without restating the
+        storage-type branch or reaching into the module.
+        """
+        if self.storage_type == "h5":
+            return load_hdf5_data_objects(datapath)
+        return torch.load(datapath, weights_only=False)
+
+    def set_shard_cache_size(self, n: int) -> "ap2_fused_module_dataset":
         """Resize the multi-shard LRU in place.
 
+        Parameters
+        ----------
+        n : int
+            Shards to keep resident.  Clamped to at least 1; anything at or
+            below 1 drops the cache entirely and restores the single
+            most-recent-shard behaviour.
+
+        Returns
+        -------
+        ap2_fused_module_dataset
+            ``self``, so the call can be chained where the loader is built.
+
+        Notes
+        -----
         The cache is sized where the loader is built rather than where the
         dataset is constructed, because the size that makes sense is the
         sampler's block size and only the loader knows that.  Attributes set
@@ -1646,10 +1683,7 @@ class ap2_fused_module_dataset(Dataset):
             self.processed_dir,
             f"dimer_ap2_fused{split_name}_spec_{self.spec_type}_{idx_datapath}{self.file_extension}",
         )
-        if self.storage_type == "h5":
-            self.active_data = load_hdf5_data_objects(datapath)
-        else:
-            self.active_data = torch.load(datapath, weights_only=False)
+        self.active_data = self._load_shard(datapath)
         # Arming the guard above. Without this assignment `active_idx_data`
         # stayed at its `__init__` value of None for the life of the dataset,
         # the `==` check could never be true, and every sample deserialised a

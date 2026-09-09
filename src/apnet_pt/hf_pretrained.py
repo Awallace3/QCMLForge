@@ -1,3 +1,4 @@
+import operator
 import os
 import sys
 from importlib import resources
@@ -160,3 +161,99 @@ def resolve_pretrained_path(rel_path: str) -> str:
     This is a thin wrapper around ``resolve_pretrained_paths``.
     """
     return resolve_pretrained_paths([rel_path])[rel_path]
+
+
+DEFAULT_APNET2_WEIGHTS = "qcmlforge"
+
+#: Named APNet2 weight sets: Hugging Face-relative path templates for the atom
+#: (multipole) and pair models plus ensemble sizes. ``ap2_tf_paper`` is the
+#: ensemble published with the paper (``zachglick/apnet``), converted from
+#: TensorFlow; see docs/apnet2-tensorflow-weights.md.
+APNET2_WEIGHT_SETS = {
+    "qcmlforge": {
+        "atom": "am_ensemble/am_{model_id}.pt",
+        "pair": "ap2_ensemble/ap2_{model_id}.pt",
+        "n_models": 5,
+        "n_atom_models": 10,
+    },
+    "ap2_tf_paper": {
+        "atom": "ap2_tf_paper/atom_models/atom{model_id}.pt",
+        "pair": "ap2_tf_paper/pair_models/pair{model_id}.pt",
+        "n_models": 5,
+    },
+}
+
+
+def apnet2_weight_sets() -> list[str]:
+    """Named APNet2 weight sets accepted by ``weights=``."""
+    return list(APNET2_WEIGHT_SETS)
+
+
+def _apnet2_weight_set(weights: str) -> dict:
+    try:
+        return APNET2_WEIGHT_SETS[weights]
+    except KeyError:
+        raise ValueError(
+            f"Unknown APNet2 weight set {weights!r}. "
+            f"Available: {apnet2_weight_sets()}"
+        ) from None
+
+
+def _checked_model_id(model_id, weights: str, kind: str) -> tuple[dict, int]:
+    """Validate ``model_id`` against a weight set's size for ``kind``."""
+    weight_set = _apnet2_weight_set(weights)
+    n_models = int(
+        weight_set.get("n_atom_models", weight_set["n_models"])
+        if kind == "atom"
+        else weight_set["n_models"]
+    )
+    try:
+        model_id = operator.index(model_id)
+    except TypeError:
+        raise TypeError(
+            f"model_id must be an integer, got {type(model_id).__name__}"
+        ) from None
+    if not 0 <= model_id < n_models:
+        label = "atom model_id" if kind == "atom" else "model_id"
+        raise ValueError(
+            f"{label} must be in [0, {n_models - 1}] for weights={weights!r}, "
+            f"got {model_id}"
+        )
+    return weight_set, model_id
+
+
+def apnet2_weight_set_size(weights: str = DEFAULT_APNET2_WEIGHTS) -> int:
+    """Number of pair-model ensemble members in a named weight set."""
+    return int(_apnet2_weight_set(weights)["n_models"])
+
+
+def apnet2_atom_weight_path(
+    model_id: int, weights: str = DEFAULT_APNET2_WEIGHTS
+) -> str:
+    """Repository-relative atom checkpoint path for a named weight set."""
+    weight_set, model_id = _checked_model_id(model_id, weights, "atom")
+    return weight_set["atom"].format(model_id=model_id)
+
+
+def apnet2_weight_paths(
+    model_id: int, weights: str = DEFAULT_APNET2_WEIGHTS
+) -> dict[str, str]:
+    """Repository-relative ``{"atom", "pair"}`` paths for one ensemble member.
+
+    The two entries belong together: each pair model was trained against its
+    own atom model.
+    """
+    weight_set, model_id = _checked_model_id(model_id, weights, "pair")
+    return {
+        kind: weight_set[kind].format(model_id=model_id)
+        for kind in ("atom", "pair")
+    }
+
+
+def resolve_apnet2_weights(
+    model_id: int, weights: str = DEFAULT_APNET2_WEIGHTS
+) -> dict[str, str]:
+    """Local ``{"atom", "pair"}`` checkpoint paths, downloading if needed."""
+    rel_paths = apnet2_weight_paths(model_id, weights)
+    resolved = resolve_pretrained_paths(list(rel_paths.values()))
+    return {kind: resolved[rel] for kind, rel in rel_paths.items()}

@@ -31,6 +31,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
+from .. import ddp_launch
 import qcelemental as qcel
 from .ap2_atom_model import (
     unsorted_segment_sum_3d,
@@ -2288,7 +2289,7 @@ units angstrom
         if world_size > 1 or _external_rank is not None:
             # External launchers enter this worker path even for a one-task job.
             print("Running distributed training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             ddp_config = {
                 "training/epochs": n_epochs,
                 "training/learning_rate_initial": lr,
@@ -2351,7 +2352,7 @@ units angstrom
         else:
             # Run single-process training directly
             print("Running single-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             run_tracked_single_process(
                 self,
                 lambda: self.single_proc_train(
