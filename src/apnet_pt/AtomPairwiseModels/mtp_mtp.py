@@ -25,6 +25,7 @@ from qcml_dftd3.d3 import d3, resolve_d3_damping_parameters
 
 from .. import constants
 from .. import ddp_launch
+from .. import local_frame
 from .. import model_io
 from ..training_tracking import (
     TrackerBackend,
@@ -346,10 +347,31 @@ CLIFF_CLASSICAL_IND_OVERLAP_INDEX = 3
 CLIFF_CLASSICAL_EXCH_INDEX = 4
 CLIFF_CLASSICAL_ANISOTROPY_L1_INDEX = 5
 CLIFF_CLASSICAL_ANISOTROPY_L2_INDEX = 6
-CLIFF_ANISOTROPY_MODES = ("none", "multipole-l1", "multipole-l2", "multipole-l1l2")
+# `multipole-*` learn only the AMPLITUDE of an angular shape pinned to the
+# orientation of the atom's own mu and Q. `mastiff-lm` learns the SHAPE too, on
+# a free real-spherical-harmonic basis read in a body-fixed frame, which is
+# MASTIFF's Eq. (3) rather than an approximation of it; see
+# `apnet_pt.local_frame`.
+CLIFF_ANISOTROPY_MODES = (
+    "none", "multipole-l1", "multipole-l2", "multipole-l1l2", "mastiff-lm",
+)
 CLIFF_ANISOTROPY_DEFAULT_BOUND = 2.0
 CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE = 1.0
 CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE = 1.0
+# Which `l <= 2` coefficients `mastiff-lm` carries. "even" keeps the
+# reflection-invariant `cos(m phi)` channels only, which is the default because
+# the constructed frame's y axis is a pseudovector and the `sin(m phi)` channels
+# therefore make the exchange energy distinguish a dimer from its mirror image.
+# It is still a superset of every symmetry-allowed coefficient in MASTIFF's
+# benzene fit. "all" restores the full eight and is chiral.
+CLIFF_ANISOTROPY_PARITY_MODES = ("even", "all")
+# Nine rotation entries plus the two validity flags that travel with them.
+_CLIFF_MASTIFF_FRAME_WIDTH = 11
+CLIFF_ANISOTROPY_DEFAULT_PARITY = "even"
+# Cutoff of the frame-building neighbour sum, in angstrom, and the width of its
+# radial basis. The cutoff matches the monomer graph the rest of this head reads.
+CLIFF_ANISOTROPY_DEFAULT_FRAME_R_CUT = 5.0
+CLIFF_ANISOTROPY_FRAME_N_RBF = 8
 
 # Disjoint trainable columns for component-wise gradient clipping. The nested
 # atom model is frozen on the dense CLIFF routes, so these groups cover every
@@ -961,17 +983,48 @@ class DimerProp(nn.Module):
         anisotropy_kwargs = {}
         if parameters_A.size(1) > CLIFF_CLASSICAL_ANISOTROPY_L2_INDEX:
             head = self.AtomTypeParam
-            anisotropy_kwargs = {
-                "dipole_A": output_A[1],
-                "dipole_B": output_B[1],
-                "quadrupole_A": output_A[2],
-                "quadrupole_B": output_B[2],
-                "anisotropy_A": parameters_A[:, CLIFF_CLASSICAL_ANISOTROPY_L1_INDEX:],
-                "anisotropy_B": parameters_B[:, CLIFF_CLASSICAL_ANISOTROPY_L1_INDEX:],
-                "anisotropy_bound": head.anisotropy_bound,
-                "dipole_scale": head.anisotropy_dipole_scale,
-                "quadrupole_scale": head.anisotropy_quadrupole_scale,
-            }
+            extra_A = parameters_A[:, CLIFF_CLASSICAL_ANISOTROPY_L1_INDEX:]
+            extra_B = parameters_B[:, CLIFF_CLASSICAL_ANISOTROPY_L1_INDEX:]
+            mode = getattr(head, "anisotropy_mode", "multipole-l1l2")
+            if mode == "mastiff-lm":
+                # Packed by `CliffClassicalNN._anisotropy_frame_columns` as
+                # `[a_lm ...] + [9 rotation entries] + [z_valid, x_valid]`, so
+                # the coefficient count is whatever is left over. Splitting on
+                # the trailing block rather than a stored width keeps the
+                # unpacking correct for a checkpoint trained under either
+                # parity setting.
+                n_coeff = extra_A.size(1) - _CLIFF_MASTIFF_FRAME_WIDTH
+                if n_coeff <= 0:
+                    raise ValueError(
+                        "mastiff-lm parameters carry "
+                        f"{extra_A.size(1)} anisotropy columns, too few for "
+                        f"{_CLIFF_MASTIFF_FRAME_WIDTH} frame columns plus at "
+                        "least one coefficient"
+                    )
+                anisotropy_kwargs = {
+                    "anisotropy_A": extra_A[:, :n_coeff],
+                    "anisotropy_B": extra_B[:, :n_coeff],
+                    "frame_A": extra_A[:, n_coeff:n_coeff + 9].reshape(-1, 3, 3),
+                    "frame_B": extra_B[:, n_coeff:n_coeff + 9].reshape(-1, 3, 3),
+                    "frame_valid_A": extra_A[:, n_coeff + 9:],
+                    "frame_valid_B": extra_B[:, n_coeff + 9:],
+                    "anisotropy_channels": tuple(head.anisotropy_channels),
+                    "anisotropy_mode": mode,
+                    "harmonics": getattr(head, "anisotropy_harmonics", None),
+                }
+            else:
+                anisotropy_kwargs = {
+                    "dipole_A": output_A[1],
+                    "dipole_B": output_B[1],
+                    "quadrupole_A": output_A[2],
+                    "quadrupole_B": output_B[2],
+                    "anisotropy_A": extra_A,
+                    "anisotropy_B": extra_B,
+                    "anisotropy_bound": head.anisotropy_bound,
+                    "dipole_scale": head.anisotropy_dipole_scale,
+                    "quadrupole_scale": head.anisotropy_quadrupole_scale,
+                    "anisotropy_mode": mode,
+                }
         Exch = cliff_exchange(
             RA=batch.RA,
             RB=batch.RB,
@@ -3237,6 +3290,8 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         "anisotropy_bound",
         "anisotropy_dipole_scale",
         "anisotropy_quadrupole_scale",
+        "anisotropy_parity",
+        "anisotropy_frame_r_cut",
     )
 
     def __init__(
@@ -3265,6 +3320,8 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         anisotropy_bound=CLIFF_ANISOTROPY_DEFAULT_BOUND,
         anisotropy_dipole_scale=CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE,
         anisotropy_quadrupole_scale=CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE,
+        anisotropy_parity=CLIFF_ANISOTROPY_DEFAULT_PARITY,
+        anisotropy_frame_r_cut=CLIFF_ANISOTROPY_DEFAULT_FRAME_R_CUT,
     ):
         if param_start_mean_by_Z is None:
             param_start_mean_by_Z = CLIFF_CLASSICAL_INITIAL_VALUES_BY_Z
@@ -3290,13 +3347,19 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         self.anisotropy_bound = float(anisotropy_bound)
         self.anisotropy_dipole_scale = float(anisotropy_dipole_scale)
         self.anisotropy_quadrupole_scale = float(anisotropy_quadrupole_scale)
+        self.anisotropy_parity = str(anisotropy_parity).strip().lower()
+        self.anisotropy_frame_r_cut = float(anisotropy_frame_r_cut)
+        self.anisotropy_channels = ()
         self.anisotropy_readout_layers = nn.ModuleList()
+        self.anisotropy_frame = None
         if anisotropy_mode != "none":
             self.enable_multipole_anisotropy(
                 anisotropy_mode,
                 bound=anisotropy_bound,
                 dipole_scale=anisotropy_dipole_scale,
                 quadrupole_scale=anisotropy_quadrupole_scale,
+                parity=anisotropy_parity,
+                frame_r_cut=anisotropy_frame_r_cut,
             )
 
     def enable_multipole_anisotropy(
@@ -3306,28 +3369,58 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         bound=CLIFF_ANISOTROPY_DEFAULT_BOUND,
         dipole_scale=CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE,
         quadrupole_scale=CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE,
+        parity=CLIFF_ANISOTROPY_DEFAULT_PARITY,
+        frame_r_cut=CLIFF_ANISOTROPY_DEFAULT_FRAME_R_CUT,
     ):
-        """Add zero-initialized hidden-state gates for equivariant mu/Q bases."""
+        """Add zero-initialized hidden-state readouts for an angular prefactor.
+
+        For the ``multipole-*`` modes the two readouts are the amplitudes of a
+        dipole and a quadrupole projection.  For ``mastiff-lm`` there is one
+        readout per retained ``a_lm``, plus a :class:`~apnet_pt.local_frame.
+        LearnedLocalFrame` that supplies the body-fixed axes those coefficients
+        are read in.  Every readout is zero-initialized in its output layer, so
+        enabling anisotropy is a numerical no-op at initialization on either
+        route -- the whole point of the arm is that any change it produces is
+        attributable to training and not to the reparameterization.
+        """
         mode = str(mode).strip().lower()
         if mode not in CLIFF_ANISOTROPY_MODES or mode == "none":
             raise ValueError(
                 "anisotropy mode must be one of "
                 f"{list(CLIFF_ANISOTROPY_MODES[1:])}, got {mode!r}"
             )
+        parity = str(parity).strip().lower()
+        if parity not in CLIFF_ANISOTROPY_PARITY_MODES:
+            raise ValueError(
+                "anisotropy parity must be one of "
+                f"{list(CLIFF_ANISOTROPY_PARITY_MODES)}, got {parity!r}"
+            )
         for name, value in (
             ("anisotropy_bound", bound),
             ("anisotropy_dipole_scale", dipole_scale),
             ("anisotropy_quadrupole_scale", quadrupole_scale),
+            ("anisotropy_frame_r_cut", frame_r_cut),
         ):
             value = float(value)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
             setattr(self, name, value)
+        self.anisotropy_parity = parity
+        if mode == "mastiff-lm":
+            labels = (
+                local_frame.PARITY_EVEN_LABELS
+                if parity == "even"
+                else local_frame.RACAH_L1L2_LABELS
+            )
+            self.anisotropy_channels = local_frame.channel_indices(labels)
+        else:
+            self.anisotropy_channels = ()
+        n_readouts = len(self.anisotropy_channels) if mode == "mastiff-lm" else 2
         if len(self.anisotropy_readout_layers) == 0:
             nodes = [self.n_embed, self.n_neuron * 2, self.n_neuron,
                      max(self.n_neuron // 2, 1), 1]
             activations = [nn.ReLU(), nn.ReLU(), nn.ReLU(), None]
-            for _ in range(2):
+            for _ in range(n_readouts):
                 stack = nn.ModuleList([
                     self._make_layers(nodes, activations)
                     for _ in range(self.n_message + 1)
@@ -3340,9 +3433,27 @@ class CliffClassicalNN(_CliffPositiveParamNN):
                     nn.init.zeros_(output_layer.weight)
                     nn.init.zeros_(output_layer.bias)
                 self.anisotropy_readout_layers.append(stack)
+            if mode == "mastiff-lm":
+                self.anisotropy_frame = local_frame.LearnedLocalFrame(
+                    n_embed=self.n_embed,
+                    n_message=self.n_message,
+                    n_rbf=CLIFF_ANISOTROPY_FRAME_N_RBF,
+                    n_neuron=self.n_neuron,
+                    r_cut=self.anisotropy_frame_r_cut,
+                )
             reference = next(self.parameters())
             self.anisotropy_readout_layers.to(
                 device=reference.device, dtype=reference.dtype
+            )
+            if self.anisotropy_frame is not None:
+                self.anisotropy_frame.to(
+                    device=reference.device, dtype=reference.dtype
+                )
+        elif len(self.anisotropy_readout_layers) != n_readouts:
+            raise ValueError(
+                f"anisotropy mode {mode!r} with parity {parity!r} needs "
+                f"{n_readouts} readouts but this head already carries "
+                f"{len(self.anisotropy_readout_layers)}"
             )
         self.anisotropy_mode = mode
         return self.anisotropy_readout_layers
@@ -3358,11 +3469,12 @@ class CliffClassicalNN(_CliffPositiveParamNN):
         if edge_index.size(1):
             keep_mask.scatter_(0, edge_index[0], True)
             keep_mask.scatter_(0, edge_index[1], True)
-        gates = output[-1].new_zeros((natom, 2))
+        n_readouts = len(self.anisotropy_readout_layers)
+        gates = output[-1].new_zeros((natom, n_readouts))
         if h_list.size(0):
             n_steps = min(self.n_message + 1, h_list.size(1))
             columns = []
-            for channel in range(2):
+            for channel in range(n_readouts):
                 value = self.anisotropy_readout_layers[channel][0](h_list[:, 0, :])
                 for step in range(1, n_steps):
                     value = value + self.anisotropy_readout_layers[channel][step](
@@ -3378,7 +3490,74 @@ class CliffClassicalNN(_CliffPositiveParamNN):
             gates = torch.stack((gates[:, 0], torch.zeros_like(gates[:, 1])), dim=-1)
         elif self.anisotropy_mode == "multipole-l2":
             gates = torch.stack((torch.zeros_like(gates[:, 0]), gates[:, 1]), dim=-1)
+        elif self.anisotropy_mode == "mastiff-lm":
+            gates = torch.cat(
+                (gates, self._anisotropy_frame_columns(batch, h_list, keep_mask)),
+                dim=-1,
+            )
         return (*output[:-1], torch.cat((output[-1], gates), dim=-1))
+
+    def _anisotropy_frame_columns(self, batch, h_list, keep_mask):
+        """The eleven packed frame columns: nine rotation entries, two flags.
+
+        The frame is a per-atom quantity but it is *consumed* per dimer edge, in
+        `cliff_exchange`, which never sees the monomer graph.  So it is computed
+        here -- where `batch.edge_index` and `batch.R` are in hand -- and carried
+        alongside the parameters, exactly as the multipoles already are.  The
+        validity flags travel with it because they cannot be recovered from the
+        rotation matrix afterwards: a degenerate frame is filled with a valid
+        rotation on purpose, so that it never emits a NaN, and it is the flags
+        rather than the matrix that record which coefficients that rotation is
+        actually entitled to carry.
+        """
+        natom = batch.x.size(0)
+        edge_index = batch.edge_index
+        columns = batch.R.new_zeros((natom, 11))
+        if edge_index.size(1) == 0 or self.anisotropy_frame is None:
+            # No monomer graph means no neighbour sum, hence no polar axis; the
+            # identity keeps the packed block a valid rotation and both flags
+            # stay false so every coefficient is masked downstream.
+            columns[:, 0] = 1.0
+            columns[:, 4] = 1.0
+            columns[:, 8] = 1.0
+            return columns
+        e_source, e_target = edge_index[0], edge_index[1]
+        delta = batch.R.index_select(0, e_target) - batch.R.index_select(0, e_source)
+        distance = torch.linalg.vector_norm(delta, dim=-1)
+        unit_ij = delta / distance.clamp_min(local_frame.FRAME_DEGENERACY_EPS).unsqueeze(-1)
+        frame, z_valid, x_valid = self.anisotropy_frame(
+            self._anisotropy_frame_features(h_list, keep_mask, natom),
+            unit_ij,
+            distance,
+            e_source,
+            e_target,
+            natom,
+        )
+        return torch.cat(
+            (
+                frame.reshape(natom, 9),
+                z_valid.to(columns.dtype).unsqueeze(-1),
+                x_valid.to(columns.dtype).unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+
+    def _anisotropy_frame_features(self, h_list, keep_mask, natom):
+        """Invariant per-atom states the frame weights are read from.
+
+        The same frozen atom-model hidden states the anisotropy coefficients are
+        read from, so the frame and the coefficients expressed in it are
+        functions of one description of the environment rather than two -- and
+        reusing the tensor `forward` already holds avoids a second atom-model
+        pass.  `h_list` may cover only the atoms that survived the graph filter,
+        while `edge_index` indexes all of them, so it is scattered back to full
+        length first.
+        """
+        if h_list.size(0) == natom:
+            return h_list
+        full = h_list.new_zeros((natom, *h_list.shape[1:]))
+        full[keep_mask] = h_list
+        return full
 
     def get_config(self) -> dict:
         # The base `get_config` is a dict literal, not a union over
@@ -3944,8 +4123,15 @@ def cliff_exchange(
     anisotropy_bound: float = CLIFF_ANISOTROPY_DEFAULT_BOUND,
     dipole_scale: float = CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE,
     quadrupole_scale: float = CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE,
+    anisotropy_mode: str = "multipole-l1l2",
+    anisotropy_channels: tuple = (),
+    frame_A: torch.Tensor | None = None,
+    frame_B: torch.Tensor | None = None,
+    frame_valid_A: torch.Tensor | None = None,
+    frame_valid_B: torch.Tensor | None = None,
+    harmonics=None,
 ) -> torch.Tensor:
-    """CLIFF classical exchange repulsion, per intermolecular edge, kcal/mol.
+    r"""CLIFF classical exchange repulsion, per intermolecular edge, kcal/mol.
 
     Implements CLIFF Eq. (8) with the Eq. (11) overlap::
 
@@ -3985,6 +4171,48 @@ def cliff_exchange(
         :data:`OVERLAP_WIDTH_CEILING` here (and to ``None`` in the helper), so
         exchange is guarded while the legacy induction-overlap call sites keep
         their exact pre-existing numerics.
+    anisotropy_mode
+        Which angular prefactor the supplied coefficients describe.  The
+        ``multipole-*`` default multiplies ``S_ij`` by
+        ``exp(b tanh(psi_i/b)) exp(b tanh(psi_j/b))`` with ``psi`` a learned
+        combination of ``mu . rhat`` and ``rhat^T Q rhat``: an amplitude on a
+        shape pinned to the atom's own multipole orientation.
+
+        ``"mastiff-lm"`` is instead MASTIFF Eq. (2)-(3) as written,
+
+        .. math::
+
+            V^{\rm exch}_{ij} = A_i(\Omega_i) A_j(\Omega_j) S_{ij},
+            \qquad A_i = A_{i,\rm iso}(1 + \xi_i),
+
+        with :math:`\xi_i = \sum_{lm} a_{i,lm} C_{lm}` a *linear* expansion on
+        Racah-normalized real spherical harmonics evaluated in a body-fixed
+        frame.  The identification is exact rather than an analogy: MASTIFF's
+        radial factor :math:`P(B_{ij} r) e^{-B_{ij} r}` with
+        :math:`B_{ij} = \sqrt{B_i B_j}` **is** :func:`atomic_overlap_S_ij` with
+        :math:`B_i = 1/\sigma_i`, so ``K_i`` plays the role of
+        :math:`A_{i,\rm iso}` and the entire model reduces to
+        :math:`K_i \to K_i (1 + \xi_i)`.  Note that MASTIFF makes only the
+        amplitude anisotropic -- :math:`B_{ij}` is isotropic there -- so this
+        mode deliberately leaves ``S_ij`` alone.
+
+        ``1 + \xi`` is linear and unbounded, exactly as published; it is not
+        clamped.  Nothing but the component loss keeps it positive, and a run
+        that drives it negative has made exchange attractive, which is a
+        training pathology to detect rather than to hide behind a clamp.
+    anisotropy_channels
+        Columns of :data:`apnet_pt.local_frame.RACAH_L1L2_LABELS` that
+        ``anisotropy_A``/``_B`` carry, in order.  Required by ``"mastiff-lm"``.
+    frame_A, frame_B
+        Per-atom body-fixed frames, ``[n_atoms, 3, 3]`` with basis vectors as
+        rows.  Required by ``"mastiff-lm"``.
+    frame_valid_A, frame_valid_B
+        ``[n_atoms, 2]`` polar-axis and azimuth validity flags accompanying the
+        frames.  See :func:`apnet_pt.local_frame.channel_mask`.
+    harmonics
+        Optional override for the ``l <= 2`` Racah harmonics, so a run can swap
+        the closed form for the ``cuequivariance-torch`` backend without
+        changing this call site.
 
     Returns
     -------
@@ -4023,7 +4251,46 @@ def cliff_exchange(
     K_i = K_exch_A.reshape(-1).index_select(0, e_AB_source)
     K_j = K_exch_B.reshape(-1).index_select(0, e_AB_target)
     angular = torch.ones_like(S_ij)
-    if use_anisotropy:
+    if use_anisotropy and anisotropy_mode == "mastiff-lm":
+        missing = [
+            name for name, value in (
+                ("anisotropy_A", anisotropy_A), ("anisotropy_B", anisotropy_B),
+                ("frame_A", frame_A), ("frame_B", frame_B),
+                ("frame_valid_A", frame_valid_A), ("frame_valid_B", frame_valid_B),
+            ) if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "mastiff-lm exchange requires coefficients, frames, and frame "
+                f"validity flags for both monomers; missing {missing}"
+            )
+        if not anisotropy_channels:
+            raise ValueError("mastiff-lm exchange requires anisotropy_channels")
+        if harmonics is None:
+            harmonics = local_frame.racah_harmonics_l1l2
+        rhat = dR_xyz / dR_ang.unsqueeze(-1)
+        # `rhat` points A -> B, so atom i on A sees `+rhat` and atom j on B sees
+        # the reversed vector. Each is then rotated into its own atom's frame.
+        xi_i = local_frame.local_angular_xi(
+            anisotropy_A.index_select(0, e_AB_source),
+            frame_A.index_select(0, e_AB_source),
+            frame_valid_A.index_select(0, e_AB_source)[:, 0] > 0.5,
+            frame_valid_A.index_select(0, e_AB_source)[:, 1] > 0.5,
+            rhat,
+            anisotropy_channels,
+            harmonics=harmonics,
+        )
+        xi_j = local_frame.local_angular_xi(
+            anisotropy_B.index_select(0, e_AB_target),
+            frame_B.index_select(0, e_AB_target),
+            frame_valid_B.index_select(0, e_AB_target)[:, 0] > 0.5,
+            frame_valid_B.index_select(0, e_AB_target)[:, 1] > 0.5,
+            -rhat,
+            anisotropy_channels,
+            harmonics=harmonics,
+        )
+        angular = (1.0 + xi_i) * (1.0 + xi_j)
+    elif use_anisotropy:
         if any(value is None for value in supplied):
             raise ValueError(
                 "anisotropic exchange requires dipoles, quadrupoles, and "
@@ -8067,6 +8334,8 @@ units angstrom
         polarizability_lr: float | None = None,
         atom_model_lr: float | None = None,
         anisotropy_lr: float | None = None,
+        exch_param_lr: float | None = None,
+        valence_width_lr: float | None = None,
     ):
         """Return the legacy iterator or disjoint per-role Adam groups."""
         head = model_io.unwrap_model(self.model)
@@ -8077,6 +8346,8 @@ units angstrom
             and alpha_scale is None
             and atom_model_lr is None
             and anisotropy_lr is None
+            and exch_param_lr is None
+            and valence_width_lr is None
         ):
             # Preserve the historical optimizer construction exactly when no
             # split is requested.
@@ -8102,6 +8373,12 @@ units angstrom
         )
         anisotropy_lr = _validate_polarizability_lr(
             anisotropy_lr, name="anisotropy_lr"
+        )
+        exch_param_lr = _validate_polarizability_lr(
+            exch_param_lr, name="exch_param_lr"
+        )
+        valence_width_lr = _validate_polarizability_lr(
+            valence_width_lr, name="valence_width_lr"
         )
         if type(head) is not CliffClassicalNN:
             raise ValueError(
@@ -8141,6 +8418,33 @@ units angstrom
                 "thole_lr was requested but no trainable direct or mutual "
                 "Thole parameters exist"
             )
+        # The isotropic exchange prefactor `K`, i.e. MASTIFF's `A_iso`.  Left
+        # in `base` unless asked for, so omitting the knob reproduces every
+        # historical run byte for byte.  It gets its own rate because the
+        # anisotropy campaign trains it against a zero-init angular head: the
+        # two have to move at different speeds for `A_iso * (1 + xi)` to be
+        # identifiable at all.
+        exch_parameters = []
+        if exch_param_lr is not None:
+            exch_parameters.extend(
+                parameter
+                for parameter in head.guess_layer[
+                    CLIFF_CLASSICAL_EXCH_INDEX
+                ].parameters()
+                if parameter.requires_grad
+            )
+            exch_parameters.extend(
+                parameter
+                for parameter in head.param_readout_layers[
+                    CLIFF_CLASSICAL_EXCH_INDEX
+                ].parameters()
+                if parameter.requires_grad
+            )
+            if not exch_parameters:
+                raise ValueError(
+                    "exch_param_lr was requested but the exchange prefactor "
+                    "readout is frozen"
+                )
         alpha_parameters = (
             [alpha_scale]
             if alpha_scale is not None and alpha_scale.requires_grad
@@ -8160,12 +8464,49 @@ units angstrom
             for parameter in head.atom_model.parameters()
             if parameter.requires_grad
         ]
-        if atom_model_lr is not None and not trunk_parameters:
+        # `head.atom_model` is an `AtomTypeParamNN` wrapping the pretrained
+        # `AtomMPNN`; its OWN readouts are what emit the Hirshfeld volume ratio
+        # and the valence width, and the valence width *is* the overlap
+        # exponent in `atomic_overlap_S_ij`.  Splitting it out lets a run move
+        # the exchange widths while the 1.89M-parameter message-passing trunk
+        # underneath stays at `atom_model_lr` (0.0 freezes it).  Requested or
+        # not, these parameters are unreachable unless `unfreeze_atom_model`
+        # already made them trainable.
+        width_parameters = []
+        if valence_width_lr is not None:
+            nested_ids = {
+                id(parameter)
+                for parameter in _innermost_atom_mpnn(
+                    head.atom_model
+                ).parameters()
+            }
+            width_parameters = [
+                parameter
+                for parameter in trunk_parameters
+                if id(parameter) not in nested_ids
+            ]
+            if not width_parameters:
+                raise ValueError(
+                    "valence_width_lr was requested but the nested "
+                    "AtomTypeParamNN readouts are frozen; pass "
+                    "unfreeze_atom_model to train them"
+                )
+            width_ids = {id(parameter) for parameter in width_parameters}
+            trunk_parameters = [
+                parameter
+                for parameter in trunk_parameters
+                if id(parameter) not in width_ids
+            ]
+        if (
+            atom_model_lr is not None
+            and not trunk_parameters
+            and not width_parameters
+        ):
             raise ValueError(
                 "atom_model_lr was requested but the nested atom_model is "
                 "frozen; pass unfreeze_atom_model to train it"
             )
-        if atom_model_lr is None and trunk_parameters:
+        if atom_model_lr is None and (trunk_parameters or width_parameters):
             raise ValueError(
                 "the nested atom_model is trainable but no atom_model_lr was "
                 "given; it would silently inherit the head's lr. Pass it "
@@ -8176,6 +8517,14 @@ units angstrom
             [p for p in anisotropy_layers.parameters() if p.requires_grad]
             if anisotropy_layers is not None else []
         )
+        # `mastiff-lm` additionally learns the body-fixed frame the harmonics
+        # are read in.  It is part of the same angular head and must land in
+        # the same group, or the full-coverage assertion below fires.
+        anisotropy_frame = getattr(head, "anisotropy_frame", None)
+        if anisotropy_frame is not None:
+            anisotropy_parameters.extend(
+                p for p in anisotropy_frame.parameters() if p.requires_grad
+            )
         if anisotropy_lr is not None and not anisotropy_parameters:
             raise ValueError(
                 "anisotropy_lr was requested but multipole anisotropy is not enabled"
@@ -8186,7 +8535,9 @@ units angstrom
             )
         split_parameters = [
             *thole_parameters,
+            *exch_parameters,
             *alpha_parameters,
+            *width_parameters,
             *trunk_parameters,
             *anisotropy_parameters,
         ]
@@ -8214,12 +8565,28 @@ units angstrom
                     "group_name": "thole",
                 }
             )
+        if exch_parameters:
+            groups.append(
+                {
+                    "params": exch_parameters,
+                    "lr": float(exch_param_lr),
+                    "group_name": "exchange_param",
+                }
+            )
         if alpha_parameters:
             groups.append(
                 {
                     "params": alpha_parameters,
                     "lr": float(polarizability_lr),
                     "group_name": "polarizability",
+                }
+            )
+        if width_parameters:
+            groups.append(
+                {
+                    "params": width_parameters,
+                    "lr": float(valence_width_lr),
+                    "group_name": "valence_width",
                 }
             )
         if trunk_parameters:
@@ -8644,6 +9011,8 @@ units angstrom
         polarizability_lr=None,
         atom_model_lr=None,
         anisotropy_lr=None,
+        exch_param_lr=None,
+        valence_width_lr=None,
         rank=0,
         world_size=1,
         local_rank=None,
@@ -8848,7 +9217,13 @@ units angstrom
         # (3) Optim/Scheduler
         optimizer = torch.optim.Adam(
             self._optimizer_parameter_groups(
-                lr, thole_lr, polarizability_lr, atom_model_lr, anisotropy_lr
+                lr,
+                thole_lr,
+                polarizability_lr,
+                atom_model_lr,
+                anisotropy_lr,
+                exch_param_lr,
+                valence_width_lr,
             ),
             lr=lr,
         )
@@ -9327,6 +9702,8 @@ units angstrom
         polarizability_lr=None,
         atom_model_lr=None,
         anisotropy_lr=None,
+        exch_param_lr=None,
+        valence_width_lr=None,
         local_rank=None,
     ):
         """Run one DDP rank of :meth:`single_proc_train`.
@@ -9357,6 +9734,8 @@ units angstrom
                 polarizability_lr=polarizability_lr,
                 atom_model_lr=atom_model_lr,
                 anisotropy_lr=anisotropy_lr,
+                exch_param_lr=exch_param_lr,
+                valence_width_lr=valence_width_lr,
                 rank=rank,
                 world_size=world_size,
                 local_rank=local_rank,
@@ -9439,6 +9818,10 @@ units angstrom
         atom_model_lr=None,
         anisotropy_mode="none",
         anisotropy_lr=None,
+        anisotropy_parity=CLIFF_ANISOTROPY_DEFAULT_PARITY,
+        anisotropy_frame_r_cut=CLIFF_ANISOTROPY_DEFAULT_FRAME_R_CUT,
+        exch_param_lr=None,
+        valence_width_lr=None,
         anisotropy_bound=CLIFF_ANISOTROPY_DEFAULT_BOUND,
         anisotropy_dipole_scale=CLIFF_ANISOTROPY_DEFAULT_DIPOLE_SCALE,
         anisotropy_quadrupole_scale=CLIFF_ANISOTROPY_DEFAULT_QUADRUPOLE_SCALE,
@@ -9483,6 +9866,12 @@ units angstrom
         )
         anisotropy_lr = _validate_polarizability_lr(
             anisotropy_lr, name="anisotropy_lr"
+        )
+        exch_param_lr = _validate_polarizability_lr(
+            exch_param_lr, name="exch_param_lr"
+        )
+        valence_width_lr = _validate_polarizability_lr(
+            valence_width_lr, name="valence_width_lr"
         )
         induction_diagnostics = bool(induction_diagnostics)
         if (
@@ -9582,6 +9971,8 @@ units angstrom
                 bound=anisotropy_bound,
                 dipole_scale=anisotropy_dipole_scale,
                 quadrupole_scale=anisotropy_quadrupole_scale,
+                parity=anisotropy_parity,
+                frame_r_cut=anisotropy_frame_r_cut,
             )
             if anisotropy_lr is None:
                 raise ValueError("multipole anisotropy requires anisotropy_lr")
@@ -9592,12 +9983,20 @@ units angstrom
             or polarizability_lr is not None
             or atom_model_lr is not None
             or anisotropy_lr is not None
+            or exch_param_lr is not None
+            or valence_width_lr is not None
         ):
             # Validate the requested optimizer split before any dataset I/O.
             # An unfrozen trunk with no rate of its own raises here, which is
             # before the dataset build rather than an epoch into the run.
             self._optimizer_parameter_groups(
-                lr, thole_lr, polarizability_lr, atom_model_lr, anisotropy_lr
+                lr,
+                thole_lr,
+                polarizability_lr,
+                atom_model_lr,
+                anisotropy_lr,
+                exch_param_lr,
+                valence_width_lr,
             )
         self.grad_clip_mode = grad_clip_mode
         # Validated before any dataset work so a misconfigured route fails
@@ -9769,6 +10168,8 @@ units angstrom
                 polarizability_lr,
                 atom_model_lr,
                 anisotropy_lr,
+                exch_param_lr,
+                valence_width_lr,
             )
             if _external_rank is None:
                 configure_distributed_tracking(
@@ -9827,6 +10228,8 @@ units angstrom
                     polarizability_lr=polarizability_lr,
                     atom_model_lr=atom_model_lr,
                     anisotropy_lr=anisotropy_lr,
+                    exch_param_lr=exch_param_lr,
+                    valence_width_lr=valence_width_lr,
                 ),
                 wandb_config,
                 model_family="parameter",

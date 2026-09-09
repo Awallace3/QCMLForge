@@ -445,6 +445,10 @@ def train_pairwise_model(
     anisotropy_bound=2.0,
     anisotropy_dipole_scale=1.0,
     anisotropy_quadrupole_scale=1.0,
+    anisotropy_parity="even",
+    anisotropy_frame_r_cut=5.0,
+    exch_param_lr=None,
+    valence_width_lr=None,
     induction_diagnostics=False,
     induction_convergence_threshold=None,
     induction_max_iterations=None,
@@ -574,6 +578,22 @@ def train_pairwise_model(
         )
     if anisotropy_mode != "none" and apnet_model_type not in COMPONENT_CLIP_CLIFF_MODEL_TYPES:
         raise ValueError("multipole anisotropy requires a dense combined CLIFF route")
+    anisotropy_parity = str(anisotropy_parity).strip().lower()
+    if anisotropy_parity not in AtomPairwiseModels.mtp_mtp.CLIFF_ANISOTROPY_PARITY_MODES:
+        raise ValueError(
+            "anisotropy_parity must be one of "
+            f"{list(AtomPairwiseModels.mtp_mtp.CLIFF_ANISOTROPY_PARITY_MODES)}"
+        )
+    for name, value in (
+        ("exch_param_lr", exch_param_lr),
+        ("valence_width_lr", valence_width_lr),
+    ):
+        if value is not None and apnet_model_type not in COMPONENT_CLIP_CLIFF_MODEL_TYPES:
+            raise ValueError(
+                f"{name} is only supported on the dense combined CLIFF routes "
+                f"{sorted(COMPONENT_CLIP_CLIFF_MODEL_TYPES)}, not "
+                f"{apnet_model_type!r}"
+            )
     if trainable_polarizability_scale or polarizability_lr is not None:
         polarizability_lr = (
             AtomPairwiseModels.mtp_mtp._validate_polarizability_lr(
@@ -1285,6 +1305,10 @@ def train_pairwise_model(
         train_kwargs["anisotropy_bound"] = anisotropy_bound
         train_kwargs["anisotropy_dipole_scale"] = anisotropy_dipole_scale
         train_kwargs["anisotropy_quadrupole_scale"] = anisotropy_quadrupole_scale
+        train_kwargs["anisotropy_parity"] = anisotropy_parity
+        train_kwargs["anisotropy_frame_r_cut"] = anisotropy_frame_r_cut
+        train_kwargs["exch_param_lr"] = exch_param_lr
+        train_kwargs["valence_width_lr"] = valence_width_lr
         train_kwargs["induction_diagnostics"] = induction_diagnostics
         if induction_convergence_threshold is not None:
             train_kwargs["induction_convergence_threshold"] = (
@@ -1903,6 +1927,47 @@ def main():
     args.add_argument("--anisotropy_dipole_scale", type=float, default=1.0)
     args.add_argument("--anisotropy_quadrupole_scale", type=float, default=1.0)
     args.add_argument(
+        "--anisotropy_parity",
+        choices=AtomPairwiseModels.mtp_mtp.CLIFF_ANISOTROPY_PARITY_MODES,
+        default="even",
+        help=(
+            "mastiff-lm only. 'even' keeps the {10,11c,20,21c,22c} channels, "
+            "whose exchange is invariant under a global reflection. 'all' adds "
+            "the sin(m*phi) channels, which makes the energy chiral because "
+            "the frame's e_y is a pseudovector."
+        ),
+    )
+    args.add_argument(
+        "--anisotropy_frame_r_cut",
+        type=float,
+        default=5.0,
+        help=(
+            "mastiff-lm only. Angstrom cutoff of the learned body-fixed frame's "
+            "neighbour sum."
+        ),
+    )
+    args.add_argument(
+        "--exch_param_lr",
+        type=float,
+        default=None,
+        help=(
+            "Dedicated rate for the isotropic exchange prefactor K "
+            "(MASTIFF's A_iso). Omitted, K stays in the base group exactly as "
+            "in every historical run."
+        ),
+    )
+    args.add_argument(
+        "--valence_width_lr",
+        type=float,
+        default=None,
+        help=(
+            "Dedicated rate for the nested AtomTypeParamNN readouts that emit "
+            "the valence width, i.e. the overlap exponent in S_ij. Requires "
+            "unfreeze_atom_model; atom_model_lr=0.0 then holds the 1.89M "
+            "message-passing trunk underneath frozen."
+        ),
+    )
+    args.add_argument(
         "--induction_diagnostics",
         action="store_true",
         default=False,
@@ -2236,6 +2301,10 @@ def main():
             anisotropy_bound=args.anisotropy_bound,
             anisotropy_dipole_scale=args.anisotropy_dipole_scale,
             anisotropy_quadrupole_scale=args.anisotropy_quadrupole_scale,
+            anisotropy_parity=args.anisotropy_parity,
+            anisotropy_frame_r_cut=args.anisotropy_frame_r_cut,
+            exch_param_lr=args.exch_param_lr,
+            valence_width_lr=args.valence_width_lr,
             induction_diagnostics=args.induction_diagnostics,
             induction_convergence_threshold=(
                 args.induction_convergence_threshold

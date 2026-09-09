@@ -362,6 +362,8 @@ def test_dense_head_declares_only_the_shared_architecture_key():
         "anisotropy_bound",
         "anisotropy_dipole_scale",
         "anisotropy_quadrupole_scale",
+        "anisotropy_parity",
+        "anisotropy_frame_r_cut",
     )
 
 
