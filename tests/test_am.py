@@ -31,6 +31,11 @@ def set_weights_to_value(model, value=0.9):
 
 @pytest.mark.pretrained_models("am")
 def test_am():
+    """Pinned multipoles of ``qcmlforge_v1``'s am_0; see docs/apnet2-pretrained-weights.md.
+
+    Kept on the v1 checkpoint because the references are properties of that
+    specific state dict, not of the loader.
+    """
     # Test Values
     qA_ref = torch.load(
         f"{current_file_path}/dataset_data/mol_charges_A.pt", weights_only=False
@@ -59,7 +64,7 @@ def test_am():
 
     am = AtomModel(
         use_GPU=False,
-    ).set_pretrained_model(model_id=0)
+    ).set_pretrained_model(model_id=0, weights="qcmlforge_v1")
     # Batch A: All full molecules
     batch_A = torch.load(
         f"{current_file_path}/dataset_data/batch_A.pt", weights_only=False

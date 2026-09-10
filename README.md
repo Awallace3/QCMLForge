@@ -107,15 +107,17 @@ interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
 )
 print(interaction_energies)
 # interaction_energies = np.array((N, 5)), where [[E_total, E_elst, E_exch, E_ind, E_disp]...]
-# [[-1.4542807  -2.25828605  2.25395055 -0.49102123 -0.95892397]
-#  [-1.45427967 -2.258285    2.25395055 -0.49102128 -0.95892394]
-#  [-1.45428585 -2.25829129  2.25395064 -0.49102129 -0.95892391]]
+# [[-2.67262248 -3.41546969  2.33096213 -0.61418158 -0.97393334]
+#  [-2.67262368 -3.41547084  2.33096209 -0.61418151 -0.97393341]
+#  [-2.67261759 -3.41546469  2.33096199 -0.61418152 -0.97393337]]
 ```
 
-By default this uses the APNet2 ensemble trained by QCMLForge. Pass
+By default this uses the APNet2 ensemble trained by QCMLForge, which reaches
+0.204 kcal/mol total MAE on the paper's 150 000-dimer Splinter test split. Pass
 `weights="ap2_tf_paper"` to use the ensemble published with the AP-Net2 paper
 instead, converted from TensorFlow and verified against the original
-predictions:
+predictions, or `weights="qcmlforge_v1"` for the pre-`AtomMPNN`-fix ensemble
+that used to be the default:
 
 ```py
 interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
@@ -126,8 +128,10 @@ interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
 )
 ```
 
-See [docs/apnet2-tensorflow-weights.md](docs/apnet2-tensorflow-weights.md) for
-the parity data and the loading caveats.
+See [docs/apnet2-pretrained-weights.md](docs/apnet2-pretrained-weights.md) for
+what each weight set contains and how they score, and
+[docs/apnet2-tensorflow-weights.md](docs/apnet2-tensorflow-weights.md) for the
+TensorFlow parity data and the loading caveats.
 
 ## Training
 To train the model, run the following command:

@@ -50,7 +50,11 @@ def planned_uploads(weights: str, models_dir: Path) -> list[tuple[Path, str]]:
     uploads = []
     for model_id in range(apnet2_weight_set_size(weights)):
         for rel_path in apnet2_weight_paths(model_id, weights).values():
-            local_path = models_dir / Path(rel_path).relative_to(weights)
+            rel = Path(rel_path)
+            # Weight-set paths conventionally start with the set name; strip it
+            # so --models-dir points at the set's own directory either way.
+            local_rel = rel.relative_to(weights) if rel.parts[0] == weights else rel
+            local_path = models_dir / local_rel
             if not local_path.is_file():
                 raise FileNotFoundError(
                     f"{local_path} is missing but the registry maps "
@@ -91,7 +95,12 @@ def main():
     for local_path, rel_path in uploads:
         size = local_path.stat().st_size
         total += size
-        print(f"  {local_path.relative_to(REPO_ROOT)} -> {rel_path} "
+        # --models-dir may point outside the repo (e.g. a staging directory).
+        try:
+            shown = local_path.relative_to(REPO_ROOT)
+        except ValueError:
+            shown = local_path
+        print(f"  {shown} -> {rel_path} "
               f"({size / 1e6:.1f} MB, sha256 {sha256(local_path)[:12]})")
     print(f"{len(uploads)} files, {total / 1e6:.1f} MB")
 

@@ -44,15 +44,25 @@ def test_weight_set_registry():
     assert DEFAULT_APNET2_WEIGHTS == "qcmlforge"
     assert "ap2_tf_paper" in apnet2_weight_sets()
     assert apnet2_weight_set_size("ap2_tf_paper") == 5
-    assert apnet2_atom_weight_path(9) == "am_ensemble/am_9.pt"
+    assert apnet2_weight_set_size("qcmlforge") == 5
+    assert apnet2_atom_weight_path(4) == "qcmlforge/atom_models/am_4.pt"
+    assert apnet2_weight_paths(4, "qcmlforge") == {
+        "atom": "qcmlforge/atom_models/am_4.pt",
+        "pair": "qcmlforge/pair_models/ap2_4.pt",
+    }
+    # The pre-AtomMPNN-fix ensemble stays reachable for older results.
+    assert apnet2_weight_paths(4, "qcmlforge_v1") == {
+        "atom": "am_ensemble/am_4.pt",
+        "pair": "ap2_ensemble/ap2_4.pt",
+    }
     for model_id in range(5):
         for rel_path in apnet2_weight_paths(model_id, "ap2_tf_paper").values():
             assert os.path.isfile(os.path.join(project_root, "models", rel_path))
 
     with pytest.raises(ValueError, match="Unknown APNet2 weight set"):
         apnet2_weight_paths(0, "ap2_tf")
-    with pytest.raises(ValueError, match=r"atom model_id must be in \[0, 9\]"):
-        apnet2_atom_weight_path(10)
+    with pytest.raises(ValueError, match=r"atom model_id must be in \[0, 4\]"):
+        apnet2_atom_weight_path(5)
     for bad_id in (-1, 5):
         with pytest.raises(ValueError, match=r"model_id must be in \[0, 4\]"):
             apnet2_weight_paths(bad_id, "ap2_tf_paper")

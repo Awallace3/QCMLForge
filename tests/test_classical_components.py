@@ -38,11 +38,12 @@ ap3_path = f"{current_file_path}/test_models/ap3_ensemble_0/ap3_.pt"
 
 @pytest.mark.pretrained_models("am")
 def test_elst_multipoles_AP2():
+    # E_ref below is a property of qcmlforge_v1's am_0 multipoles.
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
         ignore_database_null=True,
         use_GPU=False,
-    ).set_pretrained_model(model_id=0)
+    ).set_pretrained_model(model_id=0, weights="qcmlforge_v1")
     monA = lr_water_dimer.get_fragment(0).copy()
     monB = lr_water_dimer.get_fragment(1).copy()
     multipoles = atom_model.predict_qcel_mols(
@@ -275,11 +276,12 @@ def test_elst_multipoles_MTP_torch_damping():
 
 @pytest.mark.pretrained_models("am")
 def test_elst_charge_dipole_qpole():
+    # The three refs below are properties of qcmlforge_v1's am_0 multipoles.
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
         ignore_database_null=True,
         use_GPU=False,
-    ).set_pretrained_model(model_id=0)
+    ).set_pretrained_model(model_id=0, weights="qcmlforge_v1")
     monA = lr_water_dimer.get_fragment(0).copy()
     monB = lr_water_dimer.get_fragment(1).copy()
     multipoles = atom_model.predict_qcel_mols(

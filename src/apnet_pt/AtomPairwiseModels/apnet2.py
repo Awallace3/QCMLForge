@@ -802,7 +802,14 @@ class APNet2Model:
             if version >= 2 and model_io.has_embedded_submodel(
                 checkpoint, "atom_model"
             ):
-                if atom_model_pre_trained_path:
+                if atom_model_pre_trained_path and not (
+                    model_io.embedded_submodel_matches_external(
+                        checkpoint,
+                        "atom_model",
+                        atom_model_pre_trained_path,
+                        map_location=device,
+                    )
+                ):
                     model_io.warn_submodel_override(
                         "atom_model",
                         embedded_type="AtomMPNN",
@@ -1104,7 +1111,14 @@ class APNet2Model:
         # Check for embedded atom_model in v2 checkpoint
         atom_model_loaded_from_embed = False
         if version >= 2 and model_io.has_embedded_submodel(checkpoint, "atom_model"):
-            if am_model_path is not None:
+            if am_model_path is not None and not (
+                model_io.embedded_submodel_matches_external(
+                    checkpoint,
+                    "atom_model",
+                    str(am_model_path),
+                    map_location=self.device,
+                )
+            ):
                 model_io.warn_submodel_override(
                     "atom_model",
                     embedded_type="AtomMPNN",
