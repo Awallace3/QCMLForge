@@ -4,7 +4,9 @@ The registry test is pure; the inference test pins the ensemble's SAPT0
 prediction, which shifts by ~0.5 kcal/mol if ``quadrupole_scale = 1.5`` (a
 checkpoint-config value, not a state-dict entry) is not adopted on load.
 """
+import importlib.util
 import os
+import pathlib
 
 import numpy as np
 import pytest
@@ -86,3 +88,58 @@ def test_paper_ensemble_reproduces_reference_interaction_energy():
     # total, elst, exch, indu, disp
     expected = [[-2.61708314, -3.52547402, 2.46066155, -0.58232477, -0.96994591]]
     np.testing.assert_allclose(np.asarray(pred), expected, atol=1e-5)
+
+
+def test_upload_script_resolves_both_registry_layouts(tmp_path):
+    """``planned_uploads`` handles prefixed and unprefixed registry templates.
+
+    Some weight sets' Hugging Face paths start with the set name
+    (``ap2_tf_paper/...``) and some do not (``qcmlforge_v1`` reuses the flat
+    ``am_ensemble/...`` paths). Both must resolve from a directory mirroring the
+    remote tree, and a prefixed set must also resolve from its own directory
+    with the prefix stripped -- that is what a staging directory looks like.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_upload_paper_models_to_hf",
+        os.path.join(project_root, "scripts", "ap2_tf", "upload_paper_models_to_hf.py"),
+    )
+    upload = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(upload)
+
+    def stage(weights, strip_prefix):
+        root = tmp_path / f"{weights}-{'stripped' if strip_prefix else 'mirror'}"
+        for model_id in range(apnet2_weight_set_size(weights)):
+            for rel in apnet2_weight_paths(model_id, weights).values():
+                rel_path = pathlib.Path(rel)
+                if strip_prefix:
+                    if rel_path.parts[0] != weights:
+                        return None
+                    rel_path = rel_path.relative_to(weights)
+                target = root / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"")
+        return root
+
+    for weights in ("qcmlforge", "qcmlforge_v1", "ap2_tf_paper"):
+        expected = sorted(
+            rel
+            for model_id in range(apnet2_weight_set_size(weights))
+            for rel in apnet2_weight_paths(model_id, weights).values()
+        )
+        # A directory mirroring the remote tree works for either template style.
+        mirror = stage(weights, strip_prefix=False)
+        uploads = upload.planned_uploads(weights, mirror)
+        assert sorted(rel for _, rel in uploads) == expected
+        assert all(local.is_file() for local, _ in uploads)
+
+        # The set's own directory works too, when the paths carry the prefix.
+        stripped = stage(weights, strip_prefix=True)
+        if stripped is not None:
+            uploads = upload.planned_uploads(weights, stripped)
+            assert sorted(rel for _, rel in uploads) == expected
+            assert all(local.is_file() for local, _ in uploads)
+
+    # A missing checkpoint names every path tried rather than uploading a
+    # partial set.
+    with pytest.raises(FileNotFoundError, match="is missing but the registry maps"):
+        upload.planned_uploads("qcmlforge", tmp_path / "empty")

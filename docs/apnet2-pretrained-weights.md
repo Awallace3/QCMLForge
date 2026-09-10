@@ -124,9 +124,12 @@ python scripts/ap2_tf/upload_paper_models_to_hf.py \
     --weights qcmlforge --models-dir /path/to/staged --dry-run
 ```
 
-`--models-dir` points at a directory laid out like the remote paths with the
-weight-set name stripped, i.e. `atom_models/am_{i}.pt` and
-`pair_models/ap2_{i}.pt`. Drop `--dry-run` to commit. Add the weight set to
+`--models-dir` defaults to `models/`, which mirrors the remote layout for every
+weight set tracked in this repository. A staging directory outside the repo may
+instead be laid out like the remote paths with the weight-set name stripped, i.e.
+`atom_models/am_{i}.pt` and `pair_models/ap2_{i}.pt`; both layouts are accepted,
+and a checkpoint the registry asks for but cannot be found anywhere aborts the
+run naming every path tried. Drop `--dry-run` to commit. Add the weight set to
 `_PRETRAINED_MODEL_GROUPS` in `tests/conftest.py` so tests that need it skip
 cleanly when downloads are disabled.
 
