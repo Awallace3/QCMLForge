@@ -8880,6 +8880,15 @@ units angstrom
                 parameter for parameter in anisotropy_layers.parameters()
                 if parameter.requires_grad
             )
+        # `mastiff-lm` also learns the body-fixed frame the harmonics are read
+        # in.  It multiplies the exchange prefactor and nothing else, so it
+        # clips with exchange -- the same grouping the optimizer already uses.
+        anisotropy_frame = getattr(head, "anisotropy_frame", None)
+        if anisotropy_frame is not None:
+            groups["exchange"].extend(
+                parameter for parameter in anisotropy_frame.parameters()
+                if parameter.requires_grad
+            )
 
         # The shared trunk. Empty and absent unless --unfreeze_atom_model, so
         # every frozen-atom_model run clips exactly the three groups it always

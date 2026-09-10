@@ -262,6 +262,40 @@ def test_mastiff_frame_lands_in_the_anisotropy_group(nested_hfvr_vw_model):
     assert not frame_ids & {id(p) for p in groups[0]["params"]}
 
 
+def test_mastiff_frame_is_clipped_with_exchange(nested_hfvr_vw_model):
+    """The optimizer partition and the clipping partition are separate maps.
+
+    `test_mastiff_frame_lands_in_the_anisotropy_group` only covers the first.
+    Job 13049803 died at the first optimizer step because the frame was in the
+    optimizer and absent from the clipping groups, and the exact-coverage
+    assertion -- correctly -- refused to run rather than clip it by nothing.
+    """
+    harness = _harness(nested_hfvr_vw_model)
+    harness.model.enable_multipole_anisotropy("mastiff-lm")
+    groups = harness._component_gradient_parameter_groups()
+    assert tuple(groups) == ("electrostatics", "exchange", "induction")
+    frame_ids = {id(p) for p in harness.model.anisotropy_frame.parameters()}
+    assert frame_ids
+    assert frame_ids <= {id(p) for p in groups["exchange"]}
+    for component in ("electrostatics", "induction"):
+        assert not frame_ids & {id(p) for p in groups[component]}
+
+    # And it actually clips: the guard raising is what we are fixing, so the
+    # test has to reach a real clip_grad_norm_ call.
+    for parameters in groups.values():
+        for parameter in parameters:
+            parameter.grad = torch.full_like(parameter, 5.0)
+    reported = harness._clip_gradient_norms(1.0, "component")
+    assert set(reported) == set(groups)
+    after = torch.sqrt(
+        sum(
+            torch.sum(parameter.grad.square())
+            for parameter in groups["exchange"]
+        )
+    )
+    assert after == pytest.approx(1.0, rel=2e-5)
+
+
 def test_exchange_prefactor_gets_its_own_group(nested_hfvr_vw_model):
     """`A_iso` at its own rate is the point of the unfreeze arm.
 
