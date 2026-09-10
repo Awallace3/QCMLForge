@@ -65,6 +65,7 @@ def planned_uploads(weights: str, models_dir: Path) -> list[tuple[Path, str]]:
 
 
 def main():
+    """Upload a named weight set to Hugging Face and verify it by sha256."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights", default="ap2_tf_paper")
     parser.add_argument("--repo-id", default=HF_REPO_ID)

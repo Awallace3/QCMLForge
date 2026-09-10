@@ -279,7 +279,7 @@ def test_edgeless_atoms_are_batch_independent():
             ), f"{name} changed for {tag}"
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_edgeless_atom_multipoles_are_small_readout_biases():
     """A lone atom's multipoles are the readout biases, not exact zeros.
 
@@ -301,7 +301,7 @@ def test_edgeless_atom_multipoles_are_small_readout_biases():
     assert torch.as_tensor(qpole).abs().max() < 1e-2
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_am_element():
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,

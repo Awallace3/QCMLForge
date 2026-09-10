@@ -1070,8 +1070,13 @@ class APNet2Model:
         """
         Load pretrained weights for the APNet2 and AtomMPNN models.
 
-        For v2 checkpoints with embedded atom_model, the embedded submodel will
-        be used and am_model_path will be ignored (with a warning).
+        For v2 checkpoints with an embedded atom_model, the embedded submodel
+        is used and am_model_path is ignored. A warning is emitted only when the
+        two actually differ: the published ensembles ship each pair checkpoint
+        with a bit-identical copy of its atom model embedded *and* publish that
+        atom model as its own file, so passing both agrees with the checkpoint
+        rather than overriding it. See
+        ``model_io.embedded_submodel_matches_external``.
 
         Parameters
         ----------
@@ -1079,7 +1084,8 @@ class APNet2Model:
             Path to APNet2 checkpoint file.
         am_model_path : str or Path, optional
             Path to AtomMPNN checkpoint file. Ignored if ap2_model_path is a v2
-            checkpoint with embedded atom_model.
+            checkpoint with an embedded atom_model; warns only if it names
+            different weights than the embedded ones.
         model_id : int, optional
             If provided, loads ensemble member ``model_id`` of ``weights``:
             the pair model together with the atom model it was trained

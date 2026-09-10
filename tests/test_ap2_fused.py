@@ -162,7 +162,7 @@ def test_ap2_fused_dataset_size():
     assert ds_labels == cnt, f"Expected {len(ds)} points, but got {cnt} points"
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_ap2_fused_train_qcel_molecules_in_memory():
     batch_size = 2
     atomic_batch_size = 4

@@ -101,6 +101,12 @@ def test_elst_multipoles_MTP_torch_damping_AM_DimerParam():
 
 @pytest.mark.pretrained_models("am")
 def test_elst_multipoles_MTP_torch_AM_DimerParam():
+    """Multipole electrostatics against a reference pinned to ``qcmlforge_v1``.
+
+    The expected energy is a property of that weight set's ``am_0`` multipoles,
+    not of the electrostatics code, so it stays on ``qcmlforge_v1`` rather than
+    following the default weight set.
+    """
     df = pd.read_pickle(
         file_dir + os.sep + os.path.join("dataset_data", "water_dimer_pes3.pkl")
     )

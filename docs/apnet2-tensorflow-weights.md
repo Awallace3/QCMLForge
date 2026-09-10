@@ -31,8 +31,11 @@ pred = apnet2_model_predict(dimers, weights="ap2_tf_paper")
 ```
 
 `weights` defaults to `"qcmlforge"`, the ensemble trained by this project, so
-existing calls are unaffected; `"qcmlforge_v1"` selects the pre-`AtomMPNN`-fix
-ensemble that used to be the default. All three sets are compared in
+existing calls keep working unchanged -- but note that the default *weights*
+themselves changed when the `AtomMPNN` scatter fix landed, so predictions from
+the default route differ numerically from those of older releases. Pass
+`"qcmlforge_v1"` to select the pre-fix ensemble that used to be the default and
+reproduce those older numbers exactly. All three sets are compared in
 [apnet2-pretrained-weights.md](apnet2-pretrained-weights.md). The same keyword
 selects a single member on either model class:
 

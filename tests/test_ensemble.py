@@ -162,6 +162,7 @@ def test_ap2_ensemble():
 
 @pytest.mark.pretrained_models("am_ensemble")
 def test_am_ensemble_compile():
+    """``test_am_ensemble`` under ``torch.compile``; same pinned reference."""
     print("Testing AM ensemble...")
     ref = torch.load(
         os.path.join(os.path.dirname(__file__), "dataset_data/am_ensemble_test.pt"),
