@@ -7,6 +7,7 @@ checkpoint-config value, not a state-dict entry) is not adopted on load.
 import importlib.util
 import os
 import pathlib
+import warnings
 
 import numpy as np
 import pytest
@@ -143,3 +144,25 @@ def test_upload_script_resolves_both_registry_layouts(tmp_path):
     # partial set.
     with pytest.raises(FileNotFoundError, match="is missing but the registry maps"):
         upload.planned_uploads("qcmlforge", tmp_path / "empty")
+
+
+def test_fused_route_declares_which_weights_it_loads():
+    """The fused route cannot honour ``weights=``, so it must say so."""
+    # Its own generation loads silently.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pretrained_models._check_fused_weights(
+            pretrained_models.FUSED_APNET2_WEIGHTS
+        )
+    # The default set has no fused counterpart: warn rather than pass the
+    # pre-fix weights off as the current default.
+    with pytest.warns(UserWarning, match="no 'qcmlforge' checkpoints"):
+        pretrained_models._check_fused_weights(
+            pretrained_models.DEFAULT_APNET2_WEIGHTS
+        )
+    assert pretrained_models.FUSED_APNET2_WEIGHTS != (
+        pretrained_models.DEFAULT_APNET2_WEIGHTS
+    )
+    # Anything else is refused outright.
+    with pytest.raises(ValueError, match="has no fused ensemble"):
+        pretrained_models._check_fused_weights("ap2_tf_paper")

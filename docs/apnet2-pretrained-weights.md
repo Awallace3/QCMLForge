@@ -139,3 +139,12 @@ The AP3 and DAPNet2 code paths hard-code `am_ensemble/am_0.pt` and
 `dapnet2/backbone/*` rather than going through the registry. They still resolve
 the `qcmlforge_v1` atom models. Repointing them needs an AP3 evaluation against
 the retrained atom model, which does not exist yet.
+
+The **fused** route (`ap2_fused=True`, which is the default for
+`apnet2_model_predict_pairs`) is in the same position. It loads the single
+published `ap2-fused_ensemble/` state dict and cannot honour `weights=` at all,
+so it serves `qcmlforge_v1`-generation weights whose atom models predate the
+scatter fix. Asking for the default set now warns and says so; `ap2_tf_paper`
+is still refused. Pass `ap2_fused=False` to get the default weights. Publishing
+a fused counterpart of the new ensemble means fusing the retrained checkpoints
+and re-evaluating them, which has not been done.
