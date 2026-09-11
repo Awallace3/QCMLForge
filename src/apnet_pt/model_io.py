@@ -355,6 +355,62 @@ def has_embedded_submodel(checkpoint: dict[str, Any], submodel_name: str) -> boo
     return get_submodel_checkpoint(checkpoint, submodel_name) is not None
 
 
+def embedded_submodel_matches_external(
+    checkpoint: dict[str, Any],
+    submodel_name: str,
+    external_path: str,
+    map_location=None,
+) -> bool:
+    """
+    Report whether an embedded submodel is identical to a checkpoint on disk.
+
+    The published APNet2 ensembles ship the pair checkpoint with its atom model
+    embedded *and* publish that same atom model as its own file, so callers that
+    pass both paths are agreeing with the checkpoint rather than overriding it.
+    Comparing before warning keeps :func:`warn_submodel_override` for the case it
+    was written for -- a genuinely different external model being silently
+    discarded.
+
+    Parameters
+    ----------
+    checkpoint : dict
+        The parent checkpoint dictionary
+    submodel_name : str
+        Name of the embedded submodel to compare
+    external_path : str
+        Path to a checkpoint holding the same kind of model
+    map_location : optional
+        Passed through to :func:`load_checkpoint`
+
+    Returns
+    -------
+    bool
+        True when both configs and every state-dict tensor agree exactly. False
+        when they differ, when the submodel is absent, or when the external file
+        cannot be read -- a False never suppresses a warning it should emit.
+    """
+    embedded = get_submodel_checkpoint(checkpoint, submodel_name)
+    if embedded is None:
+        return False
+    try:
+        external = load_checkpoint(external_path, map_location=map_location)
+    except Exception:
+        return False
+    if load_config_from_checkpoint(embedded) != load_config_from_checkpoint(external):
+        return False
+    try:
+        embedded_state = load_state_dict_from_checkpoint(embedded)
+        external_state = load_state_dict_from_checkpoint(external)
+    except Exception:
+        return False
+    if set(embedded_state) != set(external_state):
+        return False
+    return all(
+        torch.equal(embedded_state[key], external_state[key])
+        for key in embedded_state
+    )
+
+
 def warn_submodel_override(
     submodel_name: str,
     embedded_type: str | None = None,

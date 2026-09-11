@@ -2,6 +2,7 @@ import copy
 import logging
 import os
 import sys
+import warnings
 from importlib import resources
 
 import numpy as np
@@ -143,14 +144,40 @@ def _resolve_pretrained_paths(rel_paths: list[str]) -> dict[str, str]:
     return resolved
 
 
-def _reject_fused_weights(weights: str) -> None:
-    """Refuse named weight sets that ship no single fused state dict."""
-    if weights != DEFAULT_APNET2_WEIGHTS:
-        raise ValueError(
-            f"weights={weights!r} has no fused ensemble; the fused "
-            "APNet2_AM_MPNN state dict is incompatible with the separate "
-            "atom/pair checkpoints. Pass ap2_fused=False."
+# The only published fused APNet2_AM_MPNN checkpoints (``ap2-fused_ensemble/``)
+# belong to the ``qcmlforge_v1`` generation: their atom weights predate the
+# ``AtomMPNN`` scatter fix, and no fused counterpart of the current default
+# ensemble exists yet.
+FUSED_APNET2_WEIGHTS = "qcmlforge_v1"
+
+
+def _check_fused_weights(weights: str) -> None:
+    """Validate ``weights`` against the one fused ensemble that is published.
+
+    The fused route ignores the weight-set registry and always loads
+    ``ap2-fused_ensemble/``, so it cannot honour a ``weights=`` request. Asking
+    for the default set warns instead of silently passing pre-fix weights off as
+    the current default; asking for anything else with no fused counterpart
+    raises.
+    """
+    if weights == FUSED_APNET2_WEIGHTS:
+        return
+    if weights == DEFAULT_APNET2_WEIGHTS:
+        warnings.warn(
+            f"ap2_fused=True has no {DEFAULT_APNET2_WEIGHTS!r} checkpoints, so "
+            f"the {FUSED_APNET2_WEIGHTS!r} fused ensemble is loaded instead. "
+            "Its atom weights predate the AtomMPNN scatter fix (0.4351 vs "
+            "0.2043 kcal/mol total MAE on the paper's test split). Pass "
+            "ap2_fused=False to use the default weights.",
+            UserWarning,
+            stacklevel=3,
         )
+        return
+    raise ValueError(
+        f"weights={weights!r} has no fused ensemble; the fused "
+        "APNet2_AM_MPNN state dict is incompatible with the separate "
+        "atom/pair checkpoints. Pass ap2_fused=False."
+    )
 
 
 def atom_model_predict(
@@ -253,9 +280,13 @@ def apnet2_model_predict(
 
     ``weights`` names the ensemble, as in :func:`atom_model_predict`. Returns an
     ``(N, 5)`` array: total, elst, exch, indu, disp, all in kcal/mol.
+
+    ``ap2_fused=True`` ignores ``weights`` and loads the only published fused
+    ensemble, which is the ``"qcmlforge_v1"`` generation; see
+    :data:`FUSED_APNET2_WEIGHTS`.
     """
     if ap2_fused:
-        _reject_fused_weights(weights)
+        _check_fused_weights(weights)
         num_models = 4
         additional_models_start = 2
         model_paths = _resolve_pretrained_paths(
@@ -338,6 +369,9 @@ def apnet2_model_predict_pairs(
             If True, print a formatted per-fragment summary to stdout.
         ap2_fused: bool, optional
             If True, use the fused APNet2 variant; otherwise use the standard APNet2 ensemble.
+            The fused variant ignores ``weights`` and always loads the only
+            published fused ensemble, whose atom weights predate the AtomMPNN
+            scatter fix; pass ap2_fused=False to get the default weights.
         weights: str, optional
             Named weight set from ``apnet_pt.hf_pretrained.apnet2_weight_sets()``.
             Defaults to the QCMLForge-trained ensemble; ``"ap2_tf_paper"`` selects
@@ -352,7 +386,7 @@ def apnet2_model_predict_pairs(
             Fragment-pair breakdown with columns ["fA-fB", "total", "elst", "exch", "indu", "disp"], one row per fragment-A/fragment-B pair.
     """
     if ap2_fused:
-        _reject_fused_weights(weights)
+        _check_fused_weights(weights)
     assert fAs is not None, (
         "fAs must be provided. Example: [{'Methyl1_A': [1, 2, 7, 8], 'Methyl2_A': [3, 4, 5, 6]}...]"
     )

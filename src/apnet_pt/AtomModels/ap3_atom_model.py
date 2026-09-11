@@ -1390,7 +1390,7 @@ class AtomInducedDipoleModel:
         model_path : str, optional
             Path to a checkpoint file
         model_id : int, optional
-            ID of a bundled pretrained model (0-9)
+            ID of a bundled ``am_ensemble`` atom model (0-4)
 
         Returns
         -------

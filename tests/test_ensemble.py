@@ -1,3 +1,5 @@
+import warnings
+
 import apnet_pt
 import qcelemental as qcel
 import torch
@@ -68,6 +70,12 @@ no_com
 
 @pytest.mark.pretrained_models("am_ensemble")
 def test_am_ensemble():
+    """Pinned multipoles of the ``qcmlforge_v1`` atom ensemble.
+
+    The stored reference is a property of those five checkpoints, so it stays
+    on ``qcmlforge_v1``; ``test_am_ensemble_default_weights`` covers the
+    current default.
+    """
     print("Testing AM ensemble...")
     ref = torch.load(
         os.path.join(os.path.dirname(__file__), "dataset_data/am_ensemble_test.pt"),
@@ -79,6 +87,7 @@ def test_am_ensemble():
         mols,
         compile=False,
         batch_size=2,
+        weights="qcmlforge_v1",
     )
     q_ref = ref[0]
     q = multipoles[0]
@@ -91,29 +100,69 @@ def test_am_ensemble():
     assert np.allclose(qp, qp_ref, atol=1e-6)
 
 
-@pytest.mark.skip(reason="ap2 ensemble models not available in download, huggingface shift")
-def test_ap2_ensemble():
-    print("Testing AP2 ensemble...")
-    ref = torch.load(
-        os.path.join(os.path.dirname(__file__), "dataset_data/ap2_ensemble_test.pt"),
-        weights_only=False,
-    )
+@pytest.mark.pretrained_models("qcmlforge_am_ensemble")
+def test_am_ensemble_default_weights():
+    """Pinned multipoles of the default (``qcmlforge``) atom ensemble.
 
-    mols = [mol_dimer for _ in range(3)]
-    interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
+    References are inline rather than a stored tensor so a weight change shows
+    up as a reviewable diff. The charge sum is the sharpest check: it is a
+    conservation law the readout has to satisfy, not a fitted number.
+    """
+    mols = [mol_mon for _ in range(3)]
+    q, d, qp = apnet_pt.pretrained_models.atom_model_predict(
         mols,
         compile=False,
         batch_size=2,
     )
-    torch.save(interaction_energies, os.path.join(os.path.dirname(
-        __file__), "dataset_data/ap2_ensemble_test.pt"))
-    print(interaction_energies)
-    print(ref)
-    assert np.allclose(interaction_energies, ref, atol=1e-3)
+    assert len(q) == 3
+    q_ref = [
+        0.29253941,
+        -0.23401756,
+        -0.18585328,
+        0.07721608,
+        -0.32083322,
+        0.14727051,
+        0.22367833,
+    ]
+    for mol_q in q:
+        assert np.allclose(mol_q, q_ref, atol=1e-6)
+    # Neutral monomer: the predicted charges must sum to zero.
+    assert abs(sum(float(np.sum(mol_q)) for mol_q in q)) < 1e-5
+    assert abs(sum(float(np.abs(v).sum()) for v in d) - 3.04275750) < 1e-5
+    assert abs(sum(float(np.abs(v).sum()) for v in qp) - 10.82745396) < 1e-4
+
+
+@pytest.mark.pretrained_models("qcmlforge_ensemble")
+def test_ap2_ensemble():
+    """Pinned five-member SAPT0 prediction from the default weight set.
+
+    Also guards the embedded-submodel path: every published pair checkpoint
+    carries its own atom model, and ``apnet2_model_predict`` passes the
+    matching external atom path alongside it, so loading must stay silent.
+    """
+    mols = [mol_dimer for _ in range(3)]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
+            mols,
+            compile=False,
+            batch_size=2,
+        )
+    override_warnings = [
+        str(w.message)
+        for w in caught
+        if "Using embedded submodel" in str(w.message)
+    ]
+    assert override_warnings == [], override_warnings
+
+    # total, elst, exch, indu, disp
+    expected = [[-2.67262248, -3.41546969, 2.33096213, -0.61418158, -0.97393334]] * 3
+    np.testing.assert_allclose(interaction_energies, expected, atol=1e-5)
 
 
 @pytest.mark.pretrained_models("am_ensemble")
 def test_am_ensemble_compile():
+    """``test_am_ensemble`` under ``torch.compile``; same pinned reference."""
     print("Testing AM ensemble...")
     ref = torch.load(
         os.path.join(os.path.dirname(__file__), "dataset_data/am_ensemble_test.pt"),
@@ -126,6 +175,7 @@ def test_am_ensemble_compile():
         mols,
         compile=True,
         batch_size=2,
+        weights="qcmlforge_v1",
     )
     q_ref = ref[0]
     q = multipoles[0]
