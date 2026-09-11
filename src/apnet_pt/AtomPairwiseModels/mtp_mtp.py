@@ -990,11 +990,7 @@ class AtomTypeParamNN(nn.Module):
         Z = x
         K_list = [self.guess_layer[p](Z) for p in range(self.n_params)]
         K = torch.cat(K_list, dim=-1)  # shape (n_atoms, n_params)
-        # h_list carries a row for every atom, including atoms with no
-        # intramonomer edge (monatomic monomers, isolated ions), so the readout
-        # correction applies to all rows of K. This used to filter K down to
-        # edge-bearing atoms to line up with a pre-filtered h_list; AtomMPNN
-        # returns full-length outputs since the edgeless-atom fix.
+        # h_list includes edgeless atoms, so apply corrections to every K row.
         n_message_steps = min(self.n_message + 1, h_list.size(1))
         updates = []
         for p in range(self.n_params):

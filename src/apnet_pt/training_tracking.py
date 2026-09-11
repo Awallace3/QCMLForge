@@ -1218,6 +1218,7 @@ def _model_config_from_attributes(model: Any) -> dict[str, Any]:
         "use_atom_props",
         "use_precomputed_classical",
         "no_disp_nn",
+        "use_classical_exch",
     )
     config = {}
     for name in attribute_names:

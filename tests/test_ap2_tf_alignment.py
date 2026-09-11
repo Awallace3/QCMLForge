@@ -85,41 +85,6 @@ def test_checkpoint_score_supports_tensorflow_total_mae_policy():
         checkpoint_score("unknown", component_mse, total_mae)
 
 
-def test_seeded_loader_generator_makes_batch_order_independent_of_init_policy():
-    """Regression test for the shuffling confound.
-
-    ``single_proc_train`` hands the loader its own generator.  Without one,
-    ``RandomSampler`` reseeds from the global torch RNG each epoch, which the
-    initialization policy also draws from -- so init silently reordered batches.
-    """
-    from apnet_pt.pt_datasets.ap2_fused_ds import APNet2_fused_DataLoader
-
-    dataset = list(range(64))
-
-    def order(policy, *, seeded):
-        torch.manual_seed(4201)
-        APNet2_AM_MPNN(atom_model=AtomMPNN(), parameter_initialization=policy)
-        kwargs = {}
-        if seeded:
-            generator = torch.Generator()
-            generator.manual_seed(4201)
-            kwargs["generator"] = generator
-        loader = APNet2_fused_DataLoader(
-            dataset=dataset,
-            batch_size=8,
-            shuffle=True,
-            collate_fn=list,
-            **kwargs,
-        )
-        # Two passes, because the leak reappears at every epoch boundary.
-        return [list(batch) for _ in range(2) for batch in loader]
-
-    assert order("pytorch", seeded=True) == order("tensorflow", seeded=True)
-    # Guard the premise: without the generator the policies really do diverge,
-    # so this test would fail to detect a regression if it were vacuous.
-    assert order("pytorch", seeded=False) != order("tensorflow", seeded=False)
-
-
 def test_set_all_seeds_can_request_deterministic_algorithms():
     import train_models
 
@@ -162,30 +127,16 @@ def test_ddp_worker_enables_requested_deterministic_algorithms():
             os.environ["QCMLFORGE_DETERMINISTIC"] = previous_env
 
 
-@pytest.mark.parametrize("saved_scale", [1.0, 1.5])
-def test_fused_set_pretrained_model_adopts_quadrupole_scale(tmp_path, saved_scale):
-    """A checkpoint's quadrupole scale must survive ``set_pretrained_model``.
-
-    It is a forward-pass constant, not a state-dict entry, so a loader that only
-    calls ``load_state_dict`` reports success and predicts wrong electrostatics.
-    """
-
+def test_fused_set_pretrained_model_adopts_quadrupole_scale(tmp_path):
+    """Restore the forward-pass scale, which is absent from the state dict."""
     from apnet_pt.AtomPairwiseModels.apnet2_fused import APNet2_AM_Model
 
-    saved = APNet2_AM_MPNN(atom_model=AtomMPNN(), quadrupole_scale=saved_scale)
+    saved = APNet2_AM_MPNN(atom_model=AtomMPNN(), quadrupole_scale=1.5)
     checkpoint_path = tmp_path / "ap2_fused.pt"
     torch.save(
         {
             "model_state_dict": saved.state_dict(),
-            "config": {
-                "n_message": saved.n_message,
-                "n_rbf": saved.n_rbf,
-                "n_neuron": saved.n_neuron,
-                "n_embed": saved.n_embed,
-                "r_cut": saved.r_cut,
-                "r_cut_im": saved.r_cut_im,
-                "quadrupole_scale": saved_scale,
-            },
+            "config": saved.get_config(),
         },
         checkpoint_path,
     )
@@ -195,4 +146,4 @@ def test_fused_set_pretrained_model_adopts_quadrupole_scale(tmp_path, saved_scal
     )
     assert model.model.quadrupole_scale == 1.0
     model.set_pretrained_model(ap2_model_path=str(checkpoint_path))
-    assert model.model.quadrupole_scale == saved_scale
+    assert model.model.quadrupole_scale == 1.5

@@ -1,272 +1,147 @@
-# Running APNet2 with the original TensorFlow weights
+# AP-Net2 paper weights
 
-`models/ap2_tf_paper/` holds the five-member AP-Net2 ensemble published with
-[`zachglick/apnet`](https://github.com/zachglick/apnet), converted from
-TensorFlow SavedModel format to PyTorch checkpoints. Loading them reproduces the
-original model's predictions to float32 accumulation noise, so results obtained
-this way are numerically the paper's model rather than a retrained
-approximation.
+`models/ap2_tf_paper/` contains the five-member ensemble from
+[`zachglick/apnet`](https://github.com/zachglick/apnet), converted to PyTorch.
+The source is the new, 119-element-embedding vintage on branch `sparse`,
+commit `f093e00bf64190ac30a7706d2a90e66871347b76` (tag `v0.1.0`).
+Each checkpoint records the source revision and SavedModel hash in
+`tf_provenance`. Upstream `master` is AP-Net v1, not AP-Net2.
 
-Use these checkpoints when you need the published numbers. Use the checkpoints
-in `models/` (or your own training run) when you want QCMLForge's own models.
-
-"The original model's predictions" means the TensorFlow forward pass, recorded
-and compared dimer by dimer. On the paper's own 150 000-dimer validation split
-the converted ensemble lands on the TensorFlow ensemble to five decimals on
-every component and on the paper's reported Fig. 2B MAEs to 0.001 kcal/mol; see
-[Where the converted weights stand against the paper](specs/apnet2-tensorflow-parity.md#where-the-converted-weights-stand-against-the-paper).
-
-## Selecting them by name: `weights="ap2_tf_paper"`
-
-The same checkpoints are published under `ap2_tf_paper/` in the
-[`awallace3/qcmlforge`](https://huggingface.co/awallace3/qcmlforge) Hugging Face
-repository, so they can be selected by name without cloning this repository or
-spelling out paths:
+## Usage
 
 ```python
 from apnet_pt.pretrained_models import apnet2_model_predict
 
-# Ensemble-averaged prediction from the five published models.
-pred = apnet2_model_predict(dimers, weights="ap2_tf_paper")
+# Five-member ensemble; output columns are elst, exch, indu, disp in kcal/mol.
+components = apnet2_model_predict(dimers, weights="ap2_tf_paper")
 ```
 
-`weights` defaults to `"qcmlforge"`, the ensemble trained by this project, so
-existing calls are unaffected. The same keyword selects a single member on
-either model class:
+The default remains `weights="qcmlforge"`. Named weights download from
+[`awallace3/qcmlforge`](https://huggingface.co/awallace3/qcmlforge), respecting
+`QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED`. Select a single member with:
 
 ```python
-from apnet_pt.AtomModels.ap2_atom_model import AtomModel
 from apnet_pt.AtomPairwiseModels.apnet2 import APNet2Model
 
-pair_model = APNet2Model()
-pair_model.set_pretrained_model(model_id=0, weights="ap2_tf_paper")
-
-atom_model = AtomModel()
-atom_model.set_pretrained_model(model_id=0, weights="ap2_tf_paper")
+model = APNet2Model()
+model.set_pretrained_model(model_id=0, weights="ap2_tf_paper")
 ```
 
-`APNet2Model.set_pretrained_model(model_id=...)` resolves the pair checkpoint
-*and* its matching atom checkpoint together, which is what these weights
-require: the paper checkpoints are v1 files with no embedded atom submodel, and
-each pair model was trained against its own `atom{i}`. It also adopts
-`quadrupole_scale = 1.5` from the config, so the named route cannot silently
-mis-scale electrostatics.
-
-Downloads obey `QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED` like every other pretrained
-artifact. `weights="ap2_tf_paper"` is rejected with a `ValueError` by the fused
-routes (`ap2_fused=True`); see [Loading pitfalls](#loading-pitfalls). The
-registry of named sets lives in `apnet_pt.hf_pretrained.APNET2_WEIGHT_SETS`
-(`apnet2_weight_sets()` lists them), and
-`scripts/ap2_tf/upload_paper_models_to_hf.py` is what published them.
-
-## Usage with explicit paths
+`AtomModel.set_pretrained_model` accepts the same keyword for multipole-only
+predictions. For local checkpoints:
 
 ```python
-from apnet_pt.AtomModels.ap2_atom_model import AtomModel
-from apnet_pt.AtomPairwiseModels.apnet2 import APNet2Model
-
 model = APNet2Model(
     pre_trained_model_path="models/ap2_tf_paper/pair_models/pair0.pt",
     atom_model_pre_trained_path="models/ap2_tf_paper/atom_models/atom0.pt",
 )
-model.model.eval()
-
-# (N, 4) array of [electrostatics, exchange, induction, dispersion] in kcal/mol
 components = model.predict_qcel_mols(dimers, batch_size=8)
 ```
 
-The atom model can be used on its own for multipoles:
+## Compatibility and verification
 
-```python
-atom_model = AtomModel()
-atom_model.set_pretrained_model(model_path="models/ap2_tf_paper/atom_models/atom0.pt")
-charges, dipoles, quadrupoles, hlist = atom_model.predict_qcel_mols([monomer])[0]
-```
+- Pair each `pair{i}` with its matching `atom{i}`. The named route resolves
+  both; these v1 pair checkpoints do not embed the atom submodel.
+- The pair config requires `quadrupole_scale=1.5`. The unfused constructor and
+  `set_pretrained_model` restore it. Loading only the state dict loses this
+  forward-pass constant and produces incorrect electrostatics.
+- Fused routes (`ap2_fused=True`) reject these separate atom/pair checkpoints.
+- Compare the five-member ensemble, not one member, with the paper.
+- Earlier converted pair checkpoints were incomplete, including uninitialized
+  readout parameters. Replace them and discard predictions made with them.
 
-The original paper reports ensemble predictions. `apnet2_model_predict(...,
-weights="ap2_tf_paper")` does that averaging; by hand, average the five
-`pair{i}` models, each paired with its own `atom{i}` — the pair models were trained
-against their matching atom model, and the SavedModels embed exactly those
-atom-model weights (verified byte-identical).
+`tests/test_ap2_tf_parity.py` checks all five members against recorded
+TensorFlow 2.3 outputs without requiring TensorFlow at test time. Its 26 dimers
+include charged and monatomic monomers and a following dimer to catch
+batch-index corruption from edgeless atoms. The tests also reject missing,
+non-finite, or lazy checkpoint tensors.
 
-Both `pre_trained_model_path` and `set_pretrained_model` work, and both now
-adopt `quadrupole_scale` from the checkpoint config; see
-[Loading pitfalls](#loading-pitfalls).
+### Per-member prediction agreement
 
-## Verified parity
+The original 24-dimer comparison measured the following maximum absolute
+PyTorch–TensorFlow differences. These numbers describe the original subset,
+not the two subsequently added monatomic/successor regression cases.
+Multipoles use the 10-component charge/dipole/quadrupole vector; energies are
+in kcal/mol.
 
-`tests/test_ap2_tf_parity.py` compares every converted model against recorded
-TensorFlow output for 24 dimers drawn from the processed test split (elements
-H, C, N, O, F, P, S, including charged monomers). Atom deviations are on the
-10-element multipole vector; pair deviations are in kcal/mol.
+| Member | Multipoles A max Δ | Multipoles B max Δ | SAPT component max Δ | Total energy max Δ |
+|---|---|---|---|---|
+| 0 | 5.96e-7 | 1.22e-6 | 6.48e-5 | 6.40e-5 |
+| 1 | 5.96e-7 | 3.22e-6 | 9.16e-5 | 7.77e-5 |
+| 2 | 5.96e-7 | 1.88e-6 | 8.33e-5 | 8.19e-5 |
+| 3 | 7.75e-7 | 1.05e-6 | 1.21e-4 | 1.21e-4 |
+| 4 | 5.96e-7 | 1.25e-6 | 5.34e-5 | 7.72e-5 |
 
-| model | atom max abs Δ (A) | atom max abs Δ (B) | pair component max abs Δ | pair total max abs Δ | total MAE (PT) | total MAE (TF) |
-|---|---|---|---|---|---|---|
-| 0 | 5.96e-07 | 1.22e-06 | 6.48e-05 | 6.40e-05 | 0.2520 | 0.2520 |
-| 1 | 5.96e-07 | 3.22e-06 | 9.16e-05 | 7.77e-05 | 0.3366 | 0.3366 |
-| 2 | 5.96e-07 | 1.88e-06 | 8.33e-05 | 8.19e-05 | 0.2563 | 0.2563 |
-| 3 | 7.75e-07 | 1.05e-06 | 1.21e-04 | 1.21e-04 | 0.2487 | 0.2487 |
-| 4 | 5.96e-07 | 1.25e-06 | 5.34e-05 | 7.72e-05 | 0.1834 | 0.1834 |
+Against the same 24 reference labels, total-energy MAE agrees to four decimals
+for every member (kcal/mol):
 
-Every atom-model weight transfers bit-exactly (135 of 135 tensors, verified
-against the SavedModel variable bytes), so the residual 1e-6 on multipoles is
-purely reduction-order difference in float32. The 1e-4 kcal/mol on energies is
-the same effect after propagation through the pair network. Nothing here is an
-approximation with a tunable knob: there is no remaining known systematic
-difference between the two forward passes.
+| Member | PyTorch MAE | TensorFlow MAE |
+|---|---|---|
+| 0 | 0.2520 | 0.2520 |
+| 1 | 0.3366 | 0.3366 |
+| 2 | 0.2563 | 0.2563 |
+| 3 | 0.2487 | 0.2487 |
+| 4 | 0.1834 | 0.1834 |
 
-The MAE columns are over the same 24 dimers and agree to four decimals, which is
-the check that matters for users — the conversion does not shift accuracy.
+### Full-validation ensemble agreement
 
-## Loading pitfalls
+The converted and TensorFlow ensembles gave the following MAEs on the paper's
+150,000-dimer validation split (kcal/mol):
 
-**`quadrupole_scale` must be 1.5.** TensorFlow's `KerasPairModel.mtp_elst`
-multiplies both quadrupole tensors by `3/2` before contracting them with the
-`T2` interaction tensor. QCMLForge exposes that factor as `quadrupole_scale`
-and defaults it to `1.0` to preserve historical behavior. The converted pair
-checkpoints therefore carry `quadrupole_scale: 1.5` in their config.
+| Component | PyTorch | TensorFlow | Paper Fig. 2B |
+|---|---|---|---|
+| Elst | 0.16704 | 0.16704 | 0.168 |
+| Exch | 0.14079 | 0.14079 | 0.141 |
+| Ind | 0.09567 | 0.09567 | 0.096 |
+| Disp | 0.02043 | 0.02043 | 0.021 |
+| Total | 0.19992 | 0.19992 | 0.201 |
 
-This is a forward-pass constant, not a parameter, so it does not live in the
-state dict. A loader that only calls `load_state_dict` will load the weights
-successfully and still predict the wrong electrostatics, with no error and no
-warning. On the 24 parity dimers, dropping 1.5 to 1.0 moves electrostatics by
-0.086 kcal/mol on average and up to 0.498 kcal/mol, and moves exchange,
-induction and dispersion by exactly zero. Against labels the damage is smaller
-than that spread suggests — some of it cancels — but still 0.012 kcal/mol of
-Elst MAE on the paper's validation split.
-`APNet2Model.set_pretrained_model` now reads it out of the checkpoint config.
-If you write your own loader, do the same.
+Mean absolute total prediction difference was 1.6e-5 kcal/mol; one dimer
+exceeded 1e-2 on a component. Verification used CPU float32; reduction order
+and cutoff-boundary behavior can differ across devices.
 
-**`APNet2_AM_MPNN` (`apnet2_fused.py`) cannot load these checkpoints.** The
-fused model combines the atom and pair networks into a single state dict, while
-the TensorFlow pair SavedModel and the converted 83-tensor checkpoint keep them
-separate. `apnet2_fused.py::set_pretrained_model` also does not adopt
-`quadrupole_scale` from a checkpoint config, so a fused checkpoint trained with
-`--quadrupole-scale 1.5` will silently load at `1.0`. Use the unfused
-`APNet2Model` for the converted weights; the ensemble routes raise a
-`ValueError` rather than mis-load when `weights="ap2_tf_paper"` is combined with
-`ap2_fused=True`.
+## Regenerating artifacts
 
-**Predictions were verified on CPU.** float32 reduction order differs between
-CPU and GPU, so GPU predictions will differ from the table above at roughly the
-same 1e-4 kcal/mol magnitude. That is expected and is not a loading error.
-
-## Earlier converted checkpoints were broken
-
-If you used `models/ap2_tf_paper/pair_models/*.pt` from before this revision, discard
-those results. Only 19 of the 83 pair tensors carried genuine TensorFlow
-weights. The rest — feed-forward sublayers 2, 4 and 6 of every stack, the
-element embedding table, and `distance_layer_im.frequencies` — retained their
-PyTorch initialization; their values match Kaiming-uniform and `pi * (1..8)`
-init signatures exactly and match nothing in any of the 20 published
-SavedModels. Worse, `readout_layer_indu.0.*` was left as an
-`UninitializedParameter`, so `nn.LazyLinear` materialized the induction readout
-from the ambient torch seed on first forward: the induction component was a
-different random function on every process.
-
-`load_state_dict` accepted all of this, and the existing smoke tests passed,
-because the energies remained finite and kept the right signs. Measured against
-labels on the 24-dimer set, total MAE was 48.1 / 12.3 / 275.5 / 36.7 / 20.2
-kcal/mol for models 0–4, against TensorFlow's 0.25 / 0.34 / 0.26 / 0.25 / 0.18.
-
-**This, not the `sparse`/`master` question below, explains the first accuracy
-discrepancy seen against the paper.** The atom model *weights* were always
-correct; the pair model weights were never usable. A second discrepancy
-survived that fix -- electrostatics 0.134 kcal/mol high with the other three
-components already at parity -- and was a defect in QCMLForge's own
-`AtomMPNN.forward`, not in the weights: see
-[The electrostatics gap was an atom-model indexing defect](specs/apnet2-tensorflow-parity.md#the-electrostatics-gap-was-an-atom-model-indexing-defect).
-
-`tests/test_ap2_tf_parity.py` now asserts that all 83 tensors are present,
-finite, and non-lazy, so this specific failure cannot recur silently.
-
-## Which upstream branch these come from
-
-The conversion source is branch `sparse` at commit
-`f093e00bf64190ac30a7706d2a90e66871347b76` (tag `v0.1.0`), recorded in each
-checkpoint's `tf_provenance` field along with the SavedModel's
-`saved_model.pb` SHA-256.
-
-`master` in the same repository is **AP-Net v1**, not an older AP-Net2. It uses
-ACSF/APSF symmetry-function descriptors instead of message passing, runs in
-float64 (`set_floatx('float64')`), and reads a different dataset format
-(`hive*.h5`, `hfadz*.hdf5`). Its weights have no counterpart in the QCMLForge
-APNet2 architecture and cannot be converted; the difference is architectural,
-not a version skew. So `master` is not a candidate explanation for any accuracy
-gap in APNet2 results.
-
-Within `sparse` there are two SavedModel vintages, and this one does matter:
-`atom{i}`/`pair{i}` use a 119-row element embedding table, while
-`atom{i}_old`/`pair{i}_old` use 36 rows. The checkpoints in `models/ap2_tf_paper/`
-descend from the **new** vintage. `scripts/ap2_tf/tf_reference_predictions.py`
-takes a `--vintage` flag if you need to compare against the old one.
-
-## Regenerating the conversion
-
-Ordinary use of `models/ap2_tf_paper/**` needs nothing but QCMLForge. Regenerating
-the checkpoints or the test fixture needs the legacy TensorFlow environment,
-because TF 2.3 is the last release that can read these SavedModels and its
-wheels stop at python 3.8:
+Normal inference needs no TensorFlow. Conversion uses a legacy Python 3.8 /
+TensorFlow 2.3.4 environment; its dependencies are recorded in
+`scripts/ap2_tf/legacy-tf-env.pip-freeze.txt`.
 
 ```bash
-# Builds a pinned python 3.8 / TF 2.3.4 prefix and loads all 20 SavedModels.
 scripts/ap2_tf/make_legacy_tf_env.sh
-```
 
-`scripts/ap2_tf/legacy-tf-env.pip-freeze.txt` records the environment that
-actually produced the current artifacts. Then, in that environment:
-
-```bash
-# 1. Export SavedModel variables to npz + manifest (legacy env).
+# Legacy environment: export SavedModel variables and provenance.
 python scripts/ap2_tf/export_tf_savedmodel.py \
     <apnet>/apnet/atom_models/atom0 <apnet>/apnet/pair_models/pair0 \
     --out-dir tf_npz
 
-# 2. Convert to a PyTorch checkpoint (either env; needs torch).
+# PyTorch environment: repeat for members 0–4.
 python scripts/ap2_tf/convert_tf_to_pt.py --kind atom --npz tf_npz/atom0.npz \
     --out models/ap2_tf_paper/atom_models/atom0.pt --overwrite
 python scripts/ap2_tf/convert_tf_to_pt.py --kind pair --npz tf_npz/pair0.npz \
     --out models/ap2_tf_paper/pair_models/pair0.pt --overwrite
 ```
 
-The converter walks the exported variables positionally and asserts on every
-TensorFlow variable name it consumes, so a shape or ordering change in the
-source aborts rather than producing a partly-populated checkpoint. It also
-asserts that it consumed exactly 135 variables for an atom model and 218 for a
-pair model (the pair SavedModel embeds the frozen atom model in its first 135).
-
-Regenerating the test fixture is a two-step, two-environment process, because
-the dimers come from processed PyTorch shards and the reference numbers come
-from TensorFlow:
+The converter validates variable names, shapes, and complete consumption:
+135 atom variables and 218 pair variables, including the embedded atom model.
+To regenerate the regression fixture:
 
 ```bash
-# PyTorch env: select dimers from the processed shards.
+# PyTorch environment.
 python scripts/ap2_tf/make_parity_dimers.py \
     --processed-dir <data_dir>/processed \
-    --prefix dimer_ap2_fused_test_spec_2_ --samples 24 \
+    --prefix dimer_ap2_fused_test_spec_2_ --samples 24 --ensure-monatomic \
     --out-npz tests/dataset_data/ap2_tf_parity/parity_dimers.npz \
     --out-manifest tests/dataset_data/ap2_tf_parity/parity_dimers.manifest.json
 
-# Legacy env: run TensorFlow on exactly those dimers.
+# Legacy environment.
 python scripts/ap2_tf/tf_reference_predictions.py \
     --dimers-npz tests/dataset_data/ap2_tf_parity/parity_dimers.npz \
     --out-npz tests/dataset_data/ap2_tf_parity/tf_reference.npz \
     --out-manifest tests/dataset_data/ap2_tf_parity/tf_reference.manifest.json
 ```
 
-`scripts/ap2_tf/parity_common.py` is shared by both steps and depends only on
-numpy and qcelemental so it can be imported by the python 3.8 interpreter. It
-builds molecules with `validate=False` and `fix_com`/`fix_orientation` so
-qcelemental's molparse cannot re-center or reorient one environment's geometry
-relative to the other's, and asserts that the Angstrom coordinates survive the
-round trip float32-exactly. Without that, a comparison at the 1e-6 level is
-measuring molparse, not the models.
+`parity_common.py` preserves molecular coordinates across both environments.
+`upload_paper_models_to_hf.py` publishes the checkpoints using the loader's
+registry and verifies uploaded hashes; use `--dry-run` to preview.
 
-## Related
-
-- `tests/test_ap2_tf_paper_route.py` — covers the `weights="ap2_tf_paper"`
-  route: the registry, the rejected argument combinations, and numeric
-  agreement between the named route and explicit paths.
-- [APNet2 TensorFlow/PyTorch parity controls](specs/apnet2-tensorflow-parity.md)
-  — the training-time differences between the two implementations, and why they
-  are hard to resolve experimentally.
+See [training parity controls](specs/apnet2-tensorflow-parity.md) for retraining.

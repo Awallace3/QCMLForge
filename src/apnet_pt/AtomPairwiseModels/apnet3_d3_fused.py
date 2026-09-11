@@ -85,6 +85,7 @@ warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
 
 max_Z = 118
+hartree2kcal = qcel.constants.conversion_factor("hartree", "kcal/mol")
 
 
 def lr_lambda(epoch, decay_factor, initial_lr, min_lr=4e-5):
@@ -248,6 +249,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         no_disp_nn=False,
         freeze_dimer_prop_model=None,
         d3_damping_parameters=None,
+        use_classical_exch=False,
     ):
         super().__init__()
         self.dimer_prop_model = dimer_prop_model
@@ -261,6 +263,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         self.use_precomputed_classical = use_precomputed_classical
         self.use_atom_props = use_atom_props
         self.no_disp_nn = no_disp_nn
+        self.use_classical_exch = use_classical_exch
         self.freeze_dimer_prop_model = freeze_dimer_prop_model
         self.d3_damping_parameters = resolve_d3_damping_parameters(
             d3_damping_parameters
@@ -325,6 +328,13 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             self.readout_layer_disp = self._make_layers(
                 layer_nodes_readout, layer_activations
             )
+        # Prefactor for the Slater-overlap exchange term; see
+        # ``valence_width_exch``.  Only built when the term is on so that
+        # checkpoints predating it keep loading strictly.
+        if use_classical_exch:
+            self.readout_layer_exch_quotient = self._make_layers(
+                layer_nodes_readout, layer_activations
+            )
 
         # update layers for hidden states
         self.update_layers = nn.ModuleList()
@@ -362,6 +372,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             "use_atom_props": self.use_atom_props,
             "use_precomputed_classical": self.use_precomputed_classical,
             "no_disp_nn": self.no_disp_nn,
+            "use_classical_exch": self.use_classical_exch,
             "freeze_dimer_prop_model": self.freeze_dimer_prop_model,
             "d3_damping_parameters": deepcopy(self.d3_damping_parameters),
         }
@@ -486,6 +497,42 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # dR = torch.sqrt(nn.functional.relu(torch.sum(dR_xyz**2, dim=-1)))
         dR = torch.sqrt(torch.sum(dR_xyz * dR_xyz, dim=-1).clamp_min(1e-10))
         return dR, dR_xyz
+
+    def valence_width_exch(self, e_source, e_target, vwA, vwB, r_ij):
+        """Slater 1s overlap between two atoms of given valence widths.
+
+        ``S_ij = (1/3 (B r)^2 + B r + 1) exp(-B r)`` with ``B = 1 / (sigma_A
+        sigma_B)``, the CLIFF form of Schriber et al., J. Chem. Phys. 154,
+        184110 (2021).  Ported from :mod:`apnet_pt.AtomPairwiseModels.apnet3`
+        so the fused route gets the same exponential radial prior on
+        exchange-repulsion instead of the shared ``1/r**3`` prefactor.
+
+        Parameters
+        ----------
+        e_source, e_target : torch.Tensor
+            Short-range intermolecular edge indices into monomer A and B.
+        vwA, vwB : torch.Tensor
+            Per-atom valence widths, shape ``[natom, 1]``.  Clamped at 0.1 to
+            keep ``1 / sigma`` finite for atoms the property head drives to
+            zero.
+        r_ij : torch.Tensor
+            Edge distances, shape ``[nedge]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Overlap per edge in kcal/mol, shape ``[nedge]``.
+        """
+        vwA = torch.where(vwA > 0.1, vwA, torch.full_like(vwA, 0.1))
+        vwB = torch.where(vwB > 0.1, vwB, torch.full_like(vwB, 0.1))
+        sigma_A_source = vwA.index_select(0, e_source)
+        sigma_B_target = vwB.index_select(0, e_target)
+        sigma_ij = sigma_A_source * sigma_B_target
+        # reshape, not squeeze(): a single-edge batch would otherwise collapse
+        # to a scalar and broadcast against r_ij instead of pairing with it.
+        B_ij = (1.0 / sigma_ij).reshape(-1)
+        Br = B_ij * r_ij
+        return (1.0 / 3.0 * Br * Br + Br + 1.0) * torch.exp(-Br) * hartree2kcal
 
     # @torch.compile
     def readouts(self, H):
@@ -662,6 +709,22 @@ class APNet3D3_AtomType_MPNN(nn.Module):
 
         cutoff = (1.0 / (dR_sr**3)).unsqueeze(-1)
         E_sr *= cutoff
+        if self.use_classical_exch:
+            # Exchange-repulsion follows density overlap, which decays like
+            # exp(-B r) -- not the 1/r**3 the other three components share.
+            # Give it its own radial form and let the network supply only
+            # the per-pair prefactor.  Added after the cutoff multiply so
+            # the overlap is not rescaled by 1/r**3.
+            S_ij = self.valence_width_exch(
+                e_ABsr_source, e_ABsr_target, vwA, vwB, dR_sr
+            )
+            exch_quotient = (
+                self.readout_layer_exch_quotient(hAB)
+                + self.readout_layer_exch_quotient(hBA)
+            ).reshape(-1) / 2.0
+            E_exch_overlap = torch.zeros_like(E_sr)
+            E_exch_overlap[:, 1] = S_ij * exch_quotient
+            E_sr = E_sr + E_exch_overlap
         E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
         if self.use_precomputed_classical:
             E_output = E_sr_dimer
@@ -897,6 +960,7 @@ class APNet3D3_AtomType_Model:
         no_disp_nn=False,
         freeze_dimer_prop_model=True,
         d3_damping_parameters=None,
+        use_classical_exch=None,
     ):
         """
         the path and all other parameters will be ignored except for dataset.
@@ -1010,6 +1074,8 @@ class APNet3D3_AtomType_Model:
             config = model_io.load_config_from_checkpoint(checkpoint) or {}
             use_atom_props = config.get("use_atom_props", True)
             no_disp_nn = config.get("no_disp_nn", False)
+            if use_classical_exch is None:
+                use_classical_exch = config.get("use_classical_exch", False)
             if use_precomputed_classical is None:
                 use_precomputed_classical = config.get(
                     "use_precomputed_classical", False
@@ -1034,9 +1100,34 @@ class APNet3D3_AtomType_Model:
                 no_disp_nn=no_disp_nn,
                 freeze_dimer_prop_model=freeze_dimer_prop_model,
                 d3_damping_parameters=resolved_d3_damping_parameters,
+                use_classical_exch=use_classical_exch,
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
-            self.model.load_state_dict(model_state_dict)
+            # Turning `use_classical_exch` on for a checkpoint that predates
+            # it is the intended upgrade path, so let exactly the overlap
+            # head come up fresh -- and nothing else.
+            incompatible = self.model.load_state_dict(
+                model_state_dict, strict=False
+            )
+            unexpected = list(incompatible.unexpected_keys)
+            missing = list(incompatible.missing_keys)
+            new_head = [
+                k for k in missing
+                if k.startswith("readout_layer_exch_quotient")
+            ]
+            stale = sorted(set(missing) - set(new_head))
+            if stale or unexpected:
+                raise RuntimeError(
+                    "APNet3D3 checkpoint does not match the model: "
+                    f"missing={stale} unexpected={unexpected}"
+                )
+            if new_head:
+                print(
+                    "  use_classical_exch=True on a checkpoint without an "
+                    "overlap-exchange head; initialising "
+                    f"{len(new_head)} fresh parameter tensor(s)",
+                    flush=True,
+                )
         else:
             if freeze_dimer_prop_model is None:
                 freeze_dimer_prop_model = True
@@ -1045,6 +1136,8 @@ class APNet3D3_AtomType_Model:
             resolved_d3_damping_parameters = resolve_d3_damping_parameters(
                 d3_damping_parameters
             )
+            if use_classical_exch is None:
+                use_classical_exch = False
             self.model = APNet3D3_AtomType_MPNN(
                 dimer_prop_model=self.dimer_prop_model,
                 n_message=n_message,
@@ -1058,6 +1151,18 @@ class APNet3D3_AtomType_Model:
                 no_disp_nn=no_disp_nn,
                 freeze_dimer_prop_model=freeze_dimer_prop_model,
                 d3_damping_parameters=resolved_d3_damping_parameters,
+                use_classical_exch=use_classical_exch,
+            )
+        if no_disp_nn:
+            # NOTE: this module calls warnings.filterwarnings("ignore") at
+            # import time, so warnings.warn would be swallowed; print instead.
+            print(
+                "  WARNING: no_disp_nn=True drops the dispersion residual head. "
+                "Dispersion is then absent from training and raw D3 is bolted "
+                "on at predict time, making the damping parameters an "
+                "uncorrectable bias. The supported training route is "
+                "-D3 + NN (no_disp_nn=False).",
+                flush=True,
             )
         self.use_precomputed_classical = use_precomputed_classical
         self.d3_damping_parameters = deepcopy(resolved_d3_damping_parameters)
@@ -1638,9 +1743,11 @@ class APNet3D3_AtomType_Model:
         )
 
         self.dimer_prop_model.set_forward(forward_name)
-        with torch.no_grad():
-            E_classical, _, _ = self.dimer_prop_model(dimer_batch)
-        self.dimer_prop_model.set_forward(restore_name)
+        try:
+            with torch.no_grad():
+                E_classical, _, _ = self.dimer_prop_model(dimer_batch)
+        finally:
+            self.dimer_prop_model.set_forward(restore_name)
 
         E_elst = E_classical[:, 0]
         E_ind = E_classical[:, 1]
@@ -1667,9 +1774,11 @@ class APNet3D3_AtomType_Model:
         )
 
         self.dimer_prop_model.set_forward("ap3_elst_damping__induced_dipole__disp")
-        with torch.no_grad():
-            E_classical, v_A, v_B = self.dimer_prop_model(dimer_batch)
-        self.dimer_prop_model.set_forward(restore_name)
+        try:
+            with torch.no_grad():
+                E_classical, v_A, v_B = self.dimer_prop_model(dimer_batch)
+        finally:
+            self.dimer_prop_model.set_forward(restore_name)
 
         return E_classical[:, 0], E_classical[:, 1], E_classical[:, 2], v_A, v_B
 
@@ -1964,13 +2073,13 @@ class APNet3D3_AtomType_Model:
                         )
             # If no_disp_nn=True, model outputs 3 cols; expand to 4 by computing D3 at predict time
             if self.model.no_disp_nn and not self.use_precomputed_classical:
-                # Switch dimer_prop_model to full classical (elst + ind + D3 disp)
-                self.dimer_prop_model.set_forward(
-                    "ap3_elst_damping__induced_dipole__disp"
+                # Route through the helper rather than calling set_forward
+                # inline: it restores the DimerProp's forward afterwards, so
+                # a predict call no longer leaves the harness computing D3
+                # on subsequent train/eval passes.
+                _, _, E_disp = self._predict_classical_components(
+                    dimer_batch, include_disp=True
                 )
-                with torch.no_grad():
-                    E_classical, _, _ = self.dimer_prop_model(dimer_batch)
-                E_disp = E_classical[:, 2]
                 ndimer = dimer_batch.total_charge_A.size(0)
                 E_disp_dimer = scatter_sum_compile(
                     E_disp, dimer_batch.dimer_ind_full, ndimer
@@ -3629,7 +3738,10 @@ units angstrom
         """
         for name, param in self.model.named_parameters():
             term = name.split(".")[0]
-            if "readout" in name and term[-4:] in ["elst", "exch", "indu", "disp"]:
+            if "readout" in name and (
+                term[-4:] in ["elst", "exch", "indu", "disp"]
+                or term == "readout_layer_exch_quotient"
+            ):
                 # Only allow disp if not in no_disp_nn mode
                 if term[-4:] == "disp" and self.model.no_disp_nn:
                     param.requires_grad = False

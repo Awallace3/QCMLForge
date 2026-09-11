@@ -269,6 +269,7 @@ def train_pairwise_model(
     ap2_pretrained_model_only=None,
     ds_type="total_component_energies",
     no_disp_nn=False,
+    use_classical_exch=None,
     use_precomputed_classical=None,
     freeze_dimer_prop_model=True,
     freeze_atom_model=True,
@@ -320,6 +321,7 @@ def train_pairwise_model(
         ap2_pretrained_model_only (str or None): If provided for APNet3-fused variants, load AP2 weights from this path into the APNet.
         ds_type (str): Dataset energy-type selector (e.g., "total_component_energies", "fsapt_energies").
         no_disp_nn (bool): Skip the dispersion readout when training APNet3-fused-d3 and compute D3 at predict time instead.
+        use_classical_exch (bool | None): Add the Slater-overlap exchange prior to APNet3-fused-d3. None keeps whatever the checkpoint was trained with (False for a fresh model).
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
         include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms.
 
@@ -336,6 +338,11 @@ def train_pairwise_model(
             f"WARNING: --no_disp_nn applies only to APNet3-fused-d3 (requested {apnet_model_type}); ignoring flag."
         )
         no_disp_nn = False
+    if use_classical_exch is not None and apnet_model_type != "APNet3-fused-d3":
+        print(
+            f"WARNING: --use_classical_exch applies only to APNet3-fused-d3 (requested {apnet_model_type}); ignoring flag."
+        )
+        use_classical_exch = None
     if apnet_model_type == "APNet2":
         APNet = AtomPairwiseModels.apnet2.APNet2Model
     elif apnet_model_type == "APNet2-fused":
@@ -580,6 +587,7 @@ def train_pairwise_model(
             use_precomputed_classical=use_precomputed_classical,
             ds_type=ds_type,
             no_disp_nn=no_disp_nn,
+            use_classical_exch=use_classical_exch,
             ds_batch_size=ds_batch_size,
             freeze_dimer_prop_model=freeze_dimer_prop_model,
         )
@@ -1097,6 +1105,17 @@ def main():
         help="APNet3-fused-d3 only: train elst/exch/indu (three components) and compute D3 at predict time instead of a dispersion NN.",
     )
     args.add_argument(
+        "--use_classical_exch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "APNet3-fused-d3 only: add the Slater-overlap exchange prior "
+            "(S_ij from the valence widths, scaled by a learned per-pair "
+            "prefactor). Unset keeps whatever the checkpoint was trained "
+            "with; a fresh model defaults to off."
+        ),
+    )
+    args.add_argument(
         "--unfreeze_dimer_prop_model",
         action="store_true",
         default=False,
@@ -1201,6 +1220,7 @@ def main():
             ap2_pretrained_model_only=args.ap2_pretrained_model_only,
             ds_type=args.ds_type,
             no_disp_nn=args.no_disp_nn,
+            use_classical_exch=args.use_classical_exch,
             use_precomputed_classical=args.use_precomputed_classical,
             freeze_dimer_prop_model=not args.unfreeze_dimer_prop_model,
             freeze_atom_model=not args.unfreeze_atom_model,

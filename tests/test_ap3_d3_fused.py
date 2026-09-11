@@ -1780,3 +1780,195 @@ if __name__ == "__main__":
     # test_ap3_d3_fused_predict_expansion_to_4_cols()
     # pytest.main([__file__])
     # test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice()
+
+
+def _classical_exch_submodels():
+    atom_type_hf_vw_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model_pre_trained_path=am_path,
+        pre_trained_model_path=at_hf_vw_path,
+    )
+    atom_type_elst_model = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=None,
+        use_GPU=False,
+        ignore_database_null=True,
+        atom_model=atom_type_hf_vw_model.model,
+        atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+    return atom_type_hf_vw_model, atom_type_elst_model
+
+
+def _build_exch_ap3d3(use_classical_exch, seed=7, **kwargs):
+    atom_type_hf_vw_model, atom_type_elst_model = _classical_exch_submodels()
+    torch.manual_seed(seed)
+    return APNet3D3_AtomType_Model(
+        ds_root=None,
+        atom_type_model=atom_type_hf_vw_model.model,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        am_dimer_param_model=atom_type_elst_model,
+        use_precomputed_classical=False,
+        ignore_database_null=True,
+        use_GPU=False,
+        use_classical_exch=use_classical_exch,
+        **kwargs,
+    )
+
+
+def _exch_batch(ap3d3, mols=None):
+    return ap3d3._qcel_example_input(
+        mols if mols is not None else [mol_cliff_water_close],
+        batch_size=1,
+        r_cut=ap3d3.model.r_cut,
+        r_cut_im=ap3d3.model.r_cut_im,
+    )
+
+
+def test_classical_exch_off_by_default_and_head_absent():
+    """The default fused route is untouched: no overlap head, no new config."""
+    ap3d3 = _build_exch_ap3d3(use_classical_exch=None)
+    assert ap3d3.model.use_classical_exch is False
+    assert not hasattr(ap3d3.model, "readout_layer_exch_quotient")
+    assert ap3d3.model.get_config()["use_classical_exch"] is False
+
+
+def test_classical_exch_only_perturbs_the_exchange_column():
+    """The Slater-overlap term lands in column 1 and leaves elst/ind/disp alone."""
+    off = _build_exch_ap3d3(use_classical_exch=False)
+    on = _build_exch_ap3d3(use_classical_exch=True)
+
+    batch = _exch_batch(off)
+    # forward first so the LazyLinear readouts materialise, then copy every
+    # shared weight across so the only difference is the overlap term
+    E_off = off.model(batch)[0].detach().numpy()
+    on.model(batch)
+    on.model.load_state_dict(off.model.state_dict(), strict=False)
+    E_on = on.model(batch)[0].detach().numpy()
+
+    assert hasattr(on.model, "readout_layer_exch_quotient")
+    for col, name in ((0, "elst"), (2, "ind"), (3, "disp")):
+        assert np.allclose(E_off[:, col], E_on[:, col]), (
+            f"{name} column moved when only exchange should have"
+        )
+    assert not np.allclose(E_off[:, 1], E_on[:, 1]), (
+        "exchange column did not change with use_classical_exch=True"
+    )
+
+
+def test_valence_width_exch_matches_the_slater_1s_overlap():
+    """S_ij must follow exp(-Br), not the 1/r**3 the other components share."""
+    on = _build_exch_ap3d3(use_classical_exch=True)
+    vw = torch.full((2, 1), 0.5)
+    idx = torch.tensor([0, 1])
+    r = torch.tensor([2.0, 4.0])
+    S = on.model.valence_width_exch(idx, idx, vw, vw, r)
+    assert S.shape == (2,)
+
+    B = 1.0 / (0.5 * 0.5)
+    for i, r_i in enumerate((2.0, 4.0)):
+        Br = B * r_i
+        expected = (Br * Br / 3.0 + Br + 1.0) * np.exp(-Br)
+        expected *= qcel.constants.conversion_factor("hartree", "kcal/mol")
+        assert np.isclose(S[i].item(), expected, rtol=1e-6)
+    # decays, and far faster than the 1/r**3 prefactor would
+    assert S[1].item() < S[0].item()
+    assert S[1].item() / S[0].item() < (2.0 / 4.0) ** 3
+
+
+def test_valence_width_exch_single_edge_keeps_the_edge_dimension():
+    """A one-edge batch must not collapse to a scalar, as squeeze() would."""
+    on = _build_exch_ap3d3(use_classical_exch=True)
+    vw = torch.full((1, 1), 0.5)
+    idx = torch.tensor([0])
+    S = on.model.valence_width_exch(idx, idx, vw, vw, torch.tensor([2.0]))
+    assert S.shape == (1,)
+
+
+def test_valence_width_exch_clamps_degenerate_widths():
+    """A collapsing valence width must not blow B_ij up to infinity."""
+    on = _build_exch_ap3d3(use_classical_exch=True)
+    idx = torch.tensor([0])
+    r = torch.tensor([2.0])
+    tiny = on.model.valence_width_exch(
+        idx, idx, torch.zeros(1, 1), torch.zeros(1, 1), r
+    )
+    clamped = on.model.valence_width_exch(
+        idx, idx, torch.full((1, 1), 0.1), torch.full((1, 1), 0.1), r
+    )
+    assert torch.isfinite(tiny).all()
+    assert torch.allclose(tiny, clamped)
+
+
+def test_classical_exch_roundtrips_through_a_checkpoint(tmp_path):
+    """Saving and reloading preserves both the flag and the overlap weights."""
+    on = _build_exch_ap3d3(use_classical_exch=True)
+    batch = _exch_batch(on)
+    before = on.model(batch)[0].detach().numpy()
+
+    path = str(tmp_path / "ap3d3_exch.pt")
+    on.save_model(path)
+
+    _, atom_type_elst_model = _classical_exch_submodels()
+    restored = APNet3D3_AtomType_Model(
+        ds_root=None,
+        pre_trained_model_path=path,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        am_dimer_param_model=atom_type_elst_model,
+        ignore_database_null=True,
+        use_GPU=False,
+    )
+    assert restored.model.use_classical_exch is True
+    assert np.allclose(before, restored.model(batch)[0].detach().numpy())
+
+
+def test_classical_exch_can_be_enabled_on_an_older_checkpoint(tmp_path):
+    """Upgrading a pre-overlap checkpoint initialises only the new head."""
+    off = _build_exch_ap3d3(use_classical_exch=False)
+    off.model(_exch_batch(off))
+    path = str(tmp_path / "ap3d3_no_exch.pt")
+    off.save_model(path)
+
+    _, atom_type_elst_model = _classical_exch_submodels()
+    upgraded = APNet3D3_AtomType_Model(
+        ds_root=None,
+        pre_trained_model_path=path,
+        dimer_prop_model=atom_type_elst_model.dimer_model,
+        am_dimer_param_model=atom_type_elst_model,
+        ignore_database_null=True,
+        use_GPU=False,
+        use_classical_exch=True,
+    )
+    assert upgraded.model.use_classical_exch is True
+    assert hasattr(upgraded.model, "readout_layer_exch_quotient")
+    new = upgraded.model.state_dict()
+    for k, v in off.model.state_dict().items():
+        assert torch.allclose(v, new[k]), f"{k} was not carried over"
+
+
+def test_classical_exch_head_trains_in_readout_only_finetune():
+    on = _build_exch_ap3d3(use_classical_exch=True)
+    on.model(_exch_batch(on))
+    on.freeze_parameters_except_readouts()
+    quotient = [
+        p.requires_grad
+        for n, p in on.model.named_parameters()
+        if n.startswith("readout_layer_exch_quotient")
+    ]
+    assert quotient and all(quotient), (
+        "the overlap prefactor head must train alongside the other readouts"
+    )
+
+
+def test_predict_qcel_mols_does_not_leak_the_dispersion_forward():
+    """predict_qcel_mols must restore the DimerProp forward it borrows."""
+    ap3d3 = _build_exch_ap3d3(use_classical_exch=False, no_disp_nn=True)
+    before = ap3d3.dimer_prop_model.forward
+    ap3d3.predict_qcel_mols([mol_cliff_water_close], batch_size=1)
+    assert ap3d3.dimer_prop_model.forward == before, (
+        "predict_qcel_mols left the DimerProp computing D3"
+    )
+    # and a subsequent training-style pass still sees 2 classical columns
+    E_classical, _, _ = ap3d3.dimer_prop_model(_exch_batch(ap3d3))
+    assert E_classical.shape[1] == 2
