@@ -383,6 +383,14 @@ CLIFF_CLASSICAL_IND_OVERLAP_INDEX = 3
 CLIFF_CLASSICAL_EXCH_INDEX = 4
 CLIFF_CLASSICAL_ANISOTROPY_L1_INDEX = 5
 CLIFF_CLASSICAL_ANISOTROPY_L2_INDEX = 6
+# Column indices into the *nested* ``AtomTypeParamNN``'s own readouts
+# (``guess_layer[p]`` / ``param_readout_layers[p]``), which are a different
+# indexing space from the ``CLIFF_CLASSICAL_*_INDEX`` constants above: those
+# index the dimer head, these index the two-column atomic model underneath it.
+# ``p = 0`` emits the Hirshfeld volume ratio and ``p = 1`` the valence width,
+# read back in that order by ``_node_features``.
+ATOM_TYPE_PARAM_HFVR_INDEX = 0
+ATOM_TYPE_PARAM_WIDTH_INDEX = 1
 # `multipole-*` learn only the AMPLITUDE of an angular shape pinned to the
 # orientation of the atom's own mu and Q. `mastiff-lm` learns the SHAPE too, on
 # a free real-spherical-harmonic basis read in a body-fixed frame, which is
@@ -3712,6 +3720,43 @@ def _innermost_atom_mpnn(model: nn.Module) -> nn.Module:
             f"{type(model).__name__}"
         )
     return model
+
+
+def _nested_valence_width_parameters(head: nn.Module) -> list:
+    """Trainable parameters of the nested model's valence-width column.
+
+    The nested ``AtomTypeParamNN`` emits its two scalars from two *fully
+    independent* stacks -- one ``guess_layer`` embedding plus one four-MLP
+    ``param_readout_layers`` list each, no shared hidden layer -- so the
+    valence width can be trained while the Hirshfeld volume ratio stays
+    exactly where the pretrained checkpoint put it. That separation matters
+    because the volume ratio is not an exchange quantity at all: it scales
+    ``alpha = alpha_0 * hfvr ** (4/3)`` and therefore every induction and
+    dispersion energy in the batch, and unlike the width it has no clamp --
+    only a ``torch.abs``. Training both columns together made an
+    exchange-width arm move the volume ratio *harder* than the width (max
+    relative drift 6.8% against 4.7%) and diverged the induction SCF inside
+    two epochs.
+
+    Both the optimizer map and the component-clip map partition
+    ``head.atom_model`` through this one function, so the two partitions
+    cannot drift apart.
+    """
+    nested = getattr(head, "atom_model", None)
+    if not isinstance(nested, AtomTypeParamNN):
+        return []
+    if nested.n_params <= ATOM_TYPE_PARAM_WIDTH_INDEX:
+        return []
+    return [
+        parameter
+        for parameter in (
+            *nested.guess_layer[ATOM_TYPE_PARAM_WIDTH_INDEX].parameters(),
+            *nested.param_readout_layers[
+                ATOM_TYPE_PARAM_WIDTH_INDEX
+            ].parameters(),
+        )
+        if parameter.requires_grad
+    ]
 
 
 class CliffClassicalMPNN(_CliffPositiveParamNN):
@@ -8629,27 +8674,23 @@ units angstrom
         # and the valence width, and the valence width *is* the overlap
         # exponent in `atomic_overlap_S_ij`.  Splitting it out lets a run move
         # the exchange widths while the 1.89M-parameter message-passing trunk
-        # underneath stays at `atom_model_lr` (0.0 freezes it).  Requested or
-        # not, these parameters are unreachable unless `unfreeze_atom_model`
-        # already made them trainable.
+        # underneath stays at `atom_model_lr` (0.0 freezes it).  The split is
+        # per COLUMN, not "everything outside the inner MPNN": taking the whole
+        # outer readout stack would carry the volume-ratio column along at the
+        # width's rate and make an exchange arm move induction and dispersion
+        # too.  The volume-ratio column stays with the trunk, whose rate every
+        # caller already has to state explicitly.  Requested or not, these
+        # parameters are unreachable unless `unfreeze_atom_model` already made
+        # them trainable.
         width_parameters = []
         if valence_width_lr is not None:
-            nested_ids = {
-                id(parameter)
-                for parameter in _innermost_atom_mpnn(
-                    head.atom_model
-                ).parameters()
-            }
-            width_parameters = [
-                parameter
-                for parameter in trunk_parameters
-                if id(parameter) not in nested_ids
-            ]
+            width_parameters = _nested_valence_width_parameters(head)
             if not width_parameters:
                 raise ValueError(
                     "valence_width_lr was requested but the nested "
-                    "AtomTypeParamNN readouts are frozen; pass "
-                    "unfreeze_atom_model to train them"
+                    "AtomTypeParamNN's valence-width readouts are not "
+                    "trainable; it needs a two-column nested model and "
+                    "unfreeze_atom_model"
                 )
             width_ids = {id(parameter) for parameter in width_parameters}
             trunk_parameters = [
@@ -8829,13 +8870,18 @@ units angstrom
         The nested ``atom_model`` is frozen in the default configuration and
         contributes nothing. Under ``--unfreeze_atom_model`` it becomes
         trainable, and it is genuinely shared: its multipoles feed ELST, its
-        Hirshfeld ratios feed the valence widths that EXCH and IND are built
-        from. There is no non-arbitrary way to split it across the three
-        components, so it gets its own group and is clipped once as a trunk.
-        That keeps the three component groups disjoint and independent, which
-        is the whole point of this mode, and it keeps the trunk under the same
-        finite-norm check -- an unfrozen pretrained trunk being where a
-        non-finite gradient is most likely to originate.
+        Hirshfeld ratios feed polarizability, and its valence widths feed the
+        overlaps EXCH and IND are built from. There is no non-arbitrary way to
+        split that across the three components, so it is clipped as a trunk
+        rather than assigned to one of them. That keeps the three component
+        groups disjoint and independent, which is the whole point of this
+        mode, and it keeps the trunk under the same finite-norm check -- an
+        unfrozen pretrained trunk being where a non-finite gradient is most
+        likely to originate.
+
+        The one split inside it is the nested valence-width column, which the
+        optimizer already holds at its own rate; see
+        :func:`_nested_valence_width_parameters`.
         """
         head = model_io.unwrap_model(self.model)
         if type(head) is not CliffClassicalNN:
@@ -8898,6 +8944,22 @@ units angstrom
             for parameter in head.atom_model.parameters()
             if parameter.requires_grad
         ]
+        # The nested valence-width readout is its own optimizer group at its
+        # own rate, so it has to be its own clip group as well.  Clipped
+        # jointly with the trunk, `clip_grad_norm_` renormalises 33 readout
+        # tensors by a norm the 1.89M-parameter trunk dominates, and the
+        # nominal `valence_width_lr` stops being the effective rate. The two
+        # partitions of `head.atom_model` have to agree; both are built by
+        # `_nested_valence_width_parameters` so they cannot drift.
+        width = _nested_valence_width_parameters(head)
+        if width:
+            width_ids = {id(parameter) for parameter in width}
+            trunk = [
+                parameter
+                for parameter in trunk
+                if id(parameter) not in width_ids
+            ]
+            groups["valence_width"] = width
         if trunk:
             groups["atom_model"] = trunk
 

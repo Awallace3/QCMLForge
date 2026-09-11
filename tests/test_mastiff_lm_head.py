@@ -325,6 +325,17 @@ def test_exchange_prefactor_gets_its_own_group(nested_hfvr_vw_model):
     assert not expected & {id(p) for p in groups[0]["params"]}
 
 
+def _column_ids(nested, column):
+    return {
+        id(p)
+        for layer in (
+            nested.guess_layer[column],
+            nested.param_readout_layers[column],
+        )
+        for p in layer.parameters()
+    }
+
+
 def test_valence_widths_split_out_of_the_trunk(nested_hfvr_vw_model):
     """The valence width IS the overlap exponent.
 
@@ -345,15 +356,119 @@ def test_valence_widths_split_out_of_the_trunk(nested_hfvr_vw_model):
     widths, trunk = groups[2], groups[3]
     assert widths["lr"] == 1e-6
     assert trunk["lr"] == 0.0
+    nested = harness.model.atom_model
     nested_ids = {
-        id(p)
-        for p in mtp_mtp._innermost_atom_mpnn(
-            harness.model.atom_model
-        ).parameters()
+        id(p) for p in mtp_mtp._innermost_atom_mpnn(nested).parameters()
     }
-    assert {id(p) for p in trunk["params"]} == nested_ids
+    assert nested_ids <= {id(p) for p in trunk["params"]}
     assert not {id(p) for p in widths["params"]} & nested_ids
     assert widths["params"], "no AtomTypeParamNN readout parameters were found"
+
+
+def test_the_width_group_is_the_width_column_only(nested_hfvr_vw_model):
+    """The volume-ratio column must not ride along at the width's rate.
+
+    The nested model emits two scalars from two independent stacks: column 0
+    is the Hirshfeld volume ratio, column 1 the valence width.  Only the width
+    is an exchange quantity; the volume ratio scales
+    ``alpha = alpha_0 * hfvr ** (4/3)`` and so every induction and dispersion
+    energy in the batch, and it has no clamp -- only a ``torch.abs``.  Taking
+    the whole outer readout stack made an exchange-width arm move the volume
+    ratio harder than the width and diverged the induction SCF.
+    """
+    harness = _harness(nested_hfvr_vw_model)
+    _unfreeze(harness)
+    groups = harness._optimizer_parameter_groups(
+        5e-4, 2.5e-5, None, 0.0, valence_width_lr=1e-6
+    )
+    by_name = {group["group_name"]: group for group in groups}
+    nested = harness.model.atom_model
+    width_ids = _column_ids(nested, mtp_mtp.ATOM_TYPE_PARAM_WIDTH_INDEX)
+    hfvr_ids = _column_ids(nested, mtp_mtp.ATOM_TYPE_PARAM_HFVR_INDEX)
+    assert width_ids and hfvr_ids and not (width_ids & hfvr_ids)
+    assert {id(p) for p in by_name["valence_width"]["params"]} == width_ids
+    # The volume ratio stays with the trunk, whose rate the caller has to
+    # state explicitly -- 0.0 here, which is what freezes it.
+    assert hfvr_ids <= {id(p) for p in by_name["atom_model"]["params"]}
+
+
+def test_an_optimizer_step_leaves_the_volume_ratio_alone(
+    nested_hfvr_vw_model,
+):
+    """End to end through Adam, because the grouping is the whole protection."""
+    harness = _harness(nested_hfvr_vw_model)
+    _unfreeze(harness)
+    groups = harness._optimizer_parameter_groups(
+        5e-4, 2.5e-5, None, 0.0, valence_width_lr=1e-6
+    )
+    optimizer = torch.optim.Adam(groups, lr=5e-4)
+    nested = harness.model.atom_model
+    hfvr = list(nested.param_readout_layers[
+        mtp_mtp.ATOM_TYPE_PARAM_HFVR_INDEX
+    ].parameters())
+    widths = list(nested.param_readout_layers[
+        mtp_mtp.ATOM_TYPE_PARAM_WIDTH_INDEX
+    ].parameters())
+    before_hfvr = [p.detach().clone() for p in hfvr]
+    before_widths = [p.detach().clone() for p in widths]
+    for parameter in (*hfvr, *widths):
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    for parameter, before in zip(hfvr, before_hfvr):
+        assert torch.equal(parameter, before)
+    assert any(
+        not torch.equal(parameter, before)
+        for parameter, before in zip(widths, before_widths)
+    )
+
+
+def test_the_clip_map_partitions_the_trunk_the_same_way(
+    nested_hfvr_vw_model,
+):
+    """Two partitions of one module have to agree.
+
+    ``clip_grad_norm_`` renormalises each component group jointly, so a width
+    column lumped in with the trunk is renormalised by a norm the trunk
+    dominates and its nominal rate stops being its effective one.
+    """
+    harness = _harness(nested_hfvr_vw_model)
+    _unfreeze(harness)
+    groups = harness._optimizer_parameter_groups(
+        5e-4, 2.5e-5, None, 0.0, valence_width_lr=1e-6
+    )
+    optimizer_map = {
+        name: {id(p) for p in group["params"]}
+        for name, group in (
+            (group["group_name"], group) for group in groups
+        )
+    }
+    clip_map = {
+        name: {id(p) for p in params}
+        for name, params in (
+            harness._component_gradient_parameter_groups().items()
+        )
+    }
+    for name in ("valence_width", "atom_model"):
+        assert clip_map[name] == optimizer_map[name], name
+
+
+def test_a_one_column_nested_model_has_no_width_group(nested_hfvr_vw_model):
+    """Fail closed rather than split a column index that does not exist."""
+    one_column = mtp_mtp.AtomTypeParamNN(
+        atom_model=copy.deepcopy(nested_hfvr_vw_model.atom_model),
+        n_message=1,
+        n_neuron=8,
+        n_embed=4,
+        n_params=1,
+        freeze_atom_model=False,
+    )
+    harness = _harness(one_column)
+    _unfreeze(harness)
+    with pytest.raises(ValueError, match="valence-width readouts"):
+        harness._optimizer_parameter_groups(
+            5e-4, 2.5e-5, None, 0.0, valence_width_lr=1e-6
+        )
+    assert "valence_width" not in harness._component_gradient_parameter_groups()
 
 
 def test_valence_width_lr_on_a_frozen_trunk_fails_closed(nested_hfvr_vw_model):

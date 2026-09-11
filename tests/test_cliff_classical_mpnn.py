@@ -1721,9 +1721,16 @@ def test_component_gradient_groups_cover_an_unfrozen_atom_model(
 
     The exact-coverage check exists so that a newly trainable tensor cannot be
     silently clipped by the wrong component -- or by none. ``atom_model`` is
-    genuinely shared (multipoles -> ELST, Hirshfeld ratios -> the valence
-    widths behind EXCH and IND), so it gets its own group rather than an
-    arbitrary assignment, and the three component groups stay disjoint.
+    genuinely shared (multipoles -> ELST, Hirshfeld ratios -> polarizability,
+    valence widths -> the overlaps behind EXCH and IND), so it gets its own
+    group rather than an arbitrary assignment, and the three component groups
+    stay disjoint.
+
+    The one split inside the trunk is the nested valence-width column, which
+    the optimizer already holds at its own ``valence_width_lr``.  Clipped
+    jointly with the trunk, ``clip_grad_norm_`` would renormalise 33 readout
+    tensors by a norm the 1.89M-parameter trunk dominates and the nominal rate
+    would stop being the effective one, so the two partitions have to agree.
     """
     torch.manual_seed(0)
     harness = mtp_mtp.CliffClassicalOverlapModel(
@@ -1751,33 +1758,36 @@ def test_component_gradient_groups_cover_an_unfrozen_atom_model(
         "electrostatics",
         "exchange",
         "induction",
+        "valence_width",
         "atom_model",
     )
     trunk_ids = {id(p) for p in groups["atom_model"]}
-    assert trunk_ids == {
+    width_ids = {id(p) for p in groups["valence_width"]}
+    assert trunk_ids & width_ids == set()
+    assert trunk_ids | width_ids == {
         id(p) for p in head.atom_model.parameters() if p.requires_grad
     }
     assert trunk_ids
+    assert width_ids
     # Disjoint from the component groups: the trunk lives in a different
     # submodule subtree, and the coverage check would have raised otherwise.
     for component in ("electrostatics", "exchange", "induction"):
         assert not trunk_ids & {id(p) for p in groups[component]}
 
-    # The trunk is clipped as one unit and stays inside the finite check.
-    for parameter in groups["atom_model"]:
-        parameter.grad = torch.full_like(parameter, 5.0)
-    for component in ("electrostatics", "exchange", "induction"):
-        for parameter in groups[component]:
+    # Every group is clipped as one unit and stays inside the finite check.
+    for group in groups.values():
+        for parameter in group:
             parameter.grad = torch.full_like(parameter, 5.0)
     reported = harness._clip_gradient_norms(1.0, "component")
     assert set(reported) == set(groups)
-    after = torch.sqrt(
-        sum(
-            torch.sum(parameter.grad.square())
-            for parameter in groups["atom_model"]
+    for name in ("atom_model", "valence_width"):
+        after = torch.sqrt(
+            sum(
+                torch.sum(parameter.grad.square())
+                for parameter in groups[name]
+            )
         )
-    )
-    assert after == pytest.approx(1.0, rel=2e-5)
+        assert after == pytest.approx(1.0, rel=2e-5)
 
 
 def test_component_gradient_groups_reject_the_shared_mpnn_head(
