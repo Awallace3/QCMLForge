@@ -32,6 +32,7 @@ from ..training_tracking import (
     tracked_ddp_worker,
 )
 import os
+from .. import ddp_launch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -283,10 +284,23 @@ class APNet3_MPNN(nn.Module):
         return E_elst
 
     def valence_width_exch(self, e_source, e_target, vwA, vwB, r_ij):
-        # TODO: Implement valence width exchange;
-        # vwA and vwB are the valence widths of monomer A and B,
-        # respectively. r_ij is the interatomic distance between atoms i
-        # and j. Use distance matrix to compute r_ij.
+        # NOT a physical overlap integral -- do not "fix" this.
+        #
+        # This is a learned short-range shape factor.  Its B_ij is
+        # 1 / (sigma_i * sigma_j), which is CLIFF Eq. (11) *missing its square
+        # root*; the physically correct form is
+        # mtp_mtp.atomic_overlap_S_ij, which uses
+        # B_ij = 1 / sqrt(sigma_i * sigma_j).  The literal form used here
+        # underpredicts a water-dimer hydrogen-bond overlap by roughly six
+        # orders of magnitude.
+        #
+        # That discrepancy is harmless *here* only because the returned S_ij is
+        # multiplied by the learned readout_layer_exch_quotient, which has
+        # absorbed the missing square root into its fitted weights.  Correcting
+        # B_ij in place would silently invalidate every trained AP3 checkpoint,
+        # so the numerics are pinned by a regression test
+        # (tests/test_cliff_classical_exchange.py) instead.  New physics must
+        # call mtp_mtp.atomic_overlap_S_ij, never this method.
         vwA = torch.where(vwA > 0.1, vwA, 0.1)
         vwB = torch.where(vwB > 0.1, vwB, 0.1)
         sigma_A_source = vwA.index_select(0, e_source)
@@ -871,7 +885,16 @@ class APNet3Model:
                 )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset = self.dataset[:ds_max_size]
         elif (
@@ -918,7 +941,16 @@ class APNet3Model:
                 ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
             if ds_max_size:
                 self.dataset[0] = self.dataset[0][:ds_max_size]
                 self.dataset[1] = self.dataset[1][:ds_max_size]
@@ -1900,7 +1932,7 @@ units angstrom
         }
         if world_size > 1:
             print("Running multi-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             configure_distributed_tracking(
                 self,
                 wandb_config,
@@ -1928,7 +1960,7 @@ units angstrom
             )
         else:
             print("Running single-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             run_tracked_single_process(
                 self,
                 lambda: self.single_proc_train(
