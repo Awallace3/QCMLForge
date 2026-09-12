@@ -190,7 +190,6 @@ parsl_run_dir/
 tests/test_data_path/raw/splinter_spec1_0.tar.gz
 tests/test_data_path/processed/dimer_*
 outs/
-run.sh
 data_dir*
 models/ap2_test.pt
 models/ap2_test_r_cut_im.pt
@@ -241,3 +240,8 @@ train_saptdft.py
 tests/dataset_data/ap2_fused_ensemble_test.pt
 
 .github/hooks/workmux-status
+.sweep/
+
+# CLIFF run output: trained checkpoints and W&B run state, not deliverables.
+models/cliff/
+wandb/
