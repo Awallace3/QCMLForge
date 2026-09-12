@@ -33,6 +33,16 @@ MACE_AP3D3_ARCHITECTURES = {
         "feature_mode": "all-scalars+norms",
         "provider_kind": "legacy",
     },
+    "hybrid-h3": {
+        "pair_mode": "h3",
+        "feature_mode": "all-scalars+norms",
+        "provider_kind": "legacy",
+    },
+    "hybrid-h3l1": {
+        "pair_mode": "h3l1",
+        "feature_mode": "all-scalars+norms",
+        "provider_kind": "legacy",
+    },
     "atomhead": {
         "pair_mode": "h1",
         "feature_mode": "all-scalars+norms",
@@ -132,10 +142,14 @@ class MACEAP3D3(torch.nn.Module):
                 f"{expected['feature_mode']}"
             )
         allowed_pair_ids = {architecture}
-        if architecture == "hybrid-h1":
-            allowed_pair_ids.add("MACE-AP3D3-H1")
-        elif architecture == "hybrid-h2":
-            allowed_pair_ids.add("MACE-AP3D3-H2")
+        hybrid_pair_id = {
+            "hybrid-h1": "MACE-AP3D3-H1",
+            "hybrid-h2": "MACE-AP3D3-H2",
+            "hybrid-h3": "MACE-AP3D3-H3",
+            "hybrid-h3l1": "MACE-AP3D3-H3L1",
+        }.get(architecture)
+        if hybrid_pair_id is not None:
+            allowed_pair_ids.add(hybrid_pair_id)
         if getattr(pair_core, "architecture_id", None) not in allowed_pair_ids:
             raise ValueError(
                 f"pair architecture identifier must match {architecture}"

@@ -154,6 +154,57 @@ class PhysicsConfig:
         return _canonical_hash(fields)
 
 
+def _parse_irreps(irreps: str) -> tuple[tuple[int, int, str], ...]:
+    """Parse an e3nn irreps string without importing e3nn.
+
+    ``"512x0e+512x1o"`` becomes ``((512, 0, "e"), (512, 1, "o"))``.  This module
+    is import-light by contract, and the only thing consumers need from an
+    irreps string is the multiplicity/degree layout used to slice a flattened
+    equivariant block.
+    """
+
+    parsed = []
+    for term in irreps.replace(" ", "").split("+"):
+        if not term:
+            raise ValueError(f"malformed irreps string: {irreps!r}")
+        multiplicity, _, rest = term.partition("x")
+        if not rest:
+            multiplicity, rest = "1", multiplicity
+        if not rest[:-1].isdigit() or rest[-1] not in "eo":
+            raise ValueError(f"malformed irrep term {term!r} in {irreps!r}")
+        parsed.append((int(multiplicity), int(rest[:-1]), rest[-1]))
+    return tuple(parsed)
+
+
+def irreps_degree_slice(irreps: str, degree: int) -> tuple[int, int, int]:
+    """Return ``(start, stop, multiplicity)`` of one degree in a flat block.
+
+    The layout is e3nn's irrep-major flattening: each term occupies
+    ``multiplicity * (2 * degree + 1)`` contiguous columns, channel-major within
+    the term, so the caller reshapes ``[..., start:stop]`` to
+    ``(n_atom, multiplicity, 2 * degree + 1)``.  Exactly one term of the
+    requested degree must be present -- a repeated degree would make the
+    reshape ambiguous, which is the kind of silent mis-slice that produces a
+    trainable but physically wrong model.
+    """
+
+    offset = 0
+    found = None
+    for multiplicity, term_degree, _ in _parse_irreps(irreps):
+        width = multiplicity * (2 * term_degree + 1)
+        if term_degree == degree:
+            if found is not None:
+                raise ValueError(
+                    f"irreps {irreps!r} repeats degree l={degree}; the flat "
+                    "layout is ambiguous"
+                )
+            found = (offset, offset + width, multiplicity)
+        offset += width
+    if found is None:
+        raise ValueError(f"irreps {irreps!r} has no l={degree} block")
+    return found
+
+
 @dataclass(frozen=True)
 class MACEAtomicFeatures:
     """Versioned isolated-monomer features returned by a MACE adapter."""
@@ -217,6 +268,49 @@ class MACEAtomicFeatures:
     @property
     def natom(self) -> int:
         return self.invariant.shape[0]
+
+    @property
+    def equivariant_irreps(self) -> str:
+        """Irrep layout of ``equivariant``, read back off ``feature_schema``.
+
+        The encoder appends ``:irreps=<string>`` to the schema whenever it
+        exposes a private equivariant block, so the schema -- which every
+        construction site carries, including the prepared-cache reader that
+        rebuilds these features from bare tensors -- is the single source of
+        truth. Deriving the layout here rather than storing it as a parallel
+        field means a path that forgets to populate it cannot exist.
+        """
+
+        _, separator, irreps = self.feature_schema.partition(":irreps=")
+        if not separator:
+            return ""
+        return irreps
+
+    def equivariant_degree(self, degree: int) -> torch.Tensor:
+        """Return the ``l=degree`` block as ``[n_atom, multiplicity, 2l+1]``.
+
+        Raises when the features carry no equivariant block or no such degree,
+        rather than returning something slice-shaped but meaningless.
+        """
+
+        irreps = self.equivariant_irreps
+        if not irreps:
+            raise ValueError(
+                "features expose no equivariant irrep layout; degree slicing "
+                f"requires an all-scalars+norms schema, got {self.feature_schema!r}"
+            )
+        start, stop, multiplicity = irreps_degree_slice(irreps, degree)
+        if self.equivariant.shape[1] != sum(
+            term_multiplicity * (2 * term_degree + 1)
+            for term_multiplicity, term_degree, _ in _parse_irreps(irreps)
+        ):
+            raise ValueError(
+                f"equivariant width {self.equivariant.shape[1]} does not match "
+                f"irreps {irreps!r}"
+            )
+        return self.equivariant[:, start:stop].reshape(
+            self.natom, multiplicity, 2 * degree + 1
+        )
 
 
 POLAR_DENSITY_L1_CONTRACT = "polar-density-l1-yzx-eangstrom-v1"

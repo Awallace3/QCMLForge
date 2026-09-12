@@ -601,6 +601,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         residual_only=False,
         pair_energy_envelope=False,
         bypass_intra_updates=False,
+        injected_pair_directional=None,
     ):
         ZA = batch.ZA
         RA = batch.RA
@@ -702,6 +703,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             # H2 uses the projected MACE state directly. Repeat it across the
             # established AP3 state slots and reserve zero directional slots so
             # H1 and H2 retain the exact same pair/readout input capacity.
+            # H3 leaves these zeros unused and supplies the directional
+            # contraction per edge instead, via ``injected_pair_directional``.
             hA = hA0.repeat(1, self.n_message + 1)
             hB = hB0.repeat(1, self.n_message + 1)
             directional_width = self.n_message * self.n_embed
@@ -755,11 +758,33 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # hBA = self.get_pair(hB, hA, qB, qA, rbf_sr, e_ABsr_target, e_ABsr_source)
 
         # project the directional atomic hidden states along the interatomic axis
-        hA_dir_source = hA_dir.index_select(0, e_ABsr_source)
-        hB_dir_target = hB_dir.index_select(0, e_ABsr_target)
+        if injected_pair_directional is None:
+            hA_dir_source = hA_dir.index_select(0, e_ABsr_source)
+            hB_dir_target = hB_dir.index_select(0, e_ABsr_target)
 
-        hA_dir_blah = torch.einsum("axf,ax->af", hA_dir_source, dR_sr_unit)
-        hB_dir_blah = torch.einsum("axf,ax->af", hB_dir_target, -dR_sr_unit)
+            hA_dir_blah = torch.einsum("axf,ax->af", hA_dir_source, dR_sr_unit)
+            hB_dir_blah = torch.einsum("axf,ax->af", hB_dir_target, -dR_sr_unit)
+        else:
+            # H3 contracts MACE's equivariant atom features against the
+            # interatomic axis in the caller, which owns the spherical-harmonic
+            # convention. Only the already-contracted per-edge result arrives
+            # here, so this module keeps its l=1 einsum as its sole geometry.
+            if not bypass_intra_updates:
+                raise ValueError(
+                    "injected_pair_directional requires bypass_intra_updates; "
+                    "otherwise the AP3 directional messages are silently discarded"
+                )
+            hA_dir_blah, hB_dir_blah = injected_pair_directional
+            expected_shape = (e_ABsr_source.shape[0], self.n_message * self.n_embed)
+            if (
+                tuple(hA_dir_blah.shape) != expected_shape
+                or tuple(hB_dir_blah.shape) != expected_shape
+            ):
+                raise ValueError(
+                    "injected pair directional features must have shape "
+                    f"{expected_shape}, got {tuple(hA_dir_blah.shape)} and "
+                    f"{tuple(hB_dir_blah.shape)}"
+                )
 
         hAB = torch.cat([hAB, hA_dir_blah, hB_dir_blah], dim=1)
         hBA = torch.cat([hBA, hB_dir_blah, hA_dir_blah], dim=1)
