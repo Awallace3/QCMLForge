@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
 
-from .encoder import _e3nn_o3
 from .schema import AtomicPropertyBundle, MACEAtomicFeatures
-
 
 CANONICAL_AP3D3_DIMENSIONS = {
     "n_message": 3,
@@ -59,6 +58,48 @@ DIRECTIONAL_DEGREES = {"h1": None, "h2": None, "h3": 2, "h3l1": 1}
 # would still train. ``tests/test_mace_h3_pair.py`` asserts this tuple against
 # the MACE function itself so the two cannot drift.
 MACE_E3NN_AXIS_PERMUTATION = (1, 2, 0)
+
+
+def real_spherical_harmonics(degree: int, vectors: torch.Tensor) -> torch.Tensor:
+    """``e3nn.o3.spherical_harmonics(degree, v, True, "component")`` in plain torch.
+
+    e3nn evaluates its harmonics inside a ``@torch.jit.script`` function. That
+    function is process-global mutable state: a TorchScript graph that has only
+    been profiled once can be left in a broken profile by unrelated work
+    elsewhere in the process, after which every later call raises
+    ``RuntimeError: bad optional access`` from a call site that never changed.
+    This route evaluates harmonics on the pair forward path, so a hazard that
+    depends on how many times the graph happened to run before is not one to
+    carry. The l <= 2 polynomials are four lines; spelling them out removes the
+    dependency instead of ordering around it.
+
+    Component ordering, sign convention and the ``sqrt(2l+1)`` component
+    normalization all follow e3nn exactly; ``tests/test_mace_h3_pair.py`` pins
+    the two against each other elementwise so they cannot drift.
+    """
+    unit = torch.nn.functional.normalize(vectors, dim=-1)
+    x = unit[..., 0]
+    y = unit[..., 1]
+    z = unit[..., 2]
+    if degree == 1:
+        # sqrt(3) * [x, y, z]
+        return math.sqrt(3.0) * unit
+    if degree == 2:
+        root3 = math.sqrt(3.0)
+        components = torch.stack(
+            [
+                root3 * x * z,
+                root3 * x * y,
+                y.pow(2) - 0.5 * (x.pow(2) + z.pow(2)),
+                root3 * y * z,
+                0.5 * root3 * (z.pow(2) - x.pow(2)),
+            ],
+            dim=-1,
+        )
+        return math.sqrt(5.0) * components
+    raise ValueError(
+        f"real_spherical_harmonics supports degree 1 and 2, got {degree}"
+    )
 
 
 class MACEPairResidualCore(torch.nn.Module):
@@ -305,17 +346,12 @@ class MACEPairResidualCore(torch.nn.Module):
         # Match MACE's internal frame before evaluating harmonics.
         unit = unit[:, list(MACE_E3NN_AXIS_PERMUTATION)]
 
-        o3 = _e3nn_o3()
-        harmonics_a = o3.spherical_harmonics(
-            degree, unit, normalize=True, normalization="component"
-        )
+        harmonics_a = real_spherical_harmonics(degree, unit)
         # AP3 gives the two monomers opposite axis polarity. At l=1 this
         # reproduces its own +u/-u convention exactly; at even l the harmonic
         # is parity-even, so A and B share the angular factor and only the
         # per-atom channels distinguish them.
-        harmonics_b = o3.spherical_harmonics(
-            degree, -unit, normalize=True, normalization="component"
-        )
+        harmonics_b = real_spherical_harmonics(degree, -unit)
 
         directional_a = torch.einsum(
             "amf,am->af", projected_a.index_select(0, source), harmonics_a

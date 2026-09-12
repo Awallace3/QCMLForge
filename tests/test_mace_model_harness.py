@@ -9,7 +9,12 @@ from apnet_pt.mace.model import (
     MACEAP3D3Model,
     MACEAtomicPropertiesModel,
 )
-from apnet_pt.mace.pair import MACEPairResidualCore
+from apnet_pt.mace.pair import (
+    DIRECTIONAL_DEGREES,
+    MACE_E3NN_AXIS_PERMUTATION,
+    MACEPairResidualCore,
+    real_spherical_harmonics,
+)
 from apnet_pt.mace.schema import (
     AtomicPropertyBundle,
     ClassicalEnergyBundle,
@@ -25,8 +30,19 @@ ROUTES = {
     "direct-polar": ("h1", "all-scalars+norms", "direct"),
     "hybrid-h1": ("h1", "final-layer-scalars", "legacy"),
     "hybrid-h2": ("h2", "all-scalars+norms", "legacy"),
+    "hybrid-h3": ("h3", "all-scalars+norms", "legacy"),
+    "hybrid-h3l1": ("h3l1", "all-scalars+norms", "legacy"),
     "atomhead": ("h1", "all-scalars+norms", "atomhead"),
 }
+
+# A narrow stand-in for PolarMACE's ``512x0e+512x1o+512x2e+512x3o``: the H3
+# routes only need *an* l=1 and l=2 block to slice, and four channels keep the
+# stub cheap.  Which routes need it is read off ``DIRECTIONAL_DEGREES`` rather
+# than listed here, so a future degree variant cannot reach this harness with a
+# zero-width equivariant block and fail somewhere less obvious.
+STUB_IRREPS = "4x0e+4x1o+4x2e"
+STUB_EQUIVARIANT_CHANNELS = 4
+STUB_EQUIVARIANT_WIDTH = 4 * (1 + 3 + 5)
 
 
 def _augment_batch(batch):
@@ -55,24 +71,80 @@ def _feature_values(numbers, supplied=None):
 
 
 class StubFeaturizer(torch.nn.Module):
-    def __init__(self, feature_mode):
+    def __init__(self, feature_mode, equivariant_irreps=""):
         super().__init__()
         self.feature_mode = feature_mode
+        self.equivariant_irreps = equivariant_irreps
         self.backbone = torch.nn.Linear(1, 1, bias=False)
 
-    def _features(self, numbers, batch, charge, spin, supplied=None):
+    def _equivariant(self, numbers, invariant, positions, molecule_ind):
+        """Build a block that actually rotates with the geometry.
+
+        Real MACE equivariants are covariant under rotation, and the H3 routes
+        contract them against the interatomic axis.  A block built from atomic
+        numbers alone would sit still while the coordinates turned, so the
+        harness's rotation check would fail for a reason that has nothing to do
+        with the route under test.  Each atom's offset from its own monomer
+        centroid is rotation-covariant, translation-invariant, and permutation-
+        equivariant, which is everything that check exercises.  It is expressed
+        in MACE's own axis order because that is the frame
+        ``MACEPairResidualCore`` contracts in.
+        """
+
+        if not self.equivariant_irreps:
+            return invariant.new_zeros((numbers.numel(), 0))
+        ndimer = int(molecule_ind.max().item()) + 1
+        ones = positions.new_ones(positions.shape[0])
+        counts = positions.new_zeros(ndimer).index_add_(0, molecule_ind, ones)
+        totals = positions.new_zeros((ndimer, 3)).index_add_(
+            0, molecule_ind, positions
+        )
+        offset = positions - (totals / counts.unsqueeze(1)).index_select(
+            0, molecule_ind
+        )
+        offset = offset[:, list(MACE_E3NN_AXIS_PERMUTATION)]
+        # Guard the centroid-coincident case explicitly; e3nn's own
+        # normalization would hand back NaN and the failure would surface as an
+        # unrelated assertion.
+        offset = offset / offset.norm(dim=1, keepdim=True).clamp_min(1.0e-6)
+
+        z = numbers.float().reshape(-1, 1)
+        channels = torch.arange(
+            1, STUB_EQUIVARIANT_CHANNELS + 1, device=z.device
+        ).reshape(1, -1)
+        scale = torch.sin(z * channels * 0.31).to(positions)
+        blocks = []
+        for degree in (0, 1, 2):
+            if degree == 0:
+                harmonic = offset.new_ones((numbers.numel(), 1))
+            else:
+                harmonic = real_spherical_harmonics(degree, offset)
+            blocks.append(
+                (scale.unsqueeze(2) * harmonic.unsqueeze(1)).reshape(
+                    numbers.numel(), STUB_EQUIVARIANT_CHANNELS * (2 * degree + 1)
+                )
+            )
+        return torch.cat(blocks, dim=1)
+
+    def _features(
+        self, numbers, batch, charge, spin, positions, supplied=None
+    ):
         invariant = _feature_values(numbers, supplied)
+        equivariant = self._equivariant(numbers, invariant, positions, batch)
+        schema = (
+            f"stub:mace=0.3.16:mode={self.feature_mode}:adapter=stub:"
+            f"inv=16:equiv={equivariant.shape[1]}:layers=4"
+        )
+        if self.equivariant_irreps:
+            schema = f"{schema}:irreps={self.equivariant_irreps}"
         return MACEAtomicFeatures(
             invariant=invariant,
-            equivariant=invariant.new_zeros((numbers.numel(), 0)),
+            equivariant=equivariant,
             batch=batch,
             atomic_numbers=numbers,
             total_charge=charge.to(invariant),
             total_spin=spin.to(invariant),
-            feature_schema=(
-                f"stub:mace=0.3.16:mode={self.feature_mode}:adapter=stub:"
-                "inv=16:equiv=0:layers=4"
-            ),
+            feature_schema=schema,
         )
 
     @staticmethod
@@ -94,6 +166,7 @@ class StubFeaturizer(torch.nn.Module):
             batch.molecule_ind_A,
             batch.total_charge_A,
             batch.total_spin_A,
+            batch.RA,
             getattr(batch, "stub_invariant_A", None),
         )
         features_b = self._features(
@@ -101,6 +174,7 @@ class StubFeaturizer(torch.nn.Module):
             batch.molecule_ind_B,
             batch.total_charge_B,
             batch.total_spin_B,
+            batch.RB,
             getattr(batch, "stub_invariant_B", None),
         )
         return (
@@ -115,7 +189,9 @@ class StubFeaturizer(torch.nn.Module):
     ):
         if batch is None:
             batch = torch.zeros(numbers.numel(), dtype=torch.long)
-        features = self._features(numbers, batch, total_charge, total_spin)
+        features = self._features(
+            numbers, batch, total_charge, total_spin, positions
+        )
         return features, self._direct(features, positions)
 
 
@@ -189,7 +265,11 @@ class StubLongRangeProvider(torch.nn.Module):
 
 def _make_model(route, *, no_disp=False):
     pair_mode, feature_mode, provider_kind = ROUTES[route]
-    featurizer = StubFeaturizer(feature_mode)
+    directional_degree = DIRECTIONAL_DEGREES[pair_mode]
+    featurizer = StubFeaturizer(
+        feature_mode,
+        equivariant_irreps=STUB_IRREPS if directional_degree is not None else "",
+    )
     provider = StubPropertyProvider(provider_kind)
     ap3 = APNet3D3_AtomType_MPNN(
         dimer_prop_model=None,
@@ -199,6 +279,8 @@ def _make_model(route, *, no_disp=False):
     pair_kwargs = {}
     if route in {"direct-polar", "atomhead"}:
         pair_kwargs["architecture_id"] = route
+    if directional_degree is not None:
+        pair_kwargs["mace_equivariant_dim"] = STUB_EQUIVARIANT_CHANNELS
     pair_core = MACEPairResidualCore(
         ap3,
         mace_feature_dim=16,

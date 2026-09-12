@@ -44,6 +44,16 @@ CANONICAL = {
         "pair_mode": "h2",
         "feature_mode": "all-scalars+norms",
     },
+    "MACE-AP3D3-H3": {
+        "properties": "legacy",
+        "pair_mode": "h3",
+        "feature_mode": "all-scalars+norms",
+    },
+    "MACE-AP3D3-H3L1": {
+        "properties": "legacy",
+        "pair_mode": "h3l1",
+        "feature_mode": "all-scalars+norms",
+    },
     "MACE-AP3D3-AtomHead": {
         "properties": "atomhead",
         "pair_mode": "h1",
@@ -93,7 +103,10 @@ def _base_cli(tmp_path, option="MACE-AP3D3-H1"):
         "16",
         "--skip_compile",
     ]
-    if option in {"MACE-AP3D3-H1", "MACE-AP3D3-H2"}:
+    # Derived from the registry, not listed: the legacy-property routes are the
+    # ones that take the three AP3 checkpoints, and a new one of those must not
+    # silently fall through to the atom-head branch.
+    if CANONICAL[option]["properties"] == "legacy":
         argv += [
             "--am_model_path",
             paths["am"],
@@ -332,7 +345,7 @@ def test_resume_is_rejected_before_dataset_or_model_build(tmp_path):
     assert calls == []
 
 
-def test_factory_builds_all_four_injected_harnesses(tmp_path):
+def test_factory_builds_every_registered_injected_harness(tmp_path):
     for option in CANONICAL:
         args, _ = _base_cli(tmp_path / option.replace("-", "_"), option)
         args.include_total_mse = option == "MACE-AP3D3-H1"

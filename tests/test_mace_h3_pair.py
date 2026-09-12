@@ -13,6 +13,11 @@ perfectly well, so both halves are asserted here: the frame constant against
 MACE itself, and the contraction algebra against an explicit Wigner rotation.
 """
 
+import os
+import pathlib
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -23,6 +28,7 @@ from apnet_pt.mace.pair import (
     DIRECTIONAL_DEGREES,
     MACE_E3NN_AXIS_PERMUTATION,
     MACEPairResidualCore,
+    real_spherical_harmonics,
 )
 from apnet_pt.mace.schema import MACEAtomicFeatures
 from tests.test_mace_h1_pair import _batch, _properties
@@ -264,3 +270,75 @@ def test_injected_directional_requires_the_bypass():
             residual_only=True,
             injected_pair_directional=(stub, stub),
         )
+
+
+# e3nn's harmonics are evaluated by a process-global ``@torch.jit.script``
+# graph, and a graph that has run exactly once before unrelated code elsewhere
+# in the process compiles a model is left unusable: every later call raises
+# ``RuntimeError: bad optional access``. That is precisely why the production
+# path no longer calls e3nn -- so the test that pins the replacement against
+# e3nn cannot call it in-process either. A child interpreter gives a clean JIT
+# state, and asserting against a stale saved table would pin nothing.
+_E3NN_REFERENCE_SOURCE = """
+import sys
+import torch
+from apnet_pt.mace.encoder import _e3nn_o3
+
+o3 = _e3nn_o3()
+generator = torch.Generator().manual_seed(20260912)
+vectors = torch.randn(64, 3, generator=generator, dtype=torch.float64)
+# Cover far-from-unit inputs in both directions: both sides normalize first.
+vectors[:8] *= 7.5
+vectors[8:16] *= 0.02
+payload = {"vectors": vectors}
+for degree in (1, 2):
+    payload[degree] = o3.spherical_harmonics(
+        degree, vectors, normalize=True, normalization="component"
+    )
+torch.save(payload, sys.argv[1])
+"""
+
+
+@pytest.fixture(scope="module")
+def e3nn_reference_harmonics(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("e3nn-reference")
+    script = directory / "reference.py"
+    script.write_text(_E3NN_REFERENCE_SOURCE)
+    payload = directory / "harmonics.pt"
+
+    environment = dict(os.environ)
+    environment["PYTHONNOUSERSITE"] = "1"
+    completed = subprocess.run(
+        [sys.executable, str(script), str(payload)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+        env=environment,
+        cwd=str(pathlib.Path(__file__).resolve().parent.parent),
+    )
+    assert completed.returncode == 0, (
+        f"e3nn reference subprocess failed:\n{completed.stdout}\n{completed.stderr}"
+    )
+    return torch.load(payload, weights_only=False)
+
+
+@pytest.mark.parametrize("degree", [1, 2])
+def test_real_spherical_harmonics_matches_e3nn(degree, e3nn_reference_harmonics):
+    """Pin the hand-written harmonics against the library they replace.
+
+    Component ordering, sign convention and the ``sqrt(2l+1)`` component
+    normalization are all asserted elementwise rather than assumed, so the
+    replacement cannot drift from e3nn silently.
+    """
+    vectors = e3nn_reference_harmonics["vectors"]
+    expected = e3nn_reference_harmonics[degree]
+    actual = real_spherical_harmonics(degree, vectors)
+
+    assert actual.shape == (64, 2 * degree + 1)
+    assert torch.allclose(actual, expected, atol=1.0e-12, rtol=0.0)
+
+
+def test_real_spherical_harmonics_rejects_unsupported_degrees():
+    with pytest.raises(ValueError, match="degree 1 and 2"):
+        real_spherical_harmonics(3, torch.randn(4, 3))

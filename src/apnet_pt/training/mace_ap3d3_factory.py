@@ -402,7 +402,10 @@ def _make_plan(args: Any, *, emit_warning: bool) -> MACETrainingPlan:
     mace_path, mace_digest = _resolve_mace_artifact(args)
     if resolved.properties == "legacy":
         if args.mace_atom_model_path:
-            raise ValueError("H1/H2 rejects mace_atom_model_path")
+            raise ValueError(
+                f"{resolved.public_name} uses the frozen legacy property provider "
+                "and rejects mace_atom_model_path"
+            )
     elif args.train_apnet and not args.mace_atom_model_path and not args.train_atomic_heads:
         raise ValueError(
             "DirectPolar/AtomHead requires mace_atom_model_path unless training heads"
