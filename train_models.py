@@ -14,6 +14,16 @@ import numpy as np
 import torch
 
 
+RACKERS_MODEL_TYPES = {
+    "RackersTholeDampingModel",
+    "RackersTholeDampingOverlapModel",
+}
+RACKERS_PARAM_START_MEAN = [1.8, 0.34, 0.39, 1.8]
+RACKERS_PARAM_START_STD = [0.01, 0.01, 0.01, 0.01]
+LEGACY_PAIRWISE_PRETRAINED_MODEL_PATH = "./models/dapnet2/ap2_0.pt"
+_PAIRWISE_PRETRAINED_MODEL_PATH_UNSET = object()
+
+
 def maybe_skip_training_after_dataset_setup(model_name, dataset, build_dataset_only):
     """Print dataset info and optionally stop after dataset construction."""
     print(dataset)
@@ -258,9 +268,9 @@ def train_pairwise_model(
     n_params=2,
     m1="",
     m2="",
-    pre_trained_model_path="./models/dapnet2/ap2_0.pt",
-    param_start_mean=1.5,
-    param_start_std=0.1,
+    pre_trained_model_path=_PAIRWISE_PRETRAINED_MODEL_PATH_UNSET,
+    param_start_mean=None,
+    param_start_std=None,
     dimer_eval_type="elst_damping",
     elst_damping_type="CLIFF",
     ds_in_memory=False,
@@ -281,6 +291,7 @@ def train_pairwise_model(
     adam_eps=1e-8,
     checkpoint_metric="component_mse",
     wandb_config=None,
+    omp_num_threads=8,
 ):
     # Ensure param_start_mean and param_start_std are lists
     """
@@ -309,9 +320,9 @@ def train_pairwise_model(
         n_params (int): Number of per-dimer parameters when training parametric dimer models.
         m1 (str): Optional molecular identifier or filter passed into dataset creation (used by some variants).
         m2 (str): Optional second molecular identifier or filter passed into dataset creation.
-        pre_trained_model_path (str or None): External APNet pretrained checkpoint to initialize from.
-        param_start_mean (float or list[float]): Initial mean(s) for parametric dimer parameters; broadcast to length n_params if scalar.
-        param_start_std (float or list[float]): Initial stddev(s) for parametric dimer parameters; broadcast to length n_params if scalar.
+        pre_trained_model_path (str or None): External APNet pretrained checkpoint to initialize from. When omitted, Rackers routes start without an outer checkpoint while legacy routes retain the historical dAPNet checkpoint default.
+        param_start_mean (float or list[float] or None): Initial parameter means. Rackers routes require exactly four values and use their physical defaults when unset; other routes use 1.5 when unset and broadcast scalars to n_params.
+        param_start_std (float or list[float] or None): Initial parameter standard deviations. Rackers routes require exactly four values and use their physical defaults when unset; other routes use 0.1 when unset and broadcast scalars to n_params.
         dimer_eval_type (str): Evaluation mode for dimer models (e.g., "elst_damping", "elst_damping__induced_dipole").
         elst_damping_type (str): Electrostatic damping variant for dimer prop models (e.g., "CLIFF", "AMOEBA").
         ds_in_memory (bool): Whether datasets should be loaded entirely into memory for applicable model types.
@@ -322,12 +333,48 @@ def train_pairwise_model(
         no_disp_nn (bool): Skip the dispersion readout when training APNet3-fused-d3 and compute D3 at predict time instead.
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
         include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms.
+        omp_num_threads (int): Number of OpenMP threads assigned to each training process.
 
     """
-    if not isinstance(param_start_mean, (list, tuple)):
-        param_start_mean = [param_start_mean] * n_params
-    if not isinstance(param_start_std, (list, tuple)):
-        param_start_std = [param_start_std] * n_params
+    is_rackers_model = apnet_model_type in RACKERS_MODEL_TYPES
+    if pre_trained_model_path is _PAIRWISE_PRETRAINED_MODEL_PATH_UNSET:
+        if is_rackers_model:
+            pre_trained_model_path = None
+        else:
+            pre_trained_model_path = LEGACY_PAIRWISE_PRETRAINED_MODEL_PATH
+    if is_rackers_model:
+        if param_start_mean is None:
+            param_start_mean = list(RACKERS_PARAM_START_MEAN)
+        elif not isinstance(param_start_mean, (list, tuple)) or len(
+            param_start_mean
+        ) != 4:
+            raise ValueError("param_start_mean must contain exactly four values")
+        else:
+            param_start_mean = list(param_start_mean)
+        if param_start_std is None:
+            param_start_std = list(RACKERS_PARAM_START_STD)
+        elif not isinstance(param_start_std, (list, tuple)) or len(
+            param_start_std
+        ) != 4:
+            raise ValueError("param_start_std must contain exactly four values")
+        else:
+            param_start_std = list(param_start_std)
+        param_start_mean, param_start_std, _, _ = (
+            AtomPairwiseModels.mtp_mtp._validate_rackers_initialization(
+                param_start_mean,
+                param_start_std,
+                AtomPairwiseModels.mtp_mtp.RACKERS_POSITIVITY_EPSILON,
+            )
+        )
+    else:
+        if param_start_mean is None:
+            param_start_mean = 1.5
+        if param_start_std is None:
+            param_start_std = 0.1
+        if not isinstance(param_start_mean, (list, tuple)):
+            param_start_mean = [param_start_mean] * n_params
+        if not isinstance(param_start_std, (list, tuple)):
+            param_start_std = [param_start_std] * n_params
     ds_atomic_batch_size = 4 * 256
     ds_datapoint_storage_n_objects = 16
     ds_batch_size = 16
@@ -382,6 +429,10 @@ def train_pairwise_model(
         apnet2_model.model.return_hidden_states = True
     elif apnet_model_type == "AtomTypeParamModel":
         APNet = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel
+    elif apnet_model_type == "RackersTholeDampingModel":
+        APNet = AtomPairwiseModels.mtp_mtp.RackersTholeDampingModel
+    elif apnet_model_type == "RackersTholeDampingOverlapModel":
+        APNet = AtomPairwiseModels.mtp_mtp.RackersTholeDampingOverlapModel
     else:
         raise ValueError("Invalid Atom Model Type")
     normalized_type = apnet_model_type.lower()
@@ -394,13 +445,15 @@ def train_pairwise_model(
     if end_lr is not None and not supports_end_lr:
         raise ValueError("end_lr is currently only supported for APNetD3 training")
     print("Training {}...".format(apnet_model_type))
-    if torch.cuda.is_available():
+    if is_rackers_model:
+        world_size = 1
+    elif torch.cuda.is_available():
         world_size = torch.cuda.device_count()
     else:
         world_size = 1
     print("World Size", world_size)
 
-    omp_num_threads_per_process = 8
+    omp_num_threads_per_process = omp_num_threads
     if os.path.exists(model_out) and pre_trained_model_path is None:
         pretrained_model = model_out
         print(f"\nTraining from {model_out}\n")
@@ -410,7 +463,50 @@ def train_pairwise_model(
     else:
         pretrained_model = None
         print("\nTraining from scratch...\n")
-    if apnet_model_type.startswith("dAPNet"):
+    if (
+        is_rackers_model
+        and freeze_atom_model
+        and atom_type_param_model_path is None
+        and pretrained_model is None
+        and not build_dataset_only
+    ):
+        raise ValueError(
+            "Frozen fresh Rackers training requires "
+            "atom_type_param_model_path; pass --unfreeze_atom_model to "
+            "train the nested model from scratch"
+        )
+    if is_rackers_model:
+        atom_type_hf_vw_model = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+            ds_root=None,
+            use_GPU=False,
+            ignore_database_null=True,
+            atom_model_pre_trained_path=am_model_path,
+            pre_trained_model_path=atom_type_param_model_path,
+            freeze_atom_model=freeze_atom_model,
+        )
+        apnet = APNet(
+            atom_model=atom_type_hf_vw_model.model,
+            pre_trained_model_path=pretrained_model,
+            n_rbf=n_rbf,
+            n_neuron=n_neuron,
+            n_embed=n_embed,
+            r_cut=r_cut,
+            ds_spec_type=spec_type,
+            ds_root=data_dir,
+            ignore_database_null=False,
+            ds_atomic_batch_size=ds_atomic_batch_size,
+            ds_num_devices=1,
+            ds_skip_process=False,
+            ds_datapoint_storage_n_objects=ds_datapoint_storage_n_objects,
+            ds_prebatched=False,
+            ds_random_seed=random_seed,
+            ds_in_memory=ds_in_memory,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
+            elst_damping_type=elst_damping_type,
+            freeze_atom_model=freeze_atom_model,
+        )
+    elif apnet_model_type.startswith("dAPNet"):
         apnet = APNet(
             apnet2_model=apnet2_model,
             atom_model_pre_trained_path=am_model_path,
@@ -828,7 +924,12 @@ def main():
         "--train_apnet",
         type=str,
         default="",
-        help="Train APNet Model: (APNet2, APNet3-fused, APNet3-fused-variant, APNet3-fused-d3, dAPNet2, APNet2-fused, AM-DimerParam)",
+        help=(
+            "Train APNet model, including RackersTholeDampingModel or "
+            "RackersTholeDampingOverlapModel (plus legacy APNet2, "
+            "APNet3-fused variants, dAPNet2, APNet2-fused, and "
+            "AM-DimerParam routes)."
+        ),
     )
     args.add_argument(
         "--dimer_eval_type",
@@ -1010,14 +1111,22 @@ def main():
     args.add_argument(
         "--param_start_mean",
         type=str,
-        default="2.0",
-        help="specify AM-DimerParam Embedding Start Mean (default: 2.0, or comma-separated list)",
+        default=None,
+        help=(
+            "Parameter initialization mean. Unset uses 2.0 for legacy CLI "
+            "routes or [1.8, 0.34, 0.39, 1.8] for Rackers routes; custom "
+            "Rackers values must contain exactly four comma-separated values."
+        ),
     )
     args.add_argument(
         "--param_start_std",
         type=str,
-        default="0.1",
-        help="specify AM-DimerParam Embedding Start std (default: 0.1, or comma-separated list)",
+        default=None,
+        help=(
+            "Parameter initialization std. Unset uses 0.1 for legacy CLI "
+            "routes or [0.01, 0.01, 0.01, 0.01] for Rackers routes; custom "
+            "Rackers values must contain exactly four comma-separated values."
+        ),
     )
     args.add_argument(
         "--world_size_ddp",
@@ -1044,8 +1153,11 @@ def main():
     args.add_argument(
         "--omp_num_threads",
         type=int,
-        default=1,
-        help="specify omp_num_threads for DDP only for AtomModels currently (default: 1)",
+        default=None,
+        help=(
+            "OpenMP threads per training process "
+            "(default: 1 for atom models, 8 for pairwise models)"
+        ),
     )
     args.add_argument(
         "--ds_in_memory",
@@ -1106,7 +1218,11 @@ def main():
         "--unfreeze_atom_model",
         action="store_true",
         default=False,
-        help="APNet3-fused/APNet3-fused-d3: unfreeze the atom-type submodel feeding DimerProp during training (default: frozen).",
+        help=(
+            "Unfreeze the nested atom-type model for APNet3-fused variants, "
+            "RackersTholeDampingModel, or "
+            "RackersTholeDampingOverlapModel (default: frozen)."
+        ),
     )
     args.add_argument(
         "--build_dataset_only",
@@ -1136,9 +1252,11 @@ def main():
         help="JSON object merged into the W&B run config for provenance",
     )
     args = args.parse_args()
-    # Parse param_start_mean and param_start_std
-    args.param_start_mean = parse_param_list(args.param_start_mean)
-    args.param_start_std = parse_param_list(args.param_start_std)
+    # Parse only explicitly supplied parameter initialization values.
+    if args.param_start_mean is not None:
+        args.param_start_mean = parse_param_list(args.param_start_mean)
+    if args.param_start_std is not None:
+        args.param_start_std = parse_param_list(args.param_start_std)
     pprint(args)
     set_all_seeds(args.random_seed, deterministic=args.deterministic)
     atom_wandb_config, pairwise_wandb_config = build_wandb_run_configs(args)
@@ -1154,7 +1272,11 @@ def main():
             random_seed=args.random_seed,
             ds_max_size=args.ds_max_size,
             world_size=args.world_size_ddp,
-            omp_num_threads=args.omp_num_threads,
+            omp_num_threads=(
+                args.omp_num_threads
+                if args.omp_num_threads is not None
+                else 1
+            ),
             lr=args.lr,
             n_message=args.n_message_atom,
             n_rbf=args.n_rbf_atom,
@@ -1168,6 +1290,13 @@ def main():
             wandb_config=atom_wandb_config,
         )
     if args.train_apnet != "":
+        param_start_mean = args.param_start_mean
+        param_start_std = args.param_start_std
+        if args.train_apnet not in RACKERS_MODEL_TYPES:
+            if param_start_mean is None:
+                param_start_mean = 2.0
+            if param_start_std is None:
+                param_start_std = 0.1
         train_pairwise_model(
             apnet_model_type=args.train_apnet,
             model_out=args.ap_model_path,
@@ -1191,8 +1320,8 @@ def main():
             m1=args.m1,
             m2=args.m2,
             pre_trained_model_path=args.ap_pretrained_model_path,
-            param_start_mean=args.param_start_mean,
-            param_start_std=args.param_start_std,
+            param_start_mean=param_start_mean,
+            param_start_std=param_start_std,
             dimer_eval_type=args.dimer_eval_type,
             elst_damping_type=args.elst_damping_type,
             ds_in_memory=args.ds_in_memory,
@@ -1213,6 +1342,11 @@ def main():
             adam_eps=args.adam_eps,
             checkpoint_metric=args.checkpoint_metric,
             wandb_config=pairwise_wandb_config,
+            omp_num_threads=(
+                args.omp_num_threads
+                if args.omp_num_threads is not None
+                else 8
+            ),
         )
     return
 

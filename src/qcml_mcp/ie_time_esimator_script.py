@@ -11,19 +11,22 @@ from importlib import resources
 from pprint import pprint as pp
 
 
-def load_coeffs(
-    restricted: bool
-    ) -> pd.DataFrame:
+def load_coeffs() -> pd.DataFrame:
+    """
+    Load the packaged restricted-reference timing-fit coefficients.
 
-    un = "" if restricted else "un"
+    UHF (unrestricted) references are not supported, so only the restricted
+    fit is shipped. The returned frame is indexed by method and carries a
+    ``fit_label`` column that splits fits into "Augmented", "Non-augmented",
+    and "All data" basis-set families.
+    """
     ref_path = resources.files("qcml_mcp.data").joinpath(
-        f"polynomial_coefficients.pkl"
+        "time_fit_inference_df_restricted.pkl"
     )
     with ref_path.open("rb") as handle:
         return pd.read_pickle(handle).set_index("method")
 
 
-# _res_coeffs: pd.DataFrame = load_coeffs(1)
 print("Warning, I have removed UHF functionality for now")
 _coeffs: pd.DataFrame | None = None
 
@@ -88,18 +91,22 @@ def parse_geoms(
 
                 try:
                     mol_qcel = qcel.models.Molecule.from_data(raw_geom_str)
-
                 except Exception as e:
                     print(f"Error converting raw string to qcelemental.models.Molecule: \n {e}")
                     continue
 
-                id.append(file.strip().split(".")[0])
-                n_atoms.append(len(mol_qcel.atomic_numbers))
-
-
+                # Keep invalid entries isolated so one bad file does not abort
+                # the rest of the directory.
                 fragments = mol_qcel.fragments
                 if len(fragments) != 2:
-                    raise ValueError("input geometry must be a dimer")
+                    print(
+                        f"Error processing file at {filepath}: \n "
+                        f"input geometry must be a dimer (found {len(fragments)} fragments)"
+                    )
+                    continue
+
+                id.append(file.strip().split(".")[0])
+                n_atoms.append(len(mol_qcel.atomic_numbers))
 
                 qcel_dimer.append(mol_qcel)
                 if cp:
@@ -144,23 +151,31 @@ def compute_psi4_time_estimation_variables(
         "dft_pruning_scheme": "robust",
     })
 
-    wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
-    bs = wfn.basisset()
-    grid = psi4.core.DFTGrid.build(mol, bs)
-    print("compute vars: built wfn & grid")
+    try:
+        wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
+        bs = wfn.basisset()
+        grid = psi4.core.DFTGrid.build(mol, bs)
+        print("compute vars: built wfn & grid")
+    except Exception as e:
+        print(f"Error when building grid or wavefunction: \n {e}")
+        return np.array([np.nan] * 4)
 
     n_occupied = math.ceil((wfn.nalpha() + wfn.nbeta()) / 2)
     n_virtual = bs.nbf() - n_occupied
     np_total = grid.npoints()
 
-    aux_basis = psi4.core.BasisSet.build(
-        wfn.molecule(),
-        "DF_BASIS_SCF",
-        psi4.core.get_option("SCF", "DF_BASIS_SCF"),
-        "JKFIT",
-        psi4.core.get_global_option("BASIS"),
-    )
-    print("compute vars: built aux basis")
+    try:
+        aux_basis = psi4.core.BasisSet.build(
+            wfn.molecule(),
+            "DF_BASIS_SCF",
+            psi4.core.get_option("SCF", "DF_BASIS_SCF"),
+            "JKFIT",
+            psi4.core.get_global_option("BASIS"),
+        )
+        print("compute vars: built aux basis")
+    except Exception as e:
+        print(f"Error when building the auxillary basis: \n {e}")
+        return np.array([np.nan] * 4)
 
     nbf_aux = aux_basis.nbf()
     psi4.core.clean()
@@ -185,7 +200,7 @@ def build_inference_table(
     cp_str = "/unCP"
 
     if cp:
-        # print("Warning: using un-counterpoise corrected models for counterpoise corrected timing predictions")
+        print("Warning: using un-counterpoise corrected models for counterpoise corrected timing predictions")
         cp_str = "/CP"
 
     lotr_strings = [m + "/" + b + cp_str for b in bases for m in methods] # pretty sure everything I ran was not CP-corrected
@@ -295,9 +310,7 @@ def predict_timing(
 
     global _coeffs
     if _coeffs is None:
-        _coeffs = load_coeffs(0)
-        # print(_coeffs.columns)
-        # print(_coeffs.index.name)
+        _coeffs = load_coeffs()
 
     fit_label = "Augmented" if "aug" in basis else "Non-augmented"
     mask = (_coeffs.index == method) & (_coeffs["fit_label"] == fit_label)
@@ -400,11 +413,13 @@ def main(
 
     df2 = build_inference_table(df1, methods, bases, using_cp)
 
+
     predict_ie_errors_batch(df2)
     predict_timings_batch(df2)
     pd.set_option("display.max_rows", None)
     pd.set_option("display.max_columns", None)
     pp(df2)
+    # pp(df2.iloc[80:99])
 
     return df2
 

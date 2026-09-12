@@ -39,6 +39,13 @@ class MockDDPWrapper:
         self.module = model
 
 
+class MockCompileWrapper:
+    """Mock torch.compile wrapper for recursive unwrapping tests."""
+
+    def __init__(self, model):
+        self._orig_mod = model
+
+
 class PrefixedModel(SimpleModel):
     """Model whose state dict mimics torch.compile prefixing."""
 
@@ -285,6 +292,34 @@ no_reorient
 def test_unwrap_model_handles_ddp_wrapper(simple_model):
     wrapped = MockDDPWrapper(simple_model)
     assert model_io.unwrap_model(wrapped) is simple_model
+
+
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        lambda model: MockCompileWrapper(MockDDPWrapper(model)),
+        lambda model: MockDDPWrapper(MockCompileWrapper(model)),
+    ],
+)
+def test_unwrap_model_recursively_handles_compile_and_ddp(
+    simple_model, wrapped
+):
+    assert model_io.unwrap_model(wrapped(simple_model)) is simple_model
+
+
+def test_create_checkpoint_unwraps_actual_compiled_model(simple_model):
+    compiled = torch.compile(simple_model, backend="eager")
+    checkpoint = model_io.create_checkpoint(
+        model=compiled,
+        config=model_io.unwrap_model(compiled).get_config(),
+        model_type=type(model_io.unwrap_model(compiled)).__name__,
+    )
+
+    assert checkpoint["model_type"] == "SimpleModel"
+    assert all(
+        not key.startswith("_orig_mod.")
+        for key in checkpoint["model_state_dict"]
+    )
 
 
 def test_strip_prefix_from_state_dict_handles_mixed_keys():
