@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en" data-theme="luxury">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MASTIFF · S66×8 local-frame explorer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/3dmol@2.5.3/build/3Dmol-min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+<style>
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:#101015;color:#efeee9;font:14px system-ui,sans-serif}
+header{padding:20px 25px;border-bottom:1px solid #37333c}h1{font-size:26px;font-weight:650;letter-spacing:-.7px}
+.eyebrow{font-size:11px;letter-spacing:2px;color:#cbb18b;text-transform:uppercase}
+.workspace{display:grid;grid-template-columns:260px minmax(0,1fr);min-height:760px}
+aside{padding:18px;border-right:1px solid #37333c;min-width:0}
+main{min-width:0;padding:18px}.toolbar{display:flex;gap:15px;flex-wrap:wrap;align-items:end;margin-bottom:12px}
+label.control{display:grid;gap:6px;font-size:12px;color:#cfccd6}
+.select,.input{max-width:100%}.dimers{max-height:660px;overflow:auto;margin-top:12px}
+.dimer{display:block;width:100%;text-align:left;padding:10px 8px;background:none;border:0;border-left:3px solid transparent;color:inherit;cursor:pointer;font-size:13px}
+.dimer:hover,.dimer[aria-current=true]{background:#28242c;border-left-color:#d2b48c}
+.dimer small{display:block;color:#ada4b5;margin-left:27px;font-size:10px}
+#stage{position:relative;height:clamp(390px,56vh,580px);background:#f5f3ef;border-radius:12px;overflow:hidden}
+#viewer{position:absolute;inset:0}.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12px;margin:12px 0}
+.swatch{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
+.subtle{color:#b7b2bf;font-size:12px;line-height:1.65}
+#atoms{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0;max-height:130px;overflow:auto}
+.atom{border:1px solid #65606b;border-radius:6px;padding:5px 8px;background:#24212a;color:#eee;cursor:pointer}
+.atom[aria-pressed=true]{background:#56422b;border-color:#e8be79}
+#selection{min-height:26px}details{border-top:1px solid #37333c;padding-top:12px;margin-top:12px}
+summary{cursor:pointer;color:#dbc4a4}code{font-size:12px;color:#e5cba5}
+.selection-status{margin-top:8px;font-size:12px;color:#d5c7ae;min-height:18px}
+#error{padding:16px;color:#ffb6ac;background:#462321;white-space:pre-wrap}
+.model-controls{padding:14px;border:1px solid #63513e;border-radius:10px;margin-bottom:16px}
+.inspector-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px;margin:16px 0}
+.pair-stage{height:350px;position:relative;background:#f5f3ef;border-radius:10px;overflow:hidden}
+#pairViewer{position:absolute;inset:0}.plot{min-width:0}.plot svg{width:100%;height:auto}
+.equation-card{padding:16px;background:#211d26;border:1px solid #4c414f;border-radius:10px;margin:12px 0}
+.equation{overflow-x:auto;padding:8px 0;font-size:14px}.table-wrap{overflow:auto;max-height:370px}
+.norm{width:80px;display:inline-block;vertical-align:middle}.model-note{padding:10px 12px;border-left:3px solid #d1ae7e;background:#26212a;margin:12px 0;font-size:12px;line-height:1.6}
+@media(max-width:1000px){.inspector-grid{grid-template-columns:1fr}}
+@media(max-width:760px){.workspace{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #37333c}.dimers{max-height:165px}#stage{height:460px}header,main{padding:14px}h1{font-size:23px}}
+</style>
+</head>
+<body>
+<header>
+<div class="eyebrow">MASTIFF / geometry laboratory</div>
+<h1>S66×8 local-frame explorer</h1>
+<p class="subtle">66 dimers · 8 separations · real spherical harmonics in atom-centered molecular frames</p>
+</header>
+<div id="error" role="alert" hidden></div>
+<div class="workspace">
+<aside aria-label="Dimer selection">
+<label class="control" for="search">Find a dimer<input class="input input-sm" id="search" type="search" placeholder="Water, benzene, 26…"></label>
+<p id="count" class="subtle"></p>
+<nav id="dimers" class="dimers" aria-label="S66 dimers"></nav>
+</aside>
+<main>
+<section id="modelControls" class="model-controls" hidden>
+<div class="eyebrow">Learned model · authoritative experiment frames</div>
+<div class="toolbar">
+<label class="control" for="modelPrimary">Model 1<select id="modelPrimary" class="select select-sm"></select></label>
+<label class="control" for="modelCompare">Model 2<select id="modelCompare" class="select select-sm"></select></label>
+<label class="control" for="surfaceMode">Surface comparison<select id="surfaceMode" class="select select-sm">
+<option value="single">Model 1 only</option><option value="overlay">Both models, overlaid</option>
+<option value="difference">Difference: model 1 − model 2</option>
+</select></label>
+</div>
+<p id="modelSummary" class="subtle"></p>
+<p class="subtle">Default surface is the learned angular factor fᵢ, not an unweighted basis function.
+Equivalent-frame average is what the energy uses. One reference is inspection only and never changes the energy plots.</p>
+<details><summary>Load another checkpoint export</summary>
+<label class="control" for="modelImport">Verified exporter JSON<input id="modelImport" type="file" accept=".json" class="file-input file-input-sm"></label>
+<p class="subtle">For trusted checkpoint-*.pt files, run the experiment exporter with
+<code>--checkpoint NAME=/path/to/checkpoint.pt</code>, then load its JSON here.
+The browser does not deserialize PyTorch pickle files. A new export replaces the model set and resets selections.</p>
+</details>
+</section>
+<div class="toolbar">
+<label class="control" for="distance">Separation / Rₑ<select id="distance" class="select select-sm"></select></label>
+<label class="control" for="harmonic">Spherical harmonic<select id="harmonic" class="select select-sm"></select></label>
+<label class="control" for="harmonicDisplay" id="harmonicDisplayControl" hidden>Harmonic display<select id="harmonicDisplay" class="select select-sm">
+<option value="plain">Plain basis Cₗₘ (no model mask)</option>
+<option value="used">Model-used basis Cₗₘ</option>
+<option value="scaled" selected>Scaled contribution aₗₘ Cₗₘ</option>
+</select></label>
+<label class="control" for="mode">Frame treatment<select id="mode" class="select select-sm">
+<option value="average">Equivalent-frame average</option>
+<option value="single">One reference frame (inspect)</option>
+</select></label>
+<label class="control" for="scale">Lobe scale: <span id="scaleValue">1.25 Å</span><input id="scale" type="range" min=".4" max="2.5" step=".05" value="1.25" class="range range-xs"></label>
+</div>
+<div class="toolbar">
+<label><input type="checkbox" id="axes" class="checkbox checkbox-xs" checked> Local axes</label>
+<label><input type="checkbox" id="labels" class="checkbox checkbox-xs"> Atom labels</label>
+<button id="clear" class="btn btn-sm">Hide all lobes</button>
+<button id="reset" class="btn btn-sm btn-outline">Reset camera</button>
+</div>
+<p id="harmonicDisplayNote" class="subtle" hidden></p>
+<h2 id="title" class="text-lg font-semibold"></h2>
+<div class="legend">
+<span><i class="swatch" style="background:#2563eb"></i>monA outline</span>
+<span><i class="swatch" style="background:#dc2626"></i>monB outline</span>
+<span><i class="swatch" style="background:#079b87"></i>positive harmonic</span>
+<span><i class="swatch" style="background:#c97913"></i>negative harmonic</span>
+<span>Axes: x pink · y purple · z charcoal</span>
+</div>
+<div id="stage"><div id="viewer" aria-label="Interactive 3D molecule"></div></div>
+<p id="selection" class="selection-status" role="status">No atoms selected. Click an atom to reveal its harmonic; click again to hide it.</p>
+<p class="subtle">Drag to rotate · scroll to zoom · right-drag to translate. Atom buttons below are keyboard-accessible toggles.</p>
+<button id="toggleAll" class="btn btn-sm btn-outline" aria-pressed="false">Show all atoms’ lobes</button>
+<div id="atoms" aria-label="Atom harmonic toggles"></div>
+<p id="frameInfo" class="subtle"></p>
+<section id="pairInspector" hidden>
+<h2 class="text-xl font-semibold">Atom-pair exchange inspector</h2>
+<p class="subtle">Click one monA atom and one monB atom in this separate viewer.
+Plots use all eight original S66×8 geometries, not a fabricated pair stretch.</p>
+<div class="toolbar">
+<label class="control" for="pairA">monA atom<select id="pairA" class="select select-sm"></select></label>
+<label class="control" for="pairB">monB atom<select id="pairB" class="select select-sm"></select></label>
+<button id="pairReset" class="btn btn-sm btn-outline">Reset pair camera</button>
+</div>
+<div class="inspector-grid">
+<div><div class="pair-stage"><div id="pairViewer" aria-label="Select atoms for pair energy"></div></div><p id="pairCaption" class="subtle"></p></div>
+<div id="pairPlot" class="plot"></div>
+</div>
+<p class="model-note">Pair energies are model decompositions—not atom-pair SAPT reference labels.
+Dashed curves remove anisotropy while retaining that same model’s learned A/B (a counterfactual, not a refit).
+All energy plots always use the model’s full orbit average. Displayed numbers use two decimals; computations use full precision.</p>
+<h3 class="text-lg font-semibold">The equation, then this pair in each model</h3>
+<div id="generalEquation" class="equation-card"></div>
+<div id="pairEquations"></div>
+<h3 class="text-lg font-semibold">Dimer exchange · prediction vs reference</h3>
+<div class="inspector-grid"><div id="totalPlot" class="plot"></div><div id="recordDiagnostics"></div></div>
+<p class="model-note">S66×8 is not a blind holdout: 9/54 molecular pairs and 112/528 records overlap training.
+The pair-disjoint slice has 416 records. CLIFF2 is a different model and is shown only as a dimer-total reference;
+its S66 exposure is unverified. The 2k CLIFF2 checkpoint is a collapsed fit, not a competitive baseline.</p>
+<h3 class="text-lg font-semibold">Learned parameters by atom type</h3>
+<label><input id="allTypes" type="checkbox" class="checkbox checkbox-xs"> Show all exported S66 atom types (otherwise this dimer)</label>
+<div id="parameterTable" class="table-wrap"></div>
+<details><summary>Authoritative model provenance &amp; frame treatment</summary>
+<p class="subtle">Chemical types and reference plans are from the experiment’s <code>perceive_monomer</code>.
+Angular surfaces encode the output of <code>frame_harmonics</code> as exact degree ≤2 Cartesian polynomials,
+validated against independent directions. Pair sums are checked against <code>Arm.energy</code>;
+v4 predictions are checked against the published 528-record score payload.</p>
+<p class="subtle">v4 axial uses C10/C20 only. v5 C2v additionally uses C22c (Racah slots 0,3,6).
+Frames are averaged within each axial orbit over transverse references, then across distinct axial references.
+Missing transverse references do not invent an x axis. The angular coefficients are bounded per degree by ρ=0.40;
+a20 and a22c share the same l=2 norm budget, guaranteeing f ≥ 0.20.</p>
+<p class="subtle">Aromatic v4 carbon has z toward H in the ring plane: π-face and in-plane perpendicular values are equal.
+C22c can break that degeneracy in v5; no v5 result is fabricated when its checkpoint is absent.
+Switching to one reference frame displays an individual contribution, never an alternative learned energy.</p>
+<pre id="modelProvenance" class="subtle" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+</details>
+</section>
+<details id="basisProvenance">
+<summary>What is being visualized? Frame conventions &amp; provenance</summary>
+<p class="subtle">These are angular basis functions, <strong>not fitted exchange energies, electron densities, or orbitals</strong>.
+The lobe radius is <code>scale × |Cₗₘ|</code>; hue indicates sign. Racah normalization:
+<code>Cₗₘ = √(4π/(2l+1)) Yₗₘ</code>, positive Cartesian convention from <code>apnet_pt/mastiff.py</code>.</p>
+<p class="subtle">No audited chemical frame assignments are stored on this branch. This viewer uses an explicitly
+<strong>visualization-only heuristic</strong>: monomer-local bonds from 1.2× covalent radii, iterative
+element/neighborhood graph ranks for z then x reference roles, all tied assignments retained.
+Plans are frozen at 1.0 Rₑ for all eight geometries; the dimer partner never chooses a reference.
+Terminal and wholly collinear sites are axial (10/20 only); isolated sites are explicitly isotropic.</p>
+<p class="subtle">Full frames use z toward the reference, x the second bond projected perpendicular to z,
+y = z × x. Equivalent-frame mode averages harmonic <em>values</em>, not surfaces, and suppresses sine channels
+as in <code>AveragedFrameHarmonics</code>. The one-frame inspection mode shows one tied assignment
+(not a permutation-invariant prediction) and enables sine channels; axial sites still have no transverse gauge.
+Axes show all equivalent reference frames in average mode. Vanishing or masked channels have no lobe.</p>
+<p class="subtle">Geometries: Psi4 <a class="link" href="https://github.com/psi4/psi4/blob/master/psi4/share/psi4/databases/S66by8.py">S66by8.py</a>,
+Řezáč et al., JCTC 7, 2427 (2011). All 528 original geometries are embedded in Å;
+1.0 Rₑ is not identical to the separate S66 database geometry.
+Psi4 database source is LGPL-3.0; <a class="link" href="https://www.gnu.org/licenses/lgpl-3.0.html">license</a>.
+Source SHA-256: <code id="sha" style="overflow-wrap:anywhere"></code>.
+3Dmol.js 2.5.3 (BSD-3-Clause), DaisyUI and Tailwind load from pinned CDNs; internet access and WebGL are required.</p>
+</details>
+</main>
+</div>
+<script id="dataset" type="application/json">__DATA__</script>
+<script>/*__CORE__*/</script>
+<script>/*__MODEL_MATH__*/</script>
+<script>/*__INSPECTOR__*/</script>
+<script>/*__APP__*/</script>
+</body>
+</html>
