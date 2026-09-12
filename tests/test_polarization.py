@@ -243,6 +243,52 @@ water.key  water.xyz  w.xyz
 """
 
 
+def test_thole_direct_and_mutual_torch_are_finite_and_distinct():
+    r = torch.tensor([1.2, 2.5], dtype=torch.float64)
+    alpha_i = torch.tensor([0.8, 1.1], dtype=torch.float64)
+    alpha_j = torch.tensor([1.3, 0.7], dtype=torch.float64)
+    a_direct = 0.34
+    a_mutual = 0.39
+
+    _, direct_l3, direct_l5 = (
+        apnet_pt.multipole.thole_damping_direct_torch(
+            r, alpha_i, alpha_j, a_direct
+        )
+    )
+    _, mutual_l3, mutual_l5 = (
+        apnet_pt.multipole.thole_damping_mutual_torch(
+            r, alpha_i, alpha_j, a_mutual
+        )
+    )
+
+    # Direct (permanent-induced) damping uses u ** (3 / 2) with a 0.5 * au3
+    # prefactor in l5; mutual (induced-induced) damping uses u ** 3 with a
+    # full au3 prefactor. Assert both closed forms so a mutual implementation
+    # that silently reuses the direct formula cannot pass.
+    u = r / ((alpha_i * alpha_j) ** (1.0 / 6.0))
+    expected_direct_au3 = a_direct * (u ** (3 / 2))
+    expected_direct_l3 = 1 - torch.exp(-expected_direct_au3)
+    expected_direct_l5 = 1 - (1 + 0.5 * expected_direct_au3) * torch.exp(
+        -expected_direct_au3
+    )
+    expected_mutual_au3 = a_mutual * (u**3)
+    expected_mutual_l3 = 1 - torch.exp(-expected_mutual_au3)
+    expected_mutual_l5 = 1 - (1 + expected_mutual_au3) * torch.exp(
+        -expected_mutual_au3
+    )
+
+    assert torch.allclose(direct_l3, expected_direct_l3)
+    assert torch.allclose(direct_l5, expected_direct_l5)
+    assert torch.allclose(mutual_l3, expected_mutual_l3)
+    assert torch.allclose(mutual_l5, expected_mutual_l5)
+    assert torch.isfinite(direct_l3).all()
+    assert torch.isfinite(direct_l5).all()
+    assert torch.isfinite(mutual_l3).all()
+    assert torch.isfinite(mutual_l5).all()
+    assert not torch.allclose(direct_l3, mutual_l3)
+    assert not torch.allclose(direct_l5, mutual_l5)
+
+
 def build_local_frame_rotation_matrix(
     mol_coords, atom_idx, z_axis_atom, x_axis_atom, frame_type
 ):
