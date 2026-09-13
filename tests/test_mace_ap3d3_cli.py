@@ -54,6 +54,11 @@ CANONICAL = {
         "pair_mode": "h3l1",
         "feature_mode": "all-scalars+norms",
     },
+    "MACE-AP3D3-H3L3": {
+        "properties": "legacy",
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+    },
     "MACE-AP3D3-AtomHead": {
         "properties": "atomhead",
         "pair_mode": "h1",

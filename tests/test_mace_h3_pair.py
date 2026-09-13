@@ -34,7 +34,7 @@ from apnet_pt.mace.schema import MACEAtomicFeatures
 from tests.test_mace_h1_pair import _batch, _properties
 
 
-TEST_IRREPS = "4x0e+4x1o+4x2e"
+TEST_IRREPS = "4x0e+4x1o+4x2e+4x3o"
 TEST_CHANNELS = 4
 DIRECTIONAL_WIDTH = (
     CANONICAL_AP3D3_DIMENSIONS["n_message"] * CANONICAL_AP3D3_DIMENSIONS["n_embed"]
@@ -63,7 +63,7 @@ def _h3_fixture(pair_mode="h3", *, seed=31, feature_dim=16):
     torch.manual_seed(seed)
     batch = _batch()
     width = sum(
-        TEST_CHANNELS * (2 * degree + 1) for degree in (0, 1, 2)
+        TEST_CHANNELS * (2 * degree + 1) for degree in (0, 1, 2, 3)
     )
     features = []
     for numbers in (batch.ZA, batch.ZB):
@@ -100,7 +100,9 @@ def test_frame_permutation_matches_mace():
     assert torch.equal(permuted, expected)
 
 
-@pytest.mark.parametrize("pair_mode,degree", [("h3", 2), ("h3l1", 1)])
+@pytest.mark.parametrize(
+    "pair_mode,degree", [("h3", 2), ("h3l1", 1), ("h3l3", 3)]
+)
 def test_h3_registers_its_directional_degree(pair_mode, degree):
     core, *_ = _h3_fixture(pair_mode)
     assert DIRECTIONAL_DEGREES[pair_mode] == degree
@@ -111,7 +113,7 @@ def test_h3_registers_its_directional_degree(pair_mode, degree):
     assert core.get_config()["directional_degree"] == degree
 
 
-@pytest.mark.parametrize("pair_mode", ["h3", "h3l1"])
+@pytest.mark.parametrize("pair_mode", ["h3", "h3l1", "h3l3"])
 def test_h3_pair_width_matches_h1_and_h2(pair_mode):
     core, batch, features_a, features_b, props_a, props_b = _h3_fixture(pair_mode)
     core(batch, features_a, features_b, props_a, props_b)
@@ -125,7 +127,9 @@ def test_h3_pair_width_matches_h1_and_h2(pair_mode):
     assert core.last_h_ba.shape[1] == expected
 
 
-@pytest.mark.parametrize("pair_mode,degree", [("h3", 2), ("h3l1", 1)])
+@pytest.mark.parametrize(
+    "pair_mode,degree", [("h3", 2), ("h3l1", 1), ("h3l3", 3)]
+)
 def test_h3_residual_is_rotationally_invariant(pair_mode, degree):
     """Rotate the dimer and the features together; the energy must not move.
 
@@ -156,12 +160,12 @@ def test_h3_residual_is_rotationally_invariant(pair_mode, degree):
         block_degree: o3.Irrep(
             block_degree, (-1) ** block_degree
         ).D_from_matrix(permuted_rotation)
-        for block_degree in (0, 1, 2)
+        for block_degree in (0, 1, 2, 3)
     }
     rotated = []
     for features in (features_a, features_b):
         blocks = []
-        for block_degree in (0, 1, 2):
+        for block_degree in (0, 1, 2, 3):
             block = features.equivariant_degree(block_degree)
             blocks.append(
                 torch.einsum("acm,nm->acn", block, wigner[block_degree]).reshape(
@@ -187,7 +191,7 @@ def test_h3_residual_is_rotationally_invariant(pair_mode, degree):
     assert deviation <= 2.0e-5 * scale, f"max deviation {deviation:.3e}"
 
 
-@pytest.mark.parametrize("pair_mode", ["h3", "h3l1"])
+@pytest.mark.parametrize("pair_mode", ["h3", "h3l1", "h3l3"])
 def test_h3_actually_uses_the_equivariant_block(pair_mode):
     """Zeroing the consumed degree must change the answer; H2 would not."""
 
@@ -291,7 +295,7 @@ vectors = torch.randn(64, 3, generator=generator, dtype=torch.float64)
 vectors[:8] *= 7.5
 vectors[8:16] *= 0.02
 payload = {"vectors": vectors}
-for degree in (1, 2):
+for degree in (1, 2, 3):
     payload[degree] = o3.spherical_harmonics(
         degree, vectors, normalize=True, normalization="component"
     )
@@ -323,7 +327,7 @@ def e3nn_reference_harmonics(tmp_path_factory):
     return torch.load(payload, weights_only=False)
 
 
-@pytest.mark.parametrize("degree", [1, 2])
+@pytest.mark.parametrize("degree", [1, 2, 3])
 def test_real_spherical_harmonics_matches_e3nn(degree, e3nn_reference_harmonics):
     """Pin the hand-written harmonics against the library they replace.
 
@@ -340,5 +344,5 @@ def test_real_spherical_harmonics_matches_e3nn(degree, e3nn_reference_harmonics)
 
 
 def test_real_spherical_harmonics_rejects_unsupported_degrees():
-    with pytest.raises(ValueError, match="degree 1 and 2"):
-        real_spherical_harmonics(3, torch.randn(4, 3))
+    with pytest.raises(ValueError, match="degree 1, 2 and 3"):
+        real_spherical_harmonics(4, torch.randn(4, 3))

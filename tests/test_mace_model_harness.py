@@ -32,17 +32,18 @@ ROUTES = {
     "hybrid-h2": ("h2", "all-scalars+norms", "legacy"),
     "hybrid-h3": ("h3", "all-scalars+norms", "legacy"),
     "hybrid-h3l1": ("h3l1", "all-scalars+norms", "legacy"),
+    "hybrid-h3l3": ("h3l3", "all-scalars+norms", "legacy"),
     "atomhead": ("h1", "all-scalars+norms", "atomhead"),
 }
 
 # A narrow stand-in for PolarMACE's ``512x0e+512x1o+512x2e+512x3o``: the H3
-# routes only need *an* l=1 and l=2 block to slice, and four channels keep the
-# stub cheap.  Which routes need it is read off ``DIRECTIONAL_DEGREES`` rather
-# than listed here, so a future degree variant cannot reach this harness with a
-# zero-width equivariant block and fail somewhere less obvious.
-STUB_IRREPS = "4x0e+4x1o+4x2e"
+# routes only need *an* l=1, l=2 and l=3 block to slice, and four channels keep
+# the stub cheap.  Which routes need it is read off ``DIRECTIONAL_DEGREES``
+# rather than listed here, so a future degree variant cannot reach this harness
+# with a zero-width equivariant block and fail somewhere less obvious.
+STUB_IRREPS = "4x0e+4x1o+4x2e+4x3o"
 STUB_EQUIVARIANT_CHANNELS = 4
-STUB_EQUIVARIANT_WIDTH = 4 * (1 + 3 + 5)
+STUB_EQUIVARIANT_WIDTH = 4 * (1 + 3 + 5 + 7)
 
 
 def _augment_batch(batch):
@@ -114,7 +115,7 @@ class StubFeaturizer(torch.nn.Module):
         ).reshape(1, -1)
         scale = torch.sin(z * channels * 0.31).to(positions)
         blocks = []
-        for degree in (0, 1, 2):
+        for degree in (0, 1, 2, 3):
             if degree == 0:
                 harmonic = offset.new_ones((numbers.numel(), 1))
             else:

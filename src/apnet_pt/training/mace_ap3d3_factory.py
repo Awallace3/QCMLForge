@@ -38,6 +38,11 @@ MACE_AP3D3_OPTIONS = {
         "pair_mode": "h3l1",
         "feature_mode": "all-scalars+norms",
     },
+    "MACE-AP3D3-H3L3": {
+        "properties": "legacy",
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+    },
     "MACE-AP3D3-AtomHead": {
         "properties": "atomhead",
         "pair_mode": "h1",
@@ -51,14 +56,17 @@ _INTERNAL_ARCHITECTURES = {
     "MACE-AP3D3-H2": "hybrid-h2",
     "MACE-AP3D3-H3": "hybrid-h3",
     "MACE-AP3D3-H3L1": "hybrid-h3l1",
+    "MACE-AP3D3-H3L3": "hybrid-h3l3",
     "MACE-AP3D3-AtomHead": "atomhead",
 }
 
 _FEATURE_MODES = {"final-layer-scalars", "all-scalars+norms"}
 # Channel multiplicity of each PolarMACE equivariant degree
-# (``512x0e+512x1o+512x2e+512x3o``). The H3 routes slice one degree out of that
-# block; a wrong value here is caught at the first forward by
-# ``MACEPairResidualCore._validate_features``, not absorbed into training.
+# (``512x0e+512x1o+512x2e+512x3o`` -- so l=3 is available at the same width as
+# l=1 and l=2, and the H3L3 arm needs no MACE reconfiguration). The H3 routes
+# slice one degree out of that block; a wrong value here is caught at the first
+# forward by ``MACEPairResidualCore._validate_features``, not absorbed into
+# training.
 _POLAR_EQUIVARIANT_CHANNELS = 512
 _ATOMIC_OPTION = "MACE-AtomicProperties"
 _D3_PRESETS = {
@@ -933,7 +941,10 @@ def _default_factory_dependencies(plan: MACETrainingPlan) -> MACEFactoryDependen
         from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import (
             APNet3D3_AtomType_MPNN,
         )
-        from apnet_pt.mace.pair import MACEPairResidualCore
+        from apnet_pt.mace.pair import (
+            DIRECTIONAL_DEGREES,
+            MACEPairResidualCore,
+        )
 
         ap3 = APNet3D3_AtomType_MPNN(
             dimer_prop_model=None,
@@ -946,7 +957,7 @@ def _default_factory_dependencies(plan: MACETrainingPlan) -> MACEFactoryDependen
         kwargs = {}
         if plan.internal_architecture in {"direct-polar", "atomhead"}:
             kwargs["architecture_id"] = plan.internal_architecture
-        if plan.pair_mode in {"h3", "h3l1"}:
+        if DIRECTIONAL_DEGREES[plan.pair_mode] is not None:
             kwargs["mace_equivariant_dim"] = _POLAR_EQUIVARIANT_CHANNELS
         return MACEPairResidualCore(
             ap3,

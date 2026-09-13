@@ -23,6 +23,7 @@ CANONICAL_PAIR_FEATURE_MODES = {
     "h2": "all-scalars+norms",
     "h3": "all-scalars+norms",
     "h3l1": "all-scalars+norms",
+    "h3l3": "all-scalars+norms",
 }
 
 PAIR_ARCHITECTURE_IDS = {
@@ -30,6 +31,7 @@ PAIR_ARCHITECTURE_IDS = {
     "h2": "MACE-AP3D3-H2",
     "h3": "MACE-AP3D3-H3",
     "h3l1": "MACE-AP3D3-H3L1",
+    "h3l3": "MACE-AP3D3-H3L3",
 }
 
 PAIR_ROUTE_CONFIGS = {
@@ -38,18 +40,19 @@ PAIR_ROUTE_CONFIGS = {
     "hybrid-h2": ("h2", "all-scalars+norms"),
     "hybrid-h3": ("h3", "all-scalars+norms"),
     "hybrid-h3l1": ("h3l1", "all-scalars+norms"),
+    "hybrid-h3l3": ("h3l3", "all-scalars+norms"),
     "atomhead": ("h1", "all-scalars+norms"),
 }
 
 # Pair modes that bypass the AP3 intramonomer update stack entirely.
-BYPASS_PAIR_MODES = frozenset({"h2", "h3", "h3l1"})
+BYPASS_PAIR_MODES = frozenset({"h2", "h3", "h3l1", "h3l3"})
 
 # Spherical-harmonic degree each H3 variant contracts into the AP3 directional
 # slot. H2 (degree ``None``) leaves that slot zeroed, which is the ablation H3
 # is designed to undo: MACE's equivariant channels are reduced to norms by the
 # ``all-scalars+norms`` invariant, so without this the route carries no atomic
 # anisotropy at all.
-DIRECTIONAL_DEGREES = {"h1": None, "h2": None, "h3": 2, "h3l1": 1}
+DIRECTIONAL_DEGREES = {"h1": None, "h2": None, "h3": 2, "h3l1": 1, "h3l3": 3}
 
 # MACE feeds ``_permute_to_e3nn_convention(vectors)`` to its spherical
 # harmonics, i.e. Cartesian ``(x, y, z) -> (y, z, x)``. Any contraction against
@@ -70,7 +73,7 @@ def real_spherical_harmonics(degree: int, vectors: torch.Tensor) -> torch.Tensor
     ``RuntimeError: bad optional access`` from a call site that never changed.
     This route evaluates harmonics on the pair forward path, so a hazard that
     depends on how many times the graph happened to run before is not one to
-    carry. The l <= 2 polynomials are four lines; spelling them out removes the
+    carry. The l <= 3 polynomials are a dozen lines; spelling them out removes the
     dependency instead of ordering around it.
 
     Component ordering, sign convention and the ``sqrt(2l+1)`` component
@@ -97,8 +100,29 @@ def real_spherical_harmonics(degree: int, vectors: torch.Tensor) -> torch.Tensor
             dim=-1,
         )
         return math.sqrt(5.0) * components
+    if degree == 3:
+        root3 = math.sqrt(3.0)
+        y2 = y.pow(2)
+        x2z2 = x.pow(2) + z.pow(2)
+        # e3nn builds l=3 by recursion off its own l=2 block, so these two are
+        # reused verbatim rather than re-derived.
+        sh_2_0 = root3 * x * z
+        sh_2_4 = 0.5 * root3 * (z.pow(2) - x.pow(2))
+        components = torch.stack(
+            [
+                math.sqrt(5.0 / 6.0) * (sh_2_0 * z + sh_2_4 * x),
+                math.sqrt(5.0) * sh_2_0 * y,
+                math.sqrt(3.0 / 8.0) * (4.0 * y2 - x2z2) * x,
+                0.5 * y * (2.0 * y2 - 3.0 * x2z2),
+                math.sqrt(3.0 / 8.0) * z * (4.0 * y2 - x2z2),
+                math.sqrt(5.0) * sh_2_4 * y,
+                math.sqrt(5.0 / 6.0) * (sh_2_4 * z - sh_2_0 * x),
+            ],
+            dim=-1,
+        )
+        return math.sqrt(7.0) * components
     raise ValueError(
-        f"real_spherical_harmonics supports degree 1 and 2, got {degree}"
+        f"real_spherical_harmonics supports degree 1, 2 and 3, got {degree}"
     )
 
 
@@ -109,7 +133,7 @@ class MACEPairResidualCore(torch.nn.Module):
     bypasses those updates and constructs pairs directly from projected MACE
     invariants. H3 is H2 plus MACE's equivariant features contracted into the
     directional slot H2 leaves zeroed -- ``h3`` takes degree 2, ``h3l1``
-    degree 1 -- which separates "no intramonomer message passing" from "no
+    degree 1, ``h3l3`` degree 3 -- which separates "no intramonomer message passing" from "no
     atomic anisotropy", the two things H2 ablates together. Every mode uses
     the same projection output width, AP3 pair feature width, bidirectional
     readouts, cutoff, and dimer aggregation.
@@ -347,10 +371,11 @@ class MACEPairResidualCore(torch.nn.Module):
         unit = unit[:, list(MACE_E3NN_AXIS_PERMUTATION)]
 
         harmonics_a = real_spherical_harmonics(degree, unit)
-        # AP3 gives the two monomers opposite axis polarity. At l=1 this
-        # reproduces its own +u/-u convention exactly; at even l the harmonic
-        # is parity-even, so A and B share the angular factor and only the
-        # per-atom channels distinguish them.
+        # AP3 gives the two monomers opposite axis polarity. At odd l the
+        # harmonic is parity-odd, so this reproduces its own +u/-u convention
+        # exactly (l=1 and l=3); at even l the harmonic is parity-even, so A
+        # and B share the angular factor and only the per-atom channels
+        # distinguish them.
         harmonics_b = real_spherical_harmonics(degree, -unit)
 
         directional_a = torch.einsum(

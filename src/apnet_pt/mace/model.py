@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable, Mapping
 import torch
 
 from .long_range import LongRangeSAPTProvider, assemble_sapt_components
-from .pair import MACEPairResidualCore
+from .pair import MACEPairResidualCore, PAIR_ARCHITECTURE_IDS
 from .schema import (
     COMPONENT_ORDER,
     AtomicPropertyBundle,
@@ -40,6 +40,11 @@ MACE_AP3D3_ARCHITECTURES = {
     },
     "hybrid-h3l1": {
         "pair_mode": "h3l1",
+        "feature_mode": "all-scalars+norms",
+        "provider_kind": "legacy",
+    },
+    "hybrid-h3l3": {
+        "pair_mode": "h3l3",
         "feature_mode": "all-scalars+norms",
         "provider_kind": "legacy",
     },
@@ -142,12 +147,14 @@ class MACEAP3D3(torch.nn.Module):
                 f"{expected['feature_mode']}"
             )
         allowed_pair_ids = {architecture}
-        hybrid_pair_id = {
-            "hybrid-h1": "MACE-AP3D3-H1",
-            "hybrid-h2": "MACE-AP3D3-H2",
-            "hybrid-h3": "MACE-AP3D3-H3",
-            "hybrid-h3l1": "MACE-AP3D3-H3L1",
-        }.get(architecture)
+        # Derived, not listed: a hand-maintained second copy of this mapping
+        # is what let ``hybrid-h3`` reach production with a validator that had
+        # never heard of it.
+        hybrid_pair_id = (
+            PAIR_ARCHITECTURE_IDS[expected["pair_mode"]]
+            if architecture.startswith("hybrid-")
+            else None
+        )
         if hybrid_pair_id is not None:
             allowed_pair_ids.add(hybrid_pair_id)
         if getattr(pair_core, "architecture_id", None) not in allowed_pair_ids:
