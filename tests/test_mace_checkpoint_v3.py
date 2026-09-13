@@ -1,3 +1,4 @@
+import hashlib
 from copy import deepcopy
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import torch
 
 from apnet_pt import model_io
 from apnet_pt.mace.model import MACEAP3D3
+from apnet_pt.mace.pair import PAIR_ROUTE_CONFIGS
 from apnet_pt.mace.schema import PhysicsConfig
 from tests.test_mace_model_harness import _augment_batch, _batch, _make_model
 
@@ -59,10 +61,10 @@ def _configure_model(backbone, route="hybrid-h1"):
 
 
 def _config(artifact_sha, route="hybrid-h1"):
-    pair_mode = "h2" if route == "hybrid-h2" else "h1"
-    feature_mode = (
-        "final-layer-scalars" if route == "hybrid-h1" else "all-scalars+norms"
-    )
+    # Derived from the registry, not restated.  The restated copy that used to
+    # live here agreed with the equally stale copy in ``model_io``, so both
+    # could omit the H3 routes and the suite still passed.
+    pair_mode, feature_mode = PAIR_ROUTE_CONFIGS[route]
     physics = PhysicsConfig()
     return {
         "architecture": route,
@@ -357,3 +359,33 @@ def test_v1_v2_checkpoint_versions_remain_unchanged():
     )
     assert checkpoint["checkpoint_version"] == 2
     assert model_io.CHECKPOINT_VERSION == 2
+
+
+@pytest.mark.parametrize("route", sorted(PAIR_ROUTE_CONFIGS))
+def test_v3_accepts_every_registered_route(tmp_path, route):
+    """Every route the pair registry can build must also serialize.
+
+    The H3 routes were added to ``pair.py`` and ``mace/model.py`` but not to the
+    checkpoint validator, which is reached exactly once per run -- on the final
+    write, after the epoch loop.  Eight forty-epoch seeds trained to completion
+    and then raised ``unsupported architecture`` with their metrics already
+    computed and discarded.  Parametrizing over the registry is what makes the
+    next route's omission a test failure instead of a lost arm.
+    """
+
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"stub-artifact")
+    artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    config = _config(artifact_sha, route=route)
+    # ``_config`` is normally handed to the save path, which fills this in from
+    # the live module; calling the validator directly has to supply it.
+    config["parameter_counts"] = {
+        "total": 200_016,
+        "trainable": 16,
+        "external": 200_000,
+        "serialized": 16,
+    }
+    pair_mode, feature_mode = PAIR_ROUTE_CONFIGS[route]
+    assert config["pair_mode"] == pair_mode
+    assert config["mace"]["feature_mode"] == feature_mode
+    model_io._validate_mace_v3_config(config)

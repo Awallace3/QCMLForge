@@ -549,15 +549,20 @@ def _validate_mace_v3_config(config: Mapping[str, Any]) -> None:
         },
         "MACE v3 config",
     )
-    if config["architecture"] not in {
-        "direct-polar",
-        "hybrid-h1",
-        "hybrid-h2",
-        "atomhead",
-    }:
+    # Read from the pair registry rather than a local copy of it.  The copy
+    # this replaced went stale: ``pair.py`` and ``mace/model.py`` both gained
+    # the H3 routes while these two literals did not, so an H3 run trained for
+    # forty epochs and then died on its one and only checkpoint write.  Imported
+    # inside the function because ``mace.model`` imports this module lazily.
+    from .mace.pair import PAIR_ROUTE_CONFIGS
+
+    if config["architecture"] not in PAIR_ROUTE_CONFIGS:
         raise ValueError("MACE v3 config has an unsupported architecture")
-    if config["pair_mode"] not in {"h1", "h2"}:
-        raise ValueError("MACE v3 pair_mode must be h1 or h2")
+    pair_modes = {mode for mode, _features in PAIR_ROUTE_CONFIGS.values()}
+    if config["pair_mode"] not in pair_modes:
+        raise ValueError(
+            "MACE v3 pair_mode must be one of " + ", ".join(sorted(pair_modes))
+        )
     if config["dtype_policy"] not in {"float32", "float64"}:
         raise ValueError("MACE v3 dtype_policy must be float32 or float64")
     if config["atomic_property_schema"] != (
@@ -594,13 +599,7 @@ def _validate_mace_v3_config(config: Mapping[str, Any]) -> None:
         raise ValueError("MACE v3 feature mode is unsupported")
     if f":mode={mace['feature_mode']}:" not in mace["feature_schema"]:
         raise ValueError("MACE v3 feature schema and mode disagree")
-    route_contracts = {
-        "direct-polar": ("h1", "all-scalars+norms"),
-        "hybrid-h1": ("h1", "final-layer-scalars"),
-        "hybrid-h2": ("h2", "all-scalars+norms"),
-        "atomhead": ("h1", "all-scalars+norms"),
-    }
-    expected_pair, expected_features = route_contracts[config["architecture"]]
+    expected_pair, expected_features = PAIR_ROUTE_CONFIGS[config["architecture"]]
     if config["pair_mode"] != expected_pair:
         raise ValueError("MACE v3 pair mode disagrees with architecture")
     if mace["feature_mode"] != expected_features:
