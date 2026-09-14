@@ -31,6 +31,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
+from .. import ddp_launch
 import qcelemental as qcel
 from .ap2_atom_model import (
     unsorted_segment_sum_3d,
@@ -1339,7 +1340,16 @@ class AtomInducedDipoleModel:
                     )
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
         elif (
             not ignore_database_null
             and self.dataset is None
@@ -1370,7 +1380,16 @@ class AtomInducedDipoleModel:
                 ]
 
             self.dataset = setup_ds()
-            self.dataset = setup_ds(False)
+            if ds_force_reprocess:
+                # Rebuild the handle only when the first pass was a forced
+                # reprocess. With `ds_force_reprocess` false the two calls take
+                # identical arguments, so the first construction was built and
+                # thrown away -- and construction is not free: each one globs
+                # and natural-sorts the whole processed directory (93,750
+                # shards on the production store) before PyG decides there is
+                # nothing to process. Two splits x two calls was four of those
+                # per run.
+                self.dataset = setup_ds(False)
         print(f"{self.dataset = }")
         self.rank = None
         self.world_size = None
@@ -2270,7 +2289,7 @@ units angstrom
         if world_size > 1 or _external_rank is not None:
             # External launchers enter this worker path even for a one-task job.
             print("Running distributed training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             ddp_config = {
                 "training/epochs": n_epochs,
                 "training/learning_rate_initial": lr,
@@ -2333,7 +2352,7 @@ units angstrom
         else:
             # Run single-process training directly
             print("Running single-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             run_tracked_single_process(
                 self,
                 lambda: self.single_proc_train(
