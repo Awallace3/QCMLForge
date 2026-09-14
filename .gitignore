@@ -245,3 +245,5 @@ tests/dataset_data/ap2_fused_ensemble_test.pt
 # CLIFF run output: trained checkpoints and W&B run state, not deliverables.
 models/cliff/
 wandb/
+*.pdf
+docs/superpowers
