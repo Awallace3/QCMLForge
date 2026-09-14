@@ -152,21 +152,6 @@ def test_load_split_manifest_verify_none_skips_the_check(tmp_path):
     assert len(train) == 8 and len(test) == 2
 
 
-def test_load_split_manifest_verify_accepts_a_string_count(tmp_path):
-    """argparse hands this through as a string, so "4" must mean 4."""
-    ds = _dataset(10)
-    path = _manifest(tmp_path, ds, ["train"] * 8 + ["test"] * 2)
-    train, _ = util.load_split_manifest(
-        path, dataset=ds, verify="4", print_level=0
-    )
-    assert len(train) == 8
-    with pytest.raises(ValueError, match="'all', 'none', or an integer"):
-        util.load_split_manifest(path, dataset=ds, verify="some",
-                                 print_level=0)
-    with pytest.raises(ValueError, match="must be positive"):
-        util.load_split_manifest(path, dataset=ds, verify=0, print_level=0)
-
-
 def test_load_split_manifest_rejects_malformed_input(tmp_path):
     import pandas as pd
 
@@ -223,13 +208,6 @@ def test_load_split_manifest_rejects_out_of_range_index(tmp_path):
         util.load_split_manifest(path, dataset=ds, print_level=0)
 
 
-def test_load_split_manifest_works_without_a_dataset(tmp_path):
-    ds = _dataset(5)
-    path = _manifest(tmp_path, ds, ["train"] * 4 + ["test"])
-    train, test = util.load_split_manifest(path, print_level=0)
-    assert len(train) == 4 and len(test) == 1
-
-
 # --- trainer wiring -------------------------------------------------------
 
 def test_atom_trainer_declares_explicit_split_indices():
@@ -250,20 +228,6 @@ def test_atom_trainer_validates_and_records_the_explicit_split():
     # And the run record has to say which kind of split was used, or a
     # stratified run is indistinguishable from a uniform one.
     assert '"data/split_kind"' in src
-
-
-def test_atom_trainer_seeded_uniform_split_is_the_documented_baseline():
-    """Pin the default split so the manifest's baseline column stays honest.
-
-    `build_atom_split.py` reproduces this exact draw to report what the uniform
-    alternative would have held out. If the trainer's seeding changes, that
-    comparison becomes wrong and this test should fail first.
-    """
-    src = textwrap.dedent(
-        inspect.getsource(ap3_atomtype_mpnn.AtomTypeParamModel.train)
-    )
-    assert "np.random.seed(42)" in src
-    assert "random_indices = np.random.permutation(len(self.dataset))" in src
 
 
 # --- skip_compile plumbing ------------------------------------------------

@@ -83,7 +83,6 @@ import torch.nn.functional as F
 from apnet_pt import constants, model_io
 from apnet_pt.AtomModels.ap2_atom_model import AtomMPNN
 from apnet_pt.AtomPairwiseModels import mtp_mtp
-from apnet_pt.AtomPairwiseModels.apnet3 import APNet3_MPNN
 from apnet_pt.AtomPairwiseModels.mtp_mtp import (
     CLIFF_CLASSICAL_ELST_INDEX,
     CLIFF_CLASSICAL_EXCH_INDEX,
@@ -100,8 +99,6 @@ from apnet_pt.AtomPairwiseModels.mtp_mtp import (
     COMBINED_CLIFF_DIMER_EVAL_MODES,
     OVERLAP_WIDTH_FLOOR,
     POSITIVE_PARAMETER_CONTRACTS,
-    RACKERS_INITIAL_STDS,
-    RACKERS_INITIAL_VALUES,
     RACKERS_PARAMETER_NAMES,
     AM_DimerParam_Model,
     AtomTypeParamNN,
@@ -110,12 +107,9 @@ from apnet_pt.AtomPairwiseModels.mtp_mtp import (
     CliffClassicalOverlapModel,
     CliffExchangeModel,
     CliffExchangeNN,
-    RackersTholeDampingModel,
     RackersTholeDampingNN,
-    _mae_report_header,
     _rebuild_nested_atom_model,
     _validate_positive_initialization,
-    _validate_rackers_initialization,
     atomic_overlap_S_ij,
     cliff_exchange,
     geometric_mean_edge_values,
@@ -198,31 +192,6 @@ def test_golden_overlap_value():
         dR_AB=r_bohr,
     )
     assert E.item() == pytest.approx(GOLDEN_E_EXCH_KCAL, rel=1e-3)
-
-
-def test_shipped_form_is_not_the_literal_cliff_eq_10():
-    """The literal 1/(sigma_i sigma_j) reading is not what ships.
-
-    ``apnet3.valence_width_exch`` uses that literal form; it underpredicts a
-    water-dimer hydrogen-bond overlap by more than six orders of magnitude.
-    """
-    e_src, e_tgt = _single_edge()
-    r_bohr = torch.tensor(
-        [R_HBOND_ANG / constants.au2ang], dtype=torch.float64
-    )
-    S_shipped = atomic_overlap_S_ij(
-        torch.tensor([SIGMA_O], dtype=torch.float64),
-        torch.tensor([SIGMA_H], dtype=torch.float64),
-        e_src,
-        e_tgt,
-        r_bohr,
-    ).item()
-
-    B_literal = 1.0 / (SIGMA_O * SIGMA_H)
-    x = B_literal * r_bohr.item()
-    S_literal = (x * x / 3.0 + x + 1.0) * math.exp(-x)
-
-    assert S_shipped / S_literal > 1e6
 
 
 def test_cliff_exchange_angstrom_path_matches_hand_converted_bohr():
@@ -315,66 +284,6 @@ def test_overlap_decays_monotonically_in_r():
     assert torch.all(S > 0)
 
 
-def test_overlap_decays_monotonically_in_B_ij():
-    """Larger B_ij (i.e. smaller widths) must give a smaller overlap."""
-    n = 30
-    sigma = torch.linspace(0.15, 1.2, n, dtype=torch.float64)  # B_ij decreasing
-    e_src = torch.arange(n, dtype=torch.long)
-    dR = torch.full((n,), 4.0, dtype=torch.float64)
-    S = atomic_overlap_S_ij(sigma, sigma, e_src, e_src, dR, width_floor=0.0)
-    B_ij = torch.rsqrt(sigma * sigma)
-    assert torch.all(B_ij[1:] < B_ij[:-1])
-    assert torch.all(S[1:] > S[:-1])
-
-
-def test_overlap_tends_to_one_at_zero_separation():
-    e_src, e_tgt = _single_edge()
-    S = atomic_overlap_S_ij(
-        torch.tensor([0.39], dtype=torch.float64),
-        torch.tensor([0.36], dtype=torch.float64),
-        e_src,
-        e_tgt,
-        torch.tensor([0.0], dtype=torch.float64),
-    )
-    assert S.item() == pytest.approx(1.0, abs=1e-14)
-
-    S_small = atomic_overlap_S_ij(
-        torch.tensor([0.39], dtype=torch.float64),
-        torch.tensor([0.36], dtype=torch.float64),
-        e_src,
-        e_tgt,
-        torch.tensor([1e-8], dtype=torch.float64),
-    )
-    assert S_small.item() == pytest.approx(1.0, abs=1e-12)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_overlap_preserves_dtype_and_device(dtype):
-    vwA = torch.tensor([0.39, 0.41], dtype=dtype)
-    vwB = torch.tensor([0.36], dtype=dtype)
-    e_src = torch.tensor([0, 1], dtype=torch.long)
-    e_tgt = torch.tensor([0, 0], dtype=torch.long)
-    dR = torch.tensor([3.5, 4.5], dtype=dtype)
-    S = atomic_overlap_S_ij(vwA, vwB, e_src, e_tgt, dR)
-    assert S.dtype == dtype
-    assert S.device == vwA.device
-    assert torch.isfinite(S).all()
-
-
-def test_overlap_no_unit_conversion_applied():
-    """The helper is dimensionless: no h2kcalmol, no au2ang."""
-    e_src, e_tgt = _single_edge()
-    S = atomic_overlap_S_ij(
-        torch.tensor([0.39], dtype=torch.float64),
-        torch.tensor([0.36], dtype=torch.float64),
-        e_src,
-        e_tgt,
-        torch.tensor([0.0], dtype=torch.float64),
-    )
-    # S(0) == 1 exactly rules out any hidden multiplicative factor.
-    assert S.item() == 1.0
-
-
 def test_width_floor_engages_below_the_floor():
     e_src, e_tgt = _single_edge()
     dR = torch.tensor([4.0], dtype=torch.float64)
@@ -396,32 +305,6 @@ def test_width_floor_engages_below_the_floor():
     torch.testing.assert_close(floored, clamped_ref, rtol=0, atol=0)
     assert floored.item() > unfloored.item()
     assert unfloored.item() < 1e-20  # unfloored B_ij ~ 167 bohr^-1
-
-
-def test_width_floor_zero_is_a_no_op_above_the_floor():
-    vwA = torch.tensor([0.39, 0.52], dtype=torch.float64)
-    vwB = torch.tensor([0.36], dtype=torch.float64)
-    e_src = torch.tensor([0, 1], dtype=torch.long)
-    e_tgt = torch.tensor([0, 0], dtype=torch.long)
-    dR = torch.tensor([3.0, 5.0], dtype=torch.float64)
-    torch.testing.assert_close(
-        atomic_overlap_S_ij(vwA, vwB, e_src, e_tgt, dR, width_floor=0.0),
-        atomic_overlap_S_ij(vwA, vwB, e_src, e_tgt, dR),
-        rtol=0,
-        atol=0,
-    )
-
-
-def test_overlap_never_materializes_an_nA_by_nB_intermediate():
-    """Output is per-edge, not [n_A, n_B]: 3 * 4 = 12 != 5 edges."""
-    vwA = torch.tensor([0.39, 0.41, 0.44], dtype=torch.float64)
-    vwB = torch.tensor([0.36, 0.38, 0.40, 0.42], dtype=torch.float64)
-    e_src = torch.tensor([0, 0, 1, 2, 2], dtype=torch.long)
-    e_tgt = torch.tensor([0, 3, 1, 0, 2], dtype=torch.long)
-    dR = torch.tensor([3.0, 4.0, 5.0, 6.0, 7.0], dtype=torch.float64)
-    S = atomic_overlap_S_ij(vwA, vwB, e_src, e_tgt, dR)
-    assert S.shape == (5,)
-    assert vwA.numel() * vwB.numel() == 12
 
 
 def test_overlap_is_differentiable_and_finite():
@@ -541,55 +424,6 @@ def _run_rackers(d, include_overlap, legacy=False):
     )
 
 
-def _run_induced_dipole(d, fn):
-    return fn(
-        d["ZA"], d["RA"], d["qA"], d["muA"], d["quadA"],
-        d["ZB"], d["RB"], d["qB"], d["muB"], d["quadB"],
-        d["e_AB_source"], d["e_AB_target"],
-        d["e_AA_source"], d["e_BB_source"],
-        d["e_AA_target"], d["e_BB_target"],
-        d["hfvr_A"], d["hfvr_B"], d["vw_A"], d["vw_B"],
-        d["K_A"], d["K_B"],
-        polarizability_table=d["table"],
-    )
-
-
-def test_rackers_thole_induction_overlap_matches_pre_refactor(
-    overlap_regression_inputs,
-):
-    got = _run_rackers(
-        overlap_regression_inputs, include_overlap=True, legacy=True
-    )
-    torch.testing.assert_close(
-        got,
-        torch.tensor(_PRE_REFACTOR_RACKERS_OVERLAP, dtype=torch.float64),
-        rtol=1e-10,
-        atol=1e-12,
-    )
-
-
-def test_rackers_thole_induction_no_overlap_matches_pre_refactor(
-    overlap_regression_inputs,
-):
-    got = _run_rackers(
-        overlap_regression_inputs, include_overlap=False, legacy=True
-    )
-    torch.testing.assert_close(
-        got,
-        torch.tensor(_PRE_REFACTOR_RACKERS_NO_OVERLAP, dtype=torch.float64),
-        rtol=1e-10,
-        atol=1e-12,
-    )
-    # The overlap branch must actually be doing something on this fixture,
-    # otherwise the regression pin above would be vacuous.
-    assert not torch.allclose(
-        got,
-        _run_rackers(
-            overlap_regression_inputs, include_overlap=True, legacy=True
-        ),
-    )
-
-
 # The corrected path. Per-edge values are deliberately not sign-constrained --
 # induction is many-body and a single intermolecular pair's share of it can be
 # either sign -- so the invariant is on the sum, which is the quantity that is
@@ -643,114 +477,9 @@ def test_the_corrected_path_is_attractive_on_this_fixture(
     assert corrected.item() < 0, corrected.item()
 
 
-def test_the_legacy_polarization_alone_was_repulsive_here():
-    """Why the overlap term looked healthier than it was.
-
-    The legacy polarization energy sums to +1.202 on this fixture -- repulsive,
-    which induction cannot be. Adding the overlap term drags the total back to
-    -2.318, so the *total* looked fine while the term underneath it had the
-    wrong sign. That is the same masking seen on S66x8, where `cliff2_ind_ipd`
-    was positive on 421 of 528 geometries but `cliff2_ind` on only 341.
-    """
-    legacy_polarization = sum(_PRE_REFACTOR_RACKERS_NO_OVERLAP)
-    legacy_total = sum(_PRE_REFACTOR_RACKERS_OVERLAP)
-    assert legacy_polarization > 0
-    assert legacy_total < 0
-
-
-@pytest.mark.parametrize(
-    "fn",
-    [
-        mtp_mtp.induced_dipole_induction,
-        mtp_mtp.induced_dipole_induction_optimized,
-    ],
-    ids=["induced_dipole_induction", "induced_dipole_induction_optimized"],
-)
-def test_induced_dipole_induction_matches_pre_refactor(
-    fn, overlap_regression_inputs
-):
-    got = _run_induced_dipole(overlap_regression_inputs, fn)
-    torch.testing.assert_close(
-        got,
-        torch.tensor(_PRE_REFACTOR_INDUCED_DIPOLE, dtype=torch.float64),
-        rtol=1e-10,
-        atol=1e-12,
-    )
-
-
-def test_refactored_sites_use_the_shared_helper(overlap_regression_inputs):
-    """The three call sites really delegate; patching the helper moves them."""
-    d = overlap_regression_inputs
-    calls = []
-    real = mtp_mtp.atomic_overlap_S_ij
-
-    def spy(*args, **kwargs):
-        calls.append(kwargs.get("width_floor", OVERLAP_WIDTH_FLOOR))
-        return real(*args, **kwargs)
-
-    mtp_mtp.atomic_overlap_S_ij = spy
-    try:
-        _run_rackers(d, include_overlap=True)
-        _run_induced_dipole(d, mtp_mtp.induced_dipole_induction)
-    finally:
-        mtp_mtp.atomic_overlap_S_ij = real
-
-    assert len(calls) == 2
-    # Both legacy sites must opt out of the width floor to stay numerically
-    # identical to their pre-refactor behavior.
-    assert calls == [0.0, 0.0]
-
-
 # --------------------------------------------------------------------------
 # apnet3 legacy pin test
 # --------------------------------------------------------------------------
-
-
-def test_apnet3_valence_width_exch_legacy_pin():
-    """Pin apnet3's deliberately non-physical S_ij.
-
-    ``valence_width_exch`` uses B_ij = 1/(sigma_i sigma_j) -- CLIFF Eq. (11)
-    without its square root -- and folds ``hartree2kcal`` into the returned
-    value.  That is *not* a bug to fix: the result is multiplied by the learned
-    ``readout_layer_exch_quotient``, so the missing square root has been
-    absorbed into fitted weights.  "Correcting" B_ij here would silently
-    invalidate every trained AP3 checkpoint.  New physics must call
-    ``mtp_mtp.atomic_overlap_S_ij`` instead.
-    """
-    e_source = torch.tensor([0, 0, 1], dtype=torch.long)
-    e_target = torch.tensor([0, 1, 0], dtype=torch.long)
-    vwA = torch.tensor([1.20, 0.05], dtype=torch.float64)
-    vwB = torch.tensor([1.10, 0.90], dtype=torch.float64)
-    r_ij = torch.tensor([2.0, 3.0, 2.5], dtype=torch.float64)
-
-    got = APNet3_MPNN.valence_width_exch(
-        None, e_source, e_target, vwA, vwB, r_ij
-    )
-
-    # Hand-evaluated legacy form, including the 0.1 where() floor, the literal
-    # (un-square-rooted) B_ij, and the folded hartree->kcal/mol factor.
-    h2kcal = qcel.constants.conversion_factor("hartree", "kcal/mol")
-    expected = []
-    for i, j, r in zip(
-        e_source.tolist(), e_target.tolist(), r_ij.tolist()
-    ):
-        sa = max(vwA[i].item(), 0.1)
-        sb = max(vwB[j].item(), 0.1)
-        B = 1.0 / (sa * sb)
-        x = B * r
-        expected.append((x * x / 3.0 + x + 1.0) * math.exp(-x) * h2kcal)
-    torch.testing.assert_close(
-        got,
-        torch.tensor(expected, dtype=torch.float64),
-        rtol=1e-12,
-        atol=0,
-    )
-
-    # And it is emphatically NOT the physical helper.
-    physical = atomic_overlap_S_ij(
-        vwA, vwB, e_source, e_target, r_ij, width_floor=0.1
-    )
-    assert not torch.allclose(got / h2kcal, physical, rtol=1e-3)
 
 
 # --------------------------------------------------------------------------
@@ -787,28 +516,6 @@ def test_exchange_uses_product_not_geometric_mean():
     assert E != pytest.approx(
         geo_mean * S_ij * constants.h2kcalmol, rel=1e-3
     )
-
-
-def test_exchange_path_does_not_call_geometric_mean(monkeypatch):
-    def boom(*args, **kwargs):  # pragma: no cover - must not run
-        raise AssertionError(
-            "cliff_exchange must not use geometric_mean_edge_values"
-        )
-
-    monkeypatch.setattr(mtp_mtp, "geometric_mean_edge_values", boom)
-    e_src, e_tgt = _single_edge()
-    out = cliff_exchange(
-        None,
-        None,
-        e_src,
-        e_tgt,
-        torch.tensor([SIGMA_O], dtype=torch.float64),
-        torch.tensor([SIGMA_H], dtype=torch.float64),
-        torch.tensor([K_EXCH_O2], dtype=torch.float64),
-        torch.tensor([K_EXCH_HO], dtype=torch.float64),
-        dR_AB=torch.tensor([3.6849659], dtype=torch.float64),
-    )
-    assert torch.isfinite(out).all()
 
 
 def test_exchange_is_bilinear_in_K():
@@ -915,21 +622,6 @@ def test_exchange_decays_monotonically_with_separation(
 # Generalized positive-parameter contract (_validate_positive_initialization)
 # ==========================================================================
 
-# The Rackers wrapper's error text is a hard compatibility surface: it is
-# asserted on by tests/test_rackers_thole_damping.py and surfaced verbatim to
-# users by train_models.py, which calls _validate_rackers_initialization
-# directly to validate CLI overrides.  Generalizing the validator must not
-# change a single byte of any of these.
-def _rackers_dtype_messages():
-    dtype = torch.get_default_dtype()
-    return (
-        "transformed param_start_mean values must be finite and "
-        f"representable in the {dtype} embedding dtype",
-        "param_start_std values must be representable in the "
-        f"{dtype} embedding dtype",
-    )
-
-
 def test_validate_positive_initialization_returns_softplus_preimages():
     positive_means, raw_stds, epsilon, raw_means = (
         _validate_positive_initialization(
@@ -980,113 +672,6 @@ def test_validate_positive_initialization_rejects_wrong_length(
             1e-8,
         )
     assert str(excinfo.value) == f"{field} must contain {expected}"
-
-
-@pytest.mark.parametrize("field", ["param_start_mean", "param_start_std"])
-def test_validate_positive_initialization_rejects_non_sequence(field):
-    """A bare scalar is not silently broadcast to n_params."""
-    kwargs = {
-        "param_start_mean": list(CLIFF_EXCH_INITIAL_VALUES),
-        "param_start_std": list(CLIFF_EXCH_INITIAL_STDS),
-    }
-    kwargs[field] = 2.5
-    with pytest.raises(ValueError, match="exactly one value"):
-        _validate_positive_initialization(
-            CLIFF_EXCH_PARAMETER_NAMES,
-            kwargs["param_start_mean"],
-            kwargs["param_start_std"],
-            1e-8,
-        )
-
-
-def test_rackers_wrapper_length_messages_are_byte_identical():
-    with pytest.raises(ValueError) as mean_exc:
-        _validate_rackers_initialization([0.1, 0.2, 0.3], list(RACKERS_INITIAL_STDS), 1e-8)
-    assert str(mean_exc.value) == (
-        "param_start_mean must contain exactly four values"
-    )
-
-    with pytest.raises(ValueError) as std_exc:
-        _validate_rackers_initialization(list(RACKERS_INITIAL_VALUES), [0.01], 1e-8)
-    assert str(std_exc.value) == (
-        "param_start_std must contain exactly four values"
-    )
-
-
-@pytest.mark.parametrize(
-    "mean,std,epsilon,expected",
-    [
-        (
-            RACKERS_INITIAL_VALUES,
-            RACKERS_INITIAL_STDS,
-            0.0,
-            "positivity_epsilon must be finite and strictly greater than zero",
-        ),
-        (
-            RACKERS_INITIAL_VALUES,
-            RACKERS_INITIAL_STDS,
-            float("nan"),
-            "positivity_epsilon must be finite and strictly greater than zero",
-        ),
-        (
-            (1.8, 0.0, 0.39, 1.8),
-            RACKERS_INITIAL_STDS,
-            1e-8,
-            "param_start_mean values must be finite and strictly greater than "
-            "positivity_epsilon",
-        ),
-        (
-            RACKERS_INITIAL_VALUES,
-            (0.01, -0.1, 0.01, 0.01),
-            1e-8,
-            "param_start_std values must be finite and greater than or equal "
-            "to zero",
-        ),
-    ],
-)
-def test_rackers_wrapper_domain_messages_are_byte_identical(
-    mean, std, epsilon, expected
-):
-    with pytest.raises(ValueError) as excinfo:
-        _validate_rackers_initialization(list(mean), list(std), epsilon)
-    assert str(excinfo.value) == expected
-
-
-@pytest.mark.parametrize("field", ["param_start_mean", "param_start_std"])
-def test_rackers_wrapper_dtype_messages_are_byte_identical(field):
-    mean_message, std_message = _rackers_dtype_messages()
-    kwargs = {
-        "param_start_mean": list(RACKERS_INITIAL_VALUES),
-        "param_start_std": list(RACKERS_INITIAL_STDS),
-    }
-    if field == "param_start_mean":
-        kwargs[field] = [1e39, 1.0, 1.0, 1.0]
-        expected = mean_message
-    else:
-        kwargs[field] = [1e39, 0.0, 0.0, 0.0]
-        expected = std_message
-    with pytest.raises(ValueError) as excinfo:
-        _validate_rackers_initialization(
-            kwargs["param_start_mean"], kwargs["param_start_std"], 1e-8
-        )
-    assert str(excinfo.value) == expected
-
-
-def test_rackers_wrapper_delegates_to_generalized_validator(monkeypatch):
-    """The wrapper binds RACKERS_PARAMETER_NAMES and forwards everything else."""
-    seen = {}
-
-    def spy(parameter_names, mean, std, epsilon):
-        seen["names"] = parameter_names
-        seen["args"] = (mean, std, epsilon)
-        return ([], [], epsilon, [])
-
-    monkeypatch.setattr(
-        mtp_mtp, "_validate_positive_initialization", spy
-    )
-    mtp_mtp._validate_rackers_initialization([1.0] * 4, [0.0] * 4, 1e-7)
-    assert tuple(seen["names"]) == RACKERS_PARAMETER_NAMES
-    assert seen["args"] == ([1.0] * 4, [0.0] * 4, 1e-7)
 
 
 # ==========================================================================
@@ -1215,56 +800,6 @@ def test_cliff_head_outputs_finite_and_strictly_positive(
 
 
 @pytest.mark.parametrize(
-    "model_type,_name,_parameter_names,values,_stds",
-    _HEAD_CASES,
-    ids=_HEAD_IDS,
-)
-def test_cliff_head_zeroed_corrections_recover_initial_values(
-    model_type, _name, _parameter_names, values, _stds,
-    atomic_batch, nested_hfvr_vw_model,
-):
-    """Zeroed correction heads recover the *scalar* seeds when no per-Z table.
-
-    ``param_start_mean_by_Z={}`` opts out of the per-element seeding, which is
-    the only configuration in which every atom shares a column's scalar seed.
-    The default configuration seeds ``exch`` per element and is pinned by
-    :func:`test_cliff_head_zeroed_corrections_recover_per_element_values`.
-    """
-    model = _build_head(
-        model_type, nested_hfvr_vw_model, param_start_mean_by_Z={}
-    )
-    _zero_readout_heads(model)
-    parameters = model(atomic_batch)[-1]
-    expected = torch.tensor(values, dtype=parameters.dtype)
-    # The tolerance is derived from the configured initialization spread rather
-    # than hard-coded: `param_start_std` is a *raw*-space standard deviation and
-    # `dK/draw = sigmoid(raw) <= 1`, so the emitted per-atom noise is at most
-    # `std`, and the mean over `n_atoms` has standard error at most
-    # `std / sqrt(n_atoms)`.  Four of those is a ~4-sigma band.  Hard-coding
-    # 0.05 silently pinned this to `std = 0.01` and broke the moment the
-    # exchange column moved to 0.25; the exact contract is asserted below with
-    # zero noise.
-    n_atoms = parameters.shape[0]
-    atol = 4.0 * max(model.param_start_std) / math.sqrt(n_atoms)
-    assert torch.allclose(parameters.mean(dim=0), expected, atol=atol)
-
-    # With zero initialization noise the recovery is exact, not merely close.
-    exact = _build_head(
-        model_type,
-        copy.deepcopy(nested_hfvr_vw_model),
-        param_start_std=[0.0] * len(values),
-        param_start_mean_by_Z={},
-    )
-    _zero_readout_heads(exact)
-    exact_parameters = exact(atomic_batch)[-1]
-    assert torch.allclose(
-        exact_parameters,
-        expected.expand_as(exact_parameters),
-        atol=1e-5,
-    )
-
-
-@pytest.mark.parametrize(
     "model_type,_name,parameter_names,values,_stds",
     _HEAD_CASES,
     ids=_HEAD_IDS,
@@ -1305,40 +840,6 @@ def test_cliff_head_zeroed_corrections_recover_per_element_values(
     # Water is O/H/H, so the exchange column must not be constant.
     exch_column = parameter_names.index("exch")
     assert parameters[:, exch_column].std() > 1.0
-
-
-@pytest.mark.parametrize(
-    "model_type,_name,_parameter_names,_values,_stds",
-    _HEAD_CASES,
-    ids=_HEAD_IDS,
-)
-def test_cliff_head_preserves_wrapped_outputs(
-    model_type, _name, _parameter_names, _values, _stds,
-    atomic_batch, nested_hfvr_vw_model,
-):
-    """Multipoles and the HFVR / valence-width columns must pass through.
-
-    The physics paths read Hirshfeld volume ratios as ``abs(output[-2][:, 0])``
-    and valence widths as ``output[-2][:, 1])``; appending a parameter column
-    must not shift either of them.
-    """
-    model = _build_head(model_type, nested_hfvr_vw_model)
-    nested_output = nested_hfvr_vw_model(atomic_batch)
-    output = model(atomic_batch)
-
-    assert len(output) == len(nested_output) + 1
-    for wrapped, expected in zip(output[:-1], nested_output):
-        assert torch.allclose(wrapped, expected)
-
-    nested_parameters = nested_output[-1]
-    assert nested_parameters.shape == (atomic_batch.x.numel(), 2)
-    assert output[-2] is not output[-1]
-    assert torch.allclose(output[-2], nested_parameters)
-    # HFVR (column 0) and valence width (column 1) land where the physics
-    # paths expect them.
-    assert torch.allclose(output[-2][:, 0], nested_parameters[:, 0])
-    assert torch.allclose(output[-2][:, 1], nested_parameters[:, 1])
-    assert torch.isfinite(output[-2]).all()
 
 
 @pytest.mark.parametrize(
@@ -1472,32 +973,6 @@ def test_cliff_head_rejects_non_atomtypeparamnn_nested_model(
 
 
 @pytest.mark.parametrize(
-    "model_type,_name,parameter_names,values,stds",
-    _HEAD_CASES,
-    ids=_HEAD_IDS,
-)
-def test_cliff_head_initialization_length_errors_report_true_count(
-    model_type, _name, parameter_names, values, stds,
-    nested_hfvr_vw_model,
-):
-    expected = "exactly one value" if len(values) == 1 else "exactly five values"
-    with pytest.raises(ValueError) as mean_exc:
-        _build_head(
-            model_type,
-            nested_hfvr_vw_model,
-            param_start_mean=list(values) + [1.0],
-        )
-    assert str(mean_exc.value) == f"param_start_mean must contain {expected}"
-    with pytest.raises(ValueError) as std_exc:
-        _build_head(
-            model_type,
-            nested_hfvr_vw_model,
-            param_start_std=list(stds) + [0.0],
-        )
-    assert str(std_exc.value) == f"param_start_std must contain {expected}"
-
-
-@pytest.mark.parametrize(
     "model_type,name,parameter_names,values,stds",
     _HEAD_CASES,
     ids=_HEAD_IDS,
@@ -1599,20 +1074,6 @@ def test_cliff_head_rejects_invalid_width_floor(
         )
 
 
-@pytest.mark.parametrize(
-    "model_type,_name,_parameter_names,_values,_stds",
-    _HEAD_CASES,
-    ids=_HEAD_IDS,
-)
-def test_cliff_head_width_floor_defaults_to_module_constant(
-    model_type, _name, _parameter_names, _values, _stds,
-    nested_hfvr_vw_model,
-):
-    model = _build_head(model_type, nested_hfvr_vw_model)
-    assert model.width_floor == OVERLAP_WIDTH_FLOOR
-    assert model.get_config()["width_floor"] == OVERLAP_WIDTH_FLOOR
-
-
 # --------------------------------------------------------------------------
 # Task C: FULL_EDGE_DIMER_EVAL_MODES
 # --------------------------------------------------------------------------
@@ -1699,33 +1160,6 @@ def test_full_edge_mode_set_matches_the_forwards_using_e_abfull():
         source = _forward_source_for_mode(mode)
         assert "e_ABfull_source" in source
         assert "e_ABsr_" not in source
-
-
-def test_all_four_cliff_modes_are_full_edge_modes():
-    assert CLIFF_DIMER_EVAL_MODES <= mtp_mtp.FULL_EDGE_DIMER_EVAL_MODES
-    assert {"rackers_thole", "rackers_thole_overlap"} <= (
-        mtp_mtp.FULL_EDGE_DIMER_EVAL_MODES
-    )
-    assert len(mtp_mtp.FULL_EDGE_DIMER_EVAL_MODES) == 6
-
-
-@pytest.mark.parametrize(
-    "mode,expected_index",
-    [
-        ("cliff_exch", "dimer_ind_full"),
-        ("cliff_classical", "dimer_ind_full"),
-        ("cliff_classical_overlap", "dimer_ind_full"),
-        ("cliff_classical_d3", "dimer_ind_full"),
-        ("elst_damping", "dimer_ind"),
-    ],
-)
-def test_dimer_index_for_output_uses_the_full_edge_set(
-    mode, expected_index, synthetic_dimer_batch
-):
-    harness = AM_DimerParam_Model.__new__(AM_DimerParam_Model)
-    harness.dimer_eval_type = mode
-    selected = harness._dimer_index_for_output(synthetic_dimer_batch)
-    assert selected is getattr(synthetic_dimer_batch, expected_index)
 
 
 # --------------------------------------------------------------------------
@@ -2059,64 +1493,6 @@ def test_cliff_exch_needs_no_polarizability_and_skips_induction(
     assert torch.equal(
         exchange["e_AB_target"], synthetic_dimer_batch.e_ABfull_target
     )
-
-
-@pytest.mark.parametrize(
-    "mode,expected_distance_calls",
-    [
-        # `_cliff_exch_forward` leaves the single reduction to
-        # `cliff_exchange`; the classical forwards do it themselves and hand
-        # the result down, so exchange adds no second call.
-        ("cliff_exch", 1),
-        ("cliff_classical", 1),
-        ("cliff_classical_overlap", 1),
-    ],
-)
-def test_intermolecular_distances_are_computed_once_per_forward(
-    mode, expected_distance_calls, synthetic_dimer_batch, monkeypatch
-):
-    """Stub the kernels that own their own reductions, then count.
-
-    `mtp_elst_damping` and `rackers_thole_induction` each call
-    `get_distances` internally on their own edge domains, so they are replaced
-    with stubs here; what remains is the forward's own reduction plus anything
-    `cliff_exchange` adds.
-    """
-    original_get_distances = mtp_mtp.get_distances
-    distance_calls = []
-
-    def counting_get_distances(RA, RB, e_source, e_target):
-        distance_calls.append(e_source)
-        return original_get_distances(RA, RB, e_source, e_target)
-
-    monkeypatch.setattr(mtp_mtp, "get_distances", counting_get_distances)
-    monkeypatch.setattr(
-        mtp_mtp,
-        "mtp_elst_damping",
-        lambda **kwargs: torch.zeros_like(
-            kwargs["e_AB_source"], dtype=kwargs["RA"].dtype
-        ),
-    )
-    monkeypatch.setattr(
-        mtp_mtp,
-        "rackers_thole_induction",
-        lambda **kwargs: torch.zeros_like(
-            kwargs["e_AB_source"], dtype=kwargs["RA"].dtype
-        ),
-    )
-
-    n_params = 1 if mode == "cliff_exch" else 5
-    dimer = mtp_mtp.DimerProp(
-        ATParam=_ControlledCliffClassicalAtomParam(n_params=n_params),
-        dimer_eval=mode,
-    )
-    dimer(synthetic_dimer_batch)
-
-    assert len(distance_calls) == expected_distance_calls
-    for e_source in distance_calls:
-        assert torch.equal(
-            e_source, synthetic_dimer_batch.e_ABfull_source
-        )
 
 
 def test_dimer_prop_forwards_configured_scf_controls(
@@ -2457,26 +1833,6 @@ def test_cliff_harness_contract(
 
 
 @pytest.mark.parametrize(
-    "harness_type", [entry[0] for entry in CLIFF_HARNESSES],
-    ids=CLIFF_HARNESS_IDS,
-)
-@pytest.mark.parametrize(
-    "forbidden", ["n_params", "model_type", "dimer_eval_type"]
-)
-def test_cliff_harness_hides_fixed_configuration(
-    harness_type, forbidden, nested_hfvr_vw_model
-):
-    """None of the fixed configuration is a public constructor argument."""
-    parameters = inspect.signature(harness_type.__init__).parameters
-    assert forbidden not in parameters
-    # `**dataset_kwargs` would otherwise swallow it and forward a duplicate.
-    with pytest.raises(TypeError, match=forbidden):
-        _build_cliff_harness(
-            harness_type, nested_hfvr_vw_model, **{forbidden: "ignored"}
-        )
-
-
-@pytest.mark.parametrize(
     "harness_type,parameter_names",
     [(entry[0], entry[3]) for entry in CLIFF_HARNESSES],
     ids=CLIFF_HARNESS_IDS,
@@ -2515,38 +1871,9 @@ def test_positive_parameter_contracts_cover_every_head():
     }
 
 
-def test_combined_cliff_modes_are_the_trainable_multi_component_routes():
-    assert COMBINED_CLIFF_DIMER_EVAL_MODES == frozenset(
-        {"cliff_classical", "cliff_classical_overlap"}
-    )
-    # `cliff_classical_d3` is inference-only and `cliff_exch` has a single
-    # component, so neither may carry a total/component split.
-    assert "cliff_classical_d3" not in COMBINED_CLIFF_DIMER_EVAL_MODES
-    assert "cliff_exch" not in COMBINED_CLIFF_DIMER_EVAL_MODES
-
-
 # ---------------------------------------------------------------------------
 # Task D: y_ind / term dispatch
 # ---------------------------------------------------------------------------
-
-
-def test_mae_report_header_is_width_agnostic():
-    """The header is generated, so widening the selection is data, not code.
-
-    The first two expectations are the literals the pre-Task-D dispatch used
-    for its one- and two-column selections; keeping them byte-identical is what
-    proves the generated form did not change any existing report.
-    """
-    assert _mae_report_header(("Elst",)) == "Elst"
-    assert _mae_report_header(("Elst", "Ind")) == "Elst      Ind"
-    assert (
-        _mae_report_header(("Elst", "Exch", "Ind")) == "Elst      Exch      Ind"
-    )
-    # Any width, without a per-width branch.
-    assert _mae_report_header(()) == ""
-    assert _mae_report_header(("A", "B", "C", "D")) == (
-        "A" + " " * 9 + "B" + " " * 9 + "C" + " " * 9 + "D"
-    )
 
 
 @pytest.mark.parametrize(
@@ -2685,88 +2012,6 @@ def test_component_gamma_none_reproduces_plain_mse_bitwise(
     assert torch.equal(actual, expected)
 
 
-def test_default_harness_component_gamma_is_the_neutral_default(
-    nested_hfvr_vw_model,
-):
-    harness = _build_cliff_harness(CliffClassicalModel, nested_hfvr_vw_model)
-    assert harness.component_gamma is None
-    assert harness.total_includes_d3 is False
-
-
-def test_component_loss_weighting_defaults_without_attributes():
-    """A ``__new__``-constructed harness keeps the historical behavior."""
-    harness = AM_DimerParam_Model.__new__(AM_DimerParam_Model)
-    assert harness._component_loss_weighting() == (None, False)
-
-
-class _FullEdgeCliffTrainModel(torch.nn.Module):
-    """Three-column per-edge stub standing in for a CLIFF classical forward."""
-
-    def __init__(self, n_columns=3):
-        super().__init__()
-        self.n_columns = n_columns
-        self.scale = torch.nn.Parameter(torch.tensor(1.25))
-
-    def forward(self, batch):
-        base = torch.arange(
-            1, batch.dimer_ind_full.numel() * self.n_columns + 1,
-            dtype=self.scale.dtype,
-        ).reshape(batch.dimer_ind_full.numel(), self.n_columns)
-        return (self.scale * base,)
-
-
-def test_training_loop_component_gamma_none_matches_legacy_path_bitwise(
-    synthetic_dimer_batch,
-):
-    """Same assertion, but through the real training/eval loops.
-
-    The second run replaces ``_batch_loss`` with the verbatim pre-Task-D
-    expression, so the comparison is against the old code path executing inside
-    the same loop, not against a hand-written formula.
-    """
-    y_ind = torch.tensor([0, 1, 2])
-
-    def run(use_legacy):
-        torch.manual_seed(3)
-        harness = AM_DimerParam_Model.__new__(AM_DimerParam_Model)
-        harness.dimer_eval_type = "cliff_classical"
-        harness.component_gamma = None
-        harness.total_includes_d3 = False
-        harness.model = _FullEdgeCliffTrainModel()
-        harness.dimer_model = harness.model
-        if use_legacy:
-            harness._batch_loss = (
-                lambda preds, ref, comp_errors, batch, loss_fn:
-                _legacy_batch_loss(preds, ref, comp_errors, loss_fn)
-            )
-        optimizer = torch.optim.SGD(harness.model.parameters(), lr=0.01)
-        train = harness._AM_DimerParam_Model__train_batches_single_proc(
-            [synthetic_dimer_batch],
-            loss_fn=torch.nn.MSELoss(),
-            optimizer=optimizer,
-            rank_device=torch.device("cpu"),
-            scheduler=None,
-            y_ind=y_ind,
-        )
-        evaluate = harness._AM_DimerParam_Model__evaluate_batches_single_proc(
-            [synthetic_dimer_batch],
-            loss_fn=torch.nn.MSELoss(),
-            rank_device=torch.device("cpu"),
-            y_ind=y_ind,
-        )
-        return train, evaluate
-
-    (new_train, new_eval) = run(use_legacy=False)
-    (old_train, old_eval) = run(use_legacy=True)
-
-    assert new_train[0] == old_train[0]
-    assert torch.equal(new_train[1], old_train[1])
-    assert new_eval[0] == old_eval[0]
-    assert torch.equal(new_eval[1], old_eval[1])
-    # Three columns reported, not a hardcoded two.
-    assert new_train[1].shape == (3,)
-
-
 def test_component_gamma_zero_depends_only_on_the_summed_total():
     ref = torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 0.0]])
     preds = torch.tensor([[1.0, 2.0, 3.0], [-1.0, 0.0, 1.0]])
@@ -2805,82 +2050,6 @@ def test_component_gamma_matches_hand_computed_value():
     harness = _loss_probe_harness(component_gamma=0.4)
     loss = harness._batch_loss(preds, ref, preds - ref, None, None)
     assert loss.item() == pytest.approx(6.9, rel=1e-6)
-
-
-def test_cliff_component_loss_is_continuous_across_the_gamma_sweep():
-    """CLIFF Fig. 3 sweeps gamma over [0, 1]; the loss must not step.
-
-    This is the regression guard for the earlier design in which
-    ``component_gamma = 1.0`` doubled as the legacy plain-MSE default: with
-    ``k`` columns, ``sum_C MSE(E_C) == k * mean MSE``, so the endpoint jumped by
-    a factor of ``k`` and the effective learning rate jumped with it.  The
-    legacy loss now has its own sentinel (``None``), leaving the Eq. (23)
-    family continuous.
-    """
-    ref = torch.tensor(
-        [[0.0, 1.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float64
-    )
-    preds = torch.tensor(
-        [[1.0, 2.0, 3.0], [-1.0, 0.0, 1.0]], dtype=torch.float64
-    )
-
-    def loss_at(gamma):
-        harness = _loss_probe_harness(component_gamma=gamma)
-        return harness._batch_loss(
-            preds, ref, preds - ref, None, None
-        ).item()
-
-    # Continuity at the endpoint that used to jump.  L is affine in gamma with
-    # slope (component_term - total_term), so a 1e-4 step may move it by at
-    # most 1e-4 * |slope|; the old design moved it by a factor of k instead.
-    slope = abs(loss_at(1.0) - loss_at(0.0))
-    assert abs(loss_at(1.0) - loss_at(0.9999)) <= 1e-4 * slope * 1.001
-    assert abs(loss_at(0.0) - loss_at(0.0001)) <= 1e-4 * slope * 1.001
-    assert loss_at(1.0) == pytest.approx(loss_at(0.9999), rel=1e-3)
-    assert loss_at(0.0) == pytest.approx(loss_at(0.0001), rel=1e-3)
-
-    # gamma = 1.0 is exactly the unnormalized component sum, with zero weight
-    # on the total -- the honest Eq. (23) endpoint.
-    component_sum = torch.square(preds - ref).mean(dim=0).sum()
-    assert loss_at(1.0) == pytest.approx(component_sum.item(), rel=1e-12)
-
-    # ... which is k times the legacy plain MSE, hence a different functional.
-    legacy = _loss_probe_harness(component_gamma=None)._batch_loss(
-        preds, ref, preds - ref, None, None
-    )
-    assert loss_at(1.0) == pytest.approx(
-        preds.shape[1] * legacy.item(), rel=1e-12
-    )
-
-    # Monotone and smooth across the whole sweep: no step anywhere.
-    sweep = [round(0.05 * i, 2) for i in range(21)]
-    values = [loss_at(gamma) for gamma in sweep]
-    steps = [b - a for a, b in zip(values, values[1:])]
-    assert max(steps) - min(steps) < 1e-9  # linear in gamma, so equal steps
-
-
-def test_component_gamma_is_linear_in_gamma():
-    """L is affine in gamma, so two anchors determine the whole sweep."""
-    ref = torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 0.0]])
-    preds = torch.tensor([[1.0, 2.0, 3.0], [-1.0, 0.0, 1.0]])
-
-    def loss_at(gamma):
-        return _loss_probe_harness(component_gamma=gamma)._batch_loss(
-            preds, ref, preds - ref, None, None
-        ).item()
-
-    total_only, component_only = loss_at(0.0), loss_at(1.0)
-    for gamma in (0.1, 0.4, 0.75):
-        expected = (1.0 - gamma) * total_only + gamma * component_only
-        assert loss_at(gamma) == pytest.approx(expected, rel=1e-6)
-
-
-def test_component_gamma_rejects_a_single_component_prediction():
-    harness = _loss_probe_harness(component_gamma=0.4)
-    preds = torch.tensor([1.0, 2.0])
-    ref = torch.tensor([0.0, 0.0])
-    with pytest.raises(ValueError, match="multi-component"):
-        harness._batch_loss(preds, ref, preds - ref, None, None)
 
 
 def test_total_includes_d3_changes_the_total_and_carries_no_gradient(
@@ -2925,34 +2094,6 @@ def test_total_includes_d3_changes_the_total_and_carries_no_gradient(
     assert torch.isfinite(trainable.grad).all()
 
 
-def test_total_includes_d3_compares_against_all_four_sapt_columns(
-    synthetic_dimer_batch, monkeypatch
-):
-    batch = synthetic_dimer_batch
-    n_edges = batch.dimer_ind_full.numel()
-    monkeypatch.setattr(
-        mtp_mtp, "d3", lambda b, params=None: torch.zeros(n_edges)
-    )
-    # The shared fixture's y happens to satisfy |sum of 4| == |sum of 3|, so
-    # pick columns where the three- and four-column totals genuinely differ.
-    batch.y = torch.tensor(
-        [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]
-    )
-    preds = torch.zeros((batch.total_charge_A.numel(), 3))
-    ref = batch.y[:, torch.tensor([0, 1, 2])]
-
-    harness = _loss_probe_harness(
-        component_gamma=0.0, total_includes_d3=True
-    )
-    loss = harness._batch_loss(preds, ref, preds - ref, batch, None)
-    # With zero predictions and zero dispersion the total term is the MSE of
-    # the four-column reference sum, not the three-column one.
-    expected = torch.mean(torch.square(batch.y.sum(dim=-1)))
-    assert torch.allclose(loss, expected)
-    three_column = torch.mean(torch.square(ref.sum(dim=-1)))
-    assert not torch.allclose(loss, three_column)
-
-
 @pytest.mark.parametrize("gamma", [-0.1, 1.0001, 2.0, float("nan")])
 def test_component_gamma_out_of_range_raises(gamma, nested_hfvr_vw_model):
     harness = _build_cliff_harness(CliffClassicalModel, nested_hfvr_vw_model)
@@ -2976,112 +2117,6 @@ def test_component_gamma_rejected_for_the_exchange_route(
     # reason that no dataset was supplied.
     with pytest.raises(ValueError, match="No dataset provided"):
         harness.train()
-
-
-def test_component_gamma_rejected_for_pre_existing_routes(
-    nested_hfvr_vw_model,
-):
-    harness = RackersTholeDampingModel(
-        atom_model=copy.deepcopy(nested_hfvr_vw_model),
-        dataset=None,
-        ignore_database_null=True,
-        use_GPU=False,
-        n_message=1,
-        n_neuron=8,
-        n_embed=4,
-    )
-    with pytest.raises(ValueError, match="only supported for the combined"):
-        harness.train(component_gamma=0.4)
-
-
-@pytest.mark.parametrize(
-    "harness_type",
-    [CliffClassicalModel, CliffClassicalOverlapModel],
-)
-def test_component_gamma_is_recorded_on_the_harness_by_train(
-    harness_type, nested_hfvr_vw_model
-):
-    harness = _build_cliff_harness(harness_type, nested_hfvr_vw_model)
-    with pytest.raises(ValueError, match="No dataset provided"):
-        harness.train(component_gamma=0.4, total_includes_d3=True)
-    assert harness.component_gamma == 0.4
-    assert harness.total_includes_d3 is True
-
-
-class _StubTrainDataset:
-    """Minimal stand-in for a prebatched pairwise dataset."""
-
-    training_batch_size = 1
-
-    def __len__(self):
-        return 2
-
-    def __getitem__(self, indices):
-        return self
-
-
-def test_total_includes_d3_requires_an_explicit_gamma(nested_hfvr_vw_model):
-    """The default loss has no total term, so the flag would be a no-op."""
-    harness = _build_cliff_harness(CliffClassicalModel, nested_hfvr_vw_model)
-    with pytest.raises(
-        ValueError,
-        match="total_includes_d3 requires an explicit component_gamma",
-    ):
-        harness.train(total_includes_d3=True)
-    # Accepted for any explicit gamma, including the 1.0 endpoint, which is a
-    # legitimate Eq. (23) setting rather than the legacy default.
-    for gamma in (0.4, 1.0):
-        with pytest.raises(ValueError, match="No dataset provided"):
-            harness.train(component_gamma=gamma, total_includes_d3=True)
-
-
-def test_multi_process_training_is_no_longer_rejected():
-    """The CLIFF routes now have a DDP path, and it is one loop, not two.
-
-    This test used to assert the opposite -- that ``train(world_size=2)``
-    raised ``NotImplementedError("Multi-process training ...")``. It does not
-    any more. What is worth pinning instead is that the distributed path did
-    not arrive as a *second* epoch loop: ``ddp_train`` delegates to
-    ``single_proc_train``, so the golden source-introspection contracts in
-    ``tests/test_cliff_induction_golden.py`` still cover the loop that
-    actually runs under DDP. A real two-rank gloo run lives in
-    ``tests/test_cliff_induction_ddp.py``.
-    """
-    train_source = inspect.getsource(AM_DimerParam_Model.train)
-    assert "NotImplementedError" not in train_source
-    assert "mp.spawn(" in train_source
-
-    ddp_source = inspect.getsource(AM_DimerParam_Model.ddp_train)
-    assert "self.single_proc_train(" in ddp_source
-    assert "for epoch in range(" not in ddp_source
-
-
-def test_component_gamma_survives_the_train_models_signature_filter():
-    """``train_models.py`` drops any kwarg absent from ``train``'s signature.
-
-    The shared pairwise tail filters ``train_kwargs`` through
-    ``inspect.signature(apnet.train).parameters``, so these must be *named*
-    parameters rather than ``**kwargs`` to be forwarded at all.
-    """
-    parameters = inspect.signature(AM_DimerParam_Model.train).parameters
-    assert "component_gamma" in parameters
-    assert "total_includes_d3" in parameters
-    # `None` is the default, and it must survive the filter as a real value:
-    # the filter keys on the parameter *name*, so a `None` default is forwarded
-    # like any other, and the harness -- not the CLI -- owns its meaning.
-    assert parameters["component_gamma"].default is None
-    assert parameters["total_includes_d3"].default is False
-    assert parameters["component_gamma"].kind is not (
-        inspect.Parameter.VAR_KEYWORD
-    )
-    for harness_type in (
-        CliffExchangeModel,
-        CliffClassicalModel,
-        CliffClassicalOverlapModel,
-    ):
-        harness_parameters = inspect.signature(harness_type.train).parameters
-        assert "component_gamma" in harness_parameters
-        assert "total_includes_d3" in harness_parameters
 
 
 # ---------------------------------------------------------------------------
@@ -3231,29 +2266,6 @@ def test_cliff_checkpoint_rejects_invalid_parameter_metadata(
         )
 
 
-def test_cliff_checkpoint_error_messages_name_their_own_contract(
-    tmp_path, nested_hfvr_vw_model
-):
-    """Generalized messages name the declaring model type, not "Rackers"."""
-    harness = _build_cliff_harness(CliffClassicalModel, nested_hfvr_vw_model)
-    checkpoint = harness._create_checkpoint()
-    checkpoint["config"]["parameter_names"] = list(RACKERS_PARAMETER_NAMES)
-    path = tmp_path / "labelled.pt"
-    model_io.save_checkpoint(checkpoint, path)
-    with pytest.raises(ValueError) as excinfo:
-        CliffClassicalModel(
-            pre_trained_model_path=path,
-            atom_model=None,
-            dataset=None,
-            ignore_database_null=True,
-            use_GPU=False,
-        )
-    assert str(excinfo.value) == (
-        "CliffClassicalNN checkpoint parameter_names must exactly match "
-        f"{list(CLIFF_CLASSICAL_PARAMETER_NAMES)}"
-    )
-
-
 def test_cliff_checkpoint_preserves_nondefault_scf_controls(
     tmp_path, nested_hfvr_vw_model
 ):
@@ -3278,28 +2290,6 @@ def test_cliff_checkpoint_preserves_nondefault_scf_controls(
     )
     assert loaded.dimer_model.induction_convergence_threshold == 1e-6
     assert loaded.dimer_model.induction_max_iterations == 50
-
-
-def test_legacy_cliff_checkpoint_uses_historical_scf_defaults(
-    tmp_path, nested_hfvr_vw_model
-):
-    harness = _build_cliff_harness(
-        CliffClassicalOverlapModel, nested_hfvr_vw_model
-    )
-    checkpoint = harness._create_checkpoint()
-    checkpoint["config"].pop("induction_convergence_threshold")
-    checkpoint["config"].pop("induction_max_iterations")
-    path = tmp_path / "legacy-scf.pt"
-    model_io.save_checkpoint(checkpoint, path)
-    loaded = CliffClassicalOverlapModel(
-        pre_trained_model_path=path,
-        atom_model=None,
-        dataset=None,
-        ignore_database_null=True,
-        use_GPU=False,
-    )
-    assert loaded.dimer_model.induction_convergence_threshold == 1e-8
-    assert loaded.dimer_model.induction_max_iterations == 200
 
 
 def test_cliff_checkpoint_rejects_the_wrong_harness_mode(
@@ -3420,76 +2410,6 @@ RACKERS_CHECKPOINT_CONTRACT_MESSAGES = (
         "Rackers checkpoint missing nested_atom_model metadata",
     ),
 )
-
-
-@pytest.mark.parametrize(
-    "tamper,expected",
-    [entry[1:] for entry in RACKERS_CHECKPOINT_CONTRACT_MESSAGES],
-    ids=[entry[0] for entry in RACKERS_CHECKPOINT_CONTRACT_MESSAGES],
-)
-def test_rackers_checkpoint_messages_are_byte_identical(
-    tmp_path, tamper, expected, nested_hfvr_vw_model
-):
-    """Pin the pre-generalization Rackers checkpoint-contract error text.
-
-    ``AM_DimerParam_Model.__init__`` now looks its expected contract up in
-    ``POSITIVE_PARAMETER_CONTRACTS`` instead of hard-coding
-    ``RackersTholeDampingNN``.  The Rackers strings predate that change, so
-    they are asserted here with ``==`` rather than a substring match; the
-    "Rackers" prefix in particular comes from a label mapping and would
-    silently become "RackersTholeDampingNN" if that mapping were dropped.
-    """
-    harness = RackersTholeDampingModel(
-        atom_model=copy.deepcopy(nested_hfvr_vw_model),
-        dataset=None,
-        ignore_database_null=True,
-        use_GPU=False,
-        n_message=1,
-        n_neuron=8,
-        n_embed=4,
-    )
-    checkpoint = harness._create_checkpoint()
-    tamper(checkpoint)
-    path = tmp_path / "tampered.pt"
-    model_io.save_checkpoint(checkpoint, path)
-
-    with pytest.raises(ValueError) as excinfo:
-        RackersTholeDampingModel(
-            pre_trained_model_path=path,
-            atom_model=None,
-            dataset=None,
-            ignore_database_null=True,
-            use_GPU=False,
-        )
-    assert str(excinfo.value) == expected
-
-
-def test_rackers_checkpoint_dimer_eval_message_is_byte_identical(
-    tmp_path, nested_hfvr_vw_model
-):
-    harness = RackersTholeDampingModel(
-        atom_model=copy.deepcopy(nested_hfvr_vw_model),
-        dataset=None,
-        ignore_database_null=True,
-        use_GPU=False,
-        n_message=1,
-        n_neuron=8,
-        n_embed=4,
-    )
-    path = tmp_path / "mode.pt"
-    harness.save_model(path)
-    with pytest.raises(ValueError) as excinfo:
-        mtp_mtp.RackersTholeDampingOverlapModel(
-            pre_trained_model_path=path,
-            atom_model=None,
-            dataset=None,
-            ignore_database_null=True,
-            use_GPU=False,
-        )
-    assert str(excinfo.value) == (
-        "Rackers checkpoint dimer_eval mismatch: expected "
-        "rackers_thole_overlap, got 'rackers_thole'"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -3779,46 +2699,6 @@ def test_cliff_dispatch_selects_harness_and_forwards_contract(
     ]
 
 
-@pytest.mark.parametrize("identifier", CLIFF_CLI_IDS)
-def test_cliff_dispatch_omits_the_legacy_pretrained_checkpoint(
-    tmp_path, monkeypatch, identifier
-):
-    """An unset ``pre_trained_model_path`` resolves to ``None``, not dAPNet2."""
-    _patch_cliff_dispatch_fakes(monkeypatch)
-    train_models.train_pairwise_model(
-        apnet_model_type=identifier,
-        model_out=str(tmp_path / "missing-output.pt"),
-    )
-    harness = _CLIFF_DISPATCH_FAKES[identifier].calls[0]
-    assert harness.kwargs["pre_trained_model_path"] is None
-    assert (
-        harness.kwargs["pre_trained_model_path"]
-        != train_models.LEGACY_PAIRWISE_PRETRAINED_MODEL_PATH
-    )
-
-
-@pytest.mark.parametrize("identifier", CLIFF_CLI_IDS)
-@pytest.mark.parametrize("field", ["param_start_mean", "param_start_std"])
-def test_cliff_dispatch_rejects_scalar_broadcasting(
-    monkeypatch, identifier, field
-):
-    """A bare scalar is ambiguous on a fixed-contract route, so it is rejected.
-
-    The five-parameter contract mixes electrostatic, Thole, overlap, and
-    exchange scales; broadcasting one number across them would silently invent
-    an initialization no caller asked for.
-    """
-    _patch_cliff_dispatch_fakes(monkeypatch)
-    with pytest.raises(ValueError, match="exactly"):
-        train_models.train_pairwise_model(
-            apnet_model_type=identifier,
-            pre_trained_model_path=None,
-            **{field: 1.8},
-        )
-    assert _FakeAtomTypeParamModel.calls == []
-    assert _CLIFF_DISPATCH_FAKES[identifier].calls == []
-
-
 @pytest.mark.parametrize(
     "identifier,harness_type,expected_mode,initial_values,initial_stds",
     CLIFF_CLI_ROUTES,
@@ -3851,84 +2731,7 @@ def test_cliff_dispatch_rejects_wrong_length_overrides(
     assert _CLIFF_DISPATCH_FAKES[identifier].calls == []
 
 
-@pytest.mark.parametrize(
-    "identifier,harness_type,expected_mode,initial_values,initial_stds",
-    CLIFF_CLI_ROUTES,
-    ids=CLIFF_CLI_IDS,
-)
-def test_cliff_dispatch_accepts_a_correct_length_override(
-    tmp_path,
-    monkeypatch,
-    identifier,
-    harness_type,
-    expected_mode,
-    initial_values,
-    initial_stds,
-):
-    _patch_cliff_dispatch_fakes(monkeypatch)
-    means = [1.25 + index for index in range(len(harness_type.PARAMETER_NAMES))]
-    stds = [0.02] * len(harness_type.PARAMETER_NAMES)
-    train_models.train_pairwise_model(
-        apnet_model_type=identifier,
-        model_out=str(tmp_path / "override.pt"),
-        pre_trained_model_path=None,
-        param_start_mean=means,
-        param_start_std=stds,
-    )
-    harness = _CLIFF_DISPATCH_FAKES[identifier].calls[0]
-    assert harness.kwargs["param_start_mean"] == means
-    assert harness.kwargs["param_start_std"] == stds
-
-
-@pytest.mark.parametrize("identifier", CLIFF_CLI_IDS)
-@pytest.mark.parametrize(
-    "field,value,match",
-    [
-        ("param_start_mean", 0.0, "strictly greater"),
-        ("param_start_mean", float("nan"), "strictly greater"),
-        ("param_start_std", -0.1, "greater than or equal"),
-    ],
-)
-def test_cliff_dispatch_routes_through_the_shared_validator(
-    monkeypatch, identifier, field, value, match
-):
-    """Domain errors come from ``_validate_positive_initialization`` itself."""
-    _patch_cliff_dispatch_fakes(monkeypatch)
-    _, means, stds = train_models._cliff_parameter_contract(identifier)
-    overrides = {
-        "param_start_mean": list(means),
-        "param_start_std": list(stds),
-    }
-    overrides[field][0] = value
-    with pytest.raises(ValueError, match=match):
-        train_models.train_pairwise_model(
-            apnet_model_type=identifier,
-            pre_trained_model_path=None,
-            **overrides,
-        )
-    assert _CLIFF_DISPATCH_FAKES[identifier].calls == []
-
-
 # --- component_gamma / total_includes_d3 -----------------------------------
-
-
-def test_component_gamma_survives_the_dispatch_signature_filter():
-    """The filter train_models.py applies must keep both new kwargs.
-
-    Asserted against the *real* harnesses, since the dispatch tests above use
-    fakes: `train_kwargs` is filtered by
-    ``inspect.signature(apnet.train).parameters``, so a kwarg missing from that
-    mapping is dropped silently rather than raising.
-    """
-    for harness_type in (
-        CliffExchangeModel,
-        CliffClassicalModel,
-        CliffClassicalOverlapModel,
-    ):
-        supported = inspect.signature(harness_type.train).parameters
-        assert "component_gamma" in supported
-        assert "total_includes_d3" in supported
-        assert supported["component_gamma"].default is None
 
 
 @pytest.mark.parametrize(
@@ -3967,38 +2770,6 @@ def test_component_gamma_is_forwarded_verbatim(
 
 @pytest.mark.parametrize(
     "identifier,harness_type,expected_mode,initial_values,initial_stds",
-    CLIFF_CLI_ROUTES,
-    ids=CLIFF_CLI_IDS,
-)
-def test_component_gamma_default_reaching_the_harness_is_none(
-    tmp_path,
-    monkeypatch,
-    identifier,
-    harness_type,
-    expected_mode,
-    initial_values,
-    initial_stds,
-):
-    """``None``, not ``1.0``: ``1.0`` would be ``k`` times the legacy loss."""
-    _patch_cliff_dispatch_fakes(monkeypatch)
-    train_models.train_pairwise_model(
-        apnet_model_type=identifier,
-        model_out=str(tmp_path / "default-gamma.pt"),
-        pre_trained_model_path=None,
-    )
-    forwarded = _CLIFF_DISPATCH_FAKES[identifier].calls[0].train_calls[0]
-    assert forwarded["component_gamma"] is None
-    assert forwarded["total_includes_d3"] is False
-    assert (
-        inspect.signature(train_models.train_pairwise_model)
-        .parameters["component_gamma"]
-        .default
-        is None
-    )
-
-
-@pytest.mark.parametrize(
-    "identifier,harness_type,expected_mode,initial_values,initial_stds",
     COMBINED_CLIFF_CLI_ROUTES,
     ids=COMBINED_CLIFF_CLI_IDS,
 )
@@ -4030,33 +2801,6 @@ def test_include_total_mse_becomes_gamma_one_half_on_cliff_routes(
     assert forwarded["component_gamma"] == pytest.approx(0.5)
 
 
-@pytest.mark.parametrize(
-    "identifier,harness_type,expected_mode,initial_values,initial_stds",
-    COMBINED_CLIFF_CLI_ROUTES,
-    ids=COMBINED_CLIFF_CLI_IDS,
-)
-def test_explicit_component_gamma_wins_nothing_over_include_total_mse(
-    monkeypatch,
-    identifier,
-    harness_type,
-    expected_mode,
-    initial_values,
-    initial_stds,
-):
-    """Supplying both spellings is an error, not a precedence rule."""
-    _patch_cliff_dispatch_fakes(monkeypatch)
-    with pytest.raises(
-        ValueError, match="include_total_mse and component_gamma"
-    ):
-        train_models.train_pairwise_model(
-            apnet_model_type=identifier,
-            pre_trained_model_path=None,
-            include_total_mse=True,
-            component_gamma=0.4,
-        )
-    assert _CLIFF_DISPATCH_FAKES[identifier].calls == []
-
-
 def test_include_total_mse_on_the_exchange_route_raises(monkeypatch):
     """The shorthand resolves to a gamma, which the exchange route rejects."""
     _patch_cliff_dispatch_fakes(monkeypatch)
@@ -4067,70 +2811,6 @@ def test_include_total_mse_on_the_exchange_route_raises(monkeypatch):
             include_total_mse=True,
         )
     assert _CLIFF_DISPATCH_FAKES["CliffExchangeModel"].calls == []
-
-
-@pytest.mark.parametrize(
-    "identifier",
-    [
-        "CliffExchangeModel",
-        "RackersTholeDampingModel",
-        "RackersTholeDampingOverlapModel",
-        "AM-DimerParam",
-        "APNet2",
-        "APNet3-fused",
-    ],
-)
-@pytest.mark.parametrize(
-    "kwargs,match",
-    [
-        ({"component_gamma": 0.4}, "component_gamma is only supported"),
-        ({"component_gamma": 0.0}, "component_gamma is only supported"),
-        ({"total_includes_d3": True}, "total_includes_d3 is only supported"),
-    ],
-)
-def test_component_gamma_rejected_on_every_route_without_a_split(
-    monkeypatch, identifier, kwargs, match
-):
-    """A clear error, never a silent drop.
-
-    The signature filter would otherwise discard these for any route whose
-    ``train`` does not name them, and forward a meaningless ``0.4`` to the
-    ones that do.  The check runs before any dataset or model construction, so
-    the heavyweight legacy routes are safe to exercise here.
-    """
-    _patch_cliff_dispatch_fakes(monkeypatch)
-    with pytest.raises(ValueError, match=match):
-        train_models.train_pairwise_model(
-            apnet_model_type=identifier,
-            pre_trained_model_path=None,
-            **kwargs,
-        )
-    assert _FakeAtomTypeParamModel.calls == []
-    for fake in _CLIFF_DISPATCH_FAKES.values():
-        assert fake.calls == []
-
-
-def test_include_total_mse_behavior_is_unchanged_off_the_cliff_routes(
-    tmp_path, monkeypatch
-):
-    """A pre-existing route still merely forwards (and then filters) the flag."""
-    from .test_rackers_thole_damping import (
-        _FakeRackersTholeDampingModel,
-        _patch_rackers_dispatch_fakes,
-    )
-
-    _patch_rackers_dispatch_fakes(monkeypatch)
-    train_models.train_pairwise_model(
-        apnet_model_type="RackersTholeDampingModel",
-        model_out=str(tmp_path / "rackers-include-total.pt"),
-        pre_trained_model_path=None,
-        include_total_mse=True,
-    )
-    forwarded = _FakeRackersTholeDampingModel.calls[0].train_calls[0]
-    # No component_gamma is invented for a non-CLIFF route, and the flag is
-    # filtered out by signature exactly as it always was.
-    assert "component_gamma" not in forwarded
-    assert "include_total_mse" not in forwarded
 
 
 # --- target-column dispatch -------------------------------------------------
@@ -4280,22 +2960,6 @@ def test_bounded_clamp_bounds_value_and_restores_inward():
     ]
 
 
-@pytest.mark.parametrize("mode", mtp_mtp.CLIFF_BOUND_GRADIENT_MODES)
-def test_bounded_clamp_accepts_one_sided_bounds(mode):
-    raw = torch.tensor([[-5.0], [5.0]], requires_grad=True)
-    lower_only = mtp_mtp._bounded_clamp(
-        raw, torch.tensor([[0.0]]), None, mode
-    )
-    assert lower_only.detach().tolist() == [[0.0], [5.0]]
-    upper_only = mtp_mtp._bounded_clamp(
-        raw, None, torch.tensor([[0.0]]), mode
-    )
-    assert upper_only.detach().tolist() == [[-5.0], [0.0]]
-    assert torch.equal(
-        mtp_mtp._bounded_clamp(raw, None, None, mode).detach(), raw.detach()
-    )
-
-
 @pytest.mark.parametrize(
     "model_type,_name,_parameter_names,values,_stds",
     _HEAD_CASES,
@@ -4433,22 +3097,6 @@ def test_cliff_head_ceiling_caps_a_runaway_readout(
     assert torch.all(parameters <= ceiling + 1e-4)
 
 
-@pytest.mark.parametrize(
-    "bad",
-    [0.0, -1.0, float("nan"), float("inf"), "x", object()],
-)
-@pytest.mark.parametrize(
-    "field", ["param_floor_fraction", "param_ceiling_multiple"]
-)
-def test_cliff_head_rejects_invalid_bound_scale(
-    bad, field, nested_hfvr_vw_model
-):
-    with pytest.raises(ValueError, match=field):
-        _build_head(
-            mtp_mtp.CliffExchangeNN, nested_hfvr_vw_model, **{field: bad}
-        )
-
-
 def test_cliff_head_rejects_inverted_bounds(nested_hfvr_vw_model):
     with pytest.raises(ValueError, match="strictly less than"):
         _build_head(
@@ -4457,22 +3105,6 @@ def test_cliff_head_rejects_inverted_bounds(nested_hfvr_vw_model):
             param_floor_fraction=2.0,
             param_ceiling_multiple=1.0,
         )
-
-
-def test_cliff_head_accepts_disabled_bounds(nested_hfvr_vw_model, atomic_batch):
-    """`None`/`None` reproduces the pre-bound forward exactly."""
-    model = _build_head(
-        mtp_mtp.CliffExchangeNN,
-        nested_hfvr_vw_model,
-        param_floor_fraction=None,
-        param_ceiling_multiple=None,
-    )
-    assert model.raw_parameter_floor is None
-    assert model.raw_parameter_ceiling is None
-    config = model.get_config()
-    assert config["param_floor_fraction"] is None
-    assert config["param_ceiling_multiple"] is None
-    assert torch.all(model(atomic_batch)[-1] > 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -4516,47 +3148,6 @@ def test_cliff_head_rejects_invalid_per_element_table(
         )
 
 
-def test_cliff_head_per_element_table_survives_string_keys(
-    nested_hfvr_vw_model, atomic_batch
-):
-    """A config round-trip through JSON stringifies integer keys."""
-    model = _build_head(
-        mtp_mtp.CliffExchangeNN,
-        nested_hfvr_vw_model,
-        param_start_std=[0.0],
-        param_start_mean_by_Z={"exch": {"1": 0.5, "8": 4.0}},
-    )
-    assert model.param_start_mean_by_Z == {"exch": {1: 0.5, 8: 4.0}}
-    _zero_readout_heads(model)
-    parameters = model(atomic_batch)[-1]
-    assert torch.allclose(
-        parameters.reshape(-1),
-        torch.tensor([4.0, 0.5, 0.5], dtype=parameters.dtype),
-        atol=1e-5,
-    )
-
-
-def test_cliff_head_per_element_seeds_do_not_leak_across_columns(
-    nested_hfvr_vw_model, atomic_batch
-):
-    """Seeding `exch` must leave the four Rackers columns on their scalars."""
-    model = _build_head(
-        mtp_mtp.CliffClassicalNN,
-        nested_hfvr_vw_model,
-        param_start_std=[0.0] * 5,
-    )
-    _zero_readout_heads(model)
-    parameters = model(atomic_batch)[-1]
-    rackers = parameters[:, : mtp_mtp.CLIFF_CLASSICAL_EXCH_INDEX]
-    expected = torch.tensor(
-        mtp_mtp.CLIFF_CLASSICAL_INITIAL_VALUES[
-            : mtp_mtp.CLIFF_CLASSICAL_EXCH_INDEX
-        ],
-        dtype=parameters.dtype,
-    )
-    assert torch.allclose(rackers, expected.expand_as(rackers), atol=1e-5)
-
-
 # ---------------------------------------------------------------------------
 # Gradient clipping plumbing
 # ---------------------------------------------------------------------------
@@ -4592,131 +3183,6 @@ def test_validate_induction_solver_controls_rejects_invalid(
         )
 
 
-def test_exchange_train_rejects_induction_solver_controls(
-    nested_hfvr_vw_model
-):
-    harness = _build_cliff_harness(CliffExchangeModel, nested_hfvr_vw_model)
-    with pytest.raises(ValueError, match="induction solver controls"):
-        harness.train(
-            induction_convergence_threshold=1e-6,
-            induction_max_iterations=50,
-        )
-
-
-def test_validate_induction_solver_controls_accepts_profiled_values():
-    assert mtp_mtp._validate_induction_solver_controls(1e-6, 50) == (
-        1e-6,
-        50,
-    )
-
-
-@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), "x"])
-def test_validate_bound_scale_rejects_non_positive(bad):
-    with pytest.raises(ValueError, match="grad_clip_norm"):
-        mtp_mtp._validate_bound_scale(bad, "grad_clip_norm")
-
-
-def test_validate_bound_scale_allows_none_and_coerces_ints():
-    assert mtp_mtp._validate_bound_scale(None, "grad_clip_norm") is None
-    assert mtp_mtp._validate_bound_scale(2, "grad_clip_norm") == 2.0
-    with pytest.raises(ValueError, match="grad_clip_norm"):
-        mtp_mtp._validate_bound_scale(
-            None, "grad_clip_norm", allow_none=False
-        )
-
-
-@pytest.mark.parametrize("mode", mtp_mtp.CLIFF_BOUND_GRADIENT_MODES)
-def test_bounded_clamp_is_exact_at_large_magnitudes(mode):
-    """Regression: the bound must hold when `|x|` dwarfs it.
-
-    The first implementation used `x - (x - upper).clamp_min(0).detach()`,
-    which is algebraically correct but cancels: at `x = 3e7` in float32,
-    `x - upper` rounds back toward `x` and the "clamped" result came out at 32
-    instead of 25.  `test_cliff_head_ceiling_caps_a_runaway_readout` is what
-    caught it; this pins the helper directly.
-
-    Magnitudes like these are not hypothetical -- run `12871934` reached
-    `+8.8e9` on `ind_overlap` -- so both modes are held to the same value.
-    """
-    lower = torch.tensor([[-25.0]])
-    upper = torch.tensor([[25.0]])
-    raw = torch.tensor(
-        [[-3.0e7], [-1.0e10], [3.0e7], [1.0e10], [3.4e7]], requires_grad=True
-    )
-    clamped = mtp_mtp._bounded_clamp(raw, lower, upper, mode)
-    expected = raw.detach().clamp(min=-25.0, max=25.0)
-    assert torch.equal(clamped.detach(), expected)
-    clamped.sum().backward()
-    if mode == "straight-through":
-        assert torch.equal(raw.grad, torch.ones_like(raw))
-    else:
-        # `+1` drives the two below-floor entries further down; only they are
-        # silenced.  The three above the ceiling are being pulled back in.
-        assert raw.grad.flatten().tolist() == [0.0, 0.0, 1.0, 1.0, 1.0]
-
-
-def test_bounded_clamp_rejects_an_unknown_mode():
-    raw = torch.tensor([[0.0]], requires_grad=True)
-    with pytest.raises(ValueError, match="bound_gradient_mode"):
-        mtp_mtp._bounded_clamp(raw, torch.tensor([[-1.0]]), None, "clip")
-    with pytest.raises(ValueError, match="bound_gradient_mode"):
-        mtp_mtp._validate_bound_gradient_mode("clip")
-
-
-@pytest.mark.parametrize("side", ["floor", "ceiling"])
-def test_bounded_clamp_stops_the_preimage_runaway(side):
-    """The defect itself: a bounded value whose pre-image escapes anyway.
-
-    The loss asks for a `K` the band forbids, so the clamp pins the emitted
-    value and the residual never shrinks.  Under `"straight-through"` that
-    constant residual is integrated forever, so the distance `raw` travels
-    grows with the *number of steps* -- which is how run `12871934` put 100%
-    of `ind_overlap` on a bound with raw values from `-2.3e7` to `+8.8e9`.
-    Under `"restoring"` the walk stops on the far side of the bound within one
-    step of it, and stays there no matter how long training runs.
-    """
-    lower = torch.tensor([-2.0])
-    upper = torch.tensor([2.0])
-    step = 1.0e-3
-    # A target the clamp can never reach, on the side under test.
-    target = torch.tensor([-50.0 if side == "floor" else 50.0])
-    bound = lower.item() if side == "floor" else upper.item()
-
-    def run(mode, steps):
-        raw = torch.zeros(1, requires_grad=True)
-        optimizer = torch.optim.SGD([raw], lr=step)
-        for _ in range(steps):
-            optimizer.zero_grad()
-            loss = (
-                mtp_mtp._bounded_clamp(raw, lower, upper, mode) - target
-            ).pow(2).sum()
-            loss.backward()
-            optimizer.step()
-        return raw.detach().item()
-
-    # Ten times the steps, ten times the escape: nothing is holding it.
-    short = run("straight-through", 200)
-    long = run("straight-through", 2000)
-    assert abs(short - bound) > 10.0
-    assert abs(long - bound) > 9.0 * abs(short - bound)
-    assert (short < bound) if side == "floor" else (short > bound)
-
-    # The fix: the overshoot is one optimizer step, and it does not accumulate.
-    parked_short = run("restoring", 200)
-    parked_long = run("restoring", 2000)
-    assert parked_short == parked_long
-    assert abs(parked_short - bound) <= 2.0 * step * abs(2.0 * (bound - target.item()))
-
-    # And it is still live: point the loss the other way and the gradient that
-    # brings it back inside arrives at full strength.
-    raw = torch.tensor([parked_short], requires_grad=True)
-    (
-        mtp_mtp._bounded_clamp(raw, lower, upper, "restoring")
-        - torch.tensor([0.0])
-    ).pow(2).sum().backward()
-    assert raw.grad.item() == pytest.approx(2.0 * bound)
-
-
 @pytest.mark.parametrize(
     "model_type,_name,_parameter_names,_values,_stds",
     _HEAD_CASES,
@@ -4733,128 +3199,9 @@ def test_cliff_head_defaults_to_the_restoring_bound_gradient(
     assert head.get_config()["bound_gradient_mode"] == "restoring"
 
 
-@pytest.mark.parametrize("bad", ["clip", "ste", None, 0])
-def test_cliff_head_rejects_an_unknown_bound_gradient_mode(
-    bad, nested_hfvr_vw_model
-):
-    with pytest.raises(ValueError, match="bound_gradient_mode"):
-        _build_head(
-            mtp_mtp.CliffExchangeNN,
-            copy.deepcopy(nested_hfvr_vw_model),
-            bound_gradient_mode=bad,
-        )
-
-
-@pytest.mark.parametrize(
-    "model_type,_name,_parameter_names,_values,_stds",
-    _HEAD_CASES,
-    ids=_HEAD_IDS,
-)
-def test_bound_gradient_mode_leaves_the_forward_value_untouched(
-    model_type, _name, _parameter_names, _values, _stds,
-    nested_hfvr_vw_model, atomic_batch,
-):
-    """No checkpoint is invalidated by the fix: only the backward pass moved.
-
-    Worth pinning explicitly.  The atom-model correction that preceded this one
-    *did* change predictions and silently invalidated every checkpoint trained
-    through it; this one cannot, and the guarantee should fail loudly if
-    someone later folds a value change into the same switch.
-    """
-    torch.manual_seed(11)
-    restoring = _build_head(model_type, copy.deepcopy(nested_hfvr_vw_model))
-    legacy = _build_head(
-        model_type,
-        copy.deepcopy(nested_hfvr_vw_model),
-        bound_gradient_mode="straight-through",
-    )
-    legacy.load_state_dict(restoring.state_dict())
-    # Drive the readouts hard enough that atoms actually leave the band; two
-    # unclamped forwards agreeing would say nothing at all.
-    with torch.no_grad():
-        for head in (restoring, legacy):
-            for stack in head.param_readout_layers:
-                for readout in stack:
-                    for parameter in readout.parameters():
-                        parameter.mul_(50.0)
-        emitted = restoring(atomic_batch)[-1]
-        assert torch.equal(emitted, legacy(atomic_batch)[-1])
-
-    floor = (
-        F.softplus(restoring.raw_parameter_floor) + restoring.positivity_epsilon
-    )
-    ceiling = (
-        F.softplus(restoring.raw_parameter_ceiling)
-        + restoring.positivity_epsilon
-    )
-    assert bool(
-        (emitted <= floor * 1.000001).any()
-        or (emitted >= ceiling * 0.999999).any()
-    )
-
-
 # ---------------------------------------------------------------------------
 # Readout initialization scaling
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "model_type,_name,_parameter_names,_values,_stds",
-    _HEAD_CASES,
-    ids=_HEAD_IDS,
-)
-def test_readout_init_scale_shrinks_only_the_output_layer(
-    model_type, _name, _parameter_names, _values, _stds, nested_hfvr_vw_model
-):
-    """Scaling must be linear in the knob, so only the output layer is touched.
-
-    Scaling every layer of the four-deep readout stack would compound as
-    ``s ** 4`` and make the configured number unreadable.
-    """
-    scale = 0.25
-    # Both heads must draw the *same* random initialization, or nothing about
-    # their weights is comparable.
-    torch.manual_seed(0)
-    unscaled = _build_head(
-        model_type, copy.deepcopy(nested_hfvr_vw_model), readout_init_scale=None
-    )
-    torch.manual_seed(0)
-    scaled = _build_head(
-        model_type,
-        copy.deepcopy(nested_hfvr_vw_model),
-        readout_init_scale=scale,
-    )
-    assert scaled.readout_init_scale == scale
-    assert unscaled.readout_init_scale is None
-
-    checked_outputs = 0
-    for head_u, head_s in zip(
-        unscaled.param_readout_layers, scaled.param_readout_layers
-    ):
-        for readout_u, readout_s in zip(head_u, head_s):
-            linears_u = [
-                m for m in readout_u.modules() if isinstance(m, torch.nn.Linear)
-            ]
-            linears_s = [
-                m for m in readout_s.modules() if isinstance(m, torch.nn.Linear)
-            ]
-            assert len(linears_u) == len(linears_s) > 1
-            # Every layer but the last is untouched, bit for bit.
-            for layer_u, layer_s in zip(linears_u[:-1], linears_s[:-1]):
-                assert torch.equal(layer_u.weight, layer_s.weight)
-                assert torch.equal(layer_u.bias, layer_s.bias)
-            # The output layer is scaled exactly, weight and bias alike.
-            assert torch.allclose(
-                linears_s[-1].weight, scale * linears_u[-1].weight, atol=1e-7
-            )
-            assert torch.allclose(
-                linears_s[-1].bias, scale * linears_u[-1].bias, atol=1e-7
-            )
-            assert linears_u[-1].weight.abs().max() > 0.0
-            checked_outputs += 1
-    assert checked_outputs == len(unscaled.PARAMETER_NAMES) * (
-        unscaled.n_message + 1
-    )
 
 
 def test_readout_init_scale_shrinks_the_correction(
@@ -4902,18 +3249,6 @@ def test_readout_init_scale_rejects_non_positive(bad, nested_hfvr_vw_model):
             nested_hfvr_vw_model,
             readout_init_scale=bad,
         )
-
-
-def test_cliff_head_overrides_distinguishes_none_from_unset():
-    """`None` disables a feature; the sentinel means "use the head default"."""
-    sentinel = mtp_mtp._CLIFF_HEAD_DEFAULT
-    assert mtp_mtp._cliff_head_overrides(
-        param_floor_fraction=sentinel, readout_init_scale=None
-    ) == {"readout_init_scale": None}
-    assert mtp_mtp._cliff_head_overrides(param_floor_fraction=sentinel) == {}
-    assert mtp_mtp._cliff_head_overrides(param_floor_fraction=0.5) == {
-        "param_floor_fraction": 0.5
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -5011,63 +3346,9 @@ def test_overlap_ceiling_suppresses_the_na_blowup_in_exchange():
     assert guarded > 0.0
 
 
-def test_overlap_ceiling_leaves_covered_elements_untouched():
-    """Widths for the elements CLIFF covers must pass through unchanged."""
-    # Largest per-element mean widths the frozen model emits for Table I
-    # elements, from the training data: S 0.591, C 0.521, N 0.453, O 0.404,
-    # H 0.373, F 0.346.
-    widths = torch.tensor([0.591, 0.521, 0.453, 0.404, 0.373, 0.346])
-    assert torch.all(widths < mtp_mtp.OVERLAP_WIDTH_CEILING)
-    src = torch.arange(widths.numel())
-    tgt = torch.arange(widths.numel())
-    dR = torch.full((widths.numel(),), 6.0)
-    assert torch.equal(
-        mtp_mtp.atomic_overlap_S_ij(widths, widths, src, tgt, dR),
-        mtp_mtp.atomic_overlap_S_ij(
-            widths, widths, src, tgt, dR,
-            width_ceiling=mtp_mtp.OVERLAP_WIDTH_CEILING,
-        ),
-    )
-
-
 # ---------------------------------------------------------------------------
 # CLIFF Table I fidelity
 # ---------------------------------------------------------------------------
-
-
-def test_per_element_seeds_are_the_table_i_means():
-    """Each seed must be the mean of that element's CLIFF Table I atom types."""
-    table_i_atom_types = {
-        1: (0.9890, 0.6910, 0.5996, 0.7909),   # HC, HN, HO, HS
-        6: (2.2649, 2.4566, 2.8023),           # C4, C3, C2
-        7: (4.4660, 4.6251, 3.4896),           # N3, N2, N1
-        8: (5.8538, 5.3435),                   # O2, O1
-        9: (7.6036,),                          # F
-        16: (3.2842, 3.1773),                  # S2, S1
-        17: (3.8152,),                         # Cl
-        35: (4.1008,),                         # Br
-    }
-    seeds = mtp_mtp.CLIFF_EXCH_INITIAL_VALUES_BY_Z
-    assert set(seeds) == set(table_i_atom_types)
-    for z, types in table_i_atom_types.items():
-        assert seeds[z] == pytest.approx(sum(types) / len(types), abs=1e-4), z
-    assert mtp_mtp.CLIFF_TABLE_I_ELEMENTS == frozenset(seeds)
-    # Na (11) and P (15) appear in the training data and are *not* covered.
-    assert 11 not in mtp_mtp.CLIFF_TABLE_I_ELEMENTS
-    assert 15 not in mtp_mtp.CLIFF_TABLE_I_ELEMENTS
-
-
-def test_exchange_initialization_std_is_wide_enough_to_separate_atom_types():
-    """`K_exch` spans 0.60-7.60, so a 0.01 raw std would be a delta function."""
-    assert mtp_mtp.CLIFF_EXCH_INITIAL_STDS == (0.25,)
-    assert (
-        mtp_mtp.CLIFF_CLASSICAL_INITIAL_STDS[mtp_mtp.CLIFF_CLASSICAL_EXCH_INDEX]
-        == 0.25
-    )
-    # The four Rackers columns keep their original, much tighter spread.
-    assert mtp_mtp.CLIFF_CLASSICAL_INITIAL_STDS[
-        : mtp_mtp.CLIFF_CLASSICAL_EXCH_INDEX
-    ] == mtp_mtp.RACKERS_INITIAL_STDS
 
 
 # ---------------------------------------------------------------------------

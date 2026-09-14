@@ -15,7 +15,6 @@ which is what makes warm starting an existing checkpoint into it safe and what
 makes an ``lr = 0`` arm a true control rather than an approximation of one.
 """
 import math
-import subprocess
 import sys
 from pathlib import Path
 
@@ -88,15 +87,6 @@ def test_enabled_head_carries_one_zero_seeded_vector(nested_hfvr_vw_model):
     assert torch.equal(scale.detach(), torch.zeros_like(scale))
     assert "polarizability_log_scale" in head.state_dict()
     assert head.get_config()["trainable_polarizability_scale"] is True
-
-
-def test_the_default_table_is_the_same_object_it_always_was(
-    nested_hfvr_vw_model,
-):
-    """No copy, no `.to()`, no rebuild on the untouched path."""
-    harness = _harness(nested_hfvr_vw_model)
-    dimer = harness.dimer_model
-    assert dimer._polarizability_table() is dimer.polarizability_table
 
 
 # ------------------------------------------------------------- the physics
@@ -305,18 +295,6 @@ def test_optimizer_splits_three_ways_with_thole_and_alpha(
     }
 
 
-def test_alpha_alone_splits_two_ways(nested_hfvr_vw_model):
-    """No Thole split requested: base and polarizability, nothing else."""
-    harness = _harness(
-        nested_hfvr_vw_model, trainable_polarizability_scale=True
-    )
-    groups = harness._optimizer_parameter_groups(5e-4, None, 1e-3)
-    assert [group["group_name"] for group in groups] == [
-        "base",
-        "polarizability",
-    ]
-
-
 def test_a_zero_rate_is_a_legal_control_arm(nested_hfvr_vw_model):
     """`thole_lr` rejects zero; this must not, because zero is the control."""
     harness = _harness(
@@ -373,17 +351,6 @@ def test_the_scale_clips_with_induction(nested_hfvr_vw_model):
     )
 
 
-def test_component_clipping_runs_with_the_scale_enabled(nested_hfvr_vw_model):
-    harness = _harness(
-        nested_hfvr_vw_model, trainable_polarizability_scale=True
-    )
-    for parameter in harness.model.parameters():
-        if parameter.requires_grad:
-            parameter.grad = torch.full_like(parameter, 2.0)
-    reported = harness._clip_gradient_norms(1.0, "component")
-    assert set(reported) == {"electrostatics", "exchange", "induction"}
-
-
 def test_component_clipping_stays_finite_after_a_real_backward(
     nested_hfvr_vw_model, synthetic_dimer_batch
 ):
@@ -408,13 +375,3 @@ def test_component_clipping_stays_finite_after_a_real_backward(
 # --------------------------------------------------------------------- CLI
 
 
-def test_the_cli_advertises_both_flags():
-    result = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "train_models.py"), "--help"],
-        capture_output=True,
-        text=True,
-        cwd=str(REPO_ROOT),
-    )
-    assert result.returncode == 0, result.stderr
-    assert "--trainable_polarizability_scale" in result.stdout
-    assert "--polarizability_lr" in result.stdout

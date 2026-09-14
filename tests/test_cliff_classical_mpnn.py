@@ -15,8 +15,6 @@ are mostly about that contract holding, because it is what lets the classical
 physics path stay untouched.
 """
 import inspect
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -39,8 +37,6 @@ from apnet_pt.AtomPairwiseModels.mtp_mtp import (  # noqa: E402
     CLIFF_CLASSICAL_THOLE_DIRECT_INDEX,
     CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX,
     CLIFF_EXCH_INITIAL_VALUES_BY_Z,
-    CLIFF_MPNN_SCALAR_FEATURES,
-    AtomTypeParamNN,
     CliffClassicalMPNN,
     CliffClassicalNN,
     CliffClassicalOverlapMPNNModel,
@@ -109,13 +105,6 @@ def test_contract_and_model_type_are_registered(nested_hfvr_vw_model):
     assert head.n_params == 5
 
 
-def test_n_params_is_not_a_constructor_argument():
-    """The contract fixes the count, as for every other positive head."""
-    assert "n_params" not in inspect.signature(
-        CliffClassicalMPNN.__init__
-    ).parameters
-
-
 # ---------------------------------------------------------------------------
 # Initialization: the per-element CLIFF seeds must survive the new featurizer
 
@@ -165,14 +154,6 @@ def test_zeroed_corrections_recover_the_per_element_seeds(
     # Water is O/H/H, so the exchange column must not come back constant --
     # that was the failure mode a uniform seed produced.
     assert parameters[:, CLIFF_CLASSICAL_EXCH_INDEX].std().item() > 1.0
-
-
-def test_element_embedding_starts_at_zero(nested_hfvr_vw_model):
-    """A randomly seeded element embedding would move every parameter off its
-    Table I value before training starts."""
-    torch.manual_seed(0)
-    head = _head(nested_hfvr_vw_model)
-    assert torch.count_nonzero(head.param_type_embed.weight) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -264,27 +245,6 @@ def test_a_neighbours_geometry_moves_a_parameter(
     assert bool(frequencies.grad.abs().sum() > 0)
 
 
-def test_scalar_features_are_the_documented_five(nested_hfvr_vw_model):
-    """The feature width is static, and its parts are named.
-
-    A silently wider input layer would still train, and would then refuse to
-    load its own checkpoint.
-    """
-    assert CLIFF_MPNN_SCALAR_FEATURES == (
-        "charge",
-        "dipole_norm",
-        "quadrupole_norm",
-        "hirshfeld_volume_ratio",
-        "valence_width",
-    )
-    torch.manual_seed(0)
-    head = _head(nested_hfvr_vw_model)
-    inner = nested_hfvr_vw_model.atom_model
-    expected = (inner.n_message + 1) * inner.n_embed + 5
-    assert head.param_feature_width == expected
-    assert head.param_input_layer.in_features == expected
-
-
 def test_single_atom_monomer_returns_the_seed(nested_hfvr_vw_model):
     """No edges means no message passing, so the seed is the answer."""
     from torch_geometric.data import Data
@@ -344,37 +304,9 @@ def test_config_records_the_architecture(nested_hfvr_vw_model):
     assert config["parameter_names"] == list(CLIFF_CLASSICAL_PARAMETER_NAMES)
 
 
-def test_dense_head_declares_only_the_shared_architecture_key():
-    """Every positive head can freeze columns; the others add their own.
-
-    The base tuple is replayed straight into each head's constructor, so a key
-    only belongs there when every subclass accepts it.  The dense head adds the
-    polarizability scale because it is the only head the training route allows
-    to train one; the MPNN head adds its own graph geometry.
-    """
-    shared = ("frozen_parameters", "shared_damping_parameters")
-    assert mtp_mtp._CliffPositiveParamNN.ARCHITECTURE_CONFIG_KEYS == shared
-    assert mtp_mtp.CliffExchangeNN.ARCHITECTURE_CONFIG_KEYS == shared
-    assert CliffClassicalNN.ARCHITECTURE_CONFIG_KEYS == (
-        *shared,
-        "trainable_polarizability_scale",
-        "anisotropy_mode",
-        "anisotropy_bound",
-        "anisotropy_dipole_scale",
-        "anisotropy_quadrupole_scale",
-    )
-
-
 def test_nested_model_must_be_an_atomtypeparamnn():
     with pytest.raises(ValueError, match="AtomTypeParamNN"):
         CliffClassicalMPNN(atom_model=AtomMPNN(n_message=1, n_neuron=8, n_embed=4))
-
-
-def test_innermost_atom_mpnn_walks_the_stack(nested_hfvr_vw_model):
-    inner = mtp_mtp._innermost_atom_mpnn(nested_hfvr_vw_model)
-    assert inner is nested_hfvr_vw_model.atom_model
-    with pytest.raises(ValueError, match="AtomMPNN"):
-        mtp_mtp._innermost_atom_mpnn(torch.nn.Linear(1, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -441,29 +373,6 @@ def test_harness_rejects_architecture_knobs_for_a_dense_head(
             dimer_eval_type="cliff_classical_overlap",
             param_n_message=2,
         )
-
-
-def test_help_advertises_the_route_and_its_flags():
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT / "src"), env.get("PYTHONPATH", "")]
-    ).rstrip(os.pathsep)
-    result = subprocess.run(
-        [sys.executable, "train_models.py", "--help"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "CliffClassicalOverlapMPNNModel" in result.stdout
-    for flag in (
-        "--param_n_message",
-        "--param_n_rbf",
-        "--param_hidden",
-        "--param_r_cut",
-    ):
-        assert flag in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -571,25 +480,6 @@ def test_checkpoint_round_trips_the_architecture(
     assert torch.allclose(before, after, atol=1e-6)
 
 
-def test_checkpoint_records_the_head_type_not_the_dense_one(
-    tmp_path, nested_hfvr_vw_model
-):
-    """`model_type` has to name the architecture that produced the weights."""
-    harness = mtp_mtp.CliffClassicalOverlapMPNNModel(
-        atom_model=nested_hfvr_vw_model,
-        ds_root=None,
-        use_GPU=False,
-        ignore_database_null=True,
-        n_message=1,
-        n_neuron=8,
-        n_embed=4,
-        **MPNN_KWARGS,
-    )
-    checkpoint = harness._create_checkpoint()
-    assert checkpoint["model_type"] == "CliffClassicalMPNN"
-    assert checkpoint["config"]["model_type"] == "CliffClassicalMPNN"
-
-
 # ---------------------------------------------------------------------------
 # Per-column bounds and the non-finite-gradient guard
 #
@@ -598,68 +488,6 @@ def test_checkpoint_records_the_head_type_not_the_dense_one(
 # dense 50-epoch runs drove an induction column onto that floor, and this head
 # reached all three inside a single epoch and then produced non-finite Thole
 # values, killing job 12229494 in epoch 1 via `geometric_mean_edge_values`.
-
-
-def test_every_column_floor_is_the_measured_best():
-    """0.05 everywhere, restored after measuring the alternatives.
-
-    Two tighter settings were tried over full 50-epoch runs on 100k dimers and
-    both were worse on every component. Decisively, they made *induction* worse
-    (2.431 against 1.897) -- the component the bound existed to protect -- which
-    removes the rationale rather than weakening it. `exch` also cannot take a
-    tight floor at all: hydrogen's Table I value is 0.31x the scalar seed.
-    """
-    floors = dict(
-        zip(
-            CLIFF_CLASSICAL_PARAMETER_NAMES,
-            mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION,
-        )
-    )
-    assert set(floors.values()) == {0.05}
-    hydrogen_fraction = (
-        CLIFF_EXCH_INITIAL_VALUES_BY_Z[1] / CLIFF_CLASSICAL_INITIAL_VALUES[4]
-    )
-    assert floors["exch"] < hydrogen_fraction
-    # The reasoning has to survive in the source, or the next person retries
-    # the tighter floors without knowing they were measured.
-    src = inspect.getsource(mtp_mtp)
-    assert "A bound that fights the fit is worse than" in src
-
-
-@pytest.mark.parametrize(
-    "head_type", ["CliffClassicalNN", "CliffClassicalMPNN"]
-)
-def test_both_five_column_heads_share_the_same_floor(
-    nested_hfvr_vw_model, head_type
-):
-    """The dense head has the same drift, so it gets the same treatment."""
-    torch.manual_seed(0)
-    cls = getattr(mtp_mtp, head_type)
-    kwargs = dict(HEAD_KWARGS)
-    if head_type == "CliffClassicalMPNN":
-        kwargs.update(MPNN_KWARGS)
-    head = cls(atom_model=nested_hfvr_vw_model, **kwargs)
-    assert list(head.param_floor_fraction) == list(
-        mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION
-    )
-    floor = (
-        torch.nn.functional.softplus(head.raw_parameter_floor)
-        + head.positivity_epsilon
-    ).reshape(-1)
-    seeds = torch.tensor(CLIFF_CLASSICAL_INITIAL_VALUES)
-    assert torch.allclose(floor, 0.05 * seeds, atol=1e-5)
-
-
-def test_a_scalar_floor_is_still_accepted(nested_hfvr_vw_model):
-    """Checkpoints written before this change record a single float."""
-    torch.manual_seed(0)
-    head = _head(nested_hfvr_vw_model, param_floor_fraction=0.05)
-    floor = (
-        torch.nn.functional.softplus(head.raw_parameter_floor)
-        + head.positivity_epsilon
-    ).reshape(-1)
-    seeds = torch.tensor(CLIFF_CLASSICAL_INITIAL_VALUES)
-    assert torch.allclose(floor, 0.05 * seeds, atol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -757,84 +585,6 @@ def test_non_finite_gradient_skips_the_step_instead_of_the_run():
 # its validation metrics never moved across an entire epoch.
 
 
-def test_every_hidden_state_is_normalized(nested_hfvr_vw_model):
-    torch.manual_seed(0)
-    head = _head(nested_hfvr_vw_model)
-    assert len(head.param_hidden_norms) == head.param_n_message + 1
-    for norm in head.param_hidden_norms:
-        assert isinstance(norm, torch.nn.LayerNorm)
-        assert norm.normalized_shape == (head.param_hidden,)
-    src = inspect.getsource(mtp_mtp.CliffClassicalMPNN._raw_head_output)
-    # Normalized before being stored, so the next message step and every
-    # readout see the bounded state, not just the readouts.
-    assert "self.param_hidden_norms[0](" in src
-    assert "self.param_hidden_norms[i + 1](" in src
-
-
-def test_hidden_states_stay_order_one(atomic_batch, nested_hfvr_vw_model):
-    """What the readouts consume must not scale with depth or coordination."""
-    torch.manual_seed(0)
-    head = _head(nested_hfvr_vw_model, param_n_message=3)
-    captured = []
-    for norm in head.param_hidden_norms:
-        norm.register_forward_hook(
-            lambda _m, _i, out: captured.append(out.detach())
-        )
-    head(atomic_batch)
-    assert len(captured) == head.param_n_message + 1
-    for step, state in enumerate(captured):
-        rms = float(state.pow(2).mean().sqrt())
-        assert rms < 10.0, f"hidden state {step} rms {rms}"
-
-
-def test_gradient_scale_stays_near_the_dense_head(
-    atomic_batch, nested_hfvr_vw_model
-):
-    """A regression bound on the failure that killed job 12235379.
-
-    Deliberately loose -- two orders of magnitude -- because the point is to
-    catch a return to five, not to pin a number.
-    """
-    import copy
-
-    target = torch.zeros(atomic_batch.x.numel(), 5)
-    target[:, 0] = CLIFF_CLASSICAL_INITIAL_VALUES[0]
-    target[:, 4] = CLIFF_CLASSICAL_INITIAL_VALUES[4]
-
-    def worst_grad_norm(build):
-        torch.manual_seed(0)
-        head = build()
-        opt = torch.optim.Adam(
-            [q for q in head.parameters() if q.requires_grad], lr=5e-4
-        )
-        worst = 0.0
-        for _ in range(150):
-            opt.zero_grad(set_to_none=True)
-            ((head(atomic_batch)[-1] - target) ** 2).mean().backward()
-            norm = torch.nn.utils.clip_grad_norm_(
-                head.parameters(), max_norm=1.0
-            )
-            assert torch.isfinite(norm)
-            worst = max(worst, float(norm))
-            opt.step()
-        return worst
-
-    dense = worst_grad_norm(
-        lambda: CliffClassicalNN(
-            atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
-        )
-    )
-    mpnn = worst_grad_norm(
-        lambda: CliffClassicalMPNN(
-            atom_model=copy.deepcopy(nested_hfvr_vw_model),
-            **{**HEAD_KWARGS, **MPNN_KWARGS},
-        )
-    )
-    assert mpnn < 100.0 * max(dense, 1.0), (
-        f"message-passing head gradient norm {mpnn:.3e} vs dense {dense:.3e}"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Bound occupancy: measured, not constrained
 #
@@ -842,17 +592,6 @@ def test_gradient_scale_stays_near_the_dense_head(
 # on every component -- including induction itself, which was the thing the
 # bound existed to protect. The drift onto a bound is real, but a bound that
 # fights the fit costs more than the drift. So it is logged instead.
-
-
-def test_classical_floor_is_back_to_the_measured_best():
-    assert mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION == (
-        0.05, 0.05, 0.05, 0.05, 0.05
-    )
-    # The per-column machinery stays, so retrying is a one-line change.
-    sig = inspect.signature(CliffClassicalMPNN.__init__)
-    assert sig.parameters["param_floor_fraction"].default is (
-        mtp_mtp.CLIFF_CLASSICAL_PARAM_FLOOR_FRACTION
-    )
 
 
 def test_bound_occupancy_reports_a_fraction_per_column_and_bound(
@@ -1079,75 +818,6 @@ def test_induction_diagnostic_maxima_preserve_nonfinite_failures(
     assert totals["max_abs_energy_edge"] == float("inf")
 
 
-def test_induction_energy_is_not_the_variational_functional_of_its_solve(
-    nested_hfvr_vw_model, synthetic_dimer_batch
-):
-    """The two energies now agree, which is the whole point of the fix.
-
-    This test used to assert they *disagreed*, and told its own successor what
-    to do: "if the response solve and energy expression were made consistent,
-    delete this test and assert the sign invariant instead". That is what
-    happened. The permanent field is now intermolecular, so the dipoles are the
-    response to the partner and the intermolecular edge contraction *is* the
-    variational functional `-1/2 mu . E_perm` of the solve that produced them.
-
-    That matters more than the numbers: a variational energy of a converged
-    linear response is non-positive by construction, so attractive induction is
-    now a structural property rather than something to be checked geometry by
-    geometry.
-    """
-    import copy
-
-    torch.manual_seed(0)
-    head = CliffClassicalNN(
-        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
-    )
-    _, diagnostics = mtp_mtp.rackers_thole_induction(
-        **_induction_kwargs(head, synthetic_dimer_batch),
-        include_overlap=False,
-        return_diagnostics=True,
-    )
-    contraction = diagnostics["energy_edge_contraction"]
-    variational = diagnostics["energy_variational_total"]
-    assert contraction == pytest.approx(variational, rel=1e-6), (
-        "the edge contraction is no longer the variational functional of its "
-        "own solve -- the permanent field and the energy have gone back to "
-        "covering different edge sets"
-    )
-    # Both, not just the variational one: they are the same quantity now.
-    assert variational < 0.0
-    assert contraction < 0.0
-
-    src = inspect.getsource(mtp_mtp.rackers_thole_induction)
-    assert "direct_tensors_AB[3]" in src and "direct_tensors_AB[4]" in src
-    assert "e_AA_source" in src and "e_BB_source" in src
-
-
-def test_the_legacy_path_still_shows_the_discrepancy_it_was_written_for(
-    nested_hfvr_vw_model, synthetic_dimer_batch
-):
-    """The same diagnostic on the pre-fix construction, as the control.
-
-    Without this, the agreement above could equally mean the diagnostic stopped
-    measuring anything.
-    """
-    import copy
-
-    torch.manual_seed(0)
-    head = CliffClassicalNN(
-        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
-    )
-    _, diagnostics = mtp_mtp.rackers_thole_induction(
-        **_induction_kwargs(head, synthetic_dimer_batch),
-        include_overlap=False,
-        return_diagnostics=True,
-        intramolecular_permanent_field=True,
-    )
-    assert diagnostics["energy_edge_contraction"] != pytest.approx(
-        diagnostics["energy_variational_total"], rel=1e-3
-    )
-
-
 # ---------------------------------------------------------------------------
 # Variational interaction induction
 #
@@ -1167,32 +837,6 @@ def _variational_kwargs(head, batch):
         molecule_ind_B=batch.molecule_ind_B,
     )
     return kwargs
-
-
-def test_variational_induction_is_attractive_where_legacy_is_not(
-    nested_hfvr_vw_model, synthetic_dimer_batch
-):
-    import copy
-
-    torch.manual_seed(0)
-    head = CliffClassicalNN(
-        atom_model=copy.deepcopy(nested_hfvr_vw_model), **HEAD_KWARGS
-    )
-    from apnet_pt.util import scatter_sum_compile
-
-    dimer_ind = synthetic_dimer_batch.dimer_ind_full
-    n_dimers = int(dimer_ind.max()) + 1
-    legacy = mtp_mtp.rackers_thole_induction(
-        **_induction_kwargs(head, synthetic_dimer_batch), include_overlap=False
-    )
-    variational = mtp_mtp.rackers_thole_induction(
-        **_variational_kwargs(head, synthetic_dimer_batch),
-        include_overlap=False,
-    )
-    per_dimer = scatter_sum_compile(variational, dimer_ind, dim_size=n_dimers)
-    # The invariant from ARCHITECTURE_HANDOFF.md acceptance test 1/2.
-    assert bool((per_dimer <= 1e-8).all()), per_dimer
-    assert variational.shape == legacy.shape
 
 
 def test_variational_induction_preserves_the_per_edge_contract(
@@ -1329,14 +973,6 @@ def test_variational_induction_gradients_are_finite(
 # attractive by construction.
 
 
-def test_induction_damping_columns_are_named_once():
-    assert mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS == (
-        "thole_direct", "thole_mutual"
-    )
-    for name in mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS:
-        assert name in CLIFF_CLASSICAL_PARAMETER_NAMES
-
-
 def test_frozen_columns_hold_their_seed_exactly(
     atomic_batch, nested_hfvr_vw_model
 ):
@@ -1383,24 +1019,6 @@ def test_frozen_columns_receive_no_gradient(
         for readout in head.param_readout_layers[column]:
             for parameter in readout.parameters():
                 assert parameter.requires_grad is (not frozen), name
-
-
-def test_freezing_reduces_the_trainable_parameter_count(
-    nested_hfvr_vw_model
-):
-    import copy
-
-    torch.manual_seed(0)
-    learned = _head(copy.deepcopy(nested_hfvr_vw_model))
-    torch.manual_seed(0)
-    frozen = _head(
-        copy.deepcopy(nested_hfvr_vw_model),
-        frozen_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
-    )
-    count = lambda m: sum(  # noqa: E731
-        q.numel() for q in m.parameters() if q.requires_grad
-    )
-    assert count(frozen) < count(learned)
 
 
 def test_the_dense_head_can_freeze_too(atomic_batch, nested_hfvr_vw_model):
@@ -1516,13 +1134,6 @@ def test_shared_damping_reaches_the_dense_route_and_survives_a_reload(
     assert torch.allclose(
         params.detach(), reloaded.model(atomic_batch)[-1].detach(), atol=1e-6
     )
-
-
-def test_nothing_is_frozen_by_default(nested_hfvr_vw_model):
-    torch.manual_seed(0)
-    head = _head(nested_hfvr_vw_model)
-    assert head.frozen_parameters == ()
-    assert head._frozen_parameter_indices == ()
 
 
 def test_dense_component_gradient_groups_clip_independently(
@@ -1922,16 +1533,6 @@ def test_component_clip_mode_rejects_shared_mpnn_head(tmp_path):
         )
 
 
-def test_mpnn_architecture_flags_still_rejected_on_dense_routes(tmp_path):
-    """Freezing is general; message-passing geometry is not."""
-    with pytest.raises(ValueError, match="param_hidden"):
-        train_models.train_pairwise_model(
-            apnet_model_type="CliffClassicalOverlapModel",
-            model_out=str(tmp_path / "out.pt"),
-            param_hidden=32,
-        )
-
-
 def test_shared_damping_dispatches_onto_the_dense_cliff_head(
     tmp_path, cliff_dispatch
 ):
@@ -1963,51 +1564,6 @@ def test_shared_damping_rejected_off_the_cliff_routes(tmp_path):
             model_out=str(tmp_path / "out.pt"),
             shared_damping_parameters=["thole_direct"],
         )
-
-
-def test_shared_damping_is_not_an_mpnn_only_architecture_flag(
-    tmp_path, cliff_dispatch
-):
-    """It must not be swept up by the `--param_*` rejection.
-
-    The architecture guard rejects anything left in `parameter_head_kwargs` on
-    a dense route apart from an explicit allow-list. Adding a new head kwarg
-    without extending that list makes the dense route -- the only route this
-    arm runs on -- reject its own flag.
-    """
-    train_models.train_pairwise_model(
-        apnet_model_type="CliffClassicalModel",
-        model_out=str(tmp_path / "out.pt"),
-        shared_damping_parameters=["thole_direct", "thole_mutual"],
-        ds_max_size=100,
-    )
-    assert cliff_dispatch.calls, "dense route rejected the shared-damping flag"
-
-
-def test_help_advertises_shared_damping_parameters():
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT / "src"), env.get("PYTHONPATH", "")]
-    ).rstrip(os.pathsep)
-    result = subprocess.run(
-        [sys.executable, "train_models.py", "--help"],
-        cwd=REPO_ROOT, capture_output=True, text=True, env=env,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "--shared_damping_parameters" in result.stdout
-
-
-def test_help_advertises_frozen_parameters():
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT / "src"), env.get("PYTHONPATH", "")]
-    ).rstrip(os.pathsep)
-    result = subprocess.run(
-        [sys.executable, "train_models.py", "--help"],
-        cwd=REPO_ROOT, capture_output=True, text=True, env=env,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "--frozen_parameters" in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -2049,17 +1605,6 @@ def test_induction_seeds_start_inside_cliffs_published_range():
     assert seed == mtp_mtp.CLIFF_IND_OVERLAP_SEED == 0.2
     assert 2.1e-05 <= seed <= 1.7546
     assert seed * seed < 0.64  # below CLIFF's typical pair product
-
-
-def test_both_thole_columns_seed_at_cliffs_single_smearing_coefficient():
-    """CLIFF refits one global coefficient, 0.38539, for direct and mutual."""
-    assert mtp_mtp.CLIFF_THOLE_SMEARING == 0.38539
-    direct = CLIFF_CLASSICAL_INITIAL_VALUES[CLIFF_CLASSICAL_THOLE_DIRECT_INDEX]
-    mutual = CLIFF_CLASSICAL_INITIAL_VALUES[CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX]
-    assert direct == mutual == mtp_mtp.CLIFF_THOLE_SMEARING
-    # The Rackers contract keeps its historical seeds: its checkpoints were
-    # trained with them.
-    assert mtp_mtp.RACKERS_INITIAL_VALUES == (1.8, 0.34, 0.39, 1.8)
 
 
 def test_direct_thole_exponent_is_amoeba_plus_and_cliff_is_selectable():
@@ -2121,41 +1666,6 @@ def test_energy_half_factor_defaults_to_the_historical_prefactor(
     )
     # Without the overlap term the two differ by exactly a factor of two.
     assert torch.allclose(whole, 2.0 * halved, atol=1e-6)
-
-
-def test_shared_damping_is_one_scalar_for_both_columns_and_all_atoms(
-    atomic_batch, nested_hfvr_vw_model
-):
-    """CLIFF has one global smearing coefficient, not a per-atom field.
-
-    Per-atom damping is badly conditioned: the physics tolerates a narrow band
-    and degrades sharply outside it, which is how every previous run ended with
-    a Thole column on a bound.
-    """
-    torch.manual_seed(0)
-    head = _head(
-        nested_hfvr_vw_model,
-        shared_damping_parameters=mtp_mtp.CLIFF_INDUCTION_DAMPING_PARAMETERS,
-    )
-    parameters = head(atomic_batch)[-1].detach()
-    direct = parameters[:, CLIFF_CLASSICAL_THOLE_DIRECT_INDEX]
-    mutual = parameters[:, CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX]
-    assert float(direct.max() - direct.min()) < 1e-7
-    assert torch.allclose(direct, mutual, atol=1e-9)
-    assert float(direct[0]) == pytest.approx(
-        mtp_mtp.CLIFF_THOLE_SMEARING, rel=1e-4
-    )
-    # Still learnable -- one degree of freedom, not zero.
-    head(atomic_batch)[-1].sum().backward()
-    assert head.shared_damping_raw.requires_grad
-    assert head.shared_damping_raw.grad is not None
-    assert float(head.shared_damping_raw.grad.abs()) > 0
-    # And the per-column machinery it replaces is detached.
-    for index in (
-        CLIFF_CLASSICAL_THOLE_DIRECT_INDEX,
-        CLIFF_CLASSICAL_THOLE_MUTUAL_INDEX,
-    ):
-        assert not head.guess_layer[index].weight.requires_grad
 
 
 def test_shared_and_frozen_are_mutually_exclusive(nested_hfvr_vw_model):

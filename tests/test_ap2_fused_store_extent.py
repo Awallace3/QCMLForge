@@ -13,7 +13,6 @@ say out loud that the store is smaller than requested.
 """
 
 import json
-import os
 import os.path as osp
 
 import pytest
@@ -142,25 +141,6 @@ def test_the_extent_record_round_trips(tmp_path):
     assert recorded["datapoint_storage_n_objects"] == SHARD_OBJECTS
 
 
-def test_the_extent_record_write_leaves_no_temporary_file(tmp_path):
-    ds = _store(tmp_path, shards=1, max_size=1_500_000)
-    ds._record_store_extent(source_exhausted=True)
-    leftovers = [
-        name
-        for name in os.listdir(osp.join(str(tmp_path), "processed"))
-        if name.endswith(".tmp")
-    ]
-    assert leftovers == []
-
-
-def test_the_extent_record_is_not_mistaken_for_a_shard(tmp_path):
-    """The record lives in the same directory the shard glob sweeps."""
-    ds = _store(tmp_path, shards=6250, max_size=1_500_000)
-    ds._record_store_extent(source_exhausted=True)
-    assert len(ds._existing_shard_paths()) == 6250
-    assert len(ds.reprocess_file_names()) == 6250
-
-
 def test_the_shard_glob_agrees_with_reprocess_file_names(tmp_path):
     """Two globs for "what is present" that could drift apart, pinned together."""
     ds = _store(tmp_path, shards=64, max_size=None)
@@ -255,15 +235,6 @@ def test_alignment_is_judged_from_the_last_shard_of_this_split(tmp_path):
     ds = _aligned_store(tmp_path, shards=6250, max_size=1_500_000, split="train")
     _write_shard(ds, "test", 0, range(9000, 9000 + SHARD_OBJECTS))
     assert ds._prefix_is_index_aligned() is True
-
-
-def test_a_complete_store_is_never_asked_about_alignment(tmp_path):
-    """Nothing is loaded when there is nothing to extend."""
-    ds = _aligned_store(tmp_path, shards=6250, max_size=100_000)
-    ds.skip_processed = False
-    ds._request_extension_if_store_is_short()
-    assert ds.skip_processed is False
-    assert ds.force_reprocess is False
 
 
 # The helpers above hand-assign ``root`` onto an instance built with

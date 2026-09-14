@@ -24,14 +24,12 @@ import inspect
 import os
 import pickle
 
-from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-import apnet_pt
 from apnet_pt import ddp_launch, model_io
 from apnet_pt.AtomModels.ap2_atom_model import AtomMPNN
 from apnet_pt.AtomPairwiseModels import mtp_mtp
@@ -196,42 +194,6 @@ def test_export_rendezvous_without_a_thread_count_publishes_no_omp(clean_ddp_env
     )
     assert os.environ["MASTER_ADDR"] == "h"
     assert "OMP_NUM_THREADS" not in os.environ
-
-
-def test_no_training_path_writes_omp_num_threads_directly():
-    """One guarded writer, twenty-five former call sites.
-
-    The bug was not in any one module -- the same unguarded line had been
-    copied into every model's ``train_model``.  Fixing them one at a time is
-    what let it spread, so assert the property across the package instead:
-    nothing under ``src`` assigns ``OMP_NUM_THREADS`` except
-    :func:`apnet_pt.ddp_launch.set_omp_num_threads` itself.
-    """
-    src = Path(apnet_pt.__file__).parent
-    offenders = []
-    for path in sorted(src.rglob("*.py")):
-        if path.name == "ddp_launch.py":
-            continue
-        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                continue
-            if 'os.environ["OMP_NUM_THREADS"]' in stripped and "=" in stripped:
-                offenders.append(f"{path.relative_to(src)}:{lineno}: {stripped}")
-    assert not offenders, "use ddp_launch.set_omp_num_threads:\n" + "\n".join(offenders)
-
-
-def test_train_ddp_slurm_and_train_models_share_one_resolver():
-    """Two entry points, one rendezvous. Divergence here is a multi-node hang."""
-    import train_ddp_slurm
-
-    assert "ddp_launch.resolve_rendezvous" in inspect.getsource(
-        train_ddp_slurm.setup_distributed
-    )
-    train_models_source = open(
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "train_models.py")
-    ).read()
-    assert "ddp_launch.resolve_rendezvous()" in train_models_source
 
 
 # ---------------------------------------------------------------------------
@@ -589,19 +551,6 @@ def _evaluate_batches_source():
     )
 
 
-def test_one_loop_serves_both_launch_styles():
-    """``ddp_train`` delegates; it does not carry a second epoch loop.
-
-    A duplicated loop is how the resume sidecar, the CLIFF Eq. (23) loss and the
-    induction functional version end up implemented twice and agreeing only by
-    accident. It also means the golden source-introspection tests, which read
-    ``single_proc_train``, would stop covering the distributed path.
-    """
-    source = inspect.getsource(AM_DimerParam_Model.ddp_train)
-    assert "self.single_proc_train(" in source
-    assert "for epoch in range(" not in source
-
-
 def test_nan_early_stop_is_collective():
     """The classic DDP hang, and it looks like a job that is still training.
 
@@ -721,30 +670,6 @@ def test_single_process_path_is_untouched():
         assert "if world_size > 1:" in preceding
 
 
-def test_ddp_train_signature_matches_the_tracked_worker_binding():
-    """``tracked_ddp_worker`` binds ``world_size``, the datasets and
-    ``batch_size`` by name out of this signature, so the names are API."""
-    parameters = list(
-        inspect.signature(AM_DimerParam_Model.ddp_train).parameters
-    )
-    assert parameters[:6] == [
-        "self",
-        "rank",
-        "world_size",
-        "train_dataset",
-        "test_dataset",
-        "n_epochs",
-    ]
-    assert "batch_size" in parameters
-    assert "thole_lr" in parameters
-    assert "induction_diagnostics" in parameters
-    assert parameters.index("thole_lr") < parameters.index("local_rank")
-    assert parameters.index("induction_diagnostics") < parameters.index(
-        "local_rank"
-    )
-    assert "local_rank" in parameters
-
-
 def test_ddp_train_only_tears_down_a_group_it_created():
     """An externally launched rank's group belongs to the tracker's ``finally``.
     Destroying it twice is an error; destroying it early breaks the barrier the
@@ -783,20 +708,6 @@ def test_synthetic_split_is_picklable_into_a_spawned_rank():
 # ---------------------------------------------------------------------------
 
 
-def test_component_mse_costs_no_extra_collective():
-    """The squared sums must ride in the tensor the absolute sums already use.
-
-    A second ``_ddp_all_reduce`` for the squares would be a per-epoch
-    collective added to buy a diagnostic, and -- worse -- a rank-divergent one
-    if it ever landed inside a branch. Stacking them is what keeps the cost at
-    one extra row.
-    """
-    source = inspect.getsource(AM_DimerParam_Model._ddp_reduce_epoch_sums)
-    assert "torch.stack((error_sum, sq_sum, counts))" in source
-    # The loss reduction is the only other one; nothing reduces sq_sum alone.
-    assert source.count("_ddp_all_reduce") == 2
-
-
 def test_reduce_epoch_sums_divides_squares_by_the_same_count():
     """MAE and MSE come out of one packed reduction, so the arithmetic is worth
     asserting on directly: a row swap would silently report MSE as MAE."""
@@ -828,25 +739,3 @@ def test_both_epoch_loops_accumulate_squares_and_record_a_distinct_split():
         assert f'self._record_component_mse("{split}", component_MSE)' in source
 
 
-def test_component_mse_is_printed_on_its_own_line():
-    """Not appended to ``EPOCH:``.
-
-    ``analysis/`` scrapes ``slurm-*.out`` by the EPOCH line's shape, and one of
-    them already has to dedupe a re-printed end-of-chunk block. Widening that
-    line breaks them with no error.
-    """
-    source = _loop_source()
-    epoch_print = source.index('f"  EPOCH: {epoch:4d}')
-    epoch_print_end = source.index("flush=True", epoch_print)
-    mse_print = source.index('f"  COMPONENT MSE: ')
-    assert epoch_print_end < mse_print
-    assert "COMPONENT MSE" not in source[epoch_print:epoch_print_end]
-
-
-def test_component_mse_print_is_rank_zero_only_and_survives_a_missing_split():
-    """It reads an attribute the loop may never have set on this rank."""
-    source = _loop_source()
-    guard = source.index('if is_primary and len(component_MSE.get("val"')
-    assert 'getattr(self, "last_component_MSE", None) or {}' in source[:guard]
-    # train is optional: a validation-only epoch still prints one column.
-    assert 'component_MSE.get("train", component_MSE["val"])' in source

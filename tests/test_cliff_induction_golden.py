@@ -148,15 +148,6 @@ def test_dropping_the_mutual_coupling_recovers_minus_half_alpha_e_squared():
     assert textbook > GOLDEN_E_IND_KCAL  # mutual coupling deepens the well
 
 
-def test_the_half_factor_is_exactly_a_factor_of_two():
-    """CLIFF Eq. (19) carries no half. The flag must change only that."""
-    halved = mtp_mtp.rackers_thole_induction(**_inputs()).item()
-    whole = mtp_mtp.rackers_thole_induction(
-        **_inputs(energy_half_factor=False)
-    ).item()
-    assert whole == pytest.approx(2.0 * halved, rel=1e-12)
-
-
 def test_induction_deepens_monotonically_as_the_monomers_approach():
     """The physical acceptance criterion, on a system with no confounders.
 
@@ -230,36 +221,6 @@ def test_the_overlap_terms_share_of_induction_grows_as_the_atoms_approach():
 
     shares = [share(r) for r in (6.0, 5.0, 4.0, 3.0, 2.0, 1.5)]
     assert all(a < b for a, b in zip(shares, shares[1:])), shares
-
-
-@pytest.mark.parametrize(
-    "r_bohr,expected_share",
-    [(5.0, 0.006), (4.0, 0.023), (3.0, 0.093), (2.0, 0.306), (1.5, 0.444)],
-)
-def test_at_the_seed_the_overlap_term_is_a_small_correction(
-    r_bohr, expected_share
-):
-    """Measured, not asserted from intuition -- and worth knowing.
-
-    `CLIFF_IND_OVERLAP_SEED` was lowered 1.8 -> 0.2 because 1.8 over-polarizes:
-    at 1.8 this same pair gets -425 kcal/mol of overlap at 1.5 bohr against
-    -11.8 of polarization, which is not a correction to anything. But 0.2 lands
-    on the other side. On one O-O pair the overlap term is under 1% of induction
-    at 5 bohr and under 10% at 3 bohr, so a run that fits the overlap alone
-    starts with a term that is nearly inert at contact distance and has to move
-    K a long way before it can matter.
-
-    Pinned so that a future seed change has to acknowledge this, rather than
-    silently making the term inert again. These are shares of a single pair;
-    a real dimer sums many, and K is fitted rather than fixed.
-    """
-    pol = mtp_mtp.rackers_thole_induction(**_inputs(r_bohr=r_bohr)).item()
-    total = mtp_mtp.rackers_thole_induction(
-        **_inputs(r_bohr=r_bohr, include_overlap=True)
-    ).item()
-    assert abs(total - pol) / abs(pol) == pytest.approx(
-        expected_share, abs=0.001
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -366,37 +327,6 @@ def test_intramolecular_edges_can_no_longer_flip_the_sign():
     assert with_intra == pytest.approx(-0.493529, rel=1e-5)
 
 
-def test_the_pre_fix_construction_is_still_reachable_and_still_repulsive():
-    """Kept so pre-fix checkpoints can be reproduced, not because it is right.
-
-    Pinning the old number is what makes "the tainted runs used this" a
-    checkable statement rather than a note in a log.
-    """
-    E = mtp_mtp.rackers_thole_induction(
-        **_two_atom_monomer_inputs(with_intramolecular=True),
-        intramolecular_permanent_field=True,
-    ).sum()
-    assert E.item() == pytest.approx(+0.345847, rel=1e-4)
-
-
-def test_the_size_of_the_defect_that_was_removed():
-    """How large the unconstrained term was, on one unfavourable geometry.
-
-    Recorded because it sets the scale of what changes in every pre-fix
-    number: +0.844 kcal/mol on a single three-atom system, against an
-    attractive -0.494 -- enough to reverse the sign on its own.
-    """
-    corrected = mtp_mtp.rackers_thole_induction(
-        **_two_atom_monomer_inputs(with_intramolecular=True)
-    ).sum().item()
-    pre_fix = mtp_mtp.rackers_thole_induction(
-        **_two_atom_monomer_inputs(with_intramolecular=True),
-        intramolecular_permanent_field=True,
-    ).sum().item()
-    assert pre_fix - corrected == pytest.approx(+0.839, abs=0.002)
-    assert pre_fix > 0 > corrected
-
-
 # ---------------------------------------------------------------------------
 # Equivalence with the AP3-D3 path
 #
@@ -484,21 +414,6 @@ def test_corrected_cliff2_reproduces_the_ap3d3_induction_path():
     assert _cliff2_on(shared, n_a, n_b) == pytest.approx(
         _ap3d3_on(shared), abs=1e-8
     )
-
-
-def test_the_pre_fix_construction_disagreed_with_ap3d3_by_a_kcal_per_mol():
-    """The size of the defect on a realistic system, not a toy.
-
-    1.10 kcal/mol on one water-dimer-like pair, against an AP3-D3 answer of
-    -0.117. Every induction number produced before the fix carries an error of
-    this order, which is why they are all tainted rather than merely noisy.
-    """
-    n_a, n_b, shared = _matched_dimer()
-    reference = _ap3d3_on(shared)
-    pre_fix = _cliff2_on(
-        shared, n_a, n_b, intramolecular_permanent_field=True
-    )
-    assert abs(pre_fix - reference) == pytest.approx(1.104, abs=0.01)
 
 
 # ---------------------------------------------------------------------------

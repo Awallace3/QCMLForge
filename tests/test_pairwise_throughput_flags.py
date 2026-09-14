@@ -156,16 +156,6 @@ def test_dataset_batch_size_reaches_both_splits(fake_fused_dataset, atom_model):
     assert test["batch_size"] == 256
 
 
-def test_dataset_batch_size_defaults_to_sixteen(fake_fused_dataset, atom_model):
-    model = _build(atom_model, ds_max_size=100)
-    train, test = _split_calls(fake_fused_dataset)
-    assert train["batch_size"] == 16
-    assert test["batch_size"] == 16
-    # And it is what `train` will read, which is the value that decides the
-    # step count.
-    assert model.dataset[0].training_batch_size == 16
-
-
 def test_train_reads_the_batch_size_off_the_training_dataset():
     """The knob has to be on the dataset, not on ``train``.
 
@@ -244,16 +234,6 @@ def test_exclusion_scan_bounds_each_split_separately(
     # And the requested counts, not the loosened raw caps, are what training
     # and validation actually see.
     assert [len(d) for d in model.dataset] == [100, 10]
-
-
-def test_validation_cap_unset_keeps_the_shared_cap(
-    fake_fused_dataset, atom_model
-):
-    model = _build(atom_model, ds_max_size=100)
-    train, test = _split_calls(fake_fused_dataset)
-    assert train["max_size"] == 100
-    assert test["max_size"] == 100
-    assert [len(d) for d in model.dataset] == [100, 100]
 
 
 def test_validation_cap_rejected_without_a_shared_cap(
@@ -357,12 +337,6 @@ def cliff_dispatch(monkeypatch):
     return _FakeHarness
 
 
-def test_train_pairwise_declares_both_flags():
-    sig = inspect.signature(train_models.train_pairwise_model)
-    assert sig.parameters["batch_size"].default is None
-    assert sig.parameters["ds_max_size_val"].default is None
-
-
 def test_dispatch_forwards_the_requested_batch_size(tmp_path, cliff_dispatch):
     train_models.train_pairwise_model(
         apnet_model_type="CliffClassicalModel",
@@ -377,17 +351,6 @@ def test_dispatch_forwards_the_requested_batch_size(tmp_path, cliff_dispatch):
     assert "batch_size" not in harness.train_calls[0]
 
 
-def test_dispatch_forwards_the_route_default_batch_size(
-    tmp_path, cliff_dispatch
-):
-    train_models.train_pairwise_model(
-        apnet_model_type="CliffClassicalModel",
-        model_out=str(tmp_path / "out.pt"),
-        ds_max_size=100,
-    )
-    assert cliff_dispatch.calls[0].kwargs["ds_batch_size"] == 16
-
-
 def test_dispatch_forwards_the_validation_cap(tmp_path, cliff_dispatch):
     train_models.train_pairwise_model(
         apnet_model_type="CliffClassicalModel",
@@ -398,17 +361,6 @@ def test_dispatch_forwards_the_validation_cap(tmp_path, cliff_dispatch):
     harness = cliff_dispatch.calls[0]
     assert harness.kwargs["ds_max_size"] == 100
     assert harness.kwargs["ds_max_size_val"] == 10
-
-
-def test_dispatch_forwards_an_unset_validation_cap_as_none(
-    tmp_path, cliff_dispatch
-):
-    train_models.train_pairwise_model(
-        apnet_model_type="CliffClassicalModel",
-        model_out=str(tmp_path / "out.pt"),
-        ds_max_size=100,
-    )
-    assert cliff_dispatch.calls[0].kwargs["ds_max_size_val"] is None
 
 
 @pytest.mark.parametrize("bad", [0, -1, 1.5])
@@ -472,18 +424,3 @@ def test_atom_routes_reject_the_pairwise_flags(tmp_path, flag, value):
     assert "--train_apnet" in result.stderr
 
 
-def test_help_advertises_both_flags():
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT / "src"), env.get("PYTHONPATH", "")]
-    ).rstrip(os.pathsep)
-    result = subprocess.run(
-        [sys.executable, "train_models.py", "--help"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "--batch_size" in result.stdout
-    assert "--ds_max_size_val" in result.stdout

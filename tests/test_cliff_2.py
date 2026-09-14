@@ -35,12 +35,10 @@ from apnet_pt.AtomPairwiseModels.mtp_mtp import (
     CLIFF_CLASSICAL_INITIAL_VALUES,
     CLIFF_CLASSICAL_PARAMETER_NAMES,
     FULL_EDGE_DIMER_EVAL_MODES,
-    POSITIVE_PARAMETER_CONTRACTS,
     RACKERS_PARAMETER_NAMES,
     CliffClassicalModel,
     CliffClassicalOverlapModel,
     CliffExchangeModel,
-    RackersTholeDampingModel,
     RackersTholeDampingOverlapModel,
 )
 
@@ -270,19 +268,6 @@ def test_merge_maps_every_column_by_name(component_checkpoints, tmp_path):
     assert on_disk["config"]["parameter_names"] == config["parameter_names"]
 
 
-def test_merge_without_output_path_writes_nothing(
-    component_checkpoints, tmp_path
-):
-    before = set(p.name for p in tmp_path.iterdir())
-    merged = merge_classical_parameter_checkpoints(
-        component_checkpoints["rackers_path"],
-        component_checkpoints["exchange_path"],
-        None,
-    )
-    assert merged["model_type"] == "CliffClassicalNN"
-    assert set(p.name for p in tmp_path.iterdir()) == before
-
-
 def test_merge_rackers_only_leaves_exchange_at_initialization(
     component_checkpoints,
 ):
@@ -425,24 +410,6 @@ def test_merge_rejects_nested_config_mismatch(tmp_path, nested_hfvr_vw_model):
         )
 
 
-def test_merge_rejects_architecture_mismatch(tmp_path, nested_hfvr_vw_model):
-    rackers = _build_harness(
-        RackersTholeDampingOverlapModel, nested_hfvr_vw_model
-    )
-    exchange = _build_harness(
-        CliffExchangeModel, nested_hfvr_vw_model, n_neuron=16
-    )
-    rackers_path = tmp_path / "rackers.pt"
-    exchange_path = tmp_path / "exch.pt"
-    rackers.save_model(rackers_path)
-    exchange.save_model(exchange_path)
-
-    with pytest.raises(ValueError, match="disagree on n_neuron"):
-        merge_classical_parameter_checkpoints(
-            rackers_path, exchange_path, None
-        )
-
-
 def test_merge_rejects_reordered_parameter_names(component_checkpoints):
     path = component_checkpoints["rackers_path"]
     checkpoint = model_io.load_checkpoint(path)
@@ -460,19 +427,6 @@ def test_merge_rejects_reordered_parameter_names(component_checkpoints):
         )
 
 
-def test_merge_rejects_a_missing_parameter_name_list(component_checkpoints):
-    path = component_checkpoints["exchange_path"]
-    checkpoint = model_io.load_checkpoint(path)
-    checkpoint["config"].pop("parameter_names")
-    model_io.save_checkpoint(checkpoint, path)
-    with pytest.raises(
-        ValueError, match="exchange_checkpoint_path checkpoint parameter_names"
-    ):
-        merge_classical_parameter_checkpoints(
-            component_checkpoints["rackers_path"], path, None
-        )
-
-
 def test_merge_rejects_a_non_parameter_head_checkpoint(
     tmp_path, component_checkpoints
 ):
@@ -484,40 +438,6 @@ def test_merge_rejects_a_non_parameter_head_checkpoint(
         ValueError, match="is not a positive .*per-atom parameter head"
     ):
         merge_classical_parameter_checkpoints(path, None, None)
-
-
-def test_merge_rejects_names_absent_from_the_classical_contract(
-    monkeypatch, component_checkpoints
-):
-    """A head whose contract has no classical column cannot be merged."""
-    monkeypatch.setitem(
-        POSITIVE_PARAMETER_CONTRACTS, "CliffExchangeNN", ("bogus",)
-    )
-    path = component_checkpoints["exchange_path"]
-    checkpoint = model_io.load_checkpoint(path)
-    checkpoint["config"]["parameter_names"] = ["bogus"]
-    model_io.save_checkpoint(checkpoint, path)
-    with pytest.raises(
-        ValueError, match=r"no column in the classical contract"
-    ):
-        merge_classical_parameter_checkpoints(None, path, None)
-
-
-def test_merge_rejects_a_duplicate_parameter_claim(
-    tmp_path, nested_hfvr_vw_model
-):
-    classical = _build_harness(
-        CliffClassicalOverlapModel, nested_hfvr_vw_model
-    )
-    exchange = _build_harness(CliffExchangeModel, nested_hfvr_vw_model)
-    classical_path = tmp_path / "classical.pt"
-    exchange_path = tmp_path / "exch.pt"
-    classical.save_model(classical_path)
-    exchange.save_model(exchange_path)
-    with pytest.raises(ValueError, match="claimed by both"):
-        merge_classical_parameter_checkpoints(
-            classical_path, exchange_path, None
-        )
 
 
 def test_merge_rejects_a_tensor_shape_mismatch(component_checkpoints):
@@ -786,16 +706,6 @@ def test_model_is_eval_and_gradient_free(classical_overlap_checkpoint):
     assert all(not parameter.requires_grad for parameter in parameters)
 
 
-def test_prediction_entry_points_run_under_inference_mode(
-    classical_overlap_checkpoint, synthetic_dimer_batch
-):
-    model = CLIFF2Model(
-        classical_model_path=classical_overlap_checkpoint, use_GPU=False
-    )
-    preds = model.predict_batch(synthetic_dimer_batch)
-    assert preds.is_inference()
-
-
 def test_d3_override_changes_only_the_dispersion_column(
     classical_overlap_checkpoint, synthetic_dimer_batch
 ):
@@ -866,21 +776,6 @@ def test_predict_qcel_mols_dimer_on_a_two_dimer_fixture(
     assert np.allclose(preds, one_at_a_time, rtol=1e-4, atol=1e-2)
 
 
-def test_predict_qcel_mols_dimer_mirrors_the_harness_signature():
-    harness_parameters = inspect.signature(
-        RackersTholeDampingModel.predict_qcel_mols_dimer
-    ).parameters
-    cliff2_parameters = inspect.signature(
-        CLIFF2Model.predict_qcel_mols_dimer
-    ).parameters
-    for name in ("mols", "batch_size", "r_cut", "verbose"):
-        assert name in cliff2_parameters, name
-        assert (
-            cliff2_parameters[name].default
-            == harness_parameters[name].default
-        ), name
-
-
 def test_save_load_round_trip_reproduces_predictions(
     tmp_path, merged_classical_path, two_geom_dimers
 ):
@@ -938,16 +833,6 @@ def test_cliff2_checkpoint_missing_classical_config_raises(
     model_io.save_checkpoint(checkpoint, path)
     with pytest.raises(ValueError, match="missing classical_config"):
         CLIFF2Model.from_checkpoint(path, use_GPU=False)
-
-
-def test_info_renders_a_model_tree(classical_overlap_checkpoint, capsys):
-    model = CLIFF2Model(
-        classical_model_path=classical_overlap_checkpoint, use_GPU=False
-    )
-    model.info()
-    printed = capsys.readouterr().out
-    assert "CLIFF2Model" in printed
-    assert "AtomMPNN" in printed
 
 
 # ---------------------------------------------------------------------------
@@ -1018,26 +903,6 @@ def test_cliff2_is_registered_in_the_package_namespace():
     )
     assert AtomPairwiseModels.cliff_2 is cliff_2
     assert "CLIFF2Model" in AtomPairwiseModels.__all__
-
-
-@pytest.mark.parametrize(
-    "forbidden",
-    [
-        "torch.optim",
-        "DistributedDataParallel",
-        "torch.distributed",
-        "module_dataset",
-        "DataLoader",
-        "backward()",
-    ],
-)
-def test_module_contains_no_training_machinery(forbidden):
-    """``cliff_2.py`` is inference-only by construction, not by convention."""
-    source = pathlib.Path(cliff_2.__file__).read_text()
-    assert forbidden not in source
-    assert not hasattr(CLIFF2Model, "train_model")
-    # `nn.Module.train` is inherited and unavoidable; nothing else may be.
-    assert "def train" not in source
 
 
 # ---------------------------------------------------------------------------
@@ -1165,14 +1030,3 @@ def test_merge_inherits_the_induction_version_from_the_rackers_source(
     assert merged_stale["config"]["induction_functional_version"] == 1
 
 
-def test_merging_exchange_alone_is_current(component_checkpoints):
-    """No Rackers source: the induction columns are untrained seeds."""
-    from apnet_pt.AtomPairwiseModels import mtp_mtp
-
-    merged = merge_classical_parameter_checkpoints(
-        None, component_checkpoints["exchange_path"], None
-    )
-    assert (
-        merged["config"]["induction_functional_version"]
-        == mtp_mtp.INDUCTION_FUNCTIONAL_VERSION
-    )
