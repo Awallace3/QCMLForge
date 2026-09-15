@@ -34,6 +34,9 @@ ROUTES = {
     "hybrid-h3l1": ("h3l1", "all-scalars+norms", "legacy"),
     "hybrid-h3l3": ("h3l3", "all-scalars+norms", "legacy"),
     "hybrid-h3l3q": ("h3l3", "all-scalars+norms", "legacy"),
+    "hybrid-h3l3w112": ("h3l3", "all-scalars+norms", "legacy"),
+    "hybrid-h3l3p": ("h3l3", "all-scalars+norms", "legacy"),
+    "hybrid-h3l3w112p": ("h3l3", "all-scalars+norms", "legacy"),
     "atomhead": ("h1", "all-scalars+norms", "atomhead"),
 }
 
@@ -337,6 +340,68 @@ def test_charge_blind_pair_core_cannot_mount_under_the_charge_aware_route():
             pair_core=pair_core,
             long_range_provider=StubLongRangeProvider(),
         )
+
+
+def _h3l3_pair_core(architecture_id=None):
+    ap3 = APNet3D3_AtomType_MPNN(dimer_prop_model=None, use_precomputed_classical=True)
+    kwargs = {} if architecture_id is None else {"architecture_id": architecture_id}
+    return MACEPairResidualCore(
+        ap3,
+        mace_feature_dim=16,
+        pair_mode="h3l3",
+        feature_mode="all-scalars+norms",
+        mace_equivariant_dim=STUB_EQUIVARIANT_CHANNELS,
+        **kwargs,
+    )
+
+
+def _mount(route, pair_core):
+    return MACEAP3D3(
+        architecture=route,
+        featurizer=StubFeaturizer(
+            "all-scalars+norms", equivariant_irreps=STUB_IRREPS
+        ),
+        property_provider=StubPropertyProvider("legacy"),
+        pair_core=pair_core,
+        long_range_provider=StubLongRangeProvider(),
+    )
+
+
+@pytest.mark.parametrize(
+    "route,pattern",
+    [
+        ("hybrid-h3l3w112", "directional_width=112"),
+        ("hybrid-h3l3p", "per_component_directional=True"),
+        ("hybrid-h3l3w112p", "directional_width=112"),
+    ],
+)
+def test_canonical_pair_core_cannot_mount_under_a_widened_or_split_route(
+    route, pattern
+):
+    """Same blind spot as the charge check, for the other two factors.
+
+    All four l=3 cells report ``pair_mode == "h3l3"``, so a core built without
+    naming a route carries ``MACE-AP3D3-H3L3`` and passes the identifier
+    check under any of them.  It would then train a 24-float shared slot while
+    reporting itself as the 112-float or per-component arm -- the two things
+    this campaign is trying to measure.
+    """
+
+    pair_core = _h3l3_pair_core()
+    assert pair_core.architecture_id == "MACE-AP3D3-H3L3"
+    with pytest.raises(ValueError, match=pattern):
+        _mount(route, pair_core)
+
+
+@pytest.mark.parametrize(
+    "route", ["hybrid-h3l3w112", "hybrid-h3l3p", "hybrid-h3l3w112p"]
+)
+def test_widened_or_split_pair_core_cannot_mount_under_the_control_route(route):
+    """And the reverse: the control arm must stay the control arm."""
+
+    pair_core = _h3l3_pair_core(architecture_id=route)
+    with pytest.raises(ValueError):
+        _mount("hybrid-h3l3", pair_core)
 
 
 @pytest.mark.parametrize("route", ROUTES)

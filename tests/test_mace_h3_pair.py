@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_MPNN
+from apnet_pt.mace import pair
 from apnet_pt.mace.encoder import _e3nn_o3
 from apnet_pt.mace.pair import (
     CANONICAL_AP3D3_DIMENSIONS,
@@ -355,3 +356,246 @@ def test_real_spherical_harmonics_matches_e3nn(degree, e3nn_reference_harmonics)
 def test_real_spherical_harmonics_rejects_unsupported_degrees():
     with pytest.raises(ValueError, match="degree 1, 2 and 3"):
         real_spherical_harmonics(4, torch.randn(4, 3))
+
+
+# --------------------------------------------------------------------------
+# The directional slot: width, and whether the four component readouts share
+# one projection into it.
+#
+# Every H3 route so far pushed all 512 PolarMACE channels of its degree through
+# 24 floats per edge -- ``n_message * n_embed``, which is what AP3's own l=1
+# messages occupy and was never resized when the consumed degree went to 2 and
+# then 3. These four routes are a 2x2: 24 or 112 floats, crossed with one
+# shared projection or one per readout head. ``hybrid-h3l3`` is the (24,
+# shared) cell, so all four differ in exactly those two factors.
+# --------------------------------------------------------------------------
+
+WIDENED_WIDTH = 112
+PAIR_CORE_WIDTH = 78  # get_pair_params, i.e. everything but the two dir blocks
+
+
+def _pair_width(directional_width):
+    return PAIR_CORE_WIDTH + 2 * directional_width
+
+
+@pytest.mark.parametrize(
+    "architecture_id,width,per_component",
+    [
+        ("hybrid-h3l3", DIRECTIONAL_WIDTH, False),
+        ("hybrid-h3l3w112", WIDENED_WIDTH, False),
+        ("hybrid-h3l3p", DIRECTIONAL_WIDTH, True),
+        ("hybrid-h3l3w112p", WIDENED_WIDTH, True),
+    ],
+)
+def test_directional_slot_shape_matches_the_route(
+    architecture_id, width, per_component
+):
+    core, batch, features_a, features_b, props_a, props_b = _h3_fixture(
+        "h3l3", architecture_id=architecture_id
+    )
+    assert core.directional_width == width
+    assert core.per_component_directional is per_component
+
+    if per_component:
+        assert core.directional_projection is None
+        projections = dict(core.directional_projections)
+        assert tuple(projections) == ("elst", "exch", "indu", "disp")
+        for projection in projections.values():
+            # Bias-free and channel-only per head, exactly as the shared one:
+            # the split changes how many independent channel mixings the block
+            # gets, not how any one of them touches the angular index.
+            assert projection.bias is None
+            assert projection.in_features == TEST_CHANNELS
+            assert projection.out_features == width
+    else:
+        assert core.directional_projections is None
+        assert core.directional_projection.bias is None
+        assert core.directional_projection.out_features == width
+
+    core(batch, features_a, features_b, props_a, props_b)
+    # Whichever cell, every readout head sees the same width: the per-component
+    # route gives each head its *own* block, not a wider one.
+    assert core.last_h_ab.shape[1] == _pair_width(width)
+    assert core.last_h_ba.shape[1] == _pair_width(width)
+
+
+@pytest.mark.parametrize(
+    "architecture_id", ["hybrid-h3l3w112", "hybrid-h3l3p", "hybrid-h3l3w112p"]
+)
+def test_widened_and_split_routes_stay_rotationally_invariant(architecture_id):
+    """Neither factor may touch equivariance.
+
+    A wider projection is still applied to the channel axis alone, and four of
+    them are still four channel-axis maps, so the contraction commutes with the
+    rotation exactly as it does at 24 wide. A regression here would train fine
+    and be invisible in the loss, which is why it is asserted per cell rather
+    than once for the family.
+    """
+
+    o3 = _e3nn_o3()
+    core, batch, features_a, features_b, props_a, props_b = _h3_fixture(
+        "h3l3", architecture_id=architecture_id
+    )
+    reference = core(batch, features_a, features_b, props_a, props_b)
+
+    torch.manual_seed(7)
+    rotation = o3.rand_matrix().to(batch.RA.dtype)
+    permutation = torch.eye(3, dtype=rotation.dtype)[
+        list(MACE_E3NN_AXIS_PERMUTATION)
+    ]
+    permuted_rotation = permutation @ rotation @ permutation.T
+
+    batch.RA = batch.RA @ rotation.T
+    batch.RB = batch.RB @ rotation.T
+
+    wigner = {
+        degree: o3.Irrep(degree, (-1) ** degree).D_from_matrix(permuted_rotation)
+        for degree in (0, 1, 2, 3)
+    }
+    rotated = []
+    for features in (features_a, features_b):
+        blocks = []
+        for degree in (0, 1, 2, 3):
+            block = features.equivariant_degree(degree)
+            blocks.append(
+                torch.einsum("acm,nm->acn", block, wigner[degree]).reshape(
+                    block.shape[0], -1
+                )
+            )
+        rotated.append(
+            _equivariant_features(
+                features.atomic_numbers,
+                features.invariant,
+                torch.cat(blocks, dim=1),
+            )
+        )
+    rotated_residual = core(batch, rotated[0], rotated[1], props_a, props_b)
+
+    scale = float(reference.detach().abs().max().clamp_min(1.0))
+    deviation = float((rotated_residual - reference).detach().abs().max())
+    assert deviation <= 2.0e-5 * scale, f"max deviation {deviation:.3e}"
+
+
+def test_per_component_projections_feed_only_their_own_head():
+    """The point of the split: each head's projection is its own lever.
+
+    Shared-projection routes cannot express this -- one perturbation moves all
+    four components -- so the test is what separates the two cells of the
+    factorial rather than a restatement of the construction.
+    """
+
+    core, batch, features_a, features_b, props_a, props_b = _h3_fixture(
+        "h3l3", architecture_id="hybrid-h3l3w112p"
+    )
+    reference = core(batch, features_a, features_b, props_a, props_b).detach()
+
+    for index, component in enumerate(("elst", "exch", "indu", "disp")):
+        projection = core.directional_projections[component]
+        original = projection.weight.detach().clone()
+        with torch.no_grad():
+            projection.weight.add_(1.0)
+        perturbed = core(
+            batch, features_a, features_b, props_a, props_b
+        ).detach()
+        with torch.no_grad():
+            projection.weight.copy_(original)
+
+        moved = (perturbed - reference).abs().max(dim=0).values
+        assert moved[index] > 0.0, f"{component} projection did not move {component}"
+        others = [i for i in range(moved.numel()) if i != index]
+        assert torch.all(moved[others] == 0.0), (
+            f"{component} projection leaked into {moved.tolist()}"
+        )
+
+
+def test_shared_projection_moves_every_component():
+    """The control for the test above, at the same degree and width."""
+
+    core, batch, features_a, features_b, props_a, props_b = _h3_fixture(
+        "h3l3", architecture_id="hybrid-h3l3w112"
+    )
+    reference = core(batch, features_a, features_b, props_a, props_b).detach()
+    with torch.no_grad():
+        core.directional_projection.weight.add_(1.0)
+    perturbed = core(batch, features_a, features_b, props_a, props_b).detach()
+
+    moved = (perturbed - reference).abs().max(dim=0).values
+    assert torch.all(moved > 0.0), moved.tolist()
+
+
+def test_new_slot_keys_are_absent_from_canonical_configs():
+    """``set_extra_state`` compares configs exactly, so silence is the contract.
+
+    Every H3L3 checkpoint written before the slot became resizable carries the
+    canonical 24 and one shared projection implicitly. Emitting the new keys
+    unconditionally would make all of them unloadable.
+    """
+
+    canonical, *_ = _h3_fixture("h3l3")
+    config = canonical.get_config()
+    assert "directional_width" not in config
+    assert "per_component_directional" not in config
+
+    widened, *_ = _h3_fixture("h3l3", architecture_id="hybrid-h3l3w112")
+    assert widened.get_config()["directional_width"] == WIDENED_WIDTH
+    assert "per_component_directional" not in widened.get_config()
+
+    split, *_ = _h3_fixture("h3l3", architecture_id="hybrid-h3l3p")
+    assert "directional_width" not in split.get_config()
+    assert split.get_config()["per_component_directional"] is True
+
+    both = _h3_fixture("h3l3", architecture_id="hybrid-h3l3w112p")[0].get_config()
+    assert both["directional_width"] == WIDENED_WIDTH
+    assert both["per_component_directional"] is True
+
+
+def test_non_directional_routes_cannot_widen_or_split_the_slot():
+    ap3 = APNet3D3_AtomType_MPNN(
+        dimer_prop_model=None, use_precomputed_classical=True
+    )
+    # There is no such route today; the guard exists so that adding one to
+    # ``DIRECTIONAL_WIDTH_OVERRIDES`` without a degree fails loudly instead of
+    # building a slot nothing writes to.
+    pair.DIRECTIONAL_WIDTH_OVERRIDES["hybrid-h2"] = WIDENED_WIDTH
+    try:
+        with pytest.raises(ValueError, match="cannot widen or split"):
+            MACEPairResidualCore(
+                ap3,
+                mace_feature_dim=16,
+                pair_mode="h2",
+                architecture_id="hybrid-h2",
+            )
+    finally:
+        del pair.DIRECTIONAL_WIDTH_OVERRIDES["hybrid-h2"]
+
+
+def test_slot_variants_do_not_cross_load():
+    """Four distinct cells, four mutually incompatible checkpoints."""
+
+    cores = {
+        route: _h3_fixture(
+            "h3l3", architecture_id=None if route is None else route
+        )[0]
+        for route in (
+            None,
+            "hybrid-h3l3w112",
+            "hybrid-h3l3p",
+            "hybrid-h3l3w112p",
+        )
+    }
+    for route, core in cores.items():
+        core.set_extra_state(core.get_config())
+        for other_route, other in cores.items():
+            if other_route == route:
+                continue
+            with pytest.raises(RuntimeError, match="does not match state_dict"):
+                core.set_extra_state(other.get_config())
+
+    # The shared and split cells also disagree on parameter *names*, so a
+    # cross-load would fail on the state_dict itself even if the configs were
+    # somehow reconciled.
+    shared_keys = set(cores["hybrid-h3l3w112"].state_dict())
+    split_keys = set(cores["hybrid-h3l3w112p"].state_dict())
+    assert any("directional_projection.weight" in key for key in shared_keys)
+    assert not any("directional_projection.weight" in key for key in split_keys)
+    assert any("directional_projections.elst" in key for key in split_keys)

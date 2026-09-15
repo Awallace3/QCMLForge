@@ -18,6 +18,13 @@ CANONICAL_AP3D3_DIMENSIONS = {
     "r_cut": 5.0,
 }
 
+# The directional slot AP3 has always handed the readout: one contracted float
+# per (message, embedding) pair. ``DIRECTIONAL_WIDTH_OVERRIDES`` is what lets a
+# route ask for more.
+CANONICAL_DIRECTIONAL_WIDTH = (
+    CANONICAL_AP3D3_DIMENSIONS["n_message"] * CANONICAL_AP3D3_DIMENSIONS["n_embed"]
+)
+
 CANONICAL_PAIR_FEATURE_MODES = {
     "h1": "final-layer-scalars",
     "h2": "all-scalars+norms",
@@ -42,6 +49,9 @@ PAIR_ROUTE_CONFIGS = {
     "hybrid-h3l1": ("h3l1", "all-scalars+norms"),
     "hybrid-h3l3": ("h3l3", "all-scalars+norms"),
     "hybrid-h3l3q": ("h3l3", "all-scalars+norms"),
+    "hybrid-h3l3w112": ("h3l3", "all-scalars+norms"),
+    "hybrid-h3l3p": ("h3l3", "all-scalars+norms"),
+    "hybrid-h3l3w112p": ("h3l3", "all-scalars+norms"),
     "atomhead": ("h1", "all-scalars+norms"),
 }
 
@@ -61,6 +71,35 @@ MONOMER_CONDITIONING_WIDTH = 2 * len(MONOMER_CONDITIONING_SCALARS)
 # both change, and ``expected_resume_semantics`` compares architecture ids. A
 # shared id would let a charge-aware run resume from charge-blind weights.
 MONOMER_CONDITIONING_ARCHITECTURES = frozenset({"hybrid-h3l3q"})
+
+# Width of the per-edge directional slot each route hands the readout. The
+# canonical value is ``n_message * n_embed`` = 24, which is what AP3's own l=1
+# directional messages happen to occupy and what every route used before the
+# H3 family arrived. It is a hard bottleneck: the contraction compresses all
+# 512 PolarMACE channels of one degree into that many floats per edge, and it
+# was never resized when the consumed degree went from 1 to 2 to 3, so every
+# degree comparison so far has been run through a slot sized for the smallest
+# of them. Routes that widen it name themselves here; everything absent keeps
+# the canonical width, so no existing checkpoint changes shape.
+DIRECTIONAL_WIDTH_OVERRIDES = {
+    "hybrid-h3l3w112": 112,
+    "hybrid-h3l3w112p": 112,
+}
+
+# Routes that give every per-component readout its own directional projection
+# instead of sharing one. Electrostatics, exchange, induction and dispersion
+# want different angular information out of the same equivariant block --
+# exchange is governed by overlap along the axis, induction by the field --
+# and a shared projection forces one compromise on all four. Each projection
+# stays bias-free and channel-only, so equivariance and the hAB/hBA mirror are
+# unaffected; only the number of independent channel mixings changes.
+PER_COMPONENT_DIRECTIONAL_ARCHITECTURES = frozenset(
+    {"hybrid-h3l3p", "hybrid-h3l3w112p"}
+)
+
+# Readout heads the AP3 core exposes, in the order ``readouts`` concatenates
+# them. ``disp`` is absent when ``no_disp_nn`` is set.
+PAIR_READOUT_COMPONENTS = ("elst", "exch", "indu", "disp")
 
 # Spherical-harmonic degree each H3 variant contracts into the AP3 directional
 # slot. H2 (degree ``None``) leaves that slot zeroed, which is the ablation H3
@@ -234,21 +273,54 @@ class MACEPairResidualCore(torch.nn.Module):
         self.mace_equivariant_dim = mace_equivariant_dim
         self.monomer_conditioning = bool(monomer_conditioning)
         self.bypass_intra_updates = pair_mode in BYPASS_PAIR_MODES
+        self.directional_width = DIRECTIONAL_WIDTH_OVERRIDES.get(
+            resolved_architecture_id, CANONICAL_DIRECTIONAL_WIDTH
+        )
+        self.per_component_directional = (
+            resolved_architecture_id in PER_COMPONENT_DIRECTIONAL_ARCHITECTURES
+        )
+        if directional_degree is None and (
+            self.directional_width != CANONICAL_DIRECTIONAL_WIDTH
+            or self.per_component_directional
+        ):
+            raise ValueError(
+                f"{error_prefix} has no directional contraction, so it cannot "
+                "widen or split the directional slot"
+            )
+        self.directional_components = (
+            self._resolve_readout_components()
+            if self.per_component_directional
+            else ()
+        )
         self.h0_projection = torch.nn.Linear(
             mace_feature_dim, CANONICAL_AP3D3_DIMENSIONS["n_embed"]
         )
+        # Bias-free and applied to the channel axis only: adding a bias or
+        # mixing the 2l+1 components would break equivariance, which the loss
+        # would absorb rather than report. That holds per component too -- the
+        # split changes how many independent channel mixings the block gets,
+        # not how any one of them touches the angular index.
         if directional_degree is None:
             self.directional_projection = None
-        else:
-            # Bias-free and applied to the channel axis only: adding a bias or
-            # mixing the 2l+1 components would break equivariance, which the
-            # loss would absorb rather than report.
-            self.directional_projection = torch.nn.Linear(
-                mace_equivariant_dim,
-                CANONICAL_AP3D3_DIMENSIONS["n_message"]
-                * CANONICAL_AP3D3_DIMENSIONS["n_embed"],
-                bias=False,
+            self.directional_projections = None
+        elif self.per_component_directional:
+            # The shared attribute stays ``None`` so a per-component
+            # checkpoint cannot be silently loaded into a shared-projection
+            # route, or the reverse: the parameter names do not overlap.
+            self.directional_projection = None
+            self.directional_projections = torch.nn.ModuleDict(
+                {
+                    component: torch.nn.Linear(
+                        mace_equivariant_dim, self.directional_width, bias=False
+                    )
+                    for component in self.directional_components
+                }
             )
+        else:
+            self.directional_projection = torch.nn.Linear(
+                mace_equivariant_dim, self.directional_width, bias=False
+            )
+            self.directional_projections = None
         self._materialize_lazy_layers()
         # MACE projections replace the legacy element embedding on every route.
         self.ap3_core.embed_layer.requires_grad_(False)
@@ -259,6 +331,16 @@ class MACEPairResidualCore(torch.nn.Module):
             self.ap3_core.distance_layer.requires_grad_(False)
         self.last_h_ab: torch.Tensor | None = None
         self.last_h_ba: torch.Tensor | None = None
+
+    def _resolve_readout_components(self) -> tuple[str, ...]:
+        """Name the readout heads this AP3 core actually exposes."""
+
+        return tuple(
+            component
+            for component in PAIR_READOUT_COMPONENTS
+            if hasattr(self.ap3_core, f"readout_layer_{component}")
+            and not (component == "disp" and self.ap3_core.no_disp_nn)
+        )
 
     def _materialize_lazy_layers(self) -> None:
         """Initialize canonical lazy layers before optimization/checkpointing."""
@@ -284,7 +366,10 @@ class MACEPairResidualCore(torch.nn.Module):
             2 * (self.ap3_core.n_message + 1) * self.ap3_core.n_embed
             + 6
             + self.ap3_core.n_rbf
-            + 2 * self.ap3_core.n_message * self.ap3_core.n_embed
+            # Both halves of the edge contribute one directional block, and a
+            # per-component route gives each head its own pair of blocks at the
+            # same width -- so the readout input width is identical either way.
+            + 2 * self.directional_width
         )
         if self.monomer_conditioning:
             pair_width += MONOMER_CONDITIONING_WIDTH
@@ -318,6 +403,14 @@ class MACEPairResidualCore(torch.nn.Module):
             # ``set_extra_state``.
             config["directional_degree"] = self.directional_degree
             config["mace_equivariant_dim"] = self.mace_equivariant_dim
+        if self.directional_width != CANONICAL_DIRECTIONAL_WIDTH:
+            # Written only when widened, for the same reason as the keys above:
+            # every checkpoint from before the slot was resizable carries the
+            # canonical 24 implicitly and must still satisfy the strict
+            # comparison in ``set_extra_state``.
+            config["directional_width"] = self.directional_width
+        if self.per_component_directional:
+            config["per_component_directional"] = True
         if self.monomer_conditioning:
             # Added only when on, for the same reason as the H3 keys above: a
             # checkpoint written before the flag existed must still satisfy the
@@ -380,12 +473,16 @@ class MACEPairResidualCore(torch.nn.Module):
         batch: Any,
         features_a: MACEAtomicFeatures,
         features_b: MACEAtomicFeatures,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | dict[str, tuple[torch.Tensor, torch.Tensor]]
+    ):
         """Contract MACE's l-th equivariant block onto the interatomic axis.
 
         Returns the two per-edge tensors AP3 would otherwise build from its own
-        directional messages, at exactly the AP3 directional width, so the pair
-        feature and readout widths are bit-identical across H1, H2, and H3.
+        directional messages, at this route's directional width -- or, on a
+        per-component route, one such pair per readout head, keyed by head
+        name. Either way every head sees the same pair feature width.
 
         The channel projection is applied before the contraction: it costs
         ``n_atom * (2l+1) * C * F`` instead of the per-edge equivalent, and
@@ -396,10 +493,6 @@ class MACEPairResidualCore(torch.nn.Module):
         degree = self.directional_degree
         block_a = features_a.equivariant_degree(degree)
         block_b = features_b.equivariant_degree(degree)
-        weight = self.directional_projection.weight
-        # [n_atom, channel, m] x [out, channel] -> [n_atom, m, out]
-        projected_a = torch.einsum("acm,fc->amf", block_a, weight)
-        projected_b = torch.einsum("acm,fc->amf", block_b, weight)
 
         source = batch.e_ABsr_source
         target = batch.e_ABsr_target
@@ -418,13 +511,28 @@ class MACEPairResidualCore(torch.nn.Module):
         # distinguish them.
         harmonics_b = real_spherical_harmonics(degree, -unit)
 
-        directional_a = torch.einsum(
-            "amf,am->af", projected_a.index_select(0, source), harmonics_a
-        )
-        directional_b = torch.einsum(
-            "amf,am->af", projected_b.index_select(0, target), harmonics_b
-        )
-        return directional_a, directional_b
+        def contract(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # [n_atom, channel, m] x [out, channel] -> [n_atom, m, out]
+            projected_a = torch.einsum("acm,fc->amf", block_a, weight)
+            projected_b = torch.einsum("acm,fc->amf", block_b, weight)
+            return (
+                torch.einsum(
+                    "amf,am->af", projected_a.index_select(0, source), harmonics_a
+                ),
+                torch.einsum(
+                    "amf,am->af", projected_b.index_select(0, target), harmonics_b
+                ),
+            )
+
+        if self.directional_projections is None:
+            return contract(self.directional_projection.weight)
+        # The geometry above is shared; only the channel mixing differs per
+        # head, so the harmonics are evaluated once no matter how many
+        # projections consume them.
+        return {
+            component: contract(projection.weight)
+            for component, projection in self.directional_projections.items()
+        }
 
     def _pair_monomer_scalars(
         self, batch: Any

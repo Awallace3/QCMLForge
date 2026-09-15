@@ -51,6 +51,24 @@ MACE_AP3D3_OPTIONS = {
         "pair_mode": "h3l3",
         "feature_mode": "all-scalars+norms",
     },
+    # The l=3 directional slot widened to 112 (4 x n_message x n_embed), the
+    # slot split so every component readout gets its own projection, and both
+    # together. H3L3 itself is the control cell.
+    "MACE-AP3D3-H3L3W112": {
+        "properties": "legacy",
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+    },
+    "MACE-AP3D3-H3L3P": {
+        "properties": "legacy",
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+    },
+    "MACE-AP3D3-H3L3W112P": {
+        "properties": "legacy",
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+    },
     "MACE-AP3D3-AtomHead": {
         "properties": "atomhead",
         "pair_mode": "h1",
@@ -66,6 +84,9 @@ _INTERNAL_ARCHITECTURES = {
     "MACE-AP3D3-H3L1": "hybrid-h3l1",
     "MACE-AP3D3-H3L3": "hybrid-h3l3",
     "MACE-AP3D3-H3L3Q": "hybrid-h3l3q",
+    "MACE-AP3D3-H3L3W112": "hybrid-h3l3w112",
+    "MACE-AP3D3-H3L3P": "hybrid-h3l3p",
+    "MACE-AP3D3-H3L3W112P": "hybrid-h3l3w112p",
     "MACE-AP3D3-AtomHead": "atomhead",
 }
 

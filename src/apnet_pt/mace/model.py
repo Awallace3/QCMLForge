@@ -9,9 +9,12 @@ import torch
 
 from .long_range import LongRangeSAPTProvider, assemble_sapt_components
 from .pair import (
+    CANONICAL_DIRECTIONAL_WIDTH,
+    DIRECTIONAL_WIDTH_OVERRIDES,
     MACEPairResidualCore,
     MONOMER_CONDITIONING_ARCHITECTURES,
     PAIR_ARCHITECTURE_IDS,
+    PER_COMPONENT_DIRECTIONAL_ARCHITECTURES,
 )
 from .schema import (
     COMPONENT_ORDER,
@@ -53,6 +56,25 @@ MACE_AP3D3_ARCHITECTURES = {
         "provider_kind": "legacy",
     },
     "hybrid-h3l3q": {
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+        "provider_kind": "legacy",
+    },
+    # The three cells of the 2x2 that crosses directional slot width against
+    # sharing one projection among the readouts. ``hybrid-h3l3`` is the fourth
+    # (24-wide, shared), so all four differ from each other in exactly the two
+    # factors and nothing else.
+    "hybrid-h3l3w112": {
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+        "provider_kind": "legacy",
+    },
+    "hybrid-h3l3p": {
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+        "provider_kind": "legacy",
+    },
+    "hybrid-h3l3w112p": {
         "pair_mode": "h3l3",
         "feature_mode": "all-scalars+norms",
         "provider_kind": "legacy",
@@ -182,6 +204,32 @@ class MACEAP3D3(torch.nn.Module):
             raise ValueError(
                 f"{architecture} requires pair monomer_conditioning="
                 f"{expected_conditioning}"
+            )
+        # Same hazard as the conditioning block, for the same reason: the four
+        # cells of the width x sharing factorial all report pair mode
+        # ``h3l3``, so the canonical-id alias above cannot separate them. A
+        # 24-wide core mounted under a 112-wide route would train happily at
+        # the wrong capacity and be indistinguishable in the metrics.
+        expected_width = DIRECTIONAL_WIDTH_OVERRIDES.get(
+            architecture, CANONICAL_DIRECTIONAL_WIDTH
+        )
+        actual_width = getattr(
+            pair_core, "directional_width", CANONICAL_DIRECTIONAL_WIDTH
+        )
+        if actual_width != expected_width:
+            raise ValueError(
+                f"{architecture} requires pair directional_width="
+                f"{expected_width}, got {actual_width}"
+            )
+        expected_per_component = (
+            architecture in PER_COMPONENT_DIRECTIONAL_ARCHITECTURES
+        )
+        if bool(getattr(pair_core, "per_component_directional", False)) != (
+            expected_per_component
+        ):
+            raise ValueError(
+                f"{architecture} requires pair per_component_directional="
+                f"{expected_per_component}"
             )
         if getattr(featurizer, "feature_mode", None) != expected["feature_mode"]:
             raise ValueError(

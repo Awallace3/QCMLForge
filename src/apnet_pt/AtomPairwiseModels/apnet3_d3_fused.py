@@ -588,13 +588,25 @@ class APNet3D3_AtomType_MPNN(nn.Module):
 
     # @torch.compile
     def readouts(self, H):
+        """Apply every component head to the pair feature.
+
+        ``H`` is normally one tensor every head reads. A caller that wants each
+        head to see its own pair feature -- for instance one that gives each
+        component its own directional projection -- passes a mapping from head
+        name to tensor instead; the heads are applied in the same order and the
+        concatenated result has the same shape either way.
+        """
+
+        def feature(component):
+            return H[component] if isinstance(H, dict) else H
+
         parts = [
-            self.readout_layer_elst(H),
-            self.readout_layer_exch(H),
-            self.readout_layer_indu(H),
+            self.readout_layer_elst(feature("elst")),
+            self.readout_layer_exch(feature("exch")),
+            self.readout_layer_indu(feature("indu")),
         ]
         if not self.no_disp_nn:
-            parts.append(self.readout_layer_disp(H))
+            parts.append(self.readout_layer_disp(feature("disp")))
         return torch.cat(parts, dim=1)
 
     def forward(
@@ -763,6 +775,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # hAB = self.get_pair(hA, hB, qA, qB, rbf_sr, e_ABsr_source, e_ABsr_target)
         # hBA = self.get_pair(hB, hA, qB, qA, rbf_sr, e_ABsr_target, e_ABsr_source)
 
+        n_edge = e_ABsr_source.shape[0]
+
         # project the directional atomic hidden states along the interatomic axis
         if injected_pair_directional is None:
             hA_dir_source = hA_dir.index_select(0, e_ABsr_source)
@@ -770,6 +784,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
 
             hA_dir_blah = torch.einsum("axf,ax->af", hA_dir_source, dR_sr_unit)
             hB_dir_blah = torch.einsum("axf,ax->af", hB_dir_target, -dR_sr_unit)
+            directional = (hA_dir_blah, hB_dir_blah)
         else:
             # H3 contracts MACE's equivariant atom features against the
             # interatomic axis in the caller, which owns the spherical-harmonic
@@ -780,20 +795,29 @@ class APNet3D3_AtomType_MPNN(nn.Module):
                     "injected_pair_directional requires bypass_intra_updates; "
                     "otherwise the AP3 directional messages are silently discarded"
                 )
-            hA_dir_blah, hB_dir_blah = injected_pair_directional
-            expected_shape = (e_ABsr_source.shape[0], self.n_message * self.n_embed)
-            if (
-                tuple(hA_dir_blah.shape) != expected_shape
-                or tuple(hB_dir_blah.shape) != expected_shape
-            ):
-                raise ValueError(
-                    "injected pair directional features must have shape "
-                    f"{expected_shape}, got {tuple(hA_dir_blah.shape)} and "
-                    f"{tuple(hB_dir_blah.shape)}"
-                )
-
-        hAB = torch.cat([hAB, hA_dir_blah, hB_dir_blah], dim=1)
-        hBA = torch.cat([hBA, hB_dir_blah, hA_dir_blah], dim=1)
+            directional = injected_pair_directional
+            # The width is the caller's to choose -- the contraction compresses
+            # however many equivariant channels it was given into whatever slot
+            # the route asked for -- so this checks the shape is a coherent
+            # per-edge pair rather than pinning it to AP3's own l=1 width. A
+            # mapping instead of a pair means each readout head gets its own
+            # directional block; every head still sees the same width.
+            candidates = (
+                tuple(directional.values())
+                if isinstance(directional, dict)
+                else (directional,)
+            )
+            for dir_a, dir_b in candidates:
+                if (
+                    dir_a.ndim != 2
+                    or dir_a.shape != dir_b.shape
+                    or dir_a.shape[0] != n_edge
+                ):
+                    raise ValueError(
+                        "injected pair directional features must be a matched "
+                        f"pair of [{n_edge}, w] tensors, got "
+                        f"{tuple(dir_a.shape)} and {tuple(dir_b.shape)}"
+                    )
 
         if injected_pair_scalars is not None:
             # Per-edge monomer-level scalars (formal charge, unpaired-electron
@@ -805,18 +829,47 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             # hAB and hBA stay exact mirrors of each other as they are for
             # every other pair feature.
             sAB, sBA = injected_pair_scalars
-            n_edge = e_ABsr_source.shape[0]
             if sAB.shape != sBA.shape or sAB.ndim != 2 or sAB.shape[0] != n_edge:
                 raise ValueError(
                     "injected pair scalars must be a matched pair of "
                     f"[{n_edge}, k] tensors, got {tuple(sAB.shape)} and "
                     f"{tuple(sBA.shape)}"
                 )
-            hAB = torch.cat([hAB, sAB], dim=1)
-            hBA = torch.cat([hBA, sBA], dim=1)
+
+        pair_core_ab, pair_core_ba = hAB, hBA
+
+        def assemble(dir_a, dir_b):
+            # hBA is the mirror of hAB at every position, directional block
+            # included -- swapping the two halves is what makes the readout see
+            # the same physics from either end of the edge.
+            ab = torch.cat([pair_core_ab, dir_a, dir_b], dim=1)
+            ba = torch.cat([pair_core_ba, dir_b, dir_a], dim=1)
+            if injected_pair_scalars is not None:
+                ab = torch.cat([ab, sAB], dim=1)
+                ba = torch.cat([ba, sBA], dim=1)
+            return ab, ba
+
+        if isinstance(directional, dict):
+            assembled = {
+                component: assemble(*blocks)
+                for component, blocks in directional.items()
+            }
+            hAB = {component: ab for component, (ab, _) in assembled.items()}
+            hBA = {component: ba for component, (_, ba) in assembled.items()}
+        else:
+            hAB, hBA = assemble(*directional)
 
         EAB_sr = self.readouts(hAB)
         EBA_sr = self.readouts(hBA)
+
+        if isinstance(hAB, dict):
+            # The returned hidden states are a single tensor by contract, and
+            # every head's pair feature shares the same width and the same
+            # non-directional prefix, so the first head is a faithful
+            # representative of the shape. Callers that need all four should
+            # read the projections themselves.
+            hAB = next(iter(hAB.values()))
+            hBA = next(iter(hBA.values()))
 
         E_sr = EAB_sr + EBA_sr
 
