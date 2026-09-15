@@ -8,7 +8,6 @@ from ..pt_datasets.ap2_fused_ds import (
     ap2_fused_module_dataset,
     ap2_fused_module_dataset_lmdb,
     APNet2_fused_DataLoader,
-    qcel_dimer_to_fused_data,
 )
 from ..pt_datasets.ap3_fused_ds import (
     ap3_fused_module_dataset_lmdb,
@@ -16,6 +15,12 @@ from ..pt_datasets.ap3_fused_ds import (
     ap3_fused_collate_update,
     ap3_fused_collate_update_no_target,
     qcel_inputs_are_split_db,
+    # The AP2 converter of the same name drops the monomer multiplicity, so
+    # every qcel-fed AP3-D3 prediction was reaching the collate without one
+    # and being handed the closed-shell default. The two builders are
+    # otherwise identical; this one carries ``total_spin_A/B`` through from
+    # the qcel Molecule, which is where the value actually exists.
+    qcel_dimer_to_fused_data,
 )
 from ..pt_datasets.ap3_fused_fsapt_ds import (
     ap3_fused_fsapt_collate_update,
@@ -602,6 +607,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         pair_energy_envelope=False,
         bypass_intra_updates=False,
         injected_pair_directional=None,
+        injected_pair_scalars=None,
     ):
         ZA = batch.ZA
         RA = batch.RA
@@ -788,6 +794,26 @@ class APNet3D3_AtomType_MPNN(nn.Module):
 
         hAB = torch.cat([hAB, hA_dir_blah, hB_dir_blah], dim=1)
         hBA = torch.cat([hBA, hB_dir_blah, hA_dir_blah], dim=1)
+
+        if injected_pair_scalars is not None:
+            # Per-edge monomer-level scalars (formal charge, unpaired-electron
+            # count, ...). The pair features already carry the *predicted*
+            # per-atom monopole, but never the monomer total an edge belongs
+            # to, so a -2 anion and a neutral can present the same local q.
+            # The caller owns the content; this module only requires the two
+            # halves to be the A-then-B and B-then-A views of one block, so
+            # hAB and hBA stay exact mirrors of each other as they are for
+            # every other pair feature.
+            sAB, sBA = injected_pair_scalars
+            n_edge = e_ABsr_source.shape[0]
+            if sAB.shape != sBA.shape or sAB.ndim != 2 or sAB.shape[0] != n_edge:
+                raise ValueError(
+                    "injected pair scalars must be a matched pair of "
+                    f"[{n_edge}, k] tensors, got {tuple(sAB.shape)} and "
+                    f"{tuple(sBA.shape)}"
+                )
+            hAB = torch.cat([hAB, sAB], dim=1)
+            hBA = torch.cat([hBA, sBA], dim=1)
 
         EAB_sr = self.readouts(hAB)
         EBA_sr = self.readouts(hBA)

@@ -43,6 +43,14 @@ MACE_AP3D3_OPTIONS = {
         "pair_mode": "h3l3",
         "feature_mode": "all-scalars+norms",
     },
+    # H3L3 plus the monomer conditioning block: same tower, same degree, same
+    # feature mode, six extra per-edge scalars naming the formal charge and
+    # unpaired-electron count of each monomer. One lever against H3L3.
+    "MACE-AP3D3-H3L3Q": {
+        "properties": "legacy",
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+    },
     "MACE-AP3D3-AtomHead": {
         "properties": "atomhead",
         "pair_mode": "h1",
@@ -57,10 +65,20 @@ _INTERNAL_ARCHITECTURES = {
     "MACE-AP3D3-H3": "hybrid-h3",
     "MACE-AP3D3-H3L1": "hybrid-h3l1",
     "MACE-AP3D3-H3L3": "hybrid-h3l3",
+    "MACE-AP3D3-H3L3Q": "hybrid-h3l3q",
     "MACE-AP3D3-AtomHead": "atomhead",
 }
 
 _FEATURE_MODES = {"final-layer-scalars", "all-scalars+norms"}
+# Routes the pair core can identify from ``pair_mode`` alone, so passing an
+# ``architecture_id`` would be redundant. Everything else names itself.
+_CANONICAL_PAIR_ARCHITECTURES = {
+    "hybrid-h1",
+    "hybrid-h2",
+    "hybrid-h3",
+    "hybrid-h3l1",
+    "hybrid-h3l3",
+}
 # Channel multiplicity of each PolarMACE equivariant degree
 # (``512x0e+512x1o+512x2e+512x3o`` -- so l=3 is available at the same width as
 # l=1 and l=2, and the H3L3 arm needs no MACE reconfiguration). The H3 routes
@@ -944,6 +962,7 @@ def _default_factory_dependencies(plan: MACETrainingPlan) -> MACEFactoryDependen
         from apnet_pt.mace.pair import (
             DIRECTIONAL_DEGREES,
             MACEPairResidualCore,
+            PAIR_ROUTE_CONFIGS,
         )
 
         ap3 = APNet3D3_AtomType_MPNN(
@@ -955,7 +974,13 @@ def _default_factory_dependencies(plan: MACETrainingPlan) -> MACEFactoryDependen
         )
         feature_dim = 512 if plan.feature_mode == "final-layer-scalars" else 2560
         kwargs = {}
-        if plan.internal_architecture in {"direct-polar", "atomhead"}:
+        if plan.internal_architecture in PAIR_ROUTE_CONFIGS and (
+            plan.internal_architecture not in _CANONICAL_PAIR_ARCHITECTURES
+        ):
+            # Routes whose identity is not recoverable from the pair mode alone
+            # must name themselves: ``hybrid-h3l3`` and ``hybrid-h3l3q`` share
+            # a pair mode and differ only in the conditioning block, which the
+            # pair core derives from this id.
             kwargs["architecture_id"] = plan.internal_architecture
         if DIRECTIONAL_DEGREES[plan.pair_mode] is not None:
             kwargs["mace_equivariant_dim"] = _POLAR_EQUIVARIANT_CHANNELS

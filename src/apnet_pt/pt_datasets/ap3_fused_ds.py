@@ -8,6 +8,7 @@ from torch_geometric.data import Data
 from torch_geometric.data import Dataset
 from collections import OrderedDict
 import os.path as osp
+import warnings
 import torch
 from torch_geometric.data import download_url
 
@@ -157,15 +158,41 @@ def dimer_fused_data(
     )
 
 
+#: Fields already reported as missing, so a legacy store warns once rather
+#: than once per batch.
+_MISSING_METADATA_WARNED: set[str] = set()
+
+
 def _stack_monomer_metadata(batch, name, *, default, dtype):
-    """Stack one scalar per monomer without changing source data objects."""
+    """Stack one scalar per monomer without changing source data objects.
+
+    ``default`` covers stores written before the field joined
+    ``essential_attrs``. It is still applied -- refusing to collate would make
+    every such store unreadable -- but it is announced, because charge and
+    multiplicity are MACE inputs and a substituted value changes the physics
+    the featurizer is asked for without changing anything that would fail.
+    """
 
     values = []
+    substituted = 0
     for data in batch:
-        value = getattr(data, name, default)
+        value = getattr(data, name, None)
+        if value is None:
+            value = default
+            substituted += 1
         if torch.is_tensor(value):
             value = value.detach().reshape(-1)[0].item()
         values.append(value)
+    if substituted and name not in _MISSING_METADATA_WARNED:
+        _MISSING_METADATA_WARNED.add(name)
+        warnings.warn(
+            f"{substituted}/{len(batch)} records carry no {name}; substituting "
+            f"{default}. The MACE featurizer conditions on charge and spin, so "
+            "this is a physics substitution, not a formatting one -- rebuild "
+            "the store if the monomers are not all closed shell.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return torch.tensor(values, dtype=dtype)
 
 
@@ -1353,13 +1380,16 @@ class ap3_fused_module_dataset(Dataset):
                         continue
                 print(f"raw_path: {raw_path}")
                 print("Loading dimers...")
-                RA, RB, ZA, ZB, TQA, TQB, target = util.load_dimer_dataset(
-                    raw_path,
-                    self.MAX_SIZE,
-                    return_qcel_mols=False,
-                    return_qcel_mons=False,
-                    columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
-                    random_seed_shuffle=self.random_seed,
+                RA, RB, ZA, ZB, TQA, TQB, target, TMA, TMB = (
+                    util.load_dimer_dataset(
+                        raw_path,
+                        self.MAX_SIZE,
+                        return_qcel_mols=False,
+                        return_qcel_mons=False,
+                        return_multiplicities=True,
+                        columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
+                        random_seed_shuffle=self.random_seed,
+                    )
                 )
                 RAs.extend(RA)
                 RBs.extend(RB)
@@ -1367,10 +1397,12 @@ class ap3_fused_module_dataset(Dataset):
                 ZBs.extend(ZB)
                 TQAs.extend(TQA)
                 TQBs.extend(TQB)
-                # Legacy array datasets do not carry multiplicity; preserve the
-                # historical closed-shell assumption explicitly.
-                TMAs.extend([1] * len(RA))
-                TMBs.extend([1] * len(RB))
+                # Multiplicity comes from the frame -- from its qcel Molecule
+                # column when it has one, from TMA/TMB when it has those, and
+                # only otherwise from the closed-shell assumption, which
+                # ``load_dimer_dataset`` names on stdout rather than hiding.
+                TMAs.extend(TMA)
+                TMBs.extend(TMB)
                 targets.extend(target)
         print("Creating data objects...")
         t1 = time()
@@ -2146,13 +2178,16 @@ class ap3_fused_module_dataset_lmdb(LmdbEnvHandleMixin, Dataset):
 
                 print(f"raw_path: {raw_path}")
                 print("Loading dimers...")
-                RA, RB, ZA, ZB, TQA, TQB, target = util.load_dimer_dataset(
-                    raw_path,
-                    self.MAX_SIZE,
-                    return_qcel_mols=False,
-                    return_qcel_mons=False,
-                    columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
-                    random_seed_shuffle=self.random_seed,
+                RA, RB, ZA, ZB, TQA, TQB, target, TMA, TMB = (
+                    util.load_dimer_dataset(
+                        raw_path,
+                        self.MAX_SIZE,
+                        return_qcel_mols=False,
+                        return_qcel_mons=False,
+                        return_multiplicities=True,
+                        columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
+                        random_seed_shuffle=self.random_seed,
+                    )
                 )
                 RAs.extend(RA)
                 RBs.extend(RB)
@@ -2160,8 +2195,8 @@ class ap3_fused_module_dataset_lmdb(LmdbEnvHandleMixin, Dataset):
                 ZBs.extend(ZB)
                 TQAs.extend(TQA)
                 TQBs.extend(TQB)
-                TMAs.extend([1] * len(RA))
-                TMBs.extend([1] * len(RB))
+                TMAs.extend(TMA)
+                TMBs.extend(TMB)
                 targets.extend(target)
 
         print("Creating data objects...")

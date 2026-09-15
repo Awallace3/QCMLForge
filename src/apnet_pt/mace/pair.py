@@ -41,11 +41,26 @@ PAIR_ROUTE_CONFIGS = {
     "hybrid-h3": ("h3", "all-scalars+norms"),
     "hybrid-h3l1": ("h3l1", "all-scalars+norms"),
     "hybrid-h3l3": ("h3l3", "all-scalars+norms"),
+    "hybrid-h3l3q": ("h3l3", "all-scalars+norms"),
     "atomhead": ("h1", "all-scalars+norms"),
 }
 
 # Pair modes that bypass the AP3 intramonomer update stack entirely.
 BYPASS_PAIR_MODES = frozenset({"h2", "h3", "h3l1", "h3l3"})
+
+# Scalars ``monomer_conditioning`` appends to each half of the pair feature:
+# the monomer's formal charge, that charge spread over its atoms, and its
+# unpaired-electron count. Three per monomer, both monomers on every edge.
+MONOMER_CONDITIONING_SCALARS = ("formal_charge", "charge_per_atom", "n_unpaired")
+MONOMER_CONDITIONING_WIDTH = 2 * len(MONOMER_CONDITIONING_SCALARS)
+
+# Routes that carry the monomer conditioning block. It is orthogonal to the
+# pair mode -- ``hybrid-h3l3q`` is ``hybrid-h3l3`` plus these six scalars and
+# nothing else -- but it still gets its own architecture id rather than a bare
+# constructor flag, because the readout width and the physics the head sees
+# both change, and ``expected_resume_semantics`` compares architecture ids. A
+# shared id would let a charge-aware run resume from charge-blind weights.
+MONOMER_CONDITIONING_ARCHITECTURES = frozenset({"hybrid-h3l3q"})
 
 # Spherical-harmonic degree each H3 variant contracts into the AP3 directional
 # slot. H2 (degree ``None``) leaves that slot zeroed, which is the ablation H3
@@ -148,6 +163,7 @@ class MACEPairResidualCore(torch.nn.Module):
         feature_mode: str | None = None,
         architecture_id: str | None = None,
         mace_equivariant_dim: int | None = None,
+        monomer_conditioning: bool | None = None,
     ) -> None:
         super().__init__()
         if pair_mode not in CANONICAL_PAIR_FEATURE_MODES:
@@ -195,6 +211,20 @@ class MACEPairResidualCore(torch.nn.Module):
                 f"{error_prefix} requires a positive mace_equivariant_dim "
                 f"(channel count of the l={directional_degree} block)"
             )
+        # The route table owns whether monomer conditioning is on; the keyword
+        # exists so a test can state the expectation, not so a caller can pair
+        # an id with a width it does not describe.
+        implied_conditioning = (
+            resolved_architecture_id in MONOMER_CONDITIONING_ARCHITECTURES
+        )
+        if monomer_conditioning is None:
+            monomer_conditioning = implied_conditioning
+        elif bool(monomer_conditioning) != implied_conditioning:
+            raise ValueError(
+                f"{error_prefix} sets monomer_conditioning="
+                f"{implied_conditioning}; it is a property of the route, not a "
+                "free constructor flag"
+            )
         self.ap3_core = ap3_core
         self.mace_feature_dim = mace_feature_dim
         self.pair_mode = pair_mode
@@ -202,6 +232,7 @@ class MACEPairResidualCore(torch.nn.Module):
         self.architecture_id = resolved_architecture_id
         self.directional_degree = directional_degree
         self.mace_equivariant_dim = mace_equivariant_dim
+        self.monomer_conditioning = bool(monomer_conditioning)
         self.bypass_intra_updates = pair_mode in BYPASS_PAIR_MODES
         self.h0_projection = torch.nn.Linear(
             mace_feature_dim, CANONICAL_AP3D3_DIMENSIONS["n_embed"]
@@ -255,6 +286,8 @@ class MACEPairResidualCore(torch.nn.Module):
             + self.ap3_core.n_rbf
             + 2 * self.ap3_core.n_message * self.ap3_core.n_embed
         )
+        if self.monomer_conditioning:
+            pair_width += MONOMER_CONDITIONING_WIDTH
         pair_sample = self.h0_projection.weight.new_empty((0, pair_width))
         readouts = [
             self.ap3_core.readout_layer_elst,
@@ -285,6 +318,13 @@ class MACEPairResidualCore(torch.nn.Module):
             # ``set_extra_state``.
             config["directional_degree"] = self.directional_degree
             config["mace_equivariant_dim"] = self.mace_equivariant_dim
+        if self.monomer_conditioning:
+            # Added only when on, for the same reason as the H3 keys above: a
+            # checkpoint written before the flag existed must still satisfy the
+            # strict comparison in ``set_extra_state``. Present-and-true is the
+            # only state that changes the readout width, so present-and-true is
+            # the only state that has to be recorded.
+            config["monomer_conditioning"] = True
         return config
 
     def get_extra_state(self) -> dict[str, str | int]:
@@ -386,6 +426,63 @@ class MACEPairResidualCore(torch.nn.Module):
         )
         return directional_a, directional_b
 
+    def _pair_monomer_scalars(
+        self, batch: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Broadcast each monomer's charge and spin onto every pair edge.
+
+        The AP3 pair feature already carries the *predicted* per-atom monopole
+        of both edge atoms, but nothing tells the readout what the monomer
+        those atoms belong to actually is: a -2 anion and a neutral can present
+        the same local charge. Formal charge, charge per atom and unpaired
+        electron count are exactly the monomer-level inputs an MLIP handed
+        fragment charges gets for free, and are what the PLA15 control showed
+        is worth most of MACE-POLAR-1-S's lead there.
+
+        Spin enters as ``multiplicity - 1`` so a closed-shell monomer
+        contributes an exact zero rather than a constant that duplicates the
+        readout bias. Every dimer in the current training data is a pair of
+        singlets, so today this channel is identically zero by construction and
+        the arm is a pure charge lever; it starts carrying signal the moment
+        open-shell records appear, without a second architecture.
+        """
+
+        for name in ("total_charge_A", "total_charge_B",
+                     "total_spin_A", "total_spin_B"):
+            if getattr(batch, name, None) is None:
+                raise ValueError(
+                    f"monomer conditioning requires batch.{name}; refusing to "
+                    "substitute a default charge or multiplicity"
+                )
+        dtype = batch.RA.dtype
+        charge_a = batch.total_charge_A.to(dtype).reshape(-1)
+        charge_b = batch.total_charge_B.to(dtype).reshape(-1)
+        unpaired_a = batch.total_spin_A.to(dtype).reshape(-1) - 1.0
+        unpaired_b = batch.total_spin_B.to(dtype).reshape(-1) - 1.0
+        ndimer = charge_a.numel()
+        natom_a = torch.bincount(
+            batch.molecule_ind_A, minlength=ndimer
+        ).to(dtype).clamp(min=1.0)
+        natom_b = torch.bincount(
+            batch.molecule_ind_B, minlength=ndimer
+        ).to(dtype).clamp(min=1.0)
+        per_dimer_a = torch.stack(
+            [charge_a, charge_a / natom_a, unpaired_a], dim=1
+        )
+        per_dimer_b = torch.stack(
+            [charge_b, charge_b / natom_b, unpaired_b], dim=1
+        )
+        edge_dimer = batch.dimer_ind
+        edge_a = per_dimer_a.index_select(0, edge_dimer)
+        edge_b = per_dimer_b.index_select(0, edge_dimer)
+        # A-then-B for hAB, B-then-A for hBA: the same mirror AP3 applies to
+        # every other pair feature, so the two readout directions stay exact
+        # images of each other and the residual remains swap-symmetric.
+        return (
+            torch.cat([edge_a, edge_b], dim=1),
+            torch.cat([edge_b, edge_a], dim=1),
+        )
+
     def forward(
         self,
         batch: Any,
@@ -405,6 +502,9 @@ class MACEPairResidualCore(torch.nn.Module):
             injected_directional = self._pair_directional(
                 batch, features_a, features_b
             )
+        injected_scalars = None
+        if self.monomer_conditioning:
+            injected_scalars = self._pair_monomer_scalars(batch)
         result = self.ap3_core(
             batch,
             initial_atom_states=(h0_a, h0_b),
@@ -413,6 +513,7 @@ class MACEPairResidualCore(torch.nn.Module):
             pair_energy_envelope=True,
             bypass_intra_updates=self.bypass_intra_updates,
             injected_pair_directional=injected_directional,
+            injected_pair_scalars=injected_scalars,
         )
         residual = result[0]
         if residual.ndim == 2 and residual.shape[1] == 3:

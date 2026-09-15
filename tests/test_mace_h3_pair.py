@@ -59,7 +59,7 @@ def _equivariant_features(numbers, invariant, equivariant):
     )
 
 
-def _h3_fixture(pair_mode="h3", *, seed=31, feature_dim=16):
+def _h3_fixture(pair_mode="h3", *, seed=31, feature_dim=16, architecture_id=None):
     torch.manual_seed(seed)
     batch = _batch()
     width = sum(
@@ -78,12 +78,21 @@ def _h3_fixture(pair_mode="h3", *, seed=31, feature_dim=16):
         dimer_prop_model=None,
         use_precomputed_classical=True,
     )
+    core_kwargs = {}
+    if architecture_id is not None:
+        # Only routes the pair mode cannot name on its own pass an id, which
+        # is how ``hybrid-h3l3q`` separates itself from ``hybrid-h3l3``. The
+        # AP3 core's lazy layers size themselves on the first forward, so the
+        # id has to be set here rather than by rebuilding around a core that
+        # has already materialized at the control width.
+        core_kwargs["architecture_id"] = architecture_id
     core = MACEPairResidualCore(
         ap3,
         mace_feature_dim=feature_dim,
         pair_mode=pair_mode,
         feature_mode="all-scalars+norms",
         mace_equivariant_dim=TEST_CHANNELS,
+        **core_kwargs,
     )
     props_a = _properties(batch.ZA)
     props_b = _properties(batch.ZB, 0.1)

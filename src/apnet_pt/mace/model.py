@@ -8,7 +8,11 @@ from typing import Any, Callable, Iterable, Mapping
 import torch
 
 from .long_range import LongRangeSAPTProvider, assemble_sapt_components
-from .pair import MACEPairResidualCore, PAIR_ARCHITECTURE_IDS
+from .pair import (
+    MACEPairResidualCore,
+    MONOMER_CONDITIONING_ARCHITECTURES,
+    PAIR_ARCHITECTURE_IDS,
+)
 from .schema import (
     COMPONENT_ORDER,
     AtomicPropertyBundle,
@@ -44,6 +48,11 @@ MACE_AP3D3_ARCHITECTURES = {
         "provider_kind": "legacy",
     },
     "hybrid-h3l3": {
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+        "provider_kind": "legacy",
+    },
+    "hybrid-h3l3q": {
         "pair_mode": "h3l3",
         "feature_mode": "all-scalars+norms",
         "provider_kind": "legacy",
@@ -160,6 +169,19 @@ class MACEAP3D3(torch.nn.Module):
         if getattr(pair_core, "architecture_id", None) not in allowed_pair_ids:
             raise ValueError(
                 f"pair architecture identifier must match {architecture}"
+            )
+        # The hybrid alias above accepts a canonical pair id for any route
+        # sharing its pair mode, which is exactly what ``hybrid-h3l3q`` and
+        # ``hybrid-h3l3`` do. Only the conditioning block tells them apart, so
+        # it is checked separately -- otherwise a charge-blind core would mount
+        # silently under the charge-aware route and train on six fewer inputs.
+        expected_conditioning = architecture in MONOMER_CONDITIONING_ARCHITECTURES
+        if bool(getattr(pair_core, "monomer_conditioning", False)) != (
+            expected_conditioning
+        ):
+            raise ValueError(
+                f"{architecture} requires pair monomer_conditioning="
+                f"{expected_conditioning}"
             )
         if getattr(featurizer, "feature_mode", None) != expected["feature_mode"]:
             raise ValueError(

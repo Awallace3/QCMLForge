@@ -33,6 +33,7 @@ ROUTES = {
     "hybrid-h3": ("h3", "all-scalars+norms", "legacy"),
     "hybrid-h3l1": ("h3l1", "all-scalars+norms", "legacy"),
     "hybrid-h3l3": ("h3l3", "all-scalars+norms", "legacy"),
+    "hybrid-h3l3q": ("h3l3", "all-scalars+norms", "legacy"),
     "atomhead": ("h1", "all-scalars+norms", "atomhead"),
 }
 
@@ -278,7 +279,10 @@ def _make_model(route, *, no_disp=False):
         no_disp_nn=no_disp,
     )
     pair_kwargs = {}
-    if route in {"direct-polar", "atomhead"}:
+    # Derived, not listed: a route names itself to the pair core whenever its
+    # id is not recoverable from the pair mode, which is what separates
+    # ``hybrid-h3l3q`` from ``hybrid-h3l3``.
+    if route != f"hybrid-{pair_mode}":
         pair_kwargs["architecture_id"] = route
     if directional_degree is not None:
         pair_kwargs["mace_equivariant_dim"] = STUB_EQUIVARIANT_CHANNELS
@@ -298,6 +302,41 @@ def _make_model(route, *, no_disp=False):
         long_range_provider=long_range,
     )
     return model, provider, long_range
+
+
+def test_charge_blind_pair_core_cannot_mount_under_the_charge_aware_route():
+    """The one assembly that the architecture-id check cannot see.
+
+    ``hybrid-h3l3`` and ``hybrid-h3l3q`` share a pair mode, so both accept the
+    canonical ``MACE-AP3D3-H3L3`` identifier a pair core carries when it is
+    built without naming a route.  Such a core is charge-blind, and mounting
+    it under ``hybrid-h3l3q`` raises nothing at assembly and nothing at any
+    forward after it: the route would simply train on six fewer inputs and
+    report itself as the charge-aware arm.  (The opposite pairing is already
+    impossible -- a conditioned core identifies itself as ``hybrid-h3l3q``,
+    which ``hybrid-h3l3`` rejects by identifier.)
+    """
+
+    ap3 = APNet3D3_AtomType_MPNN(dimer_prop_model=None, use_precomputed_classical=True)
+    pair_core = MACEPairResidualCore(
+        ap3,
+        mace_feature_dim=16,
+        pair_mode="h3l3",
+        feature_mode="all-scalars+norms",
+        mace_equivariant_dim=STUB_EQUIVARIANT_CHANNELS,
+    )
+    assert pair_core.architecture_id == "MACE-AP3D3-H3L3"
+    assert not pair_core.monomer_conditioning
+    with pytest.raises(ValueError, match="monomer_conditioning=True"):
+        MACEAP3D3(
+            architecture="hybrid-h3l3q",
+            featurizer=StubFeaturizer(
+                "all-scalars+norms", equivariant_irreps=STUB_IRREPS
+            ),
+            property_provider=StubPropertyProvider("legacy"),
+            pair_core=pair_core,
+            long_range_provider=StubLongRangeProvider(),
+        )
 
 
 @pytest.mark.parametrize("route", ROUTES)
