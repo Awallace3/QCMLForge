@@ -71,8 +71,9 @@ worktree. It imports the experiment's authoritative `Arm`, chemical perception,
 bounded-coefficient and frame-harmonic APIs. The original basis-only viewer
 remains available with `--source`.
 
-The model export supplies all 528 geometries, actual reference plans, chemical
-types, physical A/B/coefficient values, pair energies, total/reference exchange,
+The final model export supplies all 528 geometries, all four selected models
+(`v4-iso`, `v4-axial`, `v5-axial`, and `v5-c2v`), actual reference plans,
+chemical types, physical A/B/coefficient values, pair energies, total/reference exchange,
 minimum angular factors, overlap flags and source/checkpoint hashes. The browser
 reconstructs numerical equation terms for inspection; plots use exported pair
 energies. JavaScript parity tests verify every reconstructed pair against those
@@ -113,7 +114,26 @@ a v4 axial model, and disables model surface comparison because it has no
 model-dependent coefficients. None of these controls changes pairwise energies.
 
 Equation substitutions use two decimals **only for display**; calculation and
-export retain full float64 precision. S66 is not a blind holdout: 112 records
+export retain full float64 precision.
+
+The final result panel makes the matched comparison explicit: `v5-c2v` improves
+the 150,000-record corpus-test MAE (0.553118 versus 0.561702) but loses S66×8
+to `v5-axial` overall (0.5491 versus 0.5185), on the pair-disjoint slice
+(0.5537 versus 0.5103), and on the fully pair-disjoint π–π class
+(0.6715 versus 0.4997). Per-class and per-scale panels show that C2v loses at
+0.90–1.00 Rₑ and improves from 1.05 outward. `v5-axial` is the matched control:
+v4→v5 axial differences arise from finer typing (309→333 training types), not
+from the transverse channel.
+
+The benzene acid-test panel reproduces the final checkpoints' π-face minus
+in-plane-perpendicular contrasts: −2.86e−4 (`v4-axial`), −3.49e−4
+(`v5-axial`), and +0.517 (`v5-c2v`). It draws one shared l=2 norm budget,
+`sqrt(a20² + a22c²) / 0.40`; it does not imply independent caps. No
+per-channel gradient norms, update traces, feature-variance history, or
+epoch-resolved C22c coefficient history were recorded, and the viewer states
+that the trajectory is unavailable rather than inferring it.
+
+S66 is not a blind holdout: 112 records
 share training pairs; the correctly reconstructed pair-disjoint slice has 416.
 The `novel-mask.json` in the historical report is monomer novelty, **not** a
 pair-disjoint mask.

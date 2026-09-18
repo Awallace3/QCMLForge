@@ -77,6 +77,21 @@ def test_embedded_database_and_all_frame_geometries():
                         assert np.linalg.norm(np.cross(z, x)) > 1e-6
 
 
+def test_trained_viewer_has_required_v5_result_panels_and_warnings():
+    template = (
+        SCRIPT.parents[1] / "scripts/spherical_vis/index.html"
+    ).read_text()
+    inspector = (
+        SCRIPT.parents[1] / "scripts/spherical_vis/inspector.js"
+    ).read_text()
+    assert 'id="classBenchmark"' in template
+    assert 'id="scaleBenchmark"' in template
+    assert 'id="telemetryNotice"' in template
+    assert "matched v5 control" in template
+    assert "shared l=2" in template
+    assert "renderBenchmarks" in inspector
+
+
 def test_browser_harmonics_match_torch_reference():
     import pytest
 

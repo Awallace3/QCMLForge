@@ -40,8 +40,13 @@ summary{cursor:pointer;color:#dbc4a4}code{font-size:12px;color:#e5cba5}
 .equation-card{padding:16px;background:#211d26;border:1px solid #4c414f;border-radius:10px;margin:12px 0}
 .equation{overflow-x:auto;padding:8px 0;font-size:14px}.table-wrap{overflow:auto;max-height:370px}
 .norm{width:80px;display:inline-block;vertical-align:middle}.model-note{padding:10px 12px;border-left:3px solid #d1ae7e;background:#26212a;margin:12px 0;font-size:12px;line-height:1.6}
+.verdict{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(220px,.65fr);gap:1px;background:#50483e;border:1px solid #50483e;border-radius:12px;overflow:hidden;margin:16px 0}
+.verdict>div{background:#18161c;padding:18px}.verdict strong{font:600 24px Georgia,serif;color:#f0d6a8}.verdict .loss{color:#f2a99d}
+.benchmark-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.benchmark-card{padding:14px;background:#18161c;border:1px solid #403b46;border-radius:10px;min-width:0}
+.benchmark-card h3{margin:0 0 5px}.benchmark-card svg{display:block;width:100%;height:auto}.telemetry-missing{border:1px dashed #b68563;background:#2b211f;padding:14px;border-radius:10px;margin:16px 0;color:#ead5c8}
+.acid-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.acid-cell{padding:10px;background:#252129;border-radius:8px}.acid-cell b{display:block;color:#d9bd91;margin-bottom:3px}
 @media(max-width:1000px){.inspector-grid{grid-template-columns:1fr}}
-@media(max-width:760px){.workspace{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #37333c}.dimers{max-height:165px}#stage{height:460px}header,main{padding:14px}h1{font-size:23px}}
+@media(max-width:760px){.workspace{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #37333c}.dimers{max-height:165px}#stage{height:460px}header,main{padding:14px}h1{font-size:23px}.benchmark-grid,.verdict,.acid-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -114,6 +119,23 @@ The browser does not deserialize PyTorch pickle files. A new export replaces the
 <div id="atoms" aria-label="Atom harmonic toggles"></div>
 <p id="frameInfo" class="subtle"></p>
 <section id="pairInspector" hidden>
+<section id="benchmarkPanel">
+<div class="eyebrow">Final v5 evaluation · matched comparison</div>
+<div class="verdict">
+<div><strong>C22c wins the corpus, <span class="loss">loses S66×8.</span></strong>
+<p class="subtle">The clean channel comparison is <b>v5-c2v versus its matched v5 control, v5-axial</b>.
+The v4→v5 axial change is finer typing (309→333 types), not evidence about anisotropy.</p></div>
+<div id="headlineMetrics" aria-label="Final benchmark headline"></div>
+</div>
+<div class="benchmark-grid">
+<section class="benchmark-card"><h3>MAE by interaction class</h3>
+<p class="subtle">All 528 records; π–π is fully pair-disjoint (n=48).</p><div id="classBenchmark"></div></section>
+<section class="benchmark-card"><h3>MAE by separation</h3>
+<p class="subtle">C2v loses at compressed 0.90–1.00 Rₑ and wins from 1.05 outward.</p><div id="scaleBenchmark"></div></section>
+</div>
+<div id="benzeneAcidTest" class="equation-card"></div>
+<div id="telemetryNotice" class="telemetry-missing" role="note"></div>
+</section>
 <h2 class="text-xl font-semibold">Atom-pair exchange inspector</h2>
 <p class="subtle">Click one monA atom and one monB atom in this separate viewer.
 Plots use all eight original S66×8 geometries, not a fabricated pair stretch.</p>
@@ -150,8 +172,10 @@ Frames are averaged within each axial orbit over transverse references, then acr
 Missing transverse references do not invent an x axis. The angular coefficients are bounded per degree by ρ=0.40;
 a20 and a22c share the same l=2 norm budget, guaranteeing f ≥ 0.20.</p>
 <p class="subtle">Aromatic v4 carbon has z toward H in the ring plane: π-face and in-plane perpendicular values are equal.
-C22c can break that degeneracy in v5; no v5 result is fabricated when its checkpoint is absent.
+C22c breaks that degeneracy in the final v5-c2v checkpoint.
 Switching to one reference frame displays an individual contribution, never an alternative learned energy.</p>
+<p class="subtle">The parameter table draws one <strong>shared l=2</strong> norm bar:
+<code>sqrt(a20² + a22c²) / 0.40</code>. It never presents a20 and a22c as independent budgets.</p>
 <pre id="modelProvenance" class="subtle" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
 </details>
 </section>

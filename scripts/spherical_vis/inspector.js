@@ -15,8 +15,10 @@ class ModelInspector {
       }
       $(id).onchange=onModels;
     }
-    $("modelPrimary").value=data.models["v4-axial"]?"v4-axial":Object.keys(data.models)[0];
-    $("modelCompare").value=data.models["v4-iso"]?"v4-iso":Object.keys(data.models)[0];
+    $("modelPrimary").value=data.models["v5-c2v"]?"v5-c2v":
+      data.models["v4-axial"]?"v4-axial":Object.keys(data.models)[0];
+    $("modelCompare").value=data.models["v5-axial"]?"v5-axial":
+      data.models["v4-iso"]?"v4-iso":Object.keys(data.models)[0];
     $("surfaceMode").onchange=onModels;
     this.viewer=$3Dmol.createViewer($("pairViewer"),{backgroundColor:"#f5f3ef",antialias:true});
     this.viewer.setProjection("orthographic");
@@ -34,6 +36,7 @@ class ModelInspector {
     const note=document.createElement("p");note.className="subtle";
     note.textContent="For axial groups, C10/C20 need only z; absent transverse gauges contribute zero C22c. A has units √(kcal/mol), B is Å⁻¹, r is Å, and f and x are dimensionless. Ring-mode availability alone does not activate C22c in v4.";
     $("generalEquation").append(note);
+    this.renderBenchmarks();
     $("modelProvenance").textContent=JSON.stringify({
       dataset_sha256:data.source_sha256,...data.provenance,
       checkpoints:Object.fromEntries(Object.entries(data.models).map(([key,m])=>[key,{
@@ -54,6 +57,77 @@ class ModelInspector {
       element.append(node);
     }
   }
+  renderBenchmarks() {
+    const e=this.data.evaluation;
+    if(!e){this.$("benchmarkPanel").hidden=true;return;}
+    const axial=e.overall["v5-axial"].mae,c2v=e.overall["v5-c2v"].mae;
+    this.$("headlineMetrics").innerHTML=`<div class="subtle">150k corpus test</div>
+      <div><b>0.5531</b> C2v · 0.5617 axial</div>
+      <div class="subtle" style="margin-top:8px">S66×8 all / pair-disjoint</div>
+      <div><b class="loss">${this.f(c2v)} / ${this.f(e.pairDisjoint["v5-c2v"].mae)}</b> C2v</div>
+      <div><b>${this.f(axial)} / ${this.f(e.pairDisjoint["v5-axial"].mae)}</b> axial</div>`;
+    this.classChart(e.byClass);
+    this.scaleChart(e.byScale);
+    const acid=e.benzeneAcidTest.arms,carbon=acid.v5_c2v.carbon;
+    this.$("benzeneAcidTest").innerHTML=`<h3>Benzene acid test · aromatic carbon</h3>
+      <p class="subtle">π-face minus in-plane-perpendicular angular factor. The final C2v renderer must reproduce the sign reversal and three-order-of-magnitude opening.</p>
+      <div class="acid-grid">
+      <div class="acid-cell"><b>v4 axial</b>${acid.v4_axial.pi_minus_inplane_perp.toExponential(2)}</div>
+      <div class="acid-cell"><b>v5 axial</b>${acid.v5_axial.pi_minus_inplane_perp.toExponential(2)}</div>
+      <div class="acid-cell"><b>v5 C2v</b>+${acid.v5_c2v.pi_minus_inplane_perp.toFixed(3)}</div></div>
+      <p class="subtle" style="margin-top:12px">One shared l=2 budget:
+      √(a20² + a22c²) = ${carbon.l2_norm.toFixed(6)} / ρ 0.40
+      <progress class="progress norm" max=".4" value="${carbon.l2_norm}"></progress>
+      <b>${(100*carbon.l2_norm_over_rho).toFixed(1)}% saturated</b>.
+      C22c holds ${(100*carbon.a22c_share_of_l2).toFixed(1)}% of that norm; it does not have a second cap.</p>`;
+    const title=document.createElement("b");
+    title.textContent="Training trajectory unavailable. ";
+    const reason=document.createTextNode(e.telemetry.reason);
+    this.$("telemetryNotice").replaceChildren(title,reason);
+  }
+  classChart(values) {
+    const entries=Object.entries(values),W=650,left=150,right=44,top=22,row=55;
+    const H=top+entries.length*row+32,max=Math.max(...entries.flatMap(([,v])=>
+      [v["v5-axial"].mae,v["v5-c2v"].mae]));
+    const X=x=>left+x/max*(W-left-right),esc=s=>this.escape(s);
+    let svg=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="S66x8 MAE by interaction class"><title>S66x8 MAE by interaction class</title>`;
+    entries.forEach(([name,v],i)=>{
+      const y=top+i*row;
+      svg+=`<text x="${left-8}" y="${y+19}" text-anchor="end" fill="#ddd" font-size="12">${esc(name)}</text>
+        <rect x="${left}" y="${y+3}" width="${X(v["v5-axial"].mae)-left}" height="14" rx="3" fill="#5fcab4"><title>v5-axial ${v["v5-axial"].mae.toFixed(4)}</title></rect>
+        <rect x="${left}" y="${y+23}" width="${X(v["v5-c2v"].mae)-left}" height="14" rx="3" fill="#d88f82"><title>v5-c2v ${v["v5-c2v"].mae.toFixed(4)}</title></rect>
+        <text x="${X(v["v5-axial"].mae)+5}" y="${y+14}" fill="#bfece3" font-size="10">${v["v5-axial"].mae.toFixed(3)}</text>
+        <text x="${X(v["v5-c2v"].mae)+5}" y="${y+34}" fill="#f4c2ba" font-size="10">${v["v5-c2v"].mae.toFixed(3)}</text>`;
+    });
+    svg+=`<text x="${left}" y="${H-8}" fill="#5fcab4" font-size="11">■ v5-axial</text>
+      <text x="${left+92}" y="${H-8}" fill="#d88f82" font-size="11">■ v5-c2v</text></svg>`;
+    this.$("classBenchmark").innerHTML=svg;
+  }
+  scaleChart(values) {
+    const entries=Object.entries(values),W=650,H=330,left=55,right=22,top=22,bottom=58;
+    const ys=entries.flatMap(([,v])=>[v["v5-axial"].mae,v["v5-c2v"].mae]);
+    const lo=Math.log10(Math.min(...ys))-.08,hi=Math.log10(Math.max(...ys))+.08;
+    const X=i=>left+i/(entries.length-1)*(W-left-right);
+    const Y=v=>H-bottom-(Math.log10(v)-lo)/(hi-lo)*(H-top-bottom);
+    let svg=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="S66x8 MAE by separation on logarithmic scale"><title>S66x8 MAE by separation</title>`;
+    for(const tick of [.001,.01,.1,1]){
+      if(Math.log10(tick)<lo||Math.log10(tick)>hi)continue;
+      svg+=`<line x1="${left}" x2="${W-right}" y1="${Y(tick)}" y2="${Y(tick)}" stroke="#403b46"/>
+        <text x="${left-7}" y="${Y(tick)+4}" text-anchor="end" fill="#aaa" font-size="10">${tick}</text>`;
+    }
+    for(const [key,color] of [["v5-axial","#5fcab4"],["v5-c2v","#d88f82"]]){
+      const points=entries.map(([,v],i)=>`${X(i)},${Y(v[key].mae)}`).join(" ");
+      svg+=`<polyline points="${points}" fill="none" stroke="${color}" stroke-width="3"/>`;
+      entries.forEach(([scale,v],i)=>{
+        svg+=`<circle cx="${X(i)}" cy="${Y(v[key].mae)}" r="5" fill="${color}"><title>${key} · ${scale} Rₑ · ${v[key].mae.toFixed(6)} kcal/mol</title></circle>`;
+      });
+    }
+    entries.forEach(([scale],i)=>{svg+=`<text x="${X(i)}" y="${H-bottom+19}" text-anchor="middle" fill="#bbb" font-size="10">${scale}</text>`;});
+    svg+=`<text x="${(W+left-right)/2}" y="${H-12}" text-anchor="middle" fill="#bbb" font-size="11">Separation / Rₑ · logarithmic MAE axis</text>
+      <text x="${left}" y="14" fill="#5fcab4" font-size="11">● v5-axial</text>
+      <text x="${left+88}" y="14" fill="#d88f82" font-size="11">● v5-c2v</text></svg>`;
+    this.$("scaleBenchmark").innerHTML=svg;
+  }
   update(dimer,scale) {
     const changed=this.dimer?.id!==dimer.id;
     this.dimer=dimer;this.scale=scale;
@@ -64,7 +138,7 @@ class ModelInspector {
     }
     this.$("modelSummary").textContent=this.keys().map(key=>{
       const metric=this.data.metrics[key],m=this.data.models[key];
-      return `${key}: ${m.channels===3?"C10/C20/C22c":m.arm==="shared-iso"?"f = 1":"C10/C20"} · MAE all ${this.f(metric.all.mae)} (n=${metric.all.n}), pair-disjoint ${this.f(metric.disjoint.mae)} (n=${metric.disjoint.n}) kcal/mol`;
+      return `${key}: ${m.channels===3?"C10/C20/C22c":m.arm==="shared-iso"?"f = 1":"C10/C20"} · ${m.trainingTypeCount || "?"} training types · MAE all ${this.f(metric.all.mae)} (n=${metric.all.n}), pair-disjoint ${this.f(metric.disjoint.mae)} (n=${metric.disjoint.n}) kcal/mol`;
     }).join("   |   ");
     this.refreshPair(changed);
     this.parameters();
@@ -193,6 +267,6 @@ class ModelInspector {
       const m=this.data.models[key],t=this.data.types[id],p=m.parameters[id],l1=Math.abs(p[2]),l2=Math.hypot(p[3],p[4]);
       html+=`<tr title="${esc(JSON.stringify(t.label))}"><td>${esc(key)} / ${id}</td><td>${t.z}</td><td>${esc(ModelMath.effectiveMode(m,t))}</td>${p.map(v=>`<td title="${v.toPrecision(12)}">${f(v)}</td>`).join("")}<td>${f(l1)} <progress class="progress norm" max=".4" value="${l1}"></progress></td><td>${f(l2)} <progress class="progress norm" max=".4" value="${l2}"></progress></td></tr>`;
     }
-    this.$("parameterTable").innerHTML=html+"</tbody></table><p class='subtle'>Hover a row for its full chemical type label; hover a parameter for more digits. Values are bounded derived parameters, not raw checkpoint tensors. A: √(kcal/mol).</p>";
+    this.$("parameterTable").innerHTML=html+"</tbody></table><p class='subtle'>Hover a row for its full chemical type label; hover a parameter for more digits. Values are bounded derived parameters, not raw checkpoint tensors. A: √(kcal/mol). The single l=2 bar is √(a20² + a22c²), so both coefficients spend one shared ρ=0.40 budget.</p>";
   }
 }
