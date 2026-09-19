@@ -26,7 +26,7 @@ from apnet_pt import constants
 import h5py
 
 
-AP2_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9, 10})
+AP2_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9, 10, 11})
 
 
 def spec_type_uses_split_files(spec_type):
@@ -1022,11 +1022,14 @@ class ap2_fused_module_dataset(Dataset):
             5. testing small
             6. testing 12k
             7. testing 12k but creating batch of 16 to avoid any collating and reduce large I/O issues (potentially)
+            10. SAPT(PBE0)-D4/aug-cc-pVDZ 225K totals train/test split
+            11. splinter_omol25_sapt0indu_v1 pair-disjoint 90/10 seed 42 split
+               (OMol25 + SPLINTER; SAPT(PBE0) elst/exch, SAPT0 induction, D4 dispersion)
             None: assumes that data is passed as qcel_molecules and energy labels
         """
         self.print_level = print_level
         try:
-            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, None]
+            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, 11, None]
         except Exception:
             print("Currently spec_type must be 1 or 2 for SAPT0/jun-cc-pVDZ")
             raise ValueError
@@ -1173,6 +1176,11 @@ class ap2_fused_module_dataset(Dataset):
             return [
                 "225K_saptpbe0-d4_totals_train.pkl",
                 "225K_saptpbe0-d4_totals_test.pkl",
+            ]
+        elif self.spec_type == 11:
+            return [
+                "splinter_omol25_sapt0indu_v1_train.pkl",
+                "splinter_omol25_sapt0indu_v1_test.pkl",
             ]
         elif self.spec_type is None:
             os.system(f"touch {self.raw_dir}/tmp.txt")
@@ -1658,7 +1666,7 @@ class ap2_fused_module_dataset_lmdb(Dataset):
         self.lmdb = lmdb
         self.print_level = print_level
         try:
-            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, None]
+            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, 11, None]
         except Exception:
             print("Currently spec_type must be 1 or 2 for SAPT0/jun-cc-pVDZ")
             raise ValueError
