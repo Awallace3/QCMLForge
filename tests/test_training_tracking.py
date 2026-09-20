@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import json
 import math
 import pickle
+import textwrap
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -38,6 +40,7 @@ from apnet_pt.training_tracking import (
     track_pretraining_from_locals,
 )
 from apnet_pt.training_tracking import (
+    _LOCAL_LOSS_VARIABLES,
     _component_losses_from_locals,
     _metrics_from_locals,
 )
@@ -1348,8 +1351,11 @@ def test_real_pairwise_harness_training_emits_events_and_embedded_checkpoint(
     events = _read_events(event_directory)
     logs = [event["metrics"] for event in events if event["event"] == "log"]
     assert [log["epoch"] for log in logs] == [0, 1]
-    assert "val/mae/dispersion" in logs[-1]
-    assert "val/loss/dispersion" in logs[-1]
+    components = ("electrostatics", "exchange", "induction", "dispersion")
+    for component in components:
+        assert f"val/mae/{component}" in logs[-1]
+        assert f"train/loss/{component}" in logs[-1]
+        assert f"val/loss/{component}" in logs[-1]
     checkpoint_event = next(
         event for event in events if event["event"] == "checkpoint"
     )
@@ -1368,6 +1374,44 @@ def test_real_pairwise_harness_training_emits_events_and_embedded_checkpoint(
     )
     assert checkpoint["config"]["n_neuron"] == 4
     assert checkpoint["submodels"]["atom_model"]["config"]["n_neuron"] == 4
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name"),
+    (
+        ("apnet_pt.AtomPairwiseModels.apnet2", "APNet2Model"),
+        (
+            "apnet_pt.AtomPairwiseModels.apnet3_d3_fused",
+            "APNet3D3_AtomType_Model",
+        ),
+    ),
+)
+def test_single_proc_train_binds_every_component_loss_local(
+    module_name, class_name
+):
+    """The scraper matches names, so a renamed local silently drops a metric.
+
+    ``_component_losses_from_locals`` skips locals it cannot find rather than
+    raising, which is what lets the DDP loops keep their smaller metric set.
+    That same tolerance would turn a typo in a single-process loop into a
+    46-hour run with no per-component loss, so pin the names it must bind.
+    """
+
+    harness = getattr(importlib.import_module(module_name), class_name)
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(harness.single_proc_train))
+    )
+    bound = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+    expected = {
+        name
+        for _, train_name, validation_name in _LOCAL_LOSS_VARIABLES
+        for name in (train_name, validation_name)
+    }
+    assert expected <= bound, expected - bound
 
 
 def test_no_dispersion_model_omits_dispersion_metric(tmp_path):
