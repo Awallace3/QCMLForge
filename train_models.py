@@ -269,11 +269,15 @@ def lr_schedule_train_kwargs(
     Returns
     -------
     dict
-        Exactly one of ``{"end_lr": ...}`` or ``{"lr_decay": ...}``.
+        ``{"lr_decay": ...}`` for every route; AP3-D3 additionally receives
+        ``end_lr``.  Its ``train()`` prefers ``end_lr`` when both are set and
+        says so in the log, so forwarding both keeps either flag usable rather
+        than making one silently inert.
     """
+    kwargs = {"lr_decay": lr_decay}
     if is_apnetd3_model_type(apnet_model_type):
-        return {"end_lr": end_lr}
-    return {"lr_decay": lr_decay}
+        kwargs["end_lr"] = end_lr
+    return kwargs
 
 
 def train_pairwise_model(

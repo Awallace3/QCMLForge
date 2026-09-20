@@ -42,7 +42,20 @@ def test_end_lr_reaches_train_for_every_apnetd3_alias(alias):
     kwargs = train_models.lr_schedule_train_kwargs(
         alias, end_lr=5e-6, lr_decay=None
     )
-    assert kwargs == {"end_lr": 5e-6}
+    assert kwargs["end_lr"] == 5e-6
+
+
+@pytest.mark.parametrize("alias", APNETD3_ALIASES)
+def test_lr_decay_also_reaches_train_for_every_apnetd3_alias(alias):
+    """AP3-D3 accepts both knobs, so neither may be dropped at dispatch.
+
+    ``train()`` prefers ``end_lr`` when both are set and logs that it is doing
+    so; forwarding only one would make the other flag inert without warning.
+    """
+    kwargs = train_models.lr_schedule_train_kwargs(
+        alias, end_lr=None, lr_decay=1.0
+    )
+    assert kwargs["lr_decay"] == 1.0
 
 
 def test_non_apnetd3_routes_receive_lr_decay():
