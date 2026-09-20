@@ -1969,7 +1969,20 @@ units angstrom
         exch_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 1]))
         indu_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 2]))
         disp_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 3]))
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = comp_MSE_t.unbind()
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     # @torch.inference_mode()
     def __evaluate_batches_single_proc(
@@ -1997,7 +2010,20 @@ units angstrom
         exch_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 1]))
         indu_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 2]))
         disp_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 3]))
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = comp_MSE_t.unbind()
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     def __train_batches_single_proc_transfer(
         self, dataloader, loss_fn, optimizer, rank_device, scheduler
@@ -2462,12 +2488,30 @@ units angstrom
             **component_batch_kwargs,
         )
         if not transfer_learning:
-            train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
-                t_out
-            )
-            test_loss, total_MAE_v, elst_MAE_v, exch_MAE_v, indu_MAE_v, disp_MAE_v = (
-                v_out
-            )
+            (
+                train_loss,
+                total_MAE_t,
+                elst_MAE_t,
+                exch_MAE_t,
+                indu_MAE_t,
+                disp_MAE_t,
+                elst_MSE_t,
+                exch_MSE_t,
+                indu_MSE_t,
+                disp_MSE_t,
+            ) = t_out
+            (
+                test_loss,
+                total_MAE_v,
+                elst_MAE_v,
+                exch_MAE_v,
+                indu_MAE_v,
+                disp_MAE_v,
+                elst_MSE_v,
+                exch_MSE_v,
+                indu_MSE_v,
+                disp_MSE_v,
+            ) = v_out
             print(
                 f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} "
                 f"{elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} "
@@ -2511,6 +2555,10 @@ units angstrom
                     exch_MAE_t,
                     indu_MAE_t,
                     disp_MAE_t,
+                    elst_MSE_t,
+                    exch_MSE_t,
+                    indu_MSE_t,
+                    disp_MSE_t,
                 ) = t_out
                 (
                     test_loss,
@@ -2519,6 +2567,10 @@ units angstrom
                     exch_MAE_v,
                     indu_MAE_v,
                     disp_MAE_v,
+                    elst_MSE_v,
+                    exch_MSE_v,
+                    indu_MSE_v,
+                    disp_MSE_v,
                 ) = v_out
             else:
                 train_loss, total_MAE_t = t_out

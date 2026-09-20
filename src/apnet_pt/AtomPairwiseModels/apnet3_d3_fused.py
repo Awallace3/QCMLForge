@@ -2443,7 +2443,23 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
+        elst_MSE_t, exch_MSE_t, indu_MSE_t = comp_MSE_t[:3].unbind()
+        disp_MSE_t = (
+            torch.tensor(0.0) if self.model.no_disp_nn else comp_MSE_t[3]
+        )
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     # @torch.inference_mode()
     def __evaluate_batches_single_proc(
@@ -2482,7 +2498,23 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
+        elst_MSE_t, exch_MSE_t, indu_MSE_t = comp_MSE_t[:3].unbind()
+        disp_MSE_t = (
+            torch.tensor(0.0) if self.model.no_disp_nn else comp_MSE_t[3]
+        )
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     def __train_batches_single_proc_transfer(
         self, dataloader, loss_fn, optimizer, rank_device, scheduler
@@ -2636,7 +2668,23 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
+        elst_MSE_t, exch_MSE_t, indu_MSE_t = comp_MSE_t[:3].unbind()
+        disp_MSE_t = (
+            torch.tensor(0.0) if self.model.no_disp_nn else comp_MSE_t[3]
+        )
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     def __evaluate_batches_fsapt_single_proc(
         self, dataloader, loss_fn, rank_device, include_total_mse=False
@@ -2728,7 +2776,23 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
+        elst_MSE_t, exch_MSE_t, indu_MSE_t = comp_MSE_t[:3].unbind()
+        disp_MSE_t = (
+            torch.tensor(0.0) if self.model.no_disp_nn else comp_MSE_t[3]
+        )
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     ########################################################################
     # SINGLE-PROCESS TRAINING
@@ -3300,12 +3364,30 @@ units angstrom
             **component_batch_kwargs,
         )
         if is_fsapt or not transfer_learning:
-            train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
-                t_out
-            )
-            test_loss, total_MAE_v, elst_MAE_v, exch_MAE_v, indu_MAE_v, disp_MAE_v = (
-                v_out
-            )
+            (
+                train_loss,
+                total_MAE_t,
+                elst_MAE_t,
+                exch_MAE_t,
+                indu_MAE_t,
+                disp_MAE_t,
+                elst_MSE_t,
+                exch_MSE_t,
+                indu_MSE_t,
+                disp_MSE_t,
+            ) = t_out
+            (
+                test_loss,
+                total_MAE_v,
+                elst_MAE_v,
+                exch_MAE_v,
+                indu_MAE_v,
+                disp_MAE_v,
+                elst_MSE_v,
+                exch_MSE_v,
+                indu_MSE_v,
+                disp_MSE_v,
+            ) = v_out
             if self.model.no_disp_nn:
                 print(
                     f"  (Pre-training)({time.time() - t0: < 7.2f}s)  MAE: {
@@ -3370,6 +3452,10 @@ units angstrom
                     exch_MAE_t,
                     indu_MAE_t,
                     disp_MAE_t,
+                    elst_MSE_t,
+                    exch_MSE_t,
+                    indu_MSE_t,
+                    disp_MSE_t,
                 ) = t_out
                 (
                     test_loss,
@@ -3378,6 +3464,10 @@ units angstrom
                     exch_MAE_v,
                     indu_MAE_v,
                     disp_MAE_v,
+                    elst_MSE_v,
+                    exch_MSE_v,
+                    indu_MSE_v,
+                    disp_MSE_v,
                 ) = v_out
             else:
                 train_loss, total_MAE_t = t_out

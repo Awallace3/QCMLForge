@@ -37,7 +37,10 @@ from apnet_pt.training_tracking import (
     track_epoch_from_locals,
     track_pretraining_from_locals,
 )
-from apnet_pt.training_tracking import _metrics_from_locals
+from apnet_pt.training_tracking import (
+    _component_losses_from_locals,
+    _metrics_from_locals,
+)
 
 
 def _context(**overrides):
@@ -688,6 +691,79 @@ def test_metrics_from_locals_names_expands_and_excludes():
         _metrics_from_locals(vector, metric_labels=("only-one",))
 
 
+def test_component_losses_from_locals_names_expands_and_excludes():
+    values = {
+        "elst_MSE_t": 1.0,
+        "elst_MSE_v": 2.0,
+        "disp_MSE_t": 3.0,
+        "disp_MSE_v": 4.0,
+    }
+
+    assert _component_losses_from_locals(values) == (
+        ["electrostatics", "dispersion"],
+        [1.0, 3.0],
+        [2.0, 4.0],
+    )
+    assert _component_losses_from_locals(values, exclude=("dispersion",)) == (
+        ["electrostatics"],
+        [1.0],
+        [2.0],
+    )
+
+
+def test_component_losses_from_locals_is_optional_and_scalar_only():
+    """A harness that reports only a summed loss must still track cleanly."""
+
+    assert _component_losses_from_locals({"total_MAE_t": 1.0}) == ([], [], [])
+    with pytest.raises(ValueError, match="single component loss"):
+        _component_losses_from_locals(
+            {
+                "elst_MSE_t": torch.tensor([0.1, 0.2]),
+                "elst_MSE_v": torch.tensor([0.3, 0.4]),
+            }
+        )
+
+
+def test_pairwise_run_logs_per_component_loss_every_epoch(tmp_path):
+    """Each epoch must carry per-component loss beside per-component MAE."""
+
+    harness = _ToyTrackedHarness("pairwise")
+    dataset = list(range(4))
+
+    run_tracked_single_process(
+        harness,
+        lambda: harness.single_proc_train(n_epochs=2),
+        WandbConfig(mode="offline"),
+        model_family="pairwise",
+        train_dataset=dataset,
+        validation_dataset=dataset,
+        effective_batch_size=2,
+        world_size=1,
+        initial_config={"training/epochs": 2},
+        backend=TrackerBackend.FILE_EVENT,
+        event_directory=str(tmp_path),
+    )
+
+    events = _read_events(tmp_path)
+    logs = [event["metrics"] for event in events if event["event"] == "log"]
+    components = {"electrostatics", "exchange", "induction", "dispersion"}
+    for metrics in logs:
+        for side in ("train", "val"):
+            assert {
+                key.removeprefix(f"{side}/loss/")
+                for key in metrics
+                if key.startswith(f"{side}/loss/")
+            } == components
+    # Component MAEs run 0.2..0.5 (train) and 0.7..1.0 (val); losses are squares.
+    assert logs[-1]["train/loss/electrostatics"] == pytest.approx(0.04)
+    assert logs[-1]["train/loss/dispersion"] == pytest.approx(0.25)
+    assert logs[-1]["val/loss/electrostatics"] == pytest.approx(0.49)
+    defined = [
+        event for event in events if event["event"] == "define_metrics"
+    ]
+    assert "train/loss/induction" in defined[0]["names"]
+
+
 _PUBLIC_TRAIN_HARNESSES = (
     ("apnet_pt.AtomModels.ap2_atom_model", "AtomModel"),
     ("apnet_pt.AtomModels.ap2_hirshfeld_atom_model", "AtomHirshfeldModel"),
@@ -748,6 +824,7 @@ class _ToyTrackedHarness:
         "pairwise": ("total", "elst", "exch", "indu", "disp"),
         "parameter": ("total",),
     }
+    _MSE_NAMES = {"pairwise": ("elst", "exch", "indu", "disp")}
 
     def __init__(self, family):
         self.family = family
@@ -787,6 +864,29 @@ class _ToyTrackedHarness:
         return {
             **{f"{name}_MAE_t": value for name, value in zip(names, train_maes)},
             **{f"{name}_MAE_v": value for name, value in zip(names, validation_maes)},
+            **self._mse_locals(train_maes, validation_maes),
+        }
+
+    def _mse_locals(self, train_maes, validation_maes):
+        """Per-component loss locals, as the real pairwise loops now publish them.
+
+        Only the pairwise family reports them; the values are the squares of the
+        component MAEs so they stay deterministic and ordered like the loops'
+        ``torch.mean(torch.square(comp_errors_t), dim=0)``.
+        """
+
+        names = self._MSE_NAMES.get(self.family, ())
+        if not names:
+            return {}
+        return {
+            **{
+                f"{name}_MSE_t": value**2
+                for name, value in zip(names, train_maes[1:])
+            },
+            **{
+                f"{name}_MSE_v": value**2
+                for name, value in zip(names, validation_maes[1:])
+            },
         }
 
     def _tracking_kwargs(self):
@@ -1249,6 +1349,7 @@ def test_real_pairwise_harness_training_emits_events_and_embedded_checkpoint(
     logs = [event["metrics"] for event in events if event["event"] == "log"]
     assert [log["epoch"] for log in logs] == [0, 1]
     assert "val/mae/dispersion" in logs[-1]
+    assert "val/loss/dispersion" in logs[-1]
     checkpoint_event = next(
         event for event in events if event["event"] == "checkpoint"
     )
@@ -1295,6 +1396,8 @@ def test_no_dispersion_model_omits_dispersion_metric(tmp_path):
     ]
     assert all("train/mae/dispersion" not in metrics for metrics in logs)
     assert all("val/mae/dispersion" not in metrics for metrics in logs)
+    assert all("train/loss/dispersion" not in metrics for metrics in logs)
+    assert all("val/loss/dispersion" not in metrics for metrics in logs)
 
 
 def test_harness_failure_records_failed_status_and_cleans_up(tmp_path):
