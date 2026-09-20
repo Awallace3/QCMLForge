@@ -236,6 +236,46 @@ def train_atom_model(
     return
 
 
+# Every spelling of the AP3-D3 route accepted by ``--train_apnet``.  The
+# ``--end_lr`` validation gate and the ``train()`` kwarg dispatch must read this
+# one set: when they disagreed, ``APNet3-fused-d3 --end_lr`` passed validation
+# and was then silently replaced by ``lr_decay=None``, training at a flat rate.
+APNETD3_MODEL_TYPES = frozenset(
+    {"apnetd3", "apnet3d3", "apnet3-d3-fused", "apnet3-fused-d3"}
+)
+
+
+def is_apnetd3_model_type(apnet_model_type: str) -> bool:
+    """Whether ``apnet_model_type`` names the AP3-D3 training route."""
+    return apnet_model_type.lower() in APNETD3_MODEL_TYPES
+
+
+def lr_schedule_train_kwargs(
+    apnet_model_type: str,
+    end_lr: float | None,
+    lr_decay: float | None,
+) -> dict:
+    """The learning-rate schedule kwarg ``train()`` receives for this route.
+
+    Parameters
+    ----------
+    apnet_model_type : str
+        Value of ``--train_apnet``.
+    end_lr : float or None
+        Final learning rate for AP3-D3 exponential decay.
+    lr_decay : float or None
+        Inverse-time decay factor for every other route.
+
+    Returns
+    -------
+    dict
+        Exactly one of ``{"end_lr": ...}`` or ``{"lr_decay": ...}``.
+    """
+    if is_apnetd3_model_type(apnet_model_type):
+        return {"end_lr": end_lr}
+    return {"lr_decay": lr_decay}
+
+
 def train_pairwise_model(
     apnet_model_type="APNet2",
     model_out="./models/ap2_ensemble/ap2_1.pt",
@@ -384,14 +424,7 @@ def train_pairwise_model(
         APNet = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel
     else:
         raise ValueError("Invalid Atom Model Type")
-    normalized_type = apnet_model_type.lower()
-    supports_end_lr = normalized_type in {
-        "apnetd3",
-        "apnet3d3",
-        "apnet3-d3-fused",
-        "apnet3-fused-d3",
-    }
-    if end_lr is not None and not supports_end_lr:
+    if end_lr is not None and not is_apnetd3_model_type(apnet_model_type):
         raise ValueError("end_lr is currently only supported for APNetD3 training")
     print("Training {}...".format(apnet_model_type))
     if torch.cuda.is_available():
@@ -708,10 +741,9 @@ def train_pairwise_model(
         train_kwargs["shard_locality_block_shards"] = int(
             shard_locality_block_shards
         )
-    if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
-        train_kwargs["end_lr"] = end_lr
-    else:
-        train_kwargs["lr_decay"] = lr_decay
+    train_kwargs.update(
+        lr_schedule_train_kwargs(apnet_model_type, end_lr, lr_decay)
+    )
     supported_train_kwargs = inspect.signature(apnet.train).parameters
     unsupported_train_kwargs = sorted(
         key for key in train_kwargs if key not in supported_train_kwargs
