@@ -1,8 +1,10 @@
 """Loading legacy AtomTypeParamMPNN checkpoints that predate the ``r_cut`` config key.
 
-The shipped ``atp_hfvr_*.pt`` / ``atp_elst_*.pt`` weights were written before
-``r_cut`` was added to the saved ``config`` dict, so every loader that reads it
-must fall back to the caller's ``r_cut`` rather than raising ``KeyError``.
+The shipped ``models/ap3_ensemble/1/atp_mpnn_1.pt`` weights were written at
+``78d8e077``, before ``r_cut`` was added to the saved ``config`` dict, so every
+loader that reads it must fall back to the caller's ``r_cut`` rather than
+raising ``KeyError``.  (``atp_hfvr_*.pt`` / ``atp_elst_*.pt`` are
+``AtomTypeParamNN`` checkpoints and are not affected.)
 """
 
 import pytest
