@@ -767,3 +767,26 @@ def test_elided_energy_head_is_restored_even_when_the_forward_raises():
             assert backbone.local_electron_energy is not original
             raise ZeroDivisionError
     assert backbone.local_electron_energy is original
+
+
+def test_switching_off_the_hook_route_removes_the_hooks():
+    """Flipping ``route`` must not leave captures accumulating unread.
+
+    The A/B that prices the lever runs both routes against one backbone, so a
+    stale hook would charge the recompute arm for work the shipped code does
+    not do -- and would inflate it without bound as the run went on.
+    """
+    adapter = PolarMACEPrivateLayerAdapter("0.3.16", route="hook")
+    backbone = torch.nn.Module()
+    backbone.interactions = torch.nn.ModuleList([_StubBlock()])
+    backbone.products = torch.nn.ModuleList([_StubBlock()])
+
+    adapter.arm(backbone)
+    assert len(adapter._handles) == 2
+    assert backbone.interactions[0]._forward_hooks
+
+    adapter.route = "recompute"
+    adapter.arm(backbone)
+    assert adapter._handles == []
+    assert not backbone.interactions[0]._forward_hooks
+    assert not backbone.products[0]._forward_hooks

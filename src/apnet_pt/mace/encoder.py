@@ -129,6 +129,11 @@ class PolarMACEPrivateLayerAdapter:
         """
 
         if self.route != "hook":
+            # Leaving the hooks registered would keep filling ``_captured`` on
+            # every forward with nobody to clear it, which grows without bound
+            # and makes the recompute route cost more than the shipped code it
+            # is supposed to reproduce.
+            self.release()
             return
         if self._hooked_backbone != id(backbone):
             for handle in self._handles:
@@ -145,6 +150,20 @@ class PolarMACEPrivateLayerAdapter:
                         )
                     )
             self._hooked_backbone = id(backbone)
+        self._captured.clear()
+
+    def release(self) -> None:
+        """Remove the hooks and drop the captures.
+
+        Worth calling when a featurizer is discarded: the handles live on the
+        backbone's blocks, not on the adapter, so a shared backbone otherwise
+        accumulates one set per featurizer that ever wrapped it.
+        """
+
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+        self._hooked_backbone = None
         self._captured.clear()
 
     def _make_hook(self, kind: str, index: int):
