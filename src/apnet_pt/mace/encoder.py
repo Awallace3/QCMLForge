@@ -7,6 +7,7 @@ checkpoints.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 from importlib.metadata import version
@@ -56,22 +57,106 @@ class PrivateMACEFeatures:
     adapter_version: str
 
 
+class _ZeroLocalElectronEnergy(torch.nn.Module):
+    """Shape-correct zero stand-in for ``PolarMACE.local_electron_energy``.
+
+    MACE 0.3.16 computes this head unconditionally and reduces it into
+    ``energy``/``node_energy``/``electron_energy``.  On a V100 H3L3 step it is
+    20.0% of the backbone forward, and the featurizer reads exactly four keys of
+    the backbone output -- ``node_feats``, ``density_coefficients``, ``charges``
+    and ``dipole`` -- none of which it touches.  Every field this featurizer
+    emits is bit-equal with the head elided.
+
+    The swap is scoped to one forward by ``_elided_energy_head`` rather than
+    applied to the module.  ``add_local_electron_energy`` is ``True`` on
+    MACE-POLAR-1-S, so a permanent mutation would leave a shared backbone
+    silently returning wrong energies to any other consumer -- the exact
+    no-error, no-warning failure ``docs/model-notices.md`` exists to catch.
+    """
+
+    def forward(self, **kwargs: Any) -> torch.Tensor:
+        reference = kwargs["node_feats"]
+        return reference.new_zeros(reference.shape[0])
+
+
 class PolarMACEPrivateLayerAdapter:
     """Reviewed MACE 0.3.16 local-interaction adapter.
 
-    This adapter calls named blocks explicitly rather than installing forward
-    hooks.  Its final product-basis scalars are checked against public
-    ``node_feats`` on every use; a mismatch is fatal.
+    Two routes return the same tensors.  ``recompute`` calls the named local
+    blocks explicitly, which is auditable but runs the whole local tower a
+    second time; ``hook`` reads those same blocks off the public forward.  On
+    an H3L3 V100 train step the duplicate tower plus this adapter's assembly is
+    88.5 ms of 554 ms (job 13398476), so the route is worth choosing.
+
+    The two were compared block by block on the real MACE-POLAR-1-S artifact:
+    ``hidden`` (27, 8192) and ``final_scalars`` (27, 512) are bit-equal, max
+    difference exactly 0.0, and every tensor the featurizer emits is unchanged.
+    The feature schema is therefore identical and cached features stay valid,
+    which is why ``adapter_version`` does not move.
+
+    What the route costs is the audit.  ``recompute`` produces final scalars by
+    an independent path and the featurizer checks them against public
+    ``node_feats``; under ``hook`` the two sides are the same tensor's value, so
+    that check can no longer fail.  ``_extract_hook`` therefore carries its own
+    guards -- every expected block captured, captured exactly once -- because
+    the failure it has to catch is an upstream refactor that stops routing
+    through ``interactions``/``products``, not a numerical divergence.
     """
 
     adapter_version = "polar-private-mace-0.3.16-v1"
+    valid_routes = frozenset({"recompute", "hook"})
 
-    def __init__(self, mace_version: str) -> None:
+    def __init__(self, mace_version: str, *, route: str = "hook") -> None:
         if mace_version != SUPPORTED_MACE_VERSION:
             raise ValueError(
                 "private PolarMACE adapter supports only mace-torch 0.3.16"
             )
+        if route not in self.valid_routes:
+            raise ValueError(f"unsupported private adapter route: {route}")
         self.version = self.adapter_version
+        self.route = route
+        self._captured: dict[tuple[str, int], list[torch.Tensor]] = {}
+        self._hooked_backbone: int | None = None
+        self._handles: list[Any] = []
+
+    def arm(self, backbone: torch.nn.Module) -> None:
+        """Install capture hooks if needed and discard the previous forward.
+
+        Clearing here rather than after ``extract`` is what makes a missing
+        block an error instead of a silently reused stale tensor: a forward that
+        never reaches ``products[i]`` leaves the key absent, and ``extract``
+        refuses.
+        """
+
+        if self.route != "hook":
+            return
+        if self._hooked_backbone != id(backbone):
+            for handle in self._handles:
+                handle.remove()
+            self._handles = []
+            for kind, modules in (
+                ("interaction", backbone.interactions),
+                ("product", backbone.products),
+            ):
+                for index, module in enumerate(modules):
+                    self._handles.append(
+                        module.register_forward_hook(
+                            self._make_hook(kind, index)
+                        )
+                    )
+            self._hooked_backbone = id(backbone)
+        self._captured.clear()
+
+    def _make_hook(self, kind: str, index: int):
+        def hook(module, inputs, output):
+            # A forward hook that returns anything but ``None`` replaces the
+            # module's output, so this must not end in the expression value of
+            # the recording call.
+            value = output[0] if kind == "interaction" else output
+            self._captured.setdefault((kind, index), []).append(value)
+            return None
+
+        return hook
 
     def extract(
         self,
@@ -79,6 +164,13 @@ class PolarMACEPrivateLayerAdapter:
         graph: dict[str, torch.Tensor],
         public_outputs: dict[str, torch.Tensor],
     ) -> PrivateMACEFeatures:
+        self._check_runtime(backbone)
+        if self.route == "hook":
+            return self._extract_hook(backbone)
+        return self._extract_recompute(backbone, graph, public_outputs)
+
+    @staticmethod
+    def _check_runtime(backbone: torch.nn.Module) -> None:
         if (
             type(backbone).__name__ != "PolarMACE"
             or type(backbone).__module__ != "mace.modules.extensions"
@@ -86,6 +178,75 @@ class PolarMACEPrivateLayerAdapter:
             raise TypeError("private adapter requires the pinned PolarMACE class")
         if version("mace-torch") != SUPPORTED_MACE_VERSION:
             raise RuntimeError("private adapter MACE runtime version mismatch")
+
+    @staticmethod
+    def _flatten_hidden(hidden: torch.Tensor, interaction_irreps) -> torch.Tensor:
+        """MACE 0.3.16 [atom, channel, concatenated-m] -> irrep-major flat."""
+
+        if hidden.ndim != 3:
+            return hidden
+        offset = 0
+        flattened_parts = []
+        for multiplicity, irrep in interaction_irreps:
+            if multiplicity != hidden.shape[1]:
+                raise RuntimeError("unsupported private PolarMACE channel layout")
+            flattened_parts.append(
+                hidden[:, :, offset : offset + irrep.dim].reshape(hidden.shape[0], -1)
+            )
+            offset += irrep.dim
+        return torch.cat(flattened_parts, dim=-1)
+
+    def _extract_hook(self, backbone: torch.nn.Module) -> PrivateMACEFeatures:
+        o3 = _e3nn_o3()
+        layers = range(len(backbone.interactions))
+        hidden_layers = []
+        product_layers = []
+        layer_irreps = []
+        for index in layers:
+            for kind in ("interaction", "product"):
+                seen = self._captured.get((kind, index))
+                if not seen:
+                    raise RuntimeError(
+                        f"private PolarMACE hook adapter captured no {kind} "
+                        f"{index}; the public forward no longer routes through it"
+                    )
+                if len(seen) != 1:
+                    raise RuntimeError(
+                        f"private PolarMACE hook adapter captured {kind} {index} "
+                        f"{len(seen)} times in one forward; expected exactly one"
+                    )
+            interaction_irreps = o3.Irreps(backbone.interactions[index].irreps_out)
+            layer_irreps.append(interaction_irreps)
+            hidden_layers.append(
+                self._flatten_hidden(
+                    self._captured[("interaction", index)][0], interaction_irreps
+                )
+            )
+            product_layers.append(self._captured[("product", index)][0])
+        # Release the captures now rather than at the next ``arm``.  The hooks
+        # stay registered on the backbone, so anything else that forwards it
+        # would otherwise keep a full hidden basis -- and, outside ``no_grad``,
+        # its autograd graph -- alive until our next step.
+        self._captured.clear()
+        if not hidden_layers:
+            raise ValueError("PolarMACE private adapter found no interaction layers")
+        hidden_irreps = o3.Irreps("")
+        for irreps in layer_irreps:
+            hidden_irreps += irreps
+        return PrivateMACEFeatures(
+            final_scalars=torch.cat(product_layers, dim=-1),
+            hidden=torch.cat(hidden_layers, dim=-1),
+            hidden_irreps=str(hidden_irreps),
+            layer_count=len(hidden_layers),
+            adapter_version=self.adapter_version,
+        )
+
+    def _extract_recompute(
+        self,
+        backbone: torch.nn.Module,
+        graph: dict[str, torch.Tensor],
+        public_outputs: dict[str, torch.Tensor],
+    ) -> PrivateMACEFeatures:
         # Optional/private imports are deliberately delayed until adapter use.
         o3 = _e3nn_o3()
         from mace.modules.extensions import _permute_to_e3nn_convention
@@ -127,26 +288,7 @@ class PolarMACEPrivateLayerAdapter:
             )
             interaction_irreps = o3.Irreps(interaction.irreps_out)
             layer_irreps.append(interaction_irreps)
-            if hidden.ndim == 3:
-                # MACE 0.3.16's reshape block uses [atom, channel,
-                # concatenated-m] layout. Convert it to the conventional e3nn
-                # irrep-major flattened layout consumed by downstream heads.
-                offset = 0
-                flattened_parts = []
-                for multiplicity, irrep in interaction_irreps:
-                    if multiplicity != hidden.shape[1]:
-                        raise RuntimeError(
-                            "unsupported private PolarMACE channel layout"
-                        )
-                    flattened_parts.append(
-                        hidden[:, :, offset : offset + irrep.dim].reshape(
-                            hidden.shape[0], -1
-                        )
-                    )
-                    offset += irrep.dim
-                hidden_layers.append(torch.cat(flattened_parts, dim=-1))
-            else:
-                hidden_layers.append(hidden)
+            hidden_layers.append(self._flatten_hidden(hidden, interaction_irreps))
             node_feats = product(
                 node_feats=hidden,
                 sc=sc,
@@ -305,6 +447,7 @@ class MACEPolarFeaturizer(torch.nn.Module):
         # mis-extraction is O(1), so 1e-4 still catches every defect this guard
         # exists for while being immune to kernel selection.
         parity_atol: float = 1.0e-4,
+        elide_energy_head: bool = True,
     ) -> None:
         super().__init__()
         if feature_mode not in self.valid_feature_modes:
@@ -337,6 +480,7 @@ class MACEPolarFeaturizer(torch.nn.Module):
         self.private_adapter = private_adapter
         self.multipole_contract = multipole_contract
         self.parity_atol = parity_atol
+        self.elide_energy_head = elide_energy_head
         self.last_private_parity_error = 0.0
         self.resolved_feature_schema: str | None = None
         supported = getattr(backbone, "atomic_numbers", torch.empty(0, dtype=torch.long))
@@ -346,6 +490,40 @@ class MACEPolarFeaturizer(torch.nn.Module):
         )
         if feature_mode == "all-scalars+norms" and private_adapter is None:
             self.private_adapter = PolarMACEPrivateLayerAdapter(mace_version)
+
+    @contextmanager
+    def _elided_energy_head(self):
+        """Swap out the unread ``local_electron_energy`` head for this forward.
+
+        Restoration is in a ``finally`` so a raising forward -- the parity guard
+        below raises, and so does an OOM -- cannot leave a zeroed head installed
+        on a backbone another model shares.
+        """
+
+        head = getattr(self.backbone, "local_electron_energy", None)
+        if not self.elide_energy_head or head is None:
+            yield
+            return
+        self.backbone.local_electron_energy = _ZeroLocalElectronEnergy()
+        try:
+            yield
+        finally:
+            self.backbone.local_electron_energy = head
+
+    def _backbone_forward(self, graph: dict[str, torch.Tensor]):
+        """The one public backbone call; both run paths go through here.
+
+        Arming the adapter here rather than inside ``extract`` is what keeps the
+        hook route honest: the capture is cleared immediately before the forward
+        that fills it, so a block the forward never reaches is absent rather
+        than stale.
+        """
+
+        arm = getattr(self.private_adapter, "arm", None)
+        if arm is not None:
+            arm(self.backbone)
+        with self._elided_energy_head():
+            return self.backbone(graph, training=False, compute_force=False)
 
     def train(self, mode: bool = True):
         """Train completion heads around this module without unfreezing MACE."""
@@ -478,19 +656,33 @@ class MACEPolarFeaturizer(torch.nn.Module):
         layer_count = 1
         if self.feature_mode == "all-scalars+norms":
             private = self.private_adapter.extract(self.backbone, graph, outputs)
-            difference = (private.final_scalars - public_scalars).abs().max()
-            self.last_private_parity_error = float(difference.detach().cpu())
-            if not torch.allclose(
-                private.final_scalars,
-                public_scalars,
-                atol=self.parity_atol,
-                rtol=1.0e-6,
-            ):
-                raise RuntimeError(
-                    "private PolarMACE adapter failed public-final-scalar "
-                    f"parity: max|private-public| = {self.last_private_parity_error:.3e} "
-                    f"over {natom} atoms exceeds atol={self.parity_atol:.3e}"
-                )
+            # This audit compares two independent computations of the final
+            # scalars, so it is meaningful only where the adapter actually
+            # recomputes them.  Under the hook route ``public_scalars`` is a
+            # bit-equal copy of the captured product output (measured: max
+            # difference 0.0, ``same object: False``), so the check could never
+            # fail; running it anyway would buy nothing and cost a device
+            # synchronisation per step, because reading the scalar off the GPU
+            # blocks.  ``_extract_hook`` carries guards of the other kind --
+            # every block captured, captured exactly once -- since the failure
+            # it must catch is an upstream refactor that stops routing through
+            # ``interactions``/``products``, not a numerical divergence.  An
+            # injected adapter has no ``route`` and is audited.
+            if getattr(self.private_adapter, "route", "recompute") != "hook":
+                difference = (private.final_scalars - public_scalars).abs().max()
+                self.last_private_parity_error = float(difference.detach().cpu())
+                if not torch.allclose(
+                    private.final_scalars,
+                    public_scalars,
+                    atol=self.parity_atol,
+                    rtol=1.0e-6,
+                ):
+                    raise RuntimeError(
+                        "private PolarMACE adapter failed public-final-scalar "
+                        "parity: max|private-public| = "
+                        f"{self.last_private_parity_error:.3e} "
+                        f"over {natom} atoms exceeds atol={self.parity_atol:.3e}"
+                    )
             invariant = torch.cat(
                 (
                     public_scalars,
@@ -538,7 +730,7 @@ class MACEPolarFeaturizer(torch.nn.Module):
         )
         self.backbone.eval()
         with torch.no_grad():
-            outputs = self.backbone(graph, training=False, compute_force=False)
+            outputs = self._backbone_forward(graph)
             features = self._runtime_features(
                 graph, outputs, atomic_numbers, total_charge, total_spin
             )
@@ -672,7 +864,7 @@ class MACEPolarFeaturizer(torch.nn.Module):
         )
         self.backbone.eval()
         with torch.no_grad():
-            outputs = self.backbone(graph, training=False, compute_force=False)
+            outputs = self._backbone_forward(graph)
             features = self._runtime_features(
                 graph,
                 outputs,

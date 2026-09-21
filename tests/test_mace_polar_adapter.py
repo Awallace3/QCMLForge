@@ -476,7 +476,12 @@ def test_real_private_adapter_public_parity_and_direct_contract():
         checkpoint_sha256=POLAR_1S_SHA256,
         mace_version="0.3.16",
         feature_mode="all-scalars+norms",
-        private_adapter=PolarMACEPrivateLayerAdapter("0.3.16"),
+        # The parity assertion below compares two independent computations of
+        # the final scalars, which only the recompute route performs; the
+        # default hook route reads them off the public forward, where the check
+        # is vacuous.  Pinning the route here is what keeps the audit running.
+        private_adapter=PolarMACEPrivateLayerAdapter("0.3.16", route="recompute"),
+        elide_energy_head=False,
     )
     positions = torch.tensor(
         [[0.0, 0.0, 0.0], [0.758602, 0.0, 0.504284], [-0.758602, 0.0, 0.504284]]
@@ -647,3 +652,118 @@ def test_parity_atol_default_clears_measured_cuda_kernel_noise():
     plausible_mis_extraction = 1.0e-2
     assert default > measured_cuda_batched_max
     assert default < plausible_mis_extraction
+
+
+class _StubBlock(torch.nn.Module):
+    irreps_out = "4x0e"
+
+
+def test_hook_adapter_refuses_a_forward_that_missed_a_block():
+    """The guard that replaces the parity audit on the hook route.
+
+    Under hooks the public scalars are a bit-equal copy of the captured product
+    output, so a numerical check cannot fail.  The failure that remains possible
+    is structural: an upstream MACE change that stops routing through
+    ``interactions``/``products``, or routes through one of them twice.  Both
+    must be loud, because either one silently changes what the features are.
+    """
+    adapter = PolarMACEPrivateLayerAdapter("0.3.16", route="hook")
+    backbone = torch.nn.Module()
+    backbone.interactions = torch.nn.ModuleList([_StubBlock()])
+    backbone.products = torch.nn.ModuleList([_StubBlock()])
+
+    with pytest.raises(RuntimeError, match="captured no interaction 0"):
+        adapter._extract_hook(backbone)
+
+    tensor = torch.zeros((2, 4))
+    adapter._captured[("interaction", 0)] = [tensor]
+    with pytest.raises(RuntimeError, match="captured no product 0"):
+        adapter._extract_hook(backbone)
+
+    adapter._captured[("product", 0)] = [tensor, tensor]
+    with pytest.raises(RuntimeError, match="captured product 0 2 times"):
+        adapter._extract_hook(backbone)
+
+
+def test_adapter_rejects_an_unknown_route():
+    with pytest.raises(ValueError, match="unsupported private adapter route"):
+        PolarMACEPrivateLayerAdapter("0.3.16", route="hooks")
+
+
+@pytest.mark.mace_integration
+def test_cost_levers_are_bit_equal_to_the_recompute_path():
+    """Both cost levers must change wall clock and nothing else.
+
+    ``hook`` skips a second run of the whole local tower and ``elide_energy_head``
+    skips ``local_electron_energy``, which MACE computes unconditionally and this
+    featurizer never reads.  Together they are 1.49x on a CPU monomer and the
+    duplicate tower alone is 16.0% of a V100 H3L3 train step (job 13398476).
+    None of that is worth anything if a feature moves, and the schema must not
+    move either or every cached feature is invalidated for no reason.
+    """
+    from tests.mace_integration import polar_mace_artifact
+
+    artifact = polar_mace_artifact()
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.758602, 0.0, 0.504284], [-0.758602, 0.0, 0.504284]]
+    )
+    numbers = torch.tensor([8, 1, 1])
+
+    def run(route, elide):
+        backbone = load_verified_polar_mace(
+            artifact, expected_sha256=POLAR_1S_SHA256, offline=True
+        )
+        featurizer = MACEPolarFeaturizer(
+            backbone,
+            checkpoint_sha256=POLAR_1S_SHA256,
+            mace_version="0.3.16",
+            feature_mode="all-scalars+norms",
+            private_adapter=PolarMACEPrivateLayerAdapter("0.3.16", route=route),
+            elide_energy_head=elide,
+        )
+        features, direct = featurizer.forward_monomer(
+            positions, numbers, torch.tensor([0.0]), torch.tensor([1.0])
+        )
+        return featurizer, features, direct
+
+    reference, ref_features, ref_direct = run("recompute", False)
+    for route, elide in (("hook", False), ("recompute", True), ("hook", True)):
+        featurizer, features, direct = run(route, elide)
+        for name in ("invariant", "equivariant"):
+            assert torch.equal(
+                getattr(features, name), getattr(ref_features, name)
+            ), f"{name} moved under route={route} elide={elide}"
+        for name in ("density_coefficients", "charges", "molecular_dipole_eangstrom"):
+            assert torch.equal(
+                getattr(direct, name), getattr(ref_direct, name)
+            ), f"{name} moved under route={route} elide={elide}"
+        assert (
+            featurizer.resolved_feature_schema == reference.resolved_feature_schema
+        )
+
+
+@pytest.mark.mace_integration
+def test_elided_energy_head_is_restored_even_when_the_forward_raises():
+    """A shared backbone must never keep the zero head.
+
+    ``add_local_electron_energy`` is ``True`` on MACE-POLAR-1-S, so a leaked
+    stand-in would leave ``energy`` and ``electron_energy`` silently wrong for
+    every other consumer of the same module -- no exception, no warning.
+    """
+    from tests.mace_integration import polar_mace_artifact
+
+    backbone = load_verified_polar_mace(
+        polar_mace_artifact(), expected_sha256=POLAR_1S_SHA256, offline=True
+    )
+    featurizer = MACEPolarFeaturizer(
+        backbone,
+        checkpoint_sha256=POLAR_1S_SHA256,
+        mace_version="0.3.16",
+        feature_mode="all-scalars+norms",
+    )
+    original = backbone.local_electron_energy
+    with pytest.raises(ZeroDivisionError):
+        with featurizer._elided_energy_head():
+            assert backbone.local_electron_energy is not original
+            raise ZeroDivisionError
+    assert backbone.local_electron_energy is original
