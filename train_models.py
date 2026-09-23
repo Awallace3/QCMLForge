@@ -1,5 +1,9 @@
 from apnet_pt import AtomModels
 from apnet_pt import AtomPairwiseModels
+from apnet_pt.AtomPairwiseModels.component_losses import (
+    COMPONENT_LOSS_NAMES,
+    build_component_loss,
+)
 from apnet_pt.training_tracking import WandbConfig
 import argparse
 import inspect
@@ -280,6 +284,65 @@ def lr_schedule_train_kwargs(
     return kwargs
 
 
+def component_loss_train_kwargs(
+    component_loss: str = "component_mse",
+    huber_delta: float = 1.0,
+    relative_loss_eps: float = 1.0,
+    component_loss_weights=None,
+) -> dict:
+    """The component-loss kwarg ``train()`` receives for this run.
+
+    Parameters
+    ----------
+    component_loss : str
+        Name from ``apnet_pt.AtomPairwiseModels.component_losses``.
+    huber_delta : float
+        Crossover in kcal/mol for ``component_huber``.
+    relative_loss_eps : float
+        Denominator floor in kcal/mol for ``component_relative_mse``.
+    component_loss_weights : sequence of float or None
+        Per-component weights ``(elst, exch, ind, disp)`` for
+        ``component_weighted_mse``.
+
+    Returns
+    -------
+    dict
+        ``{"loss_fn": None}`` for the ``component_mse`` baseline, so a default
+        run is bit-identical to the loss the harnesses inline today, and
+        ``{"loss_fn": <callable>}`` otherwise.
+
+    Raises
+    ------
+    ValueError
+        If ``component_loss`` is unknown, or if ``component_weighted_mse`` is
+        selected without weights -- defaulting those to ones would make the
+        flag inert without warning.
+    """
+    if component_loss not in COMPONENT_LOSS_NAMES:
+        raise ValueError(
+            f"unknown component loss {component_loss!r}; expected one of "
+            f"{', '.join(COMPONENT_LOSS_NAMES)}"
+        )
+    if component_loss == "component_mse":
+        return {"loss_fn": None}
+    if component_loss == "component_huber":
+        return {"loss_fn": build_component_loss(component_loss, delta=huber_delta)}
+    if component_loss == "component_relative_mse":
+        return {
+            "loss_fn": build_component_loss(component_loss, eps=relative_loss_eps)
+        }
+    if component_loss_weights is None:
+        raise ValueError(
+            "component_weighted_mse requires --component_loss_weights "
+            "(four comma-separated floats: elst,exch,ind,disp)"
+        )
+    return {
+        "loss_fn": build_component_loss(
+            component_loss, weights=tuple(float(w) for w in component_loss_weights)
+        )
+    }
+
+
 def train_pairwise_model(
     apnet_model_type="APNet2",
     model_out="./models/ap2_ensemble/ap2_1.pt",
@@ -292,6 +355,10 @@ def train_pairwise_model(
     lr=5e-4,
     end_lr=None,
     lr_decay=None,
+    component_loss="component_mse",
+    huber_delta=1.0,
+    relative_loss_eps=1.0,
+    component_loss_weights=None,
     random_seed=42,
     spec_type=2,
     r_cut_im=8.0,
@@ -748,6 +815,14 @@ def train_pairwise_model(
     train_kwargs.update(
         lr_schedule_train_kwargs(apnet_model_type, end_lr, lr_decay)
     )
+    train_kwargs.update(
+        component_loss_train_kwargs(
+            component_loss,
+            huber_delta,
+            relative_loss_eps,
+            component_loss_weights,
+        )
+    )
     supported_train_kwargs = inspect.signature(apnet.train).parameters
     unsupported_train_kwargs = sorted(
         key for key in train_kwargs if key not in supported_train_kwargs
@@ -805,11 +880,11 @@ def parse_param_list(param_str):
         return float(param_str)
 
 
-def main():
-    """
-    Parse command-line arguments and run configured model training routines.
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the ``train_models.py`` command-line parser.
 
-    Parses command-line options that configure atom and pairwise (APNet) training, converts the parameter-start mean/std strings to numeric lists, sets global random seeds, prints the parsed arguments, and invokes train_atom_model and/or train_pairwise_model when the corresponding flags are provided.
+    Split out of :func:`main` so flag wiring can be exercised by tests
+    without standing up a training run.
     """
     args = argparse.ArgumentParser()
     args.add_argument(
@@ -940,6 +1015,37 @@ def main():
         type=float,
         default=None,
         help="Final learning rate for exponential decay over n_epochs (APNetD3 only)",
+    )
+    args.add_argument(
+        "--component_loss",
+        type=str,
+        default="component_mse",
+        choices=list(COMPONENT_LOSS_NAMES),
+        help=(
+            "Component-wise training loss. The default reproduces the "
+            "unweighted MSE the pairwise harnesses have always used."
+        ),
+    )
+    args.add_argument(
+        "--huber_delta",
+        type=float,
+        default=1.0,
+        help="kcal/mol crossover for --component_loss component_huber",
+    )
+    args.add_argument(
+        "--relative_loss_eps",
+        type=float,
+        default=1.0,
+        help="kcal/mol denominator floor for --component_loss component_relative_mse",
+    )
+    args.add_argument(
+        "--component_loss_weights",
+        type=parse_param_list,
+        default=None,
+        help=(
+            "Four comma-separated weights (elst,exch,ind,disp) for "
+            "--component_loss component_weighted_mse"
+        ),
     )
     args.add_argument(
         "--lr_decay",
@@ -1171,7 +1277,16 @@ def main():
         default=None,
         help="JSON object merged into the W&B run config for provenance",
     )
-    args = args.parse_args()
+    return args
+
+
+def main():
+    """
+    Parse command-line arguments and run configured model training routines.
+
+    Parses command-line options that configure atom and pairwise (APNet) training, converts the parameter-start mean/std strings to numeric lists, sets global random seeds, prints the parsed arguments, and invokes train_atom_model and/or train_pairwise_model when the corresponding flags are provided.
+    """
+    args = build_arg_parser().parse_args()
     # Parse param_start_mean and param_start_std
     args.param_start_mean = parse_param_list(args.param_start_mean)
     args.param_start_std = parse_param_list(args.param_start_std)
@@ -1216,6 +1331,10 @@ def main():
             lr=args.lr,
             end_lr=args.end_lr,
             lr_decay=args.lr_decay,
+            component_loss=args.component_loss,
+            huber_delta=args.huber_delta,
+            relative_loss_eps=args.relative_loss_eps,
+            component_loss_weights=args.component_loss_weights,
             random_seed=args.random_seed,
             spec_type=args.spec_type_ap,
             r_cut=args.r_cut,

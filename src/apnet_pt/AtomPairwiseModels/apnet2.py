@@ -2208,6 +2208,7 @@ units angstrom
         include_total_mse=False,
         adam_eps=1e-8,
         checkpoint_metric="component_mse",
+        loss_fn=None,
     ):
         print(f"{self.device.type=}")
         if self.device.type == "cpu":
@@ -2287,7 +2288,8 @@ units angstrom
             )
         else:
             scheduler = None
-        criterion = None
+        # None falls back to the inlined unweighted component MSE.
+        criterion = loss_fn
         lowest_test_loss = torch.tensor(float("inf"))
         self.model = self.model.to(rank_device)
 
@@ -2400,6 +2402,7 @@ units angstrom
         adam_eps=1e-8,
         checkpoint_metric="component_mse",
         random_seed=42,
+        loss_fn=None,
     ):
         # (1) Compile Model
         rank_device = self.device
@@ -2451,8 +2454,9 @@ units angstrom
             if lr_decay
             else None
         )
-        # criterion = None  # defaults to MSE
-        criterion = torch.nn.MSELoss()
+        # None falls back to the inlined unweighted component MSE, which is
+        # numerically identical to torch.nn.MSELoss().
+        criterion = loss_fn
 
         # (4) Set eval functions
         if not transfer_learning:
@@ -2639,6 +2643,7 @@ units angstrom
         include_total_mse=False,
         adam_eps=1e-8,
         checkpoint_metric="component_mse",
+        loss_fn=None,
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
         _tracker_event_directory=None,
@@ -2769,6 +2774,7 @@ units angstrom
                     include_total_mse,
                     adam_eps,
                     checkpoint_metric,
+                    loss_fn,
                 ),
                 nprocs=world_size,
                 join=True,
@@ -2793,6 +2799,7 @@ units angstrom
                     adam_eps=adam_eps,
                     checkpoint_metric=checkpoint_metric,
                     random_seed=random_seed,
+                    loss_fn=loss_fn,
                 ),
                 wandb_config,
                 model_family="pairwise",
