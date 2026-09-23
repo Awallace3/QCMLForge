@@ -108,3 +108,88 @@ def test_patch_refuses_an_unrecognised_upstream_body(monkeypatch):
     monkeypatch.setattr(rse, "charges_energy_from_graph", impostor)
     with pytest.raises(RuntimeError, match="does not match the version"):
         patch_realspace_scatter_dim_size()
+
+
+# --------------------------------------------------------------------------
+# Non-periodic Ewald k-grid elision
+# --------------------------------------------------------------------------
+
+extensions = pytest.importorskip("mace.modules.extensions")
+gl_features = pytest.importorskip("graph_longrange.features")
+
+from apnet_pt.mace._graph_longrange_compat import (
+    nonperiodic_kspace_elision,
+    patch_kspace_grid_for_nonperiodic,
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_kspace():
+    original = extensions.compute_k_vectors_flat
+    yield
+    extensions.compute_k_vectors_flat = original
+
+
+def _cube(edge=10.0):
+    cell = torch.eye(3) * edge
+    rcell = 2 * torch.pi * torch.linalg.inv(cell.mT)
+    return cell.view(1, 3, 3), rcell.view(1, 3, 3)
+
+
+def test_kspace_patch_is_idempotent():
+    assert patch_kspace_grid_for_nonperiodic() is True
+    assert patch_kspace_grid_for_nonperiodic() is False
+
+
+def test_kspace_grid_is_built_outside_the_elision_context():
+    patch_kspace_grid_for_nonperiodic()
+    cell, rcell = _cube()
+    kvectors, *_ = extensions.compute_k_vectors_flat(1.0, cell, rcell)
+    assert kvectors.shape[0] > 0
+
+
+def test_kspace_grid_is_elided_inside_the_context():
+    patch_kspace_grid_for_nonperiodic()
+    cell, rcell = _cube()
+    real = extensions.compute_k_vectors_flat(1.0, cell, rcell)
+    with nonperiodic_kspace_elision():
+        elided = extensions.compute_k_vectors_flat(1.0, cell, rcell)
+    # Same arity and dtypes as upstream, but no grid.  A caller that reads the
+    # k-vectors gets an empty batch rather than a wrong one.
+    assert len(elided) == len(real)
+    assert [t.shape[0] for t in elided] == [0, 0, 0, 0]
+    assert [t.dtype for t in elided] == [t.dtype for t in real]
+    assert elided[0].shape[1:] == real[0].shape[1:]
+    # And the context does not leak.
+    assert extensions.compute_k_vectors_flat(1.0, cell, rcell)[0].shape[0] > 0
+
+
+def test_elision_context_is_a_no_op_when_disabled():
+    patch_kspace_grid_for_nonperiodic()
+    cell, rcell = _cube()
+    with nonperiodic_kspace_elision(enabled=False):
+        kvectors, *_ = extensions.compute_k_vectors_flat(1.0, cell, rcell)
+    assert kvectors.shape[0] > 0
+
+
+def test_elision_context_restores_an_enclosing_context():
+    patch_kspace_grid_for_nonperiodic()
+    cell, rcell = _cube()
+    with nonperiodic_kspace_elision():
+        with nonperiodic_kspace_elision(enabled=False):
+            pass
+        # The inner no-op must not cancel the outer elision.
+        assert extensions.compute_k_vectors_flat(1.0, cell, rcell)[0].shape[0] == 0
+
+
+def test_kspace_patch_refuses_an_upstream_that_ignores_pbc(monkeypatch):
+    def precompute_geometry(self, *args, **kwargs):
+        raise AssertionError("never called")
+
+    monkeypatch.setattr(
+        gl_features.GTOElectrostaticFeatures,
+        "precompute_geometry",
+        precompute_geometry,
+    )
+    with pytest.raises(RuntimeError, match="no longer dispatches on pbc"):
+        patch_kspace_grid_for_nonperiodic()

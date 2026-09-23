@@ -18,7 +18,11 @@ import torch
 
 from apnet_pt.constants import ALLOWED_ELEMENTS
 
-from ._graph_longrange_compat import patch_realspace_scatter_dim_size
+from ._graph_longrange_compat import (
+    nonperiodic_kspace_elision,
+    patch_kspace_grid_for_nonperiodic,
+    patch_realspace_scatter_dim_size,
+)
 from .schema import (
     MACEAtomicFeatures,
     MACEFeatureCacheKey,
@@ -400,6 +404,10 @@ def load_verified_polar_mace(
     # when the last graph of a batch has no edges, which a monatomic monomer
     # guarantees.  Correct it before any forward can hit that path.
     patch_realspace_scatter_dim_size()
+    # And it builds an Ewald k-grid before it knows the batch is non-periodic,
+    # sized from the largest coordinate rather than the molecular extent.  The
+    # wrapper only bites inside ``nonperiodic_kspace_elision``.
+    patch_kspace_grid_for_nonperiodic()
 
     load = loader or _default_polar_loader
     model = load(
@@ -541,7 +549,14 @@ class MACEPolarFeaturizer(torch.nn.Module):
         arm = getattr(self.private_adapter, "arm", None)
         if arm is not None:
             arm(self.backbone)
-        with self._elided_energy_head():
+        # Every graph this module builds is non-periodic -- ``_build_graphs``
+        # passes no cell to ``Configuration`` -- but the elision is gated on
+        # the flag actually present in the batch rather than on that promise,
+        # so a caller who starts supplying cells pays for the grid instead of
+        # silently getting the wrong electrostatics.
+        pbc = graph.get("pbc")
+        elide = pbc is not None and not bool(pbc.any())
+        with self._elided_energy_head(), nonperiodic_kspace_elision(elide):
             return self.backbone(graph, training=False, compute_force=False)
 
     def train(self, mode: bool = True):

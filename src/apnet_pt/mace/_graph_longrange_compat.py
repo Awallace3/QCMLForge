@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import threading
+from contextlib import contextmanager
 from typing import Any
 
 _PATCH_MARK = "_apnet_pt_dim_size_patched"
@@ -110,4 +112,100 @@ def patch_realspace_scatter_dim_size() -> bool:
     charges_energy_from_graph._apnet_pt_original = original
     setattr(charges_energy_from_graph, _PATCH_MARK, True)
     rse.charges_energy_from_graph = charges_energy_from_graph
+    return True
+
+
+# --------------------------------------------------------------------------
+# Non-periodic Ewald k-grid elision
+# --------------------------------------------------------------------------
+#
+# ``LongRangeMACE.forward`` builds an Ewald k-grid unconditionally before it
+# knows whether anything will use it, and ``mace.data.get_neighborhood`` sizes
+# the synthetic non-periodic cell from ``max|position|`` rather than from the
+# molecular extent.  A structure kept in a crystal frame therefore pays a grid
+# cubic in its *distance from the origin*: a 30 A pocket 281 A out asks for
+# 1.85 TB in a single ``torch.cartesian_prod``, and the allocation fails.
+#
+# On a non-periodic batch the grid is then discarded.  ``precompute_geometry``
+# dispatches on ``pbc``, and the real-space branch reads only node positions
+# and the batch vector.  Eliding the build is therefore exact, not an
+# approximation -- verified bitwise on real checkpoints -- but only while the
+# batch really is non-periodic, which is why the elision is scoped to a context
+# manager that the caller opens after checking ``pbc``.
+
+_KSPACE_MARK = "_apnet_pt_kspace_elidable"
+
+_kspace_state = threading.local()
+
+
+@contextmanager
+def nonperiodic_kspace_elision(enabled: bool = True):
+    """Elide the Ewald k-grid for the duration of a non-periodic forward.
+
+    The caller is responsible for ``enabled``: pass ``True`` only when every
+    graph in the batch has ``pbc`` all false and the forward is not asking for
+    the periodic evaluator.  ``enabled=False`` is a no-op, so the guard can be
+    written unconditionally at the call site.
+    """
+
+    if not enabled:
+        yield
+        return
+    previous = getattr(_kspace_state, "elide", False)
+    _kspace_state.elide = True
+    try:
+        yield
+    finally:
+        _kspace_state.elide = previous
+
+
+def patch_kspace_grid_for_nonperiodic() -> bool:
+    """Make ``compute_k_vectors_flat`` skippable inside the elision context.
+
+    Returns ``True`` when the wrapper was installed by this call and ``False``
+    when it was already installed.  Raises ``RuntimeError`` if upstream no
+    longer dispatches ``precompute_geometry`` on ``pbc``, because the whole
+    argument for eliding the grid is that the non-periodic branch never reads
+    it.
+    """
+
+    from graph_longrange import features as gl_features
+    from mace.modules import extensions
+
+    original = extensions.compute_k_vectors_flat
+    if getattr(original, _KSPACE_MARK, False):
+        return False
+
+    for cls in (
+        gl_features.GTOElectrostaticFeatures,
+        gl_features.GTOElectrostaticFeaturesMultiChannel,
+    ):
+        source = inspect.getsource(cls.precompute_geometry)
+        if (
+            "_realspace_precompute_geometry" not in source
+            or "pbc" not in source
+        ):
+            raise RuntimeError(
+                f"{cls.__name__}.precompute_geometry no longer dispatches on "
+                "pbc; the k-grid is not provably unused on a non-periodic "
+                "batch, so re-read the upstream body before eliding it."
+            )
+
+    import torch
+
+    def compute_k_vectors_flat(cutoff, cell_vectors, r_cell_vectors):
+        if not getattr(_kspace_state, "elide", False):
+            return original(cutoff, cell_vectors, r_cell_vectors)
+        device, dtype = cell_vectors.device, cell_vectors.dtype
+        return (
+            torch.zeros((0, 3), device=device, dtype=dtype),
+            torch.zeros((0,), device=device, dtype=dtype),
+            torch.zeros((0,), device=device, dtype=torch.long),
+            torch.zeros((0,), device=device, dtype=dtype),
+        )
+
+    compute_k_vectors_flat.__doc__ = original.__doc__
+    compute_k_vectors_flat._apnet_pt_original = original
+    setattr(compute_k_vectors_flat, _KSPACE_MARK, True)
+    extensions.compute_k_vectors_flat = compute_k_vectors_flat
     return True
