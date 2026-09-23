@@ -36,6 +36,7 @@ from ..training_tracking import (
     tracked_ddp_worker,
 )
 from ..util import scatter_sum_compile
+from .apnet2_parity import _CHECKPOINT_METRICS, checkpoint_score
 from ..pt_datasets.shard_locality import ShardBlockSampler
 from typing import Optional
 import os
@@ -2949,6 +2950,7 @@ units angstrom
         end_lr=None,
         include_total_mse=False,
         loss_fn=None,
+        checkpoint_metric="component_mse",
     ):
         print(f"{self.device.type=}")
         if self.device.type == "cpu":
@@ -3132,8 +3134,11 @@ units angstrom
             )
 
             if rank == 0:
-                if test_loss < lowest_test_loss:
-                    lowest_test_loss = test_loss
+                validation_score = checkpoint_score(
+                    checkpoint_metric, test_loss, total_MAE_v
+                )
+                if validation_score < lowest_test_loss:
+                    lowest_test_loss = validation_score
                     test_lowered = "*"
                     if self.model_save_path:
                         print("Saving model")
@@ -3203,6 +3208,7 @@ units angstrom
         transfer_learning=False,
         include_total_mse=False,
         loss_fn=None,
+        checkpoint_metric="component_mse",
     ):
         # (1) Compile Model
         rank_device = self.device
@@ -3428,7 +3434,9 @@ units angstrom
         )
 
         # (6) Main training loop
-        lowest_test_loss = test_loss
+        lowest_test_loss = checkpoint_score(
+            checkpoint_metric, test_loss, total_MAE_v
+        )
         model_saved = False
         for epoch in range(n_epochs):
             # Re-draw which shards share a block, so a dimer's batch-mates
@@ -3486,8 +3494,11 @@ units angstrom
 
             # Track best model
             star_marker = " "
-            if test_loss < lowest_test_loss:
-                lowest_test_loss = test_loss
+            validation_score = checkpoint_score(
+                checkpoint_metric, test_loss, total_MAE_v
+            )
+            if validation_score < lowest_test_loss:
+                lowest_test_loss = validation_score
                 star_marker = "*"
                 cpu_model = model_io.unwrap_model(self.model).to("cpu")
                 best_model = deepcopy(cpu_model)
@@ -3568,6 +3579,7 @@ units angstrom
         transfer_learning=False,
         include_total_mse=False,
         loss_fn=None,
+        checkpoint_metric="component_mse",
         shard_locality_block_shards=0,
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
@@ -3584,6 +3596,13 @@ units angstrom
             self.dataset = dataset
         if self.dataset is None:
             raise ValueError("No dataset provided")
+        # Checked up front: the selector is first consulted after the
+        # pre-training evaluation, which is too late to find a typo.
+        if checkpoint_metric not in _CHECKPOINT_METRICS:
+            raise ValueError(
+                f"checkpoint metric must be one of {sorted(_CHECKPOINT_METRICS)}, "
+                f"got {checkpoint_metric!r}"
+            )
         np.random.seed(random_seed)
         self.model_save_path = model_path
         print(f"Saving training results to...\n{model_path}")
@@ -3633,6 +3652,7 @@ units angstrom
         print(f"  {lr_decay=}\n", flush=True)
         print(f"  {end_lr=}\n", flush=True)
         print(f"  {include_total_mse=}\n", flush=True)
+        print(f"  {checkpoint_metric=}", flush=True)
         # Read back off `self` by both training paths.  `ddp_train` is handed
         # to `mp.spawn` as a bound method, so `self` is pickled to every rank
         # and this travels with it -- no signature change on either worker.
@@ -3663,6 +3683,7 @@ units angstrom
             "training/transfer_learning": transfer_learning,
             "training/include_total_mse": include_total_mse,
             "training/shard_locality_block_shards": self.shard_locality_block_shards,
+            "training/checkpoint_metric": checkpoint_metric,
         }
         if world_size > 1:
             print("Running multi-process training", flush=True)
@@ -3691,6 +3712,7 @@ units angstrom
                     end_lr,
                     include_total_mse,
                     loss_fn,
+                    checkpoint_metric,
                 ),
                 nprocs=world_size,
                 join=True,
@@ -3714,6 +3736,7 @@ units angstrom
                     transfer_learning=transfer_learning,
                     include_total_mse=include_total_mse,
                     loss_fn=loss_fn,
+                    checkpoint_metric=checkpoint_metric,
                 ),
                 wandb_config,
                 model_family="pairwise",

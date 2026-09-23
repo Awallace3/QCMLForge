@@ -100,3 +100,9 @@ def test_cli_defaults_to_the_baseline_loss():
     args = train_models.build_arg_parser().parse_args([])
     assert args.component_loss == "component_mse"
     assert args.component_loss_weights is None
+
+
+@pytest.mark.parametrize("model_cls", [APNet2Model, APNet3D3_AtomType_Model])
+def test_pairwise_harnesses_expose_checkpoint_metric(model_cls):
+    """Non-default-loss arms select by total MAE, so the route must accept it."""
+    assert "checkpoint_metric" in inspect.signature(model_cls.train).parameters
