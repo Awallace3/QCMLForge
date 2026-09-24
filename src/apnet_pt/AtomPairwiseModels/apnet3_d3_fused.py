@@ -1934,35 +1934,29 @@ class APNet3D3_AtomType_Model:
         indB_to_dimer = np.concatenate(indB_to_dimer)
         indA_to_atom = np.concatenate(indA_to_atom)
         indB_to_atom = np.concatenate(indB_to_atom)
-        for e_elst, e_ind, indA, indB in zip(E_elst_mtp, E_ind_mtp, indsA, indsB):
+        # The classical terms are edge quantities over ``e_ABfull``: the model
+        # sums each of them once with ``scatter_sum(..., dimer_ind_full)`` when
+        # it builds ``E_output``, so each one is deposited here exactly once,
+        # on the full intermolecular edge list. ``E_sr`` is the only quantity
+        # defined on the short-range edge list, and it carries its own
+        # dispersion residual in column 3.
+        for e_elst, e_ind, e_disp, indA, indB in zip(
+            E_elst_mtp, E_ind_mtp, E_disp, indsA, indsB
+        ):
             i = indA_to_dimer[indA]
             assert i == indB_to_dimer[indB]
             atomA = indA_to_atom[indA]
             atomB = indB_to_atom[indB]
             pair_energies_batch[i][0, atomA, atomB] += e_elst.numpy()
             pair_energies_batch[i][2, atomA, atomB] += e_ind.numpy()
+            pair_energies_batch[i][3, atomA, atomB] += e_disp.numpy()
 
-        for e_pair, e_elst, e_disp, indA, indB in zip(
-            E_sr, E_elst_mtp, E_disp, indsA_sr, indsB_sr
-        ):
+        for e_pair, indA, indB in zip(E_sr, indsA_sr, indsB_sr):
             i = indA_to_dimer[indA]
             assert i == indB_to_dimer[indB]
             atomA = indA_to_atom[indA]
             atomB = indB_to_atom[indB]
             pair_energies_batch[i][0:4, atomA, atomB] += e_pair.numpy()
-            pair_energies_batch[i][0, atomA, atomB] += e_elst.numpy()
-            pair_energies_batch[i][3, atomA, atomB] += e_disp.numpy()
-
-        indsA_lr = inp_batch["e_ABlr_source"]
-        indsB_lr = inp_batch["e_ABlr_target"]
-
-        for e_ind, e_disp, indA, indB in zip(E_ind_mtp, E_disp, indsA_lr, indsB_lr):
-            i = indA_to_dimer[indA]
-            assert i == indB_to_dimer[indB]
-            atomA = indA_to_atom[indA]
-            atomB = indB_to_atom[indB]
-            pair_energies_batch[i][2, atomA, atomB] += e_ind
-            pair_energies_batch[i][3, atomA, atomB] += e_disp
         return pair_energies_batch
 
     def _assemble_mtp_pairs(

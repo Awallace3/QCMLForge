@@ -2064,3 +2064,102 @@ def test_a_later_chunk_does_not_overwrite_a_better_earlier_sidecar(tmp_path):
     ap3d3.train(ds, n_epochs=1, **train_kwargs)
     assert _sidecar_record(model_path)["val_total_MAE"] < 1e9
     assert np.isfinite(first)
+
+
+def _synthetic_pair_inputs():
+    """Two dimers with hand-built intermolecular edge lists.
+
+    ``e_ABsr`` is a subset of ``e_ABfull`` and ``e_ABlr`` is its complement,
+    which is the layout ``qcel_dimer_to_fused_data`` produces. Dimer 0 is
+    2x2 atoms and dimer 1 is 1x2, so a per-dimer mix-up cannot hide behind a
+    symmetric shape.
+    """
+    full_source = torch.tensor([0, 0, 1, 1, 2, 2])
+    full_target = torch.tensor([0, 1, 0, 1, 2, 3])
+    sr = [0, 3, 4]
+    lr = [1, 2, 5]
+    batch = Data(
+        indA=torch.tensor([0, 0, 1]),
+        indB=torch.tensor([0, 0, 1, 1]),
+        e_ABfull_source=full_source,
+        e_ABfull_target=full_target,
+        e_ABsr_source=full_source[sr],
+        e_ABsr_target=full_target[sr],
+        e_ABlr_source=full_source[lr],
+        e_ABlr_target=full_target[lr],
+        dimer_ind_full=torch.tensor([0, 0, 0, 0, 1, 1]),
+        dimer_ind=torch.tensor([0, 0, 1]),
+    )
+    # Distinct, non-repeating magnitudes so that a duplicated or misaligned
+    # deposit cannot cancel out.
+    E_elst = torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0, 32.0], dtype=torch.float64)
+    E_ind = torch.tensor([0.1, 0.2, 0.4, 0.8, 1.6, 3.2], dtype=torch.float64)
+    E_disp = torch.tensor([-0.01, -0.02, -0.04, -0.08, -0.16, -0.32],
+                          dtype=torch.float64)
+    E_sr = torch.tensor(
+        [
+            [100.0, 200.0, 300.0, 400.0],
+            [500.0, 600.0, 700.0, 800.0],
+            [900.0, 1000.0, 1100.0, 1200.0],
+        ],
+        dtype=torch.float64,
+    )
+    return batch, E_sr, E_elst, E_ind, E_disp
+
+
+def test_ap3d3_assemble_pairs_deposits_each_term_once():
+    """``_assemble_pairs`` must reproduce the forward's own reduction.
+
+    ``E_elst``/``E_ind``/``E_disp`` are edge quantities over ``e_ABfull`` that
+    the forward sums once each with ``scatter_sum_compile(..., dimer_ind_full)``;
+    ``E_sr`` is the only quantity on the short-range edge list. A regression
+    that also deposits classical terms on the short-range or long-range edge
+    lists silently multiplies them, so pin the per-pair matrix exactly.
+    """
+    batch, E_sr, E_elst, E_ind, E_disp = _synthetic_pair_inputs()
+
+    pairs = APNet3D3_AtomType_Model._assemble_pairs(
+        None, batch, None, E_sr, E_elst, E_ind, E_disp
+    )
+
+    expected = [np.zeros((4, 2, 2)), np.zeros((4, 1, 2))]
+    atom_a = np.array([0, 1, 0])          # global A index -> within-dimer atom
+    atom_b = np.array([0, 1, 0, 1])       # global B index -> within-dimer atom
+    dimer_of_a = np.array([0, 0, 1])
+    for edge in range(batch.e_ABfull_source.numel()):
+        a = int(batch.e_ABfull_source[edge])
+        b = int(batch.e_ABfull_target[edge])
+        d = dimer_of_a[a]
+        expected[d][0, atom_a[a], atom_b[b]] += float(E_elst[edge])
+        expected[d][2, atom_a[a], atom_b[b]] += float(E_ind[edge])
+        expected[d][3, atom_a[a], atom_b[b]] += float(E_disp[edge])
+    for edge in range(batch.e_ABsr_source.numel()):
+        a = int(batch.e_ABsr_source[edge])
+        b = int(batch.e_ABsr_target[edge])
+        d = dimer_of_a[a]
+        expected[d][:, atom_a[a], atom_b[b]] += E_sr[edge].numpy()
+
+    assert len(pairs) == 2
+    for got, want in zip(pairs, expected):
+        assert got.shape == want.shape
+        np.testing.assert_allclose(got, want, rtol=0, atol=0)
+
+
+def test_ap3d3_assemble_pairs_reduces_to_forward_components():
+    """The pair matrices must sum to the dimer components the forward returns."""
+    batch, E_sr, E_elst, E_ind, E_disp = _synthetic_pair_inputs()
+    ndimer = 2
+
+    # This is the reduction apnet3_d3_fused.APNet3D3_AtomType_MPNN.forward
+    # performs when it builds E_output.
+    components = scatter_sum_compile(E_sr, batch.dimer_ind, ndimer).clone()
+    components[:, 0] += scatter_sum_compile(E_elst, batch.dimer_ind_full, ndimer)
+    components[:, 2] += scatter_sum_compile(E_ind, batch.dimer_ind_full, ndimer)
+    components[:, 3] += scatter_sum_compile(E_disp, batch.dimer_ind_full, ndimer)
+
+    pairs = APNet3D3_AtomType_Model._assemble_pairs(
+        None, batch, None, E_sr, E_elst, E_ind, E_disp
+    )
+    reduced = np.stack([p.sum(axis=(1, 2)) for p in pairs])
+
+    np.testing.assert_allclose(reduced, components.numpy(), rtol=0, atol=1e-12)
