@@ -483,6 +483,8 @@ def validate_checkpoint(
         If checkpoint is invalid
     """
     version = get_checkpoint_version(checkpoint)
+    if version not in {1, CHECKPOINT_VERSION, MACE_CHECKPOINT_VERSION}:
+        raise ValueError(f"Unsupported checkpoint_version: {version!r}")
 
     if version == MACE_CHECKPOINT_VERSION:
         validate_mace_checkpoint_v3(checkpoint)

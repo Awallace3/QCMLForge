@@ -279,7 +279,9 @@ class LongRangeSAPTProvider(nn.Module):
         mode = self.config.electrostatics_mode
         kernel = self.electrostatics_kernels[mode]
         if mode == "undamped":
-            return kernel(qA=a.q, qB=b.q, **common)
+            # mtp_elst subtracts ZA from q in place, so q must be rank 1 like
+            # ZA; the bundle stores it as [natom, 1].
+            return kernel(qA=a.q.reshape(-1), qB=b.q.reshape(-1), **common)
         if mode == "damped-amoeba":
             if not hasattr(batch, "amoeba_K_A") or not hasattr(batch, "amoeba_K_B"):
                 raise ValueError(

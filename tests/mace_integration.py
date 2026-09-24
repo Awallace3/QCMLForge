@@ -24,9 +24,8 @@ def polar_mace_artifact() -> Path:
         pytest.skip("QCMLFORGE_POLARMACE_ARTIFACT is not configured")
     artifact = Path(value)
     if not artifact.is_file():
-        if required:
-            pytest.fail("configured PolarMACE artifact is missing")
-        pytest.skip("configured PolarMACE artifact is unavailable")
+        # A configured path that does not resolve is a typo, not an opt-out.
+        pytest.fail("configured PolarMACE artifact is missing")
     if artifact.stat().st_size != POLAR_1S_SIZE:
         pytest.fail("configured PolarMACE artifact size does not match the canonical artifact")
     digest = hashlib.sha256()

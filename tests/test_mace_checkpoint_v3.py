@@ -389,3 +389,15 @@ def test_v3_accepts_every_registered_route(tmp_path, route):
     assert config["pair_mode"] == pair_mode
     assert config["mace"]["feature_mode"] == feature_mode
     model_io._validate_mace_v3_config(config)
+
+
+def test_unknown_checkpoint_version_is_rejected():
+    with pytest.raises(ValueError, match="Unsupported checkpoint_version"):
+        model_io.validate_checkpoint(
+            {
+                "checkpoint_version": 4,
+                "model_state_dict": {},
+                "config": {},
+                "model_type": "MACEAP3D3",
+            }
+        )
