@@ -23,6 +23,12 @@ from ..training_tracking import (
     track_pretraining_from_locals,
     tracked_ddp_worker,
 )
+from ..training_resume import (
+    apply_training_state,
+    describe_loss_fn,
+    load_training_state,
+    save_training_state,
+)
 from ..pairwise_datasets import (
     apnet2_module_dataset,
     APNet2_DataLoader,
@@ -2410,6 +2416,7 @@ units angstrom
         checkpoint_metric="component_mse",
         random_seed=42,
         loss_fn=None,
+        resume_state_path=None,
     ):
         # (1) Compile Model
         rank_device = self.device
@@ -2481,68 +2488,107 @@ units angstrom
                 flush=True,
             )
 
-        # (5) Evaluate once pre-training
-        t0 = time.time()
+        # (5) Evaluate once pre-training, unless this continues an earlier run
+        # whose resume state already holds the best score so far.
+        resume_fingerprint = {
+            "harness": type(self).__name__,
+            "n_train": len(train_dataset),
+            "n_test": len(test_dataset),
+            "steps_per_epoch": len(train_loader),
+            "lr": lr,
+            "lr_decay": lr_decay,
+            "adam_eps": adam_eps,
+            "checkpoint_metric": checkpoint_metric,
+            "random_seed": random_seed,
+            "include_total_mse": include_total_mse,
+            "transfer_learning": transfer_learning,
+            "loss_fn": describe_loss_fn(loss_fn),
+        }
+        resume = (
+            load_training_state(resume_state_path, resume_fingerprint)
+            if resume_state_path
+            else None
+        )
         component_batch_kwargs = (
             {"include_total_mse": include_total_mse} if not transfer_learning else {}
         )
-        t_out = __evaluate_batch(
-            train_loader,
-            criterion,
-            rank_device,
-            **component_batch_kwargs,
-        )
-        v_out = __evaluate_batch(
-            test_loader,
-            criterion,
-            rank_device,
-            **component_batch_kwargs,
-        )
-        if not transfer_learning:
-            (
-                train_loss,
-                total_MAE_t,
-                elst_MAE_t,
-                exch_MAE_t,
-                indu_MAE_t,
-                disp_MAE_t,
-                elst_MSE_t,
-                exch_MSE_t,
-                indu_MSE_t,
-                disp_MSE_t,
-            ) = t_out
-            (
-                test_loss,
-                total_MAE_v,
-                elst_MAE_v,
-                exch_MAE_v,
-                indu_MAE_v,
-                disp_MAE_v,
-                elst_MSE_v,
-                exch_MSE_v,
-                indu_MSE_v,
-                disp_MSE_v,
-            ) = v_out
-            print(
-                f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} "
-                f"{elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} "
-                f"{indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
-                flush=True,
+        if resume is None:
+            t0 = time.time()
+            t_out = __evaluate_batch(
+                train_loader,
+                criterion,
+                rank_device,
+                **component_batch_kwargs,
             )
+            v_out = __evaluate_batch(
+                test_loader,
+                criterion,
+                rank_device,
+                **component_batch_kwargs,
+            )
+            if not transfer_learning:
+                (
+                    train_loss,
+                    total_MAE_t,
+                    elst_MAE_t,
+                    exch_MAE_t,
+                    indu_MAE_t,
+                    disp_MAE_t,
+                    elst_MSE_t,
+                    exch_MSE_t,
+                    indu_MSE_t,
+                    disp_MSE_t,
+                ) = t_out
+                (
+                    test_loss,
+                    total_MAE_v,
+                    elst_MAE_v,
+                    exch_MAE_v,
+                    indu_MAE_v,
+                    disp_MAE_v,
+                    elst_MSE_v,
+                    exch_MSE_v,
+                    indu_MSE_v,
+                    disp_MSE_v,
+                ) = v_out
+                print(
+                    f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} "
+                    f"{elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} "
+                    f"{indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
+                    flush=True,
+                )
+            else:
+                train_loss, total_MAE_t = t_out
+                test_loss, total_MAE_v = v_out
+                print(
+                    f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f}",
+                    flush=True,
+                )
+            track_pretraining_from_locals(self, locals())
+            lowest_test_loss = checkpoint_score(
+                checkpoint_metric, test_loss, total_MAE_v
+            )
+            start_epoch = best_epoch = 0
         else:
-            train_loss, total_MAE_t = t_out
-            test_loss, total_MAE_v = v_out
+            apply_training_state(
+                resume,
+                model=self.model,
+                best_model=best_model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                generator=train_loader_generator,
+            )
+            lowest_test_loss = resume["best_score"]
+            start_epoch = resume["epochs_completed"]
+            best_epoch = resume["best_epoch"]
             print(
-                f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f}",
+                f"Resuming {resume_state_path}: {start_epoch}/{n_epochs} epochs "
+                f"done, best score {lowest_test_loss:.6g} at epoch {best_epoch}",
                 flush=True,
             )
-        track_pretraining_from_locals(self, locals())
 
         # (6) Main training loop
-        lowest_test_loss = checkpoint_score(
-            checkpoint_metric, test_loss, total_MAE_v
-        )
-        for epoch in range(n_epochs):
+        for epoch in range(start_epoch, n_epochs):
             t1 = time.time()
             t_out = __train_batch(
                 train_loader,
@@ -2596,6 +2642,7 @@ units angstrom
             if validation_score < lowest_test_loss:
                 lowest_test_loss = validation_score
                 star_marker = "*"
+                best_epoch = epoch + 1
                 cpu_model = model_io.unwrap_model(self.model).to("cpu")
                 best_model = deepcopy(cpu_model)
                 if self.model_save_path:
@@ -2626,6 +2673,21 @@ units angstrom
                 )
             if not self.device == "CPU":
                 torch.cuda.empty_cache()
+            if resume_state_path:
+                # Last in the epoch, after every RNG draw the epoch makes.
+                save_training_state(
+                    resume_state_path,
+                    model=self.model,
+                    best_model=best_model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    generator=train_loader_generator,
+                    epochs_completed=epoch + 1,
+                    n_epochs=n_epochs,
+                    best_epoch=best_epoch,
+                    best_score=float(lowest_test_loss),
+                    fingerprint=resume_fingerprint,
+                )
         # Publish the real final-epoch weights before restoring the best ones.
         stage_final_weights(self)
         self.model = best_model
@@ -2651,6 +2713,7 @@ units angstrom
         adam_eps=1e-8,
         checkpoint_metric="component_mse",
         loss_fn=None,
+        resume_state_path: str | None = None,
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
         _tracker_event_directory=None,
@@ -2673,10 +2736,15 @@ units angstrom
             skip_compile (bool): If True, skip optional torch.compile model compilation in single-process training.
             transfer_learning (bool): If True, run training in transfer-learning mode (alters loss/aggregation behavior).
             include_total_mse (bool): If True, add an extra MSE term on the total energy in addition to the four component terms.
+            resume_state_path (str | None): File holding everything needed to continue training after any epoch: weights, Adam and scheduler state, RNG streams, and the best score so far. Rewritten after every epoch; if it already exists, training resumes from it instead of starting over. Single-process only.
 
         Returns:
             None
         """
+        if resume_state_path and world_size > 1:
+            raise ValueError(
+                "resume_state_path is only supported for single-process training"
+            )
         if dataset is not None:
             self.dataset = dataset
         elif dataset is not None:
@@ -2807,6 +2875,7 @@ units angstrom
                     checkpoint_metric=checkpoint_metric,
                     random_seed=random_seed,
                     loss_fn=loss_fn,
+                    resume_state_path=resume_state_path,
                 ),
                 wandb_config,
                 model_family="pairwise",

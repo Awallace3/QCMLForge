@@ -284,6 +284,44 @@ def lr_schedule_train_kwargs(
     return kwargs
 
 
+def resume_state_train_kwargs(
+    apnet_model_type: str,
+    train_fn,
+    resume_state_path: str | None,
+) -> dict:
+    """The resume-state kwarg ``train()`` receives for this route.
+
+    Parameters
+    ----------
+    apnet_model_type : str
+        Value of ``--train_apnet``.
+    train_fn : callable
+        The harness ``train`` method the kwarg would be passed to.
+    resume_state_path : str or None
+        Value of ``--resume-state``.
+
+    Returns
+    -------
+    dict
+        ``{}`` when no resume state was requested, else
+        ``{"resume_state_path": ...}``.
+
+    Raises
+    ------
+    ValueError
+        If the route cannot resume.  Unlike other unsupported kwargs this one
+        is never dropped: a preempted job would silently restart from scratch.
+    """
+    if not resume_state_path:
+        return {}
+    if "resume_state_path" not in inspect.signature(train_fn).parameters:
+        raise ValueError(
+            f"{apnet_model_type} cannot resume training; --resume-state is "
+            "only supported by routes whose train() accepts resume_state_path"
+        )
+    return {"resume_state_path": resume_state_path}
+
+
 def component_loss_train_kwargs(
     component_loss: str = "component_mse",
     huber_delta: float = 1.0,
@@ -391,6 +429,7 @@ def train_pairwise_model(
     parameter_initialization="pytorch",
     adam_eps=1e-8,
     checkpoint_metric="component_mse",
+    resume_state_path=None,
     wandb_config=None,
 ):
     # Ensure param_start_mean and param_start_std are lists
@@ -823,6 +862,9 @@ def train_pairwise_model(
             component_loss_weights,
         )
     )
+    train_kwargs.update(
+        resume_state_train_kwargs(apnet_model_type, apnet.train, resume_state_path)
+    )
     supported_train_kwargs = inspect.signature(apnet.train).parameters
     unsupported_train_kwargs = sorted(
         key for key in train_kwargs if key not in supported_train_kwargs
@@ -1009,6 +1051,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("component_mse", "total_mae"),
         default="component_mse",
         help="Validation metric used to choose the saved APNet2 checkpoint",
+    )
+    args.add_argument(
+        "--resume-state",
+        type=str,
+        default=None,
+        help=(
+            "Pairwise resume-state file, rewritten after every epoch with the "
+            "weights, optimizer, scheduler, and RNG state; an existing file is "
+            "resumed from.  Lets a preemptible job continue exactly."
+        ),
     )
     args.add_argument(
         "--end_lr",
@@ -1367,6 +1419,7 @@ def main():
             parameter_initialization=args.parameter_initialization,
             adam_eps=args.adam_eps,
             checkpoint_metric=args.checkpoint_metric,
+            resume_state_path=args.resume_state,
             wandb_config=pairwise_wandb_config,
         )
     return
