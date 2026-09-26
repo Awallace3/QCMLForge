@@ -1,0 +1,1238 @@
+"""Verified, optional PolarMACE loading helpers.
+
+MACE imports occur only after a local artifact has passed digest verification.
+The foundation checkpoint is external and must never be embedded in QCMLForge
+checkpoints.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+import hashlib
+from importlib.metadata import version
+from pathlib import Path
+from typing import Any, Callable, MutableMapping
+
+import torch
+
+from apnet_pt.constants import ALLOWED_ELEMENTS
+
+from ._graph_longrange_compat import patch_realspace_scatter_dim_size
+from .schema import (
+    MACEAtomicFeatures,
+    MACEFeatureCacheKey,
+    POLAR_DENSITY_L1_CONTRACT,
+    PhysicsConfig,
+    PolarMACEDirectOutputs,
+)
+
+
+POLAR_1S_MODEL_ID = "polar-1-s"
+POLAR_1S_SHA256 = "e4495612037b3b3312633182882a38a694ecac9ea0be2b9889ac0b2a84a99510"
+POLAR_1S_URL = (
+    "https://github.com/ACEsuit/mace-foundations/releases/download/"
+    "mace_polar_1/MACE-POLAR-1-S.model"
+)
+SUPPORTED_MACE_VERSION = "0.3.16"
+
+#: Feature widths the MACE-POLAR-1-S backbone emits per atom, keyed by feature
+#: mode.  A downstream pair core has to be sized before it can be handed a
+#: featurizer, and the widths are fixed by the artifact rather than by anything
+#: configurable, so they are named here instead of being rediscovered by a
+#: throwaway forward.  ``tests/test_mace_integration_polar.py`` checks them
+#: against the real checkpoint.
+POLAR_1S_INVARIANT_DIMS = {"final-layer-scalars": 512, "all-scalars+norms": 2560}
+#: Equivariant channels per irrep degree in the same backbone, which is what a
+#: directional route slices its l=1..3 blocks out of.
+POLAR_1S_EQUIVARIANT_CHANNELS = 512
+
+
+def _e3nn_o3():
+    """Import pinned e3nn constants under PyTorch's restricted safe loader."""
+
+    with torch.serialization.safe_globals([slice]):
+        from e3nn import o3
+
+    return o3
+
+
+@dataclass(frozen=True)
+class PrivateMACEFeatures:
+    """Versioned result of the reviewed private-layer adapter."""
+
+    final_scalars: torch.Tensor
+    hidden: torch.Tensor
+    hidden_irreps: str
+    layer_count: int
+    adapter_version: str
+
+
+class _ZeroLocalElectronEnergy(torch.nn.Module):
+    """Shape-correct zero stand-in for ``PolarMACE.local_electron_energy``.
+
+    MACE 0.3.16 computes this head unconditionally and reduces it into
+    ``energy``/``node_energy``/``electron_energy``.  On a V100 H3L3 step it is
+    20.0% of the backbone forward, and the featurizer reads exactly four keys of
+    the backbone output -- ``node_feats``, ``density_coefficients``, ``charges``
+    and ``dipole`` -- none of which it touches.  Every field this featurizer
+    emits is bit-equal with the head elided.
+
+    The swap is scoped to one forward by ``_elided_energy_head`` rather than
+    applied to the module.  ``add_local_electron_energy`` is ``True`` on
+    MACE-POLAR-1-S, so a permanent mutation would leave a shared backbone
+    silently returning wrong energies to any other consumer -- the exact
+    no-error, no-warning failure ``docs/model-notices.md`` exists to catch.
+    """
+
+    def forward(self, **kwargs: Any) -> torch.Tensor:
+        reference = kwargs["node_feats"]
+        return reference.new_zeros(reference.shape[0])
+
+
+class PolarMACEPrivateLayerAdapter:
+    """Reviewed MACE 0.3.16 local-interaction adapter.
+
+    Two routes return the same tensors.  ``recompute`` calls the named local
+    blocks explicitly, which is auditable but runs the whole local tower a
+    second time; ``hook`` reads those same blocks off the public forward.  On
+    an H3L3 V100 train step the duplicate tower plus this adapter's assembly is
+    88.5 ms of 554 ms (job 13398476), so the route is worth choosing.
+
+    The two were compared block by block on the real MACE-POLAR-1-S artifact:
+    ``hidden`` (27, 8192) and ``final_scalars`` (27, 512) are bit-equal, max
+    difference exactly 0.0, and every tensor the featurizer emits is unchanged.
+    The feature schema is therefore identical and cached features stay valid,
+    which is why ``adapter_version`` does not move.
+
+    What the route costs is the audit.  ``recompute`` produces final scalars by
+    an independent path and the featurizer checks them against public
+    ``node_feats``; under ``hook`` the two sides are the same tensor's value, so
+    that check can no longer fail.  ``_extract_hook`` therefore carries its own
+    guards -- every expected block captured, captured exactly once -- because
+    the failure it has to catch is an upstream refactor that stops routing
+    through ``interactions``/``products``, not a numerical divergence.
+    """
+
+    adapter_version = "polar-private-mace-0.3.16-v1"
+    valid_routes = frozenset({"recompute", "hook"})
+
+    def __init__(self, mace_version: str, *, route: str = "hook") -> None:
+        if mace_version != SUPPORTED_MACE_VERSION:
+            raise ValueError(
+                "private PolarMACE adapter supports only mace-torch 0.3.16"
+            )
+        if route not in self.valid_routes:
+            raise ValueError(f"unsupported private adapter route: {route}")
+        self.version = self.adapter_version
+        self.route = route
+        self._captured: dict[tuple[str, int], list[torch.Tensor]] = {}
+        self._hooked_backbone: int | None = None
+        self._handles: list[Any] = []
+
+    def arm(self, backbone: torch.nn.Module) -> None:
+        """Install capture hooks if needed and discard the previous forward.
+
+        Clearing here rather than after ``extract`` is what makes a missing
+        block an error instead of a silently reused stale tensor: a forward that
+        never reaches ``products[i]`` leaves the key absent, and ``extract``
+        refuses.
+        """
+
+        if self.route != "hook":
+            # Leaving the hooks registered would keep filling ``_captured`` on
+            # every forward with nobody to clear it, which grows without bound
+            # and makes the recompute route cost more than the shipped code it
+            # is supposed to reproduce.
+            self.release()
+            return
+        if self._hooked_backbone != id(backbone):
+            for handle in self._handles:
+                handle.remove()
+            self._handles = []
+            for kind, modules in (
+                ("interaction", backbone.interactions),
+                ("product", backbone.products),
+            ):
+                for index, module in enumerate(modules):
+                    self._handles.append(
+                        module.register_forward_hook(
+                            self._make_hook(kind, index)
+                        )
+                    )
+            self._hooked_backbone = id(backbone)
+        self._captured.clear()
+
+    def release(self) -> None:
+        """Remove the hooks and drop the captures.
+
+        Worth calling when a featurizer is discarded: the handles live on the
+        backbone's blocks, not on the adapter, so a shared backbone otherwise
+        accumulates one set per featurizer that ever wrapped it.
+        """
+
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+        self._hooked_backbone = None
+        self._captured.clear()
+
+    def _make_hook(self, kind: str, index: int):
+        def hook(module, inputs, output):
+            # A forward hook that returns anything but ``None`` replaces the
+            # module's output, so this must not end in the expression value of
+            # the recording call.
+            value = output[0] if kind == "interaction" else output
+            self._captured.setdefault((kind, index), []).append(value)
+            return None
+
+        return hook
+
+    def extract(
+        self,
+        backbone: torch.nn.Module,
+        graph: dict[str, torch.Tensor],
+        public_outputs: dict[str, torch.Tensor],
+    ) -> PrivateMACEFeatures:
+        self._check_runtime(backbone)
+        if self.route == "hook":
+            return self._extract_hook(backbone)
+        return self._extract_recompute(backbone, graph, public_outputs)
+
+    @staticmethod
+    def _check_runtime(backbone: torch.nn.Module) -> None:
+        if (
+            type(backbone).__name__ != "PolarMACE"
+            or type(backbone).__module__ != "mace.modules.extensions"
+        ):
+            raise TypeError("private adapter requires the pinned PolarMACE class")
+        if version("mace-torch") != SUPPORTED_MACE_VERSION:
+            raise RuntimeError("private adapter MACE runtime version mismatch")
+
+    @staticmethod
+    def _flatten_hidden(hidden: torch.Tensor, interaction_irreps) -> torch.Tensor:
+        """MACE 0.3.16 [atom, channel, concatenated-m] -> irrep-major flat."""
+
+        if hidden.ndim != 3:
+            return hidden
+        offset = 0
+        flattened_parts = []
+        for multiplicity, irrep in interaction_irreps:
+            if multiplicity != hidden.shape[1]:
+                raise RuntimeError("unsupported private PolarMACE channel layout")
+            flattened_parts.append(
+                hidden[:, :, offset : offset + irrep.dim].reshape(hidden.shape[0], -1)
+            )
+            offset += irrep.dim
+        return torch.cat(flattened_parts, dim=-1)
+
+    def _extract_hook(self, backbone: torch.nn.Module) -> PrivateMACEFeatures:
+        o3 = _e3nn_o3()
+        layers = range(len(backbone.interactions))
+        hidden_layers = []
+        product_layers = []
+        layer_irreps = []
+        for index in layers:
+            for kind in ("interaction", "product"):
+                seen = self._captured.get((kind, index))
+                if not seen:
+                    raise RuntimeError(
+                        f"private PolarMACE hook adapter captured no {kind} "
+                        f"{index}; the public forward no longer routes through it"
+                    )
+                if len(seen) != 1:
+                    raise RuntimeError(
+                        f"private PolarMACE hook adapter captured {kind} {index} "
+                        f"{len(seen)} times in one forward; expected exactly one"
+                    )
+            interaction_irreps = o3.Irreps(backbone.interactions[index].irreps_out)
+            layer_irreps.append(interaction_irreps)
+            hidden_layers.append(
+                self._flatten_hidden(
+                    self._captured[("interaction", index)][0], interaction_irreps
+                )
+            )
+            product_layers.append(self._captured[("product", index)][0])
+        # Release the captures now rather than at the next ``arm``.  The hooks
+        # stay registered on the backbone, so anything else that forwards it
+        # would otherwise keep a full hidden basis -- and, outside ``no_grad``,
+        # its autograd graph -- alive until our next step.
+        self._captured.clear()
+        if not hidden_layers:
+            raise ValueError("PolarMACE private adapter found no interaction layers")
+        hidden_irreps = o3.Irreps("")
+        for irreps in layer_irreps:
+            hidden_irreps += irreps
+        return PrivateMACEFeatures(
+            final_scalars=torch.cat(product_layers, dim=-1),
+            hidden=torch.cat(hidden_layers, dim=-1),
+            hidden_irreps=str(hidden_irreps),
+            layer_count=len(hidden_layers),
+            adapter_version=self.adapter_version,
+        )
+
+    def _extract_recompute(
+        self,
+        backbone: torch.nn.Module,
+        graph: dict[str, torch.Tensor],
+        public_outputs: dict[str, torch.Tensor],
+    ) -> PrivateMACEFeatures:
+        # Optional/private imports are deliberately delayed until adapter use.
+        o3 = _e3nn_o3()
+        from mace.modules.extensions import _permute_to_e3nn_convention
+        from mace.modules.utils import prepare_graph
+
+        ctx = prepare_graph(
+            graph,
+            compute_virials=False,
+            compute_stress=False,
+            compute_displacement=False,
+            lammps_mliap=False,
+        )
+        node_feats = backbone.node_embedding(graph["node_attrs"])
+        edge_attrs = backbone.spherical_harmonics(
+            _permute_to_e3nn_convention(ctx.vectors)
+        )
+        edge_feats, cutoff = backbone.radial_embedding(
+            ctx.lengths,
+            graph["node_attrs"],
+            graph["edge_index"],
+            backbone.atomic_numbers,
+        )
+        hidden_layers = []
+        product_layers = []
+        layer_irreps = []
+        for index, (interaction, product) in enumerate(
+            zip(backbone.interactions, backbone.products)
+        ):
+            hidden, sc = interaction(
+                node_attrs=graph["node_attrs"],
+                node_feats=node_feats,
+                edge_attrs=edge_attrs,
+                edge_feats=edge_feats,
+                edge_index=graph["edge_index"],
+                cutoff=cutoff,
+                first_layer=(index == 0),
+                lammps_class=ctx.interaction_kwargs.lammps_class,
+                lammps_natoms=ctx.interaction_kwargs.lammps_natoms,
+            )
+            interaction_irreps = o3.Irreps(interaction.irreps_out)
+            layer_irreps.append(interaction_irreps)
+            hidden_layers.append(self._flatten_hidden(hidden, interaction_irreps))
+            node_feats = product(
+                node_feats=hidden,
+                sc=sc,
+                node_attrs=graph["node_attrs"],
+            )
+            product_layers.append(node_feats)
+        if not hidden_layers:
+            raise ValueError("PolarMACE private adapter found no interaction layers")
+        hidden_irreps = o3.Irreps("")
+        for irreps in layer_irreps:
+            hidden_irreps += irreps
+        return PrivateMACEFeatures(
+            final_scalars=torch.cat(product_layers, dim=-1),
+            hidden=torch.cat(hidden_layers, dim=-1),
+            hidden_irreps=str(hidden_irreps),
+            layer_count=len(hidden_layers),
+            adapter_version=self.adapter_version,
+        )
+
+
+def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    """Hash an artifact without deserializing or loading it into memory."""
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_artifact(path: str | Path, expected_sha256: str) -> str:
+    """Verify a local artifact and return its normalized digest."""
+
+    artifact = Path(path)
+    if not artifact.is_file():
+        raise FileNotFoundError(f"MACE artifact does not exist: {artifact}")
+    expected = expected_sha256.lower()
+    if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError("expected_sha256 must be a 64-character hexadecimal digest")
+    actual = sha256_file(artifact)
+    if actual != expected:
+        raise ValueError(
+            f"MACE artifact SHA-256 mismatch for {artifact}: "
+            f"expected {expected}, got {actual}"
+        )
+    return actual
+
+
+def _default_polar_loader(**kwargs):
+    # Optional import intentionally occurs only after verify_artifact succeeds.
+    from mace.calculators.foundations_models import mace_polar
+
+    return mace_polar(**kwargs)
+
+
+def load_verified_polar_mace(
+    path: str | Path,
+    *,
+    expected_sha256: str,
+    device: str | torch.device = "cpu",
+    offline: bool = True,
+    loader: Callable[..., torch.nn.Module] | None = None,
+) -> torch.nn.Module:
+    """Load a digest-verified local PolarMACE artifact as a frozen module.
+
+    Parameters
+    ----------
+    path
+        Local external checkpoint.  This function never downloads artifacts.
+    expected_sha256
+        Required trusted digest, checked before MACE is imported/deserializes.
+    device
+        Device passed to the upstream raw-module loader.
+    offline
+        Kept explicit in manifests/API.  Missing local files fail early in both
+        modes; callers that permit downloads must resolve and verify separately.
+    loader
+        Test seam or version-pinned upstream loader.
+    """
+
+    artifact = Path(path)
+    if not artifact.is_file():
+        qualifier = " while offline" if offline else ""
+        raise FileNotFoundError(
+            f"Local MACE artifact is required{qualifier}: {artifact}"
+        )
+    verify_artifact(artifact, expected_sha256)
+
+    # The backbone's real-space Coulomb term truncates its per-node scatter
+    # when the last graph of a batch has no edges, which a monatomic monomer
+    # guarantees.  Correct it before any forward can hit that path.
+    patch_realspace_scatter_dim_size()
+
+    load = loader or _default_polar_loader
+    model = load(
+        model=str(artifact),
+        device=str(device),
+        return_raw_model=True,
+    )
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("PolarMACE loader did not return a torch.nn.Module")
+    model.eval()
+    model.requires_grad_(False)
+    return model
+
+
+def _clone_features(features: MACEAtomicFeatures) -> MACEAtomicFeatures:
+    return MACEAtomicFeatures(
+        invariant=features.invariant.clone(),
+        equivariant=features.equivariant.clone(),
+        batch=features.batch.clone(),
+        atomic_numbers=features.atomic_numbers.clone(),
+        total_charge=features.total_charge.clone(),
+        total_spin=features.total_spin.clone(),
+        feature_schema=features.feature_schema,
+    )
+
+
+def _clone_direct(outputs: PolarMACEDirectOutputs) -> PolarMACEDirectOutputs:
+    return PolarMACEDirectOutputs(
+        density_coefficients=outputs.density_coefficients.clone(),
+        charges=outputs.charges.clone(),
+        molecular_dipole_eangstrom=outputs.molecular_dipole_eangstrom.clone(),
+        positions_angstrom=outputs.positions_angstrom.clone(),
+        batch=outputs.batch.clone(),
+        total_charge=outputs.total_charge.clone(),
+        multipole_contract=outputs.multipole_contract,
+    )
+
+
+class MACEPolarFeaturizer(torch.nn.Module):
+    """Frozen isolated-monomer PolarMACE feature and direct-output adapter."""
+
+    valid_feature_modes = {"final-layer-scalars", "all-scalars+norms"}
+
+    def __init__(
+        self,
+        backbone: torch.nn.Module,
+        *,
+        checkpoint_sha256: str,
+        mace_version: str = SUPPORTED_MACE_VERSION,
+        model_id: str = POLAR_1S_MODEL_ID,
+        feature_mode: str = "final-layer-scalars",
+        dtype: torch.dtype = torch.float32,
+        physics_config: PhysicsConfig | None = None,
+        cache: MutableMapping[str, tuple[MACEAtomicFeatures, PolarMACEDirectOutputs]]
+        | None = None,
+        graph_builder: Callable[..., dict[str, torch.Tensor]] | None = None,
+        private_adapter: Any | None = None,
+        multipole_contract: str = POLAR_DENSITY_L1_CONTRACT,
+        # 1e-6 sat inside float32 CUDA rounding: the private and public paths
+        # are bit-identical on CPU at every batch size, but on a V100 their
+        # largest per-atom gap grows with batch size (5.96e-07 serial vs
+        # 1.371e-06 batched over the same 1196 atoms, job 12781573) because the
+        # two call sequences select different reduction kernels.  A real
+        # mis-extraction is O(1), so 1e-4 still catches every defect this guard
+        # exists for while being immune to kernel selection.
+        parity_atol: float = 1.0e-4,
+        elide_energy_head: bool = True,
+    ) -> None:
+        super().__init__()
+        if feature_mode not in self.valid_feature_modes:
+            raise ValueError(f"unsupported MACE feature mode: {feature_mode}")
+        if dtype not in {torch.float32, torch.float64}:
+            raise ValueError("MACE featurizer dtype must be float32 or float64")
+        if multipole_contract != POLAR_DENSITY_L1_CONTRACT:
+            raise ValueError("incompatible PolarMACE multipole contract")
+        maximum_l = getattr(backbone, "atomic_multipoles_max_l", 1)
+        if int(maximum_l) != 1:
+            raise ValueError("PolarMACE artifact must provide direct multipoles through l=1")
+        if len(checkpoint_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in checkpoint_sha256
+        ):
+            raise ValueError("checkpoint_sha256 must be a lowercase SHA-256 digest")
+        if graph_builder is None and type(backbone).__name__ != "PolarMACE":
+            raise TypeError("production featurization requires a PolarMACE backbone")
+        self.backbone = backbone
+        self.backbone.to(dtype=dtype)
+        self.backbone.eval()
+        self.backbone.requires_grad_(False)
+        self.checkpoint_sha256 = checkpoint_sha256
+        self.mace_version = mace_version
+        self.model_id = model_id
+        self.feature_mode = feature_mode
+        self.dtype = dtype
+        self.physics_config = physics_config or PhysicsConfig()
+        self.cache = cache
+        self.graph_builder = graph_builder
+        self.private_adapter = private_adapter
+        self.multipole_contract = multipole_contract
+        self.parity_atol = parity_atol
+        self.elide_energy_head = elide_energy_head
+        self.last_private_parity_error = 0.0
+        self.resolved_feature_schema: str | None = None
+        supported = getattr(backbone, "atomic_numbers", torch.empty(0, dtype=torch.long))
+        self.backbone_elements = tuple(int(value) for value in supported.tolist())
+        self.supported_elements = frozenset(
+            value for value in self.backbone_elements if value in ALLOWED_ELEMENTS
+        )
+        if feature_mode == "all-scalars+norms" and private_adapter is None:
+            self.private_adapter = PolarMACEPrivateLayerAdapter(mace_version)
+
+    @contextmanager
+    def _elided_energy_head(self):
+        """Swap out the unread ``local_electron_energy`` head for this forward.
+
+        Restoration is in a ``finally`` so a raising forward -- the parity guard
+        below raises, and so does an OOM -- cannot leave a zeroed head installed
+        on a backbone another model shares.
+        """
+
+        head = getattr(self.backbone, "local_electron_energy", None)
+        if not self.elide_energy_head or head is None:
+            yield
+            return
+        self.backbone.local_electron_energy = _ZeroLocalElectronEnergy()
+        try:
+            yield
+        finally:
+            self.backbone.local_electron_energy = head
+
+    def _backbone_forward(self, graph: dict[str, torch.Tensor]):
+        """The one public backbone call; both run paths go through here.
+
+        Arming the adapter here rather than inside ``extract`` is what keeps the
+        hook route honest: the capture is cleared immediately before the forward
+        that fills it, so a block the forward never reaches is absent rather
+        than stale.
+        """
+
+        arm = getattr(self.private_adapter, "arm", None)
+        if arm is not None:
+            arm(self.backbone)
+        with self._elided_energy_head():
+            return self.backbone(graph, training=False, compute_force=False)
+
+    def train(self, mode: bool = True):
+        """Train completion heads around this module without unfreezing MACE."""
+
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """Return reconstruction metadata suitable for checkpoint manifests."""
+
+        return {
+            "model_id": self.model_id,
+            "mace_version": self.mace_version,
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "dtype": str(self.dtype),
+            "supported_elements": tuple(sorted(self.supported_elements)),
+            "feature_mode": self.feature_mode,
+            "private_adapter": getattr(self.private_adapter, "version", None),
+            "feature_schema": self.resolved_feature_schema,
+            "multipole_contract": self.multipole_contract,
+        }
+
+    @property
+    def schema_identity(self) -> str:
+        adapter = getattr(self.private_adapter, "version", "public")
+        return (
+            f"{self.model_id}:mace={self.mace_version}:mode={self.feature_mode}:"
+            f"adapter={adapter}"
+        )
+
+    def _default_graph_builder(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        import numpy as np
+        from mace.data import AtomicData, Configuration
+        from mace.tools import AtomicNumberTable
+        from mace.tools.torch_geometric import DataLoader
+
+        properties = {
+            "total_charge": float(total_charge.item()),
+            "total_spin": float(total_spin.item()),
+            "external_field": np.zeros(3),
+            "fermi_level": 0.0,
+        }
+        config = Configuration(
+            atomic_numbers=atomic_numbers.detach().cpu().numpy(),
+            positions=positions.detach().cpu().numpy(),
+            properties=properties,
+            property_weights={},
+        )
+        z_table = AtomicNumberTable(self.backbone_elements)
+        graph = AtomicData.from_config(
+            config,
+            z_table=z_table,
+            cutoff=float(self.backbone.r_max),
+            heads=getattr(self.backbone, "heads", ["Default"]),
+        )
+        batch = next(iter(DataLoader([graph], batch_size=1, shuffle=False)))
+        result = batch.to_dict()
+        result["atomic_numbers"] = atomic_numbers
+        return result
+
+    def _build_graph(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        builder = self.graph_builder or self._default_graph_builder
+        graph = builder(
+            positions,
+            atomic_numbers,
+            total_charge,
+            total_spin,
+            self.dtype,
+        )
+        device = self._backbone_device()
+        converted = {}
+        for name, value in graph.items():
+            if not torch.is_tensor(value):
+                converted[name] = value
+            elif torch.is_floating_point(value):
+                converted[name] = value.to(device=device, dtype=self.dtype)
+            else:
+                converted[name] = value.to(device=device)
+        return converted
+
+    def _backbone_device(self) -> torch.device:
+        for tensor in list(self.backbone.parameters()) + list(self.backbone.buffers()):
+            return tensor.device
+        return torch.device("cpu")
+
+    @staticmethod
+    def _scalars_and_norms(hidden: torch.Tensor, irreps_string: str) -> torch.Tensor:
+        o3 = _e3nn_o3()
+
+        irreps = o3.Irreps(irreps_string)
+        values = []
+        for (multiplicity, irrep), feature_slice in zip(irreps, irreps.slices()):
+            block = hidden[:, feature_slice].reshape(
+                hidden.shape[0], multiplicity, irrep.dim
+            )
+            if irrep.l == 0:
+                values.append(block[..., 0])
+            else:
+                values.append(torch.linalg.vector_norm(block, dim=-1))
+        return torch.cat(values, dim=-1)
+
+    def _runtime_features(
+        self,
+        graph: dict[str, torch.Tensor],
+        outputs: dict[str, torch.Tensor],
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        node_batch: torch.Tensor | None = None,
+    ) -> MACEAtomicFeatures:
+        public_scalars = outputs["node_feats"].to(dtype=self.dtype)
+        natom = public_scalars.shape[0]
+        equivariant = public_scalars.new_zeros((natom, 0))
+        schema_suffix = "public"
+        layer_count = 1
+        if self.feature_mode == "all-scalars+norms":
+            private = self.private_adapter.extract(self.backbone, graph, outputs)
+            # This audit compares two independent computations of the final
+            # scalars, so it is meaningful only where the adapter actually
+            # recomputes them.  Under the hook route ``public_scalars`` is a
+            # bit-equal copy of the captured product output (measured: max
+            # difference 0.0, ``same object: False``), so the check could never
+            # fail; running it anyway would buy nothing and cost a device
+            # synchronisation per step, because reading the scalar off the GPU
+            # blocks.  ``_extract_hook`` carries guards of the other kind --
+            # every block captured, captured exactly once -- since the failure
+            # it must catch is an upstream refactor that stops routing through
+            # ``interactions``/``products``, not a numerical divergence.  An
+            # injected adapter has no ``route`` and is audited.
+            if getattr(self.private_adapter, "route", "recompute") != "hook":
+                difference = (private.final_scalars - public_scalars).abs().max()
+                self.last_private_parity_error = float(difference.detach().cpu())
+                if not torch.allclose(
+                    private.final_scalars,
+                    public_scalars,
+                    atol=self.parity_atol,
+                    rtol=1.0e-6,
+                ):
+                    raise RuntimeError(
+                        "private PolarMACE adapter failed public-final-scalar "
+                        "parity: max|private-public| = "
+                        f"{self.last_private_parity_error:.3e} "
+                        f"over {natom} atoms exceeds atol={self.parity_atol:.3e}"
+                    )
+            invariant = torch.cat(
+                (
+                    public_scalars,
+                    self._scalars_and_norms(private.hidden, private.hidden_irreps),
+                ),
+                dim=-1,
+            )
+            equivariant = private.hidden
+            schema_suffix = (
+                f"private={private.adapter_version}:irreps={private.hidden_irreps}"
+            )
+            layer_count = private.layer_count
+        else:
+            invariant = public_scalars
+        feature_schema = (
+            f"{self.schema_identity}:inv={invariant.shape[1]}:"
+            f"equiv={equivariant.shape[1]}:layers={layer_count}:{schema_suffix}"
+        )
+        if self.resolved_feature_schema not in {None, feature_schema}:
+            raise RuntimeError("PolarMACE runtime feature schema changed within a run")
+        self.resolved_feature_schema = feature_schema
+        return MACEAtomicFeatures(
+            invariant=invariant.detach(),
+            equivariant=equivariant.detach(),
+            batch=(
+                torch.zeros(natom, dtype=torch.long, device=invariant.device)
+                if node_batch is None
+                else node_batch.to(invariant.device)
+            ),
+            atomic_numbers=atomic_numbers.to(invariant.device),
+            total_charge=total_charge.to(invariant),
+            total_spin=total_spin.to(invariant),
+            feature_schema=feature_schema,
+        )
+
+    def _run_single(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+    ) -> tuple[MACEAtomicFeatures, PolarMACEDirectOutputs]:
+        graph = self._build_graph(
+            positions, atomic_numbers, total_charge, total_spin
+        )
+        self.backbone.eval()
+        with torch.no_grad():
+            outputs = self._backbone_forward(graph)
+            features = self._runtime_features(
+                graph, outputs, atomic_numbers, total_charge, total_spin
+            )
+        required = {"density_coefficients", "charges", "dipole"}
+        missing = required.difference(outputs)
+        if missing:
+            raise ValueError(f"PolarMACE output is missing {sorted(missing)}")
+        density = outputs["density_coefficients"].detach().to(dtype=self.dtype)
+        if density.ndim != 2 or density.shape[1] != 4:
+            raise ValueError(
+                "PolarMACE artifact has an incompatible direct multipole width"
+            )
+        direct = PolarMACEDirectOutputs(
+            density_coefficients=density,
+            charges=outputs["charges"].detach().to(dtype=self.dtype),
+            molecular_dipole_eangstrom=outputs["dipole"].detach().to(dtype=self.dtype),
+            positions_angstrom=graph["positions"].detach().to(dtype=self.dtype),
+            batch=torch.zeros(
+                atomic_numbers.numel(), dtype=torch.long, device=density.device
+            ),
+            total_charge=total_charge.to(density),
+            multipole_contract=self.multipole_contract,
+        )
+        reconstructed = (
+            direct.charges[:, None] * direct.positions_angstrom
+            + direct.intrinsic_dipole_eangstrom
+        ).sum(0, keepdim=True)
+        if not torch.allclose(
+            reconstructed,
+            direct.molecular_dipole_eangstrom,
+            atol=1.0e-5,
+            rtol=1.0e-6,
+        ):
+            raise ValueError(
+                "PolarMACE direct coefficients do not reconstruct molecular dipole"
+            )
+        return features, direct
+
+    def _default_batched_graph_builder(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        ptr: list[int],
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        import numpy as np
+        from mace.data import AtomicData, Configuration
+        from mace.tools import AtomicNumberTable
+        from mace.tools.torch_geometric import DataLoader
+
+        z_table = AtomicNumberTable(self.backbone_elements)
+        heads = getattr(self.backbone, "heads", ["Default"])
+        cutoff = float(self.backbone.r_max)
+        numbers_cpu = atomic_numbers.detach().cpu().numpy()
+        positions_cpu = positions.detach().cpu().numpy()
+        graphs = []
+        for monomer in range(len(ptr) - 1):
+            start, stop = ptr[monomer], ptr[monomer + 1]
+            properties = {
+                "total_charge": float(total_charge[monomer].item()),
+                "total_spin": float(total_spin[monomer].item()),
+                "external_field": np.zeros(3),
+                "fermi_level": 0.0,
+            }
+            config = Configuration(
+                atomic_numbers=numbers_cpu[start:stop],
+                positions=positions_cpu[start:stop],
+                properties=properties,
+                property_weights={},
+            )
+            graphs.append(
+                AtomicData.from_config(
+                    config, z_table=z_table, cutoff=cutoff, heads=heads
+                )
+            )
+        collated = next(
+            iter(DataLoader(graphs, batch_size=len(graphs), shuffle=False))
+        )
+        result = collated.to_dict()
+        result["atomic_numbers"] = atomic_numbers
+        return result
+
+    def _build_batched_graph(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        ptr: list[int],
+    ) -> dict[str, torch.Tensor]:
+        graph = self._default_batched_graph_builder(
+            positions,
+            atomic_numbers,
+            total_charge,
+            total_spin,
+            ptr,
+            self.dtype,
+        )
+        device = self._backbone_device()
+        converted = {}
+        for name, value in graph.items():
+            if not torch.is_tensor(value):
+                converted[name] = value
+            elif torch.is_floating_point(value):
+                converted[name] = value.to(device=device, dtype=self.dtype)
+            else:
+                converted[name] = value.to(device=device)
+        return converted
+
+    def _run_batched(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        ptr: list[int],
+        node_batch: torch.Tensor,
+    ) -> tuple[MACEAtomicFeatures, PolarMACEDirectOutputs]:
+        """Featurize every monomer of a batch with one backbone call.
+
+        Monomers are isolated from one another, so the collated graph carries no
+        edges between them and each atom sees exactly the neighbourhood it would
+        see alone.  The per-atom results therefore match running the monomers
+        one at a time through ``_run_single``.
+        """
+
+        graph = self._build_batched_graph(
+            positions, atomic_numbers, total_charge, total_spin, ptr
+        )
+        self.backbone.eval()
+        with torch.no_grad():
+            outputs = self._backbone_forward(graph)
+            features = self._runtime_features(
+                graph,
+                outputs,
+                atomic_numbers,
+                total_charge,
+                total_spin,
+                node_batch,
+            )
+        required = {"density_coefficients", "charges", "dipole"}
+        missing = required.difference(outputs)
+        if missing:
+            raise ValueError(f"PolarMACE output is missing {sorted(missing)}")
+        density = outputs["density_coefficients"].detach().to(dtype=self.dtype)
+        if density.ndim != 2 or density.shape[1] != 4:
+            raise ValueError(
+                "PolarMACE artifact has an incompatible direct multipole width"
+            )
+        direct = PolarMACEDirectOutputs(
+            density_coefficients=density,
+            charges=outputs["charges"].detach().to(dtype=self.dtype),
+            molecular_dipole_eangstrom=outputs["dipole"].detach().to(dtype=self.dtype),
+            positions_angstrom=graph["positions"].detach().to(dtype=self.dtype),
+            batch=node_batch.to(density.device),
+            total_charge=total_charge.to(density),
+            multipole_contract=self.multipole_contract,
+        )
+        # Same reconstruction guard as the serial path, accumulated per monomer
+        # instead of over the whole batch.
+        contribution = (
+            direct.charges[:, None] * direct.positions_angstrom
+            + direct.intrinsic_dipole_eangstrom
+        )
+        reconstructed = direct.molecular_dipole_eangstrom.new_zeros(
+            direct.molecular_dipole_eangstrom.shape
+        )
+        reconstructed.index_add_(0, direct.batch, contribution)
+        if not torch.allclose(
+            reconstructed,
+            direct.molecular_dipole_eangstrom,
+            atol=1.0e-5,
+            rtol=1.0e-6,
+        ):
+            raise ValueError(
+                "PolarMACE direct coefficients do not reconstruct molecular dipole"
+            )
+        return features, direct
+
+    def _cache_key(
+        self,
+        positions: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+    ) -> str:
+        return MACEFeatureCacheKey.from_tensors(
+            checkpoint_sha256=self.checkpoint_sha256,
+            mace_version=self.mace_version,
+            feature_schema=self.schema_identity,
+            physics_config_hash=self.physics_config.physics_hash,
+            atomic_numbers=atomic_numbers,
+            coordinates_angstrom=positions,
+            total_charge=float(total_charge.item()),
+            total_spin=float(total_spin.item()),
+            dtype=self.dtype,
+        ).cache_hash
+
+    def _forward_monomer_batched(
+        self,
+        positions_angstrom: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        batch: torch.Tensor,
+        monomers: list[int],
+    ) -> tuple[MACEAtomicFeatures, PolarMACEDirectOutputs]:
+        """Uncached ``forward_monomer`` with a single backbone call per batch.
+
+        The serial path runs the backbone once per monomer, which leaves a
+        training step waiting on kernel launches rather than on arithmetic.
+        Atoms are permuted into contiguous per-monomer blocks, featurized
+        together, then scattered back into the caller's ordering.
+        """
+
+        device = positions_angstrom.device
+        index_groups = [torch.where(batch == monomer)[0] for monomer in monomers]
+        perm = torch.cat(index_groups)
+        sizes = [int(group.numel()) for group in index_groups]
+        ptr = [0]
+        for size in sizes:
+            ptr.append(ptr[-1] + size)
+        node_batch = torch.repeat_interleave(
+            torch.arange(len(monomers), dtype=torch.long, device=device),
+            torch.tensor(sizes, dtype=torch.long, device=device),
+        )
+        features, direct = self._run_batched(
+            positions_angstrom[perm],
+            atomic_numbers[perm],
+            total_charge,
+            total_spin,
+            ptr,
+            node_batch,
+        )
+        if self.resolved_feature_schema not in {None, features.feature_schema}:
+            raise RuntimeError("cached PolarMACE feature schema does not match runtime")
+        self.resolved_feature_schema = features.feature_schema
+
+        indices = perm.to(features.invariant.device)
+        invariant = features.invariant.new_empty(features.invariant.shape)
+        invariant.index_copy_(0, indices, features.invariant)
+        equivariant = features.equivariant.new_empty(features.equivariant.shape)
+        equivariant.index_copy_(0, indices, features.equivariant)
+        density = direct.density_coefficients.new_empty(
+            direct.density_coefficients.shape
+        )
+        density.index_copy_(0, indices, direct.density_coefficients)
+        charges = direct.charges.new_empty(direct.charges.shape)
+        charges.index_copy_(0, indices, direct.charges)
+        positions = direct.positions_angstrom.new_empty(
+            direct.positions_angstrom.shape
+        )
+        positions.index_copy_(0, indices, direct.positions_angstrom)
+
+        features = MACEAtomicFeatures(
+            invariant=invariant,
+            equivariant=equivariant,
+            batch=batch.to(invariant.device),
+            atomic_numbers=atomic_numbers.to(invariant.device),
+            total_charge=total_charge.to(invariant),
+            total_spin=total_spin.to(invariant),
+            feature_schema=features.feature_schema,
+        )
+        direct = PolarMACEDirectOutputs(
+            density_coefficients=density,
+            charges=charges,
+            molecular_dipole_eangstrom=direct.molecular_dipole_eangstrom,
+            positions_angstrom=positions,
+            batch=batch.to(density.device),
+            total_charge=total_charge.to(density),
+            multipole_contract=self.multipole_contract,
+        )
+        return features, direct
+
+    def forward_monomer(
+        self,
+        positions_angstrom: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        total_charge: torch.Tensor,
+        total_spin: torch.Tensor,
+        *,
+        batch: torch.Tensor | None = None,
+    ) -> tuple[MACEAtomicFeatures, PolarMACEDirectOutputs]:
+        """Run one or more isolated monomers and preserve input atom ordering."""
+
+        if positions_angstrom.ndim != 2 or positions_angstrom.shape[1] != 3:
+            raise ValueError("positions must have shape [n_atom, 3]")
+        if positions_angstrom.shape[0] == 0:
+            raise ValueError("at least one atom is required")
+        if not torch.is_floating_point(positions_angstrom) or not torch.isfinite(
+            positions_angstrom
+        ).all():
+            raise ValueError("positions must be finite floating values")
+        if atomic_numbers.shape != (positions_angstrom.shape[0],) or atomic_numbers.dtype not in {
+            torch.int32,
+            torch.int64,
+        }:
+            raise ValueError("atomic numbers must be a rank-1 integer tensor")
+        if atomic_numbers.device != positions_angstrom.device:
+            raise ValueError("atomic numbers and positions must share a device")
+        for name, values in (("total_charge", total_charge), ("total_spin", total_spin)):
+            if not torch.is_floating_point(values) or not torch.isfinite(values).all():
+                raise ValueError(f"{name} must contain finite floating values")
+        unsupported = sorted(set(int(z) for z in atomic_numbers.tolist()) - self.supported_elements)
+        if unsupported:
+            raise ValueError(f"unsupported element(s) for PolarMACE: {unsupported}")
+        if batch is None:
+            batch = torch.zeros(
+                atomic_numbers.numel(), dtype=torch.long, device=atomic_numbers.device
+            )
+        if batch.shape != atomic_numbers.shape or batch.dtype not in {
+            torch.int32,
+            torch.int64,
+        }:
+            raise ValueError("batch must be a rank-1 integer tensor")
+        if batch.device != positions_angstrom.device:
+            raise ValueError("batch and monomer tensors must share a device")
+        if (
+            total_charge.device != positions_angstrom.device
+            or total_spin.device != positions_angstrom.device
+        ):
+            raise ValueError("charge/spin and monomer tensors must share a device")
+        monomers = sorted(int(value) for value in batch.unique().tolist())
+        if monomers != list(range(len(monomers))):
+            raise ValueError("monomer batch indices must be contiguous from zero")
+        if total_charge.shape != (len(monomers),) or total_spin.shape != (
+            len(monomers),
+        ):
+            raise ValueError("charge and spin must contain one value per monomer")
+
+        if self.cache is None and self.graph_builder is None:
+            return self._forward_monomer_batched(
+                positions_angstrom,
+                atomic_numbers,
+                total_charge,
+                total_spin,
+                batch,
+                monomers,
+            )
+
+        per_monomer = []
+        for monomer in monomers:
+            atom_indices = torch.where(batch == monomer)[0]
+            positions = positions_angstrom[atom_indices]
+            numbers = atomic_numbers[atom_indices]
+            charge = total_charge[monomer : monomer + 1]
+            spin = total_spin[monomer : monomer + 1]
+            key = self._cache_key(positions, numbers, charge, spin)
+            if self.cache is not None and key in self.cache:
+                features, direct = self.cache[key]
+                features = _clone_features(features)
+                direct = _clone_direct(direct)
+                features = MACEAtomicFeatures(
+                    invariant=features.invariant.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    equivariant=features.equivariant.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    batch=features.batch.to(device=positions.device),
+                    atomic_numbers=features.atomic_numbers.to(device=positions.device),
+                    total_charge=features.total_charge.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    total_spin=features.total_spin.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    feature_schema=features.feature_schema,
+                )
+                direct = PolarMACEDirectOutputs(
+                    density_coefficients=direct.density_coefficients.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    charges=direct.charges.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    molecular_dipole_eangstrom=(
+                        direct.molecular_dipole_eangstrom.to(
+                            device=positions.device, dtype=self.dtype
+                        )
+                    ),
+                    positions_angstrom=direct.positions_angstrom.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    batch=direct.batch.to(device=positions.device),
+                    total_charge=direct.total_charge.to(
+                        device=positions.device, dtype=self.dtype
+                    ),
+                    multipole_contract=direct.multipole_contract,
+                )
+                result = (features, direct)
+            else:
+                if self.cache is not None and getattr(
+                    self.cache, "strict_read_only", False
+                ):
+                    raise KeyError(f"prepared feature cache miss: {key}")
+                result = self._run_single(positions, numbers, charge, spin)
+                if self.cache is not None:
+                    self.cache[key] = (
+                        _clone_features(result[0]),
+                        _clone_direct(result[1]),
+                    )
+            per_monomer.append((atom_indices, *result))
+
+        first_features = per_monomer[0][1]
+        first_direct = per_monomer[0][2]
+        if self.resolved_feature_schema not in {
+            None,
+            first_features.feature_schema,
+        }:
+            raise RuntimeError("cached PolarMACE feature schema does not match runtime")
+        self.resolved_feature_schema = first_features.feature_schema
+        natom = atomic_numbers.numel()
+        invariant = first_features.invariant.new_empty(
+            (natom, first_features.invariant.shape[1])
+        )
+        equivariant = first_features.equivariant.new_empty(
+            (natom, first_features.equivariant.shape[1])
+        )
+        density = first_direct.density_coefficients.new_empty((natom, 4))
+        charges = first_direct.charges.new_empty(natom)
+        positions = first_direct.positions_angstrom.new_empty((natom, 3))
+        dipoles = []
+        for atom_indices, features, direct in per_monomer:
+            indices = atom_indices.to(invariant.device)
+            invariant.index_copy_(0, indices, features.invariant)
+            equivariant.index_copy_(0, indices, features.equivariant)
+            density.index_copy_(0, indices, direct.density_coefficients)
+            charges.index_copy_(0, indices, direct.charges)
+            positions.index_copy_(0, indices, direct.positions_angstrom)
+            dipoles.append(direct.molecular_dipole_eangstrom)
+        features = MACEAtomicFeatures(
+            invariant=invariant,
+            equivariant=equivariant,
+            batch=batch.to(invariant.device),
+            atomic_numbers=atomic_numbers.to(invariant.device),
+            total_charge=total_charge.to(invariant),
+            total_spin=total_spin.to(invariant),
+            feature_schema=first_features.feature_schema,
+        )
+        direct = PolarMACEDirectOutputs(
+            density_coefficients=density,
+            charges=charges,
+            molecular_dipole_eangstrom=torch.cat(dipoles, dim=0),
+            positions_angstrom=positions,
+            batch=batch.to(density.device),
+            total_charge=total_charge.to(density),
+            multipole_contract=self.multipole_contract,
+        )
+        return features, direct
+
+    def forward_dimer(self, batch: Any):
+        """Run A and B as separate graph batches with shared frozen weights."""
+
+        # Charges and spins are stored as integers by the dimer datasets
+        # (total_charge_A/B are int32), while forward_monomer requires floating
+        # point tensors. Cast here so an integral charge is not reported as a
+        # non-finite value.
+        features_a, direct_a = self.forward_monomer(
+            batch.RA,
+            batch.ZA,
+            batch.total_charge_A.float(),
+            batch.total_spin_A.float(),
+            batch=batch.molecule_ind_A,
+        )
+        features_b, direct_b = self.forward_monomer(
+            batch.RB,
+            batch.ZB,
+            batch.total_charge_B.float(),
+            batch.total_spin_B.float(),
+            batch=batch.molecule_ind_B,
+        )
+        return features_a, direct_a, features_b, direct_b
