@@ -15,6 +15,7 @@ from .pair import (
     MONOMER_CONDITIONING_ARCHITECTURES,
     PAIR_ARCHITECTURE_IDS,
     PER_COMPONENT_DIRECTIONAL_ARCHITECTURES,
+    TENSOR_PRODUCT_ARCHITECTURES,
 )
 from .schema import (
     COMPONENT_ORDER,
@@ -51,6 +52,11 @@ MACE_AP3D3_ARCHITECTURES = {
         "provider_kind": "legacy",
     },
     "hybrid-h3l3": {
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+        "provider_kind": "legacy",
+    },
+    "hybrid-h3l3t": {
         "pair_mode": "h3l3",
         "feature_mode": "all-scalars+norms",
         "provider_kind": "legacy",
@@ -230,6 +236,14 @@ class MACEAP3D3(torch.nn.Module):
             raise ValueError(
                 f"{architecture} requires pair per_component_directional="
                 f"{expected_per_component}"
+            )
+        expected_tensor_product = architecture in TENSOR_PRODUCT_ARCHITECTURES
+        if bool(getattr(pair_core, "pair_tensor_product", False)) != (
+            expected_tensor_product
+        ):
+            raise ValueError(
+                f"{architecture} requires pair pair_tensor_product="
+                f"{expected_tensor_product}"
             )
         if getattr(featurizer, "feature_mode", None) != expected["feature_mode"]:
             raise ValueError(

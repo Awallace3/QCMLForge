@@ -33,6 +33,7 @@ ROUTES = {
     "hybrid-h3": ("h3", "all-scalars+norms", "legacy"),
     "hybrid-h3l1": ("h3l1", "all-scalars+norms", "legacy"),
     "hybrid-h3l3": ("h3l3", "all-scalars+norms", "legacy"),
+    "hybrid-h3l3t": ("h3l3", "all-scalars+norms", "legacy"),
     "hybrid-h3l3q": ("h3l3", "all-scalars+norms", "legacy"),
     "hybrid-h3l3w112": ("h3l3", "all-scalars+norms", "legacy"),
     "hybrid-h3l3p": ("h3l3", "all-scalars+norms", "legacy"),

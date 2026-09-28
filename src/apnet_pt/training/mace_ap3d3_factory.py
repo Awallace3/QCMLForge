@@ -43,6 +43,11 @@ MACE_AP3D3_OPTIONS = {
         "pair_mode": "h3l3",
         "feature_mode": "all-scalars+norms",
     },
+    "MACE-AP3D3-H3L3T": {
+        "properties": "legacy",
+        "pair_mode": "h3l3",
+        "feature_mode": "all-scalars+norms",
+    },
     # H3L3 plus the monomer conditioning block: same tower, same degree, same
     # feature mode, six extra per-edge scalars naming the formal charge and
     # unpaired-electron count of each monomer. One lever against H3L3.
@@ -83,6 +88,7 @@ _INTERNAL_ARCHITECTURES = {
     "MACE-AP3D3-H3": "hybrid-h3",
     "MACE-AP3D3-H3L1": "hybrid-h3l1",
     "MACE-AP3D3-H3L3": "hybrid-h3l3",
+    "MACE-AP3D3-H3L3T": "hybrid-h3l3t",
     "MACE-AP3D3-H3L3Q": "hybrid-h3l3q",
     "MACE-AP3D3-H3L3W112": "hybrid-h3l3w112",
     "MACE-AP3D3-H3L3P": "hybrid-h3l3p",

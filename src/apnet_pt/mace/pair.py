@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from .schema import AtomicPropertyBundle, MACEAtomicFeatures
+from .schema import AtomicPropertyBundle, MACEAtomicFeatures, _parse_irreps
 
 CANONICAL_AP3D3_DIMENSIONS = {
     "n_message": 3,
@@ -48,6 +48,7 @@ PAIR_ROUTE_CONFIGS = {
     "hybrid-h3": ("h3", "all-scalars+norms"),
     "hybrid-h3l1": ("h3l1", "all-scalars+norms"),
     "hybrid-h3l3": ("h3l3", "all-scalars+norms"),
+    "hybrid-h3l3t": ("h3l3", "all-scalars+norms"),
     "hybrid-h3l3q": ("h3l3", "all-scalars+norms"),
     "hybrid-h3l3w112": ("h3l3", "all-scalars+norms"),
     "hybrid-h3l3p": ("h3l3", "all-scalars+norms"),
@@ -71,6 +72,10 @@ MONOMER_CONDITIONING_WIDTH = 2 * len(MONOMER_CONDITIONING_SCALARS)
 # both change, and ``expected_resume_semantics`` compares architecture ids. A
 # shared id would let a charge-aware run resume from charge-blind weights.
 MONOMER_CONDITIONING_ARCHITECTURES = frozenset({"hybrid-h3l3q"})
+
+# Cross-atom inner products of the same projected tensors used by the axial
+# slot. This adds relative orientation information, not projection capacity.
+TENSOR_PRODUCT_ARCHITECTURES = frozenset({"hybrid-h3l3t"})
 
 # Width of the per-edge directional slot each route hands the readout. The
 # canonical value is ``n_message * n_embed`` = 24, which is what AP3's own l=1
@@ -115,6 +120,31 @@ DIRECTIONAL_DEGREES = {"h1": None, "h2": None, "h3": 2, "h3l1": 1, "h3l3": 3}
 # would still train. ``tests/test_mace_h3_pair.py`` asserts this tuple against
 # the MACE function itself so the two cannot drift.
 MACE_E3NN_AXIS_PERMUTATION = (1, 2, 0)
+
+
+def pair_tensor_invariants(
+    tensor_a: torch.Tensor, tensor_b: torch.Tensor
+) -> torch.Tensor:
+    """Contract matched edge tensors without discarding relative orientation.
+
+    Parameters
+    ----------
+    tensor_a, tensor_b
+        Tensors of shape ``[n_edge, n_channel, 2*l+1]`` in the same orthonormal
+        real irrep basis and parity. Any channel projection must be shared
+        between A and B and must not mix angular components.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[n_edge, n_channel]`` raw inner products, invariant under joint O(3)
+        transformations and symmetric under A/B exchange. Unlike separate
+        axial contractions, these retain relative azimuthal information.
+        They are descriptors, not normalized cosines or physical overlaps.
+    """
+    if tensor_a.ndim != 3 or tensor_a.shape != tensor_b.shape:
+        raise ValueError("pair tensors must have matching [edge, channel, m] shapes")
+    return (tensor_a * tensor_b).sum(dim=-1)
 
 
 def real_spherical_harmonics(degree: int, vectors: torch.Tensor) -> torch.Tensor:
@@ -279,6 +309,13 @@ class MACEPairResidualCore(torch.nn.Module):
         self.per_component_directional = (
             resolved_architecture_id in PER_COMPONENT_DIRECTIONAL_ARCHITECTURES
         )
+        self.pair_tensor_product = (
+            resolved_architecture_id in TENSOR_PRODUCT_ARCHITECTURES
+        )
+        if self.pair_tensor_product and (
+            directional_degree is None or self.per_component_directional
+        ):
+            raise ValueError("pair tensor products require a shared directional projection")
         if directional_degree is None and (
             self.directional_width != CANONICAL_DIRECTIONAL_WIDTH
             or self.per_component_directional
@@ -373,6 +410,8 @@ class MACEPairResidualCore(torch.nn.Module):
         )
         if self.monomer_conditioning:
             pair_width += MONOMER_CONDITIONING_WIDTH
+        if self.pair_tensor_product:
+            pair_width += self.directional_width
         pair_sample = self.h0_projection.weight.new_empty((0, pair_width))
         readouts = [
             self.ap3_core.readout_layer_elst,
@@ -411,6 +450,8 @@ class MACEPairResidualCore(torch.nn.Module):
             config["directional_width"] = self.directional_width
         if self.per_component_directional:
             config["per_component_directional"] = True
+        if self.pair_tensor_product:
+            config["pair_tensor_product"] = "shared-raw-inner-product-v1"
         if self.monomer_conditioning:
             # Added only when on, for the same reason as the H3 keys above: a
             # checkpoint written before the flag existed must still satisfy the
@@ -591,6 +632,45 @@ class MACEPairResidualCore(torch.nn.Module):
             torch.cat([edge_b, edge_a], dim=1),
         )
 
+    def _pair_tensor_scalars(
+        self,
+        batch: Any,
+        features_a: MACEAtomicFeatures,
+        features_b: MACEAtomicFeatures,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shared-frame two-centre invariants, identical for AB and BA."""
+        if features_a.equivariant_irreps != features_b.equivariant_irreps:
+            raise ValueError("pair tensor products require the same irrep layout")
+        natural_parity = "o" if self.directional_degree % 2 else "e"
+        if any(
+            parity != natural_parity
+            for _, degree, parity in _parse_irreps(features_a.equivariant_irreps)
+            if degree == self.directional_degree
+        ):
+            # A dot product of two equal-parity tensors is always even, but
+            # this route also uses the existing Y_l axial slots. Those require
+            # natural parity to remain scalars under reflections.
+            raise ValueError("axial tensor routes require natural parity irreps")
+        weight = self.directional_projection.weight
+        # Project at atoms before gathering onto edges. No angular-index
+        # mixing, biases, opposite-axis signs or local-frame transformations:
+        # these are tensors in one common frame, not axial descriptors.
+        projected_a = torch.einsum(
+            "acm,fc->afm",
+            features_a.equivariant_degree(self.directional_degree),
+            weight,
+        )
+        projected_b = torch.einsum(
+            "acm,fc->afm",
+            features_b.equivariant_degree(self.directional_degree),
+            weight,
+        )
+        scalars = pair_tensor_invariants(
+            projected_a.index_select(0, batch.e_ABsr_source),
+            projected_b.index_select(0, batch.e_ABsr_target),
+        )
+        return scalars, scalars
+
     def forward(
         self,
         batch: Any,
@@ -613,6 +693,16 @@ class MACEPairResidualCore(torch.nn.Module):
         injected_scalars = None
         if self.monomer_conditioning:
             injected_scalars = self._pair_monomer_scalars(batch)
+        if self.pair_tensor_product:
+            tensor_scalars = self._pair_tensor_scalars(batch, features_a, features_b)
+            injected_scalars = (
+                tensor_scalars
+                if injected_scalars is None
+                else tuple(
+                    torch.cat([conditioning, tensor], dim=-1)
+                    for conditioning, tensor in zip(injected_scalars, tensor_scalars)
+                )
+            )
         result = self.ap3_core(
             batch,
             initial_atom_states=(h0_a, h0_b),
