@@ -32,6 +32,7 @@ __all__ = [
     "PolarDirectPropertyProvider",
     "LegacyAtomMPNNPropertyProvider",
     "MACEPairResidualCore",
+    "MACEExchangeCorrection",
     "MACEAP3D3",
     "MACEAP3D3Model",
     "MACEAP3D3Result",
@@ -60,6 +61,10 @@ def __getattr__(name):
         from .pair import MACEPairResidualCore
 
         return MACEPairResidualCore
+    if name == "MACEExchangeCorrection":
+        from .exchange import MACEExchangeCorrection
+
+        return MACEExchangeCorrection
     if name in {
         "MACEAP3D3",
         "MACEAP3D3Model",
