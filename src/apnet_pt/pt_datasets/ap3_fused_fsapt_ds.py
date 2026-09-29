@@ -26,7 +26,7 @@ from .. import util
 from ..AtomModels.ap2_atom_model import AtomModel
 from ..hf_pretrained import resolve_pretrained_path
 from .. import atomic_datasets
-from ..lmdb_utils import acquire_lmdb_env, release_lmdb_env
+from ..lmdb_utils import LmdbEnvHandleMixin, acquire_lmdb_env, release_lmdb_env
 import tarfile
 from time import time
 from pathlib import Path
@@ -670,7 +670,7 @@ def fsapt_spec_type_uses_split_files(spec_type):
     return spec_type in AP3_FUSED_FSAPT_SPLIT_SPEC_TYPES
 
 
-class ap3_fused_fsapt_module_dataset_lmdb(Dataset):
+class ap3_fused_fsapt_module_dataset_lmdb(LmdbEnvHandleMixin, Dataset):
     split_spec_types = AP3_FUSED_FSAPT_SPLIT_SPEC_TYPES
 
     @classmethod

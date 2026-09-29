@@ -1,0 +1,792 @@
+import hashlib
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+import torch
+
+from apnet_pt.mace.encoder import (
+    POLAR_1S_SHA256,
+    MACEPolarFeaturizer,
+    PrivateMACEFeatures,
+    PolarMACEPrivateLayerAdapter,
+    load_verified_polar_mace,
+    verify_artifact,
+)
+
+
+def test_base_package_import_does_not_require_mace():
+    code = """
+import builtins
+real_import = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name == 'mace' or name.startswith('mace.'):
+        raise AssertionError('base import attempted to import optional MACE')
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded
+import apnet_pt
+print(apnet_pt.__version__)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+class TinyBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(2, 2)
+
+
+def test_artifact_digest_is_verified_before_loader_runs(tmp_path):
+    artifact = tmp_path / "polar.model"
+    artifact.write_bytes(b"not-a-checkpoint")
+    called = False
+
+    def loader(**kwargs):
+        nonlocal called
+        called = True
+        return TinyBackbone()
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        load_verified_polar_mace(
+            artifact,
+            expected_sha256="0" * 64,
+            loader=loader,
+        )
+    assert not called
+
+
+def test_invalid_digest_does_not_import_default_mace_loader(tmp_path, monkeypatch):
+    artifact = tmp_path / "polar.model"
+    artifact.write_bytes(b"tampered")
+    real_import = __import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "mace" or name.startswith("mace."):
+            raise AssertionError("MACE imported before digest verification")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", guarded_import)
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        load_verified_polar_mace(artifact, expected_sha256="0" * 64)
+
+
+def test_verified_loader_rejects_non_module_result(tmp_path):
+    artifact = tmp_path / "polar.model"
+    payload = b"verified-model"
+    artifact.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    with pytest.raises(TypeError, match="torch.nn.Module"):
+        load_verified_polar_mace(
+            artifact,
+            expected_sha256=digest,
+            loader=lambda **kwargs: {"not": "a module"},
+        )
+
+
+def test_verified_loader_freezes_backbone_without_global_dtype_side_effect(tmp_path):
+    artifact = tmp_path / "polar.model"
+    payload = b"verified-model"
+    artifact.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    dtype_before = torch.get_default_dtype()
+
+    model = load_verified_polar_mace(
+        artifact,
+        expected_sha256=digest,
+        loader=lambda **kwargs: TinyBackbone(),
+    )
+
+    assert verify_artifact(artifact, digest) == digest
+    assert not model.training
+    assert all(not parameter.requires_grad for parameter in model.parameters())
+    assert torch.get_default_dtype() == dtype_before
+
+
+@pytest.mark.mace_integration
+def test_real_verified_polar_checkpoint_loads_as_frozen_module():
+    from tests.mace_integration import polar_mace_artifact
+
+    artifact = polar_mace_artifact()
+    model = load_verified_polar_mace(
+        artifact,
+        expected_sha256=POLAR_1S_SHA256,
+        offline=True,
+    )
+    assert type(model).__name__ == "PolarMACE"
+    assert not model.training
+    assert all(not parameter.requires_grad for parameter in model.parameters())
+
+
+def test_offline_loader_requires_local_artifact(tmp_path):
+    with pytest.raises(FileNotFoundError, match="offline"):
+        load_verified_polar_mace(
+            tmp_path / "missing.model",
+            expected_sha256="0" * 64,
+            offline=True,
+        )
+
+
+class ProtocolBackbone(torch.nn.Module):
+    def __init__(self, node_width=4):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.node_width = node_width
+        self.atomic_numbers = torch.tensor([1, 6, 8])
+        self.atomic_multipoles_max_l = 1
+        self.calls = []
+
+    def forward(self, data, **kwargs):
+        self.calls.append({key: value.detach().clone() for key, value in data.items()})
+        positions = data["positions"]
+        numbers = data["atomic_numbers"].to(positions)
+        count = positions.shape[0]
+        target = data["total_charge"][0]
+        centered_numbers = numbers - numbers.mean()
+        charges = target / count + 0.01 * centered_numbers
+        intrinsic = 0.1 * (positions - positions.mean(0, keepdim=True))
+        density = torch.cat((charges[:, None], intrinsic[:, [1, 2, 0]]), dim=-1)
+        node_feats = torch.stack(
+            [numbers + float(index) for index in range(self.node_width)], dim=-1
+        )
+        dipole = (charges[:, None] * positions + intrinsic).sum(0, keepdim=True)
+        return {
+            "node_feats": node_feats * self.scale,
+            "density_coefficients": density,
+            "charges": charges,
+            "dipole": dipole,
+            "total_charge": charges.sum().reshape(1),
+        }
+
+
+class ProtocolPrivateAdapter:
+    version = "protocol-private-v1"
+
+    def extract(self, backbone, graph, public_outputs):
+        positions = graph["positions"]
+        scalar = public_outputs["node_feats"][:, :1]
+        vector_yzx = positions[:, [1, 2, 0]]
+        quadrupole = torch.stack(
+            (
+                positions[:, 0] * positions[:, 1],
+                positions[:, 1] * positions[:, 2],
+                positions[:, 2].square() - positions[:, 0].square(),
+                positions[:, 2] * positions[:, 0],
+                positions[:, 0].square() - positions[:, 1].square(),
+            ),
+            dim=-1,
+        )
+        hidden = torch.cat((scalar, vector_yzx, quadrupole), dim=-1)
+        return PrivateMACEFeatures(
+            final_scalars=public_outputs["node_feats"],
+            hidden=hidden,
+            hidden_irreps="1x0e+1x1o+1x2e",
+            layer_count=1,
+            adapter_version=self.version,
+        )
+
+
+def protocol_graph_builder(positions, atomic_numbers, total_charge, total_spin, dtype):
+    count = atomic_numbers.numel()
+    source, target = torch.where(~torch.eye(count, dtype=torch.bool))
+    return {
+        "positions": positions.to(dtype=dtype),
+        "atomic_numbers": atomic_numbers,
+        "batch": torch.zeros(count, dtype=torch.long, device=positions.device),
+        "edge_index": torch.stack((source, target)).to(positions.device),
+        "total_charge": total_charge.to(dtype=dtype),
+        "total_spin": total_spin.to(dtype=dtype),
+    }
+
+
+def _protocol_featurizer(**kwargs):
+    return MACEPolarFeaturizer(
+        ProtocolBackbone(),
+        checkpoint_sha256="a" * 64,
+        mace_version="0.3.16",
+        graph_builder=protocol_graph_builder,
+        private_adapter=ProtocolPrivateAdapter(),
+        **kwargs,
+    )
+
+
+def test_protocol_dimer_calls_are_isolated_frozen_and_have_runtime_schema():
+    featurizer = _protocol_featurizer(feature_mode="all-scalars+norms")
+    batch = type("Batch", (), {})()
+    batch.RA = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.8]])
+    batch.ZA = torch.tensor([8, 1])
+    batch.molecule_ind_A = torch.tensor([0, 0])
+    batch.total_charge_A = torch.tensor([0.0])
+    batch.total_spin_A = torch.tensor([1.0])
+    batch.RB = torch.tensor([[4.0, 0.0, 0.0], [4.0, 0.7, 0.0], [4.0, -0.7, 0.0]])
+    batch.ZB = torch.tensor([6, 1, 1])
+    batch.molecule_ind_B = torch.tensor([0, 0, 0])
+    batch.total_charge_B = torch.tensor([0.0])
+    batch.total_spin_B = torch.tensor([2.0])
+
+    features_a, direct_a, features_b, direct_b = featurizer.forward_dimer(batch)
+
+    assert [call["positions"].shape[0] for call in featurizer.backbone.calls] == [2, 3]
+    for call in featurizer.backbone.calls:
+        assert call["batch"].unique().tolist() == [0]
+        assert call["edge_index"].max() < call["positions"].shape[0]
+    assert features_a.feature_schema.startswith("polar-1-s:mace=0.3.16")
+    assert featurizer.metadata["feature_schema"] == features_a.feature_schema
+    assert featurizer.metadata["checkpoint_sha256"] == "a" * 64
+    assert featurizer.metadata["supported_elements"] == (1, 6, 8)
+    assert "inv=7" in features_a.feature_schema
+    assert "irreps=1x0e+1x1o+1x2e" in features_a.feature_schema
+    assert direct_a.density_coefficients.shape == (2, 4)
+    assert direct_b.density_coefficients.shape == (3, 4)
+    assert not featurizer.backbone.training
+    featurizer.train()
+    assert not featurizer.backbone.training
+    assert all(not parameter.requires_grad for parameter in featurizer.backbone.parameters())
+    assert not features_a.invariant.requires_grad
+    assert not direct_b.charges.requires_grad
+
+
+def test_private_adapter_parity_failure_is_fatal():
+    class BadAdapter(ProtocolPrivateAdapter):
+        def extract(self, backbone, graph, public_outputs):
+            result = super().extract(backbone, graph, public_outputs)
+            return PrivateMACEFeatures(
+                final_scalars=result.final_scalars + 1.0,
+                hidden=result.hidden,
+                hidden_irreps=result.hidden_irreps,
+                layer_count=result.layer_count,
+                adapter_version=result.adapter_version,
+            )
+
+    featurizer = MACEPolarFeaturizer(
+        ProtocolBackbone(),
+        checkpoint_sha256="a" * 64,
+        mace_version="0.3.16",
+        graph_builder=protocol_graph_builder,
+        private_adapter=BadAdapter(),
+        feature_mode="all-scalars+norms",
+    )
+    with pytest.raises(RuntimeError, match="public-final-scalar parity"):
+        featurizer.forward_monomer(
+            torch.zeros(1, 3),
+            torch.tensor([1]),
+            torch.tensor([0.0]),
+            torch.tensor([1.0]),
+        )
+
+
+def test_protocol_local_dtype_unsupported_elements_and_schema_discovery():
+    default_before = torch.get_default_dtype()
+    with pytest.raises(ValueError, match="multipole contract"):
+        _protocol_featurizer(multipole_contract="unknown-contract")
+    featurizer = _protocol_featurizer(
+        feature_mode="final-layer-scalars", dtype=torch.float64
+    )
+    features, direct = featurizer.forward_monomer(
+        torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+        torch.tensor([1, 8]),
+        torch.tensor([0.0]),
+        torch.tensor([1.0]),
+    )
+    assert features.invariant.dtype == torch.float64
+    assert direct.density_coefficients.dtype == torch.float64
+    assert "inv=4" in features.feature_schema
+    assert torch.get_default_dtype() == default_before
+    with pytest.raises(ValueError, match="unsupported element.*9"):
+        featurizer.forward_monomer(
+            torch.zeros(1, 3), torch.tensor([9]), torch.tensor([0.0]), torch.tensor([1.0])
+        )
+
+
+def test_protocol_cache_online_parity_and_exact_invalidation():
+    cache = {}
+    featurizer = _protocol_featurizer(
+        feature_mode="all-scalars+norms", cache=cache
+    )
+    positions = torch.tensor([[0.0, 0.0, 0.0], [0.7, 0.0, 0.0]])
+    numbers = torch.tensor([1, 8])
+    args = (positions, numbers, torch.tensor([0.0]), torch.tensor([1.0]))
+    online = featurizer.forward_monomer(*args)
+    calls = len(featurizer.backbone.calls)
+    cached = featurizer.forward_monomer(*args)
+    assert len(featurizer.backbone.calls) == calls
+    assert torch.equal(online[0].invariant, cached[0].invariant)
+    assert torch.equal(online[0].equivariant, cached[0].equivariant)
+    assert torch.equal(online[1].density_coefficients, cached[1].density_coefficients)
+
+    variants = [
+        (positions + 0.1, numbers, torch.tensor([0.0]), torch.tensor([1.0])),
+        (positions.flip(0), numbers.flip(0), torch.tensor([0.0]), torch.tensor([1.0])),
+        (positions, numbers, torch.tensor([1.0]), torch.tensor([1.0])),
+        (positions, numbers, torch.tensor([0.0]), torch.tensor([2.0])),
+    ]
+    for variant in variants:
+        featurizer.forward_monomer(*variant)
+    assert len(featurizer.backbone.calls) == calls + len(variants)
+
+    other_schema = _protocol_featurizer(
+        feature_mode="final-layer-scalars", cache=cache
+    )
+    other_schema.forward_monomer(*args)
+    assert len(other_schema.backbone.calls) == 1
+    other_dtype = _protocol_featurizer(
+        feature_mode="all-scalars+norms", cache=cache, dtype=torch.float64
+    )
+    other_dtype.forward_monomer(*args)
+    assert len(other_dtype.backbone.calls) == 1
+
+
+def test_prepared_cache_values_follow_request_dtype_and_device():
+    source = _protocol_featurizer(feature_mode="all-scalars+norms")
+    positions = torch.tensor([[0.0, 0.0, 0.0], [0.7, 0.0, 0.0]])
+    numbers = torch.tensor([1, 8])
+    cached_value = source.forward_monomer(
+        positions,
+        numbers,
+        torch.tensor([0.0]),
+        torch.tensor([1.0]),
+    )
+
+    class PreparedCache:
+        strict_read_only = True
+
+        def __contains__(self, key):
+            return True
+
+        def __getitem__(self, key):
+            return cached_value
+
+    consumer = _protocol_featurizer(
+        feature_mode="all-scalars+norms",
+        dtype=torch.float64,
+        cache=PreparedCache(),
+    )
+    features, direct = consumer.forward_monomer(
+        positions.double(),
+        numbers,
+        torch.tensor([0.0], dtype=torch.float64),
+        torch.tensor([1.0], dtype=torch.float64),
+    )
+    assert not consumer.backbone.calls
+    assert features.invariant.dtype == torch.float64
+    assert direct.density_coefficients.dtype == torch.float64
+    assert features.invariant.device == positions.device
+    assert direct.density_coefficients.device == positions.device
+
+
+def test_protocol_translation_and_rotation_behavior():
+    featurizer = _protocol_featurizer(feature_mode="final-layer-scalars")
+    positions = torch.tensor([[0.2, -0.1, 0.3], [0.9, 0.4, -0.2]])
+    numbers = torch.tensor([1, 8])
+    charge = torch.tensor([0.0])
+    spin = torch.tensor([1.0])
+    features, direct = featurizer.forward_monomer(
+        positions, numbers, charge, spin
+    )
+    shift = torch.tensor([1.5, -0.7, 0.2])
+    shifted_features, shifted = featurizer.forward_monomer(
+        positions + shift, numbers, charge, spin
+    )
+    assert torch.allclose(shifted_features.invariant, features.invariant)
+    assert torch.allclose(shifted.charges, direct.charges)
+    assert torch.allclose(
+        shifted.intrinsic_dipole_eangstrom, direct.intrinsic_dipole_eangstrom
+    )
+    assert torch.allclose(
+        shifted.molecular_dipole_eangstrom,
+        direct.molecular_dipole_eangstrom,
+        atol=1.0e-6,
+    )
+
+    rotation = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    rotated_features, rotated = featurizer.forward_monomer(
+        positions @ rotation.T, numbers, charge, spin
+    )
+    assert torch.allclose(rotated_features.invariant, features.invariant)
+    assert torch.allclose(
+        rotated.intrinsic_dipole_eangstrom,
+        direct.intrinsic_dipole_eangstrom @ rotation.T,
+        atol=1.0e-6,
+    )
+    assert torch.allclose(
+        rotated.molecular_dipole_eangstrom,
+        direct.molecular_dipole_eangstrom @ rotation.T,
+        atol=1.0e-6,
+    )
+
+
+def test_protocol_monomer_batch_order_and_atom_permutation():
+    featurizer = _protocol_featurizer(feature_mode="final-layer-scalars")
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [3.0, 0.0, 0.0], [3.0, 0.8, 0.0]]
+    )
+    numbers = torch.tensor([1, 8, 6, 1])
+    batch = torch.tensor([0, 0, 1, 1])
+    features, direct = featurizer.forward_monomer(
+        positions,
+        numbers,
+        torch.tensor([0.0, 1.0]),
+        torch.tensor([1.0, 2.0]),
+        batch=batch,
+    )
+    assert len(featurizer.backbone.calls) == 2
+    assert features.batch.tolist() == [0, 0, 1, 1]
+    assert torch.allclose(direct.total_charge, torch.tensor([0.0, 1.0]))
+
+    order = torch.tensor([1, 0, 3, 2])
+    permuted, permuted_direct = featurizer.forward_monomer(
+        positions[order],
+        numbers[order],
+        torch.tensor([0.0, 1.0]),
+        torch.tensor([1.0, 2.0]),
+        batch=batch,
+    )
+    assert torch.allclose(permuted.invariant, features.invariant[order])
+    assert torch.allclose(permuted_direct.charges, direct.charges[order])
+
+    monomer_order = torch.tensor([2, 3, 0, 1])
+    reordered, reordered_direct = featurizer.forward_monomer(
+        positions[monomer_order],
+        numbers[monomer_order],
+        torch.tensor([1.0, 0.0]),
+        torch.tensor([2.0, 1.0]),
+        batch=batch,
+    )
+    assert torch.allclose(reordered.invariant, features.invariant[monomer_order])
+    assert torch.allclose(reordered_direct.charges, direct.charges[monomer_order])
+    assert torch.allclose(reordered_direct.total_charge, torch.tensor([1.0, 0.0]))
+
+
+@pytest.mark.mace_integration
+def test_real_private_adapter_public_parity_and_direct_contract():
+    from tests.mace_integration import polar_mace_artifact
+
+    artifact = polar_mace_artifact()
+    backbone = load_verified_polar_mace(
+        artifact, expected_sha256=POLAR_1S_SHA256, offline=True
+    )
+    featurizer = MACEPolarFeaturizer(
+        backbone,
+        checkpoint_sha256=POLAR_1S_SHA256,
+        mace_version="0.3.16",
+        feature_mode="all-scalars+norms",
+        # The parity assertion below compares two independent computations of
+        # the final scalars, which only the recompute route performs; the
+        # default hook route reads them off the public forward, where the check
+        # is vacuous.  Pinning the route here is what keeps the audit running.
+        private_adapter=PolarMACEPrivateLayerAdapter("0.3.16", route="recompute"),
+        elide_energy_head=False,
+    )
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.758602, 0.0, 0.504284], [-0.758602, 0.0, 0.504284]]
+    )
+    features, direct = featurizer.forward_monomer(
+        positions,
+        torch.tensor([8, 1, 1]),
+        torch.tensor([0.0]),
+        torch.tensor([1.0]),
+    )
+    assert features.invariant.shape == (3, 2560)
+    assert features.equivariant.shape == (3, 8192)
+    assert featurizer.last_private_parity_error <= 1.0e-6
+    assert torch.allclose(direct.density_coefficients[:, 0], direct.charges, atol=1.0e-7)
+    reconstructed = (
+        direct.charges[:, None] * positions
+        + direct.density_coefficients[:, [3, 1, 2]]
+    ).sum(0, keepdim=True)
+    assert torch.allclose(reconstructed, direct.molecular_dipole_eangstrom, atol=1.0e-5)
+
+    from e3nn import o3
+
+    rotation = torch.tensor(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    rotated_features, rotated_direct = featurizer.forward_monomer(
+        positions @ rotation.T,
+        torch.tensor([8, 1, 1]),
+        torch.tensor([0.0]),
+        torch.tensor([1.0]),
+    )
+    physical_to_mace = torch.tensor(
+        [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]
+    )
+    mace_rotation = physical_to_mace @ rotation @ physical_to_mace.T
+    irreps = o3.Irreps("512x0e+512x1o+512x2e+512x3o")
+    d_matrix = irreps.D_from_matrix(mace_rotation)
+    assert torch.allclose(rotated_features.invariant, features.invariant, atol=5.0e-6)
+    assert torch.allclose(
+        rotated_features.equivariant,
+        features.equivariant @ d_matrix.T,
+        atol=5.0e-6,
+    )
+    assert torch.allclose(rotated_direct.charges, direct.charges, atol=1.0e-6)
+    assert torch.allclose(
+        rotated_direct.intrinsic_dipole_eangstrom,
+        direct.intrinsic_dipole_eangstrom @ rotation.T,
+        atol=1.0e-6,
+    )
+
+
+def test_forward_dimer_accepts_integer_total_charge_from_datasets():
+    """Dimer datasets store total_charge as int32; forward_monomer needs floats.
+
+    Without a cast the integral charge trips forward_monomer's floating-point
+    guard, which reports it as a non-finite value even though it is finite.
+    """
+    featurizer = _protocol_featurizer(feature_mode="all-scalars+norms")
+    batch = type("Batch", (), {})()
+    batch.RA = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.8]])
+    batch.ZA = torch.tensor([8, 1])
+    batch.molecule_ind_A = torch.tensor([0, 0])
+    # Matches the on-disk dtype of the AP3 fused dimer LMDB.
+    batch.total_charge_A = torch.tensor([-1], dtype=torch.int32)
+    batch.total_spin_A = torch.tensor([1.0])
+    batch.RB = torch.tensor([[4.0, 0.0, 0.0], [4.0, 0.7, 0.0], [4.0, -0.7, 0.0]])
+    batch.ZB = torch.tensor([6, 1, 1])
+    batch.molecule_ind_B = torch.tensor([0, 0, 0])
+    batch.total_charge_B = torch.tensor([0], dtype=torch.int32)
+    batch.total_spin_B = torch.tensor([2.0])
+
+    features_a, _, features_b, _ = featurizer.forward_dimer(batch)
+
+    assert features_a.total_charge.dtype.is_floating_point
+    assert features_b.total_charge.dtype.is_floating_point
+    assert features_a.total_charge.reshape(-1).tolist() == [-1.0]
+    assert features_b.total_charge.reshape(-1).tolist() == [0.0]
+
+
+@pytest.mark.mace_integration
+@pytest.mark.parametrize("feature_mode", ["final-layer-scalars", "all-scalars+norms"])
+def test_batched_monomer_featurization_matches_serial(feature_mode):
+    """One collated backbone call must reproduce per-monomer calls exactly.
+
+    Monomers are separate graphs, so the short-range neighbour lists carry no
+    cross-monomer edges and the long-range k-space sum is indexed per graph.
+    Overlapping the monomers in space makes any accidental coupling visible.
+    """
+
+    from tests.mace_integration import polar_mace_artifact
+
+    backbone = load_verified_polar_mace(
+        polar_mace_artifact(), expected_sha256=POLAR_1S_SHA256, offline=True
+    )
+    featurizer = MACEPolarFeaturizer(
+        backbone, checkpoint_sha256=POLAR_1S_SHA256, feature_mode=feature_mode
+    )
+    assert featurizer.cache is None and featurizer.graph_builder is None
+
+    water = ([8, 1, 1], [[0.0, 0.0, 0.0], [0.0, 0.757, 0.587], [0.0, -0.757, 0.587]])
+    ammonia = (
+        [7, 1, 1, 1],
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, -0.939, -0.383],
+            [0.813, 0.470, -0.383],
+            [-0.813, 0.470, -0.383],
+        ],
+    )
+    positions = torch.tensor(water[1] + ammonia[1], dtype=torch.float32)
+    numbers = torch.tensor(water[0] + ammonia[0], dtype=torch.long)
+    batch = torch.tensor([0] * len(water[0]) + [1] * len(ammonia[0]), dtype=torch.long)
+    charge = torch.zeros(2, dtype=torch.float32)
+    spin = torch.ones(2, dtype=torch.float32)
+
+    features, direct = featurizer.forward_monomer(
+        positions, numbers, charge, spin, batch=batch
+    )
+    for monomer in range(2):
+        indices = torch.where(batch == monomer)[0]
+        expected_features, expected_direct = featurizer._run_single(
+            positions[indices],
+            numbers[indices],
+            charge[monomer : monomer + 1],
+            spin[monomer : monomer + 1],
+        )
+        for name in ("invariant", "equivariant"):
+            torch.testing.assert_close(
+                getattr(features, name)[indices],
+                getattr(expected_features, name),
+                atol=1.0e-5,
+                rtol=1.0e-5,
+            )
+        for name in ("density_coefficients", "charges", "positions_angstrom"):
+            torch.testing.assert_close(
+                getattr(direct, name)[indices],
+                getattr(expected_direct, name),
+                atol=1.0e-5,
+                rtol=1.0e-5,
+            )
+        torch.testing.assert_close(
+            direct.molecular_dipole_eangstrom[monomer : monomer + 1],
+            expected_direct.molecular_dipole_eangstrom,
+            atol=1.0e-5,
+            rtol=1.0e-5,
+        )
+    assert torch.equal(features.batch, batch)
+    assert torch.equal(features.atomic_numbers, numbers)
+
+
+def test_parity_atol_default_clears_measured_cuda_kernel_noise():
+    """The guard must catch a mis-extraction, not float32 reduction order.
+
+    Job 12781573 (V100, torch 2.10.0+cu128) measured the private-vs-public
+    final-scalar gap as exactly 0.0 on CPU at every batch size, and on CUDA as
+    5.96e-07 serial against 1.371e-06 batched over the same 1196 atoms -- the
+    two paths select different reduction kernels once the batch is large enough.
+    The previous 1.0e-6 default sat inside that band, so it discriminated batch
+    size rather than correctness.
+    """
+
+    import inspect
+
+    from apnet_pt.mace.encoder import MACEPolarFeaturizer
+
+    default = inspect.signature(MACEPolarFeaturizer).parameters["parity_atol"].default
+    measured_cuda_batched_max = 1.371e-06
+    plausible_mis_extraction = 1.0e-2
+    assert default > measured_cuda_batched_max
+    assert default < plausible_mis_extraction
+
+
+class _StubBlock(torch.nn.Module):
+    irreps_out = "4x0e"
+
+
+def test_hook_adapter_refuses_a_forward_that_missed_a_block():
+    """The guard that replaces the parity audit on the hook route.
+
+    Under hooks the public scalars are a bit-equal copy of the captured product
+    output, so a numerical check cannot fail.  The failure that remains possible
+    is structural: an upstream MACE change that stops routing through
+    ``interactions``/``products``, or routes through one of them twice.  Both
+    must be loud, because either one silently changes what the features are.
+    """
+    adapter = PolarMACEPrivateLayerAdapter("0.3.16", route="hook")
+    backbone = torch.nn.Module()
+    backbone.interactions = torch.nn.ModuleList([_StubBlock()])
+    backbone.products = torch.nn.ModuleList([_StubBlock()])
+
+    with pytest.raises(RuntimeError, match="captured no interaction 0"):
+        adapter._extract_hook(backbone)
+
+    tensor = torch.zeros((2, 4))
+    adapter._captured[("interaction", 0)] = [tensor]
+    with pytest.raises(RuntimeError, match="captured no product 0"):
+        adapter._extract_hook(backbone)
+
+    adapter._captured[("product", 0)] = [tensor, tensor]
+    with pytest.raises(RuntimeError, match="captured product 0 2 times"):
+        adapter._extract_hook(backbone)
+
+
+def test_adapter_rejects_an_unknown_route():
+    with pytest.raises(ValueError, match="unsupported private adapter route"):
+        PolarMACEPrivateLayerAdapter("0.3.16", route="hooks")
+
+
+@pytest.mark.mace_integration
+def test_cost_levers_are_bit_equal_to_the_recompute_path():
+    """Both cost levers must change wall clock and nothing else.
+
+    ``hook`` skips a second run of the whole local tower and ``elide_energy_head``
+    skips ``local_electron_energy``, which MACE computes unconditionally and this
+    featurizer never reads.  Together they are 1.49x on a CPU monomer and the
+    duplicate tower alone is 16.0% of a V100 H3L3 train step (job 13398476).
+    None of that is worth anything if a feature moves, and the schema must not
+    move either or every cached feature is invalidated for no reason.
+    """
+    from tests.mace_integration import polar_mace_artifact
+
+    artifact = polar_mace_artifact()
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.758602, 0.0, 0.504284], [-0.758602, 0.0, 0.504284]]
+    )
+    numbers = torch.tensor([8, 1, 1])
+
+    def run(route, elide):
+        backbone = load_verified_polar_mace(
+            artifact, expected_sha256=POLAR_1S_SHA256, offline=True
+        )
+        featurizer = MACEPolarFeaturizer(
+            backbone,
+            checkpoint_sha256=POLAR_1S_SHA256,
+            mace_version="0.3.16",
+            feature_mode="all-scalars+norms",
+            private_adapter=PolarMACEPrivateLayerAdapter("0.3.16", route=route),
+            elide_energy_head=elide,
+        )
+        features, direct = featurizer.forward_monomer(
+            positions, numbers, torch.tensor([0.0]), torch.tensor([1.0])
+        )
+        return featurizer, features, direct
+
+    reference, ref_features, ref_direct = run("recompute", False)
+    for route, elide in (("hook", False), ("recompute", True), ("hook", True)):
+        featurizer, features, direct = run(route, elide)
+        for name in ("invariant", "equivariant"):
+            assert torch.equal(
+                getattr(features, name), getattr(ref_features, name)
+            ), f"{name} moved under route={route} elide={elide}"
+        for name in ("density_coefficients", "charges", "molecular_dipole_eangstrom"):
+            assert torch.equal(
+                getattr(direct, name), getattr(ref_direct, name)
+            ), f"{name} moved under route={route} elide={elide}"
+        assert (
+            featurizer.resolved_feature_schema == reference.resolved_feature_schema
+        )
+
+
+@pytest.mark.mace_integration
+def test_elided_energy_head_is_restored_even_when_the_forward_raises():
+    """A shared backbone must never keep the zero head.
+
+    ``add_local_electron_energy`` is ``True`` on MACE-POLAR-1-S, so a leaked
+    stand-in would leave ``energy`` and ``electron_energy`` silently wrong for
+    every other consumer of the same module -- no exception, no warning.
+    """
+    from tests.mace_integration import polar_mace_artifact
+
+    backbone = load_verified_polar_mace(
+        polar_mace_artifact(), expected_sha256=POLAR_1S_SHA256, offline=True
+    )
+    featurizer = MACEPolarFeaturizer(
+        backbone,
+        checkpoint_sha256=POLAR_1S_SHA256,
+        mace_version="0.3.16",
+        feature_mode="all-scalars+norms",
+    )
+    original = backbone.local_electron_energy
+    with pytest.raises(ZeroDivisionError):
+        with featurizer._elided_energy_head():
+            assert backbone.local_electron_energy is not original
+            raise ZeroDivisionError
+    assert backbone.local_electron_energy is original
+
+
+def test_switching_off_the_hook_route_removes_the_hooks():
+    """Flipping ``route`` must not leave captures accumulating unread.
+
+    The A/B that prices the lever runs both routes against one backbone, so a
+    stale hook would charge the recompute arm for work the shipped code does
+    not do -- and would inflate it without bound as the run went on.
+    """
+    adapter = PolarMACEPrivateLayerAdapter("0.3.16", route="hook")
+    backbone = torch.nn.Module()
+    backbone.interactions = torch.nn.ModuleList([_StubBlock()])
+    backbone.products = torch.nn.ModuleList([_StubBlock()])
+
+    adapter.arm(backbone)
+    assert len(adapter._handles) == 2
+    assert backbone.interactions[0]._forward_hooks
+
+    adapter.route = "recompute"
+    adapter.arm(backbone)
+    assert adapter._handles == []
+    assert not backbone.interactions[0]._forward_hooks
+    assert not backbone.products[0]._forward_hooks

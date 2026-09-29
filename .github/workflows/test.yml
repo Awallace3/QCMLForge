@@ -5,6 +5,8 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  merge_group:
+    branches: [ main ]
 
 jobs:
   test:
@@ -74,9 +76,53 @@ jobs:
                 time.sleep(sleep_s)
         PY
     
-    - name: Run tests
+    - name: Run broad ordinary tests (PolarMACE artifact-free)
       shell: bash -l {0}
       env:
         QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED: "1"
       run: |
-        python -m pytest tests/
+        python -m pytest -m "not mace_integration" --junitxml=junit-ordinary.xml tests/
+
+    - name: Produce CI-0 local validation evidence
+      if: always()
+      shell: bash -l {0}
+      run: |
+        python scripts/validate_mace_local.py --tier CI-0 --output-dir artifacts/mace-local/ci0
+
+    - name: Produce CI-1 merge-queue validation evidence
+      if: always() && github.event_name == 'merge_group'
+      shell: bash -l {0}
+      run: |
+        python scripts/validate_mace_local.py --tier CI-1 --output-dir artifacts/mace-local/ci1
+
+    - name: Upload ordinary JUnit and local evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ordinary-local-validation
+        path: |
+          junit-ordinary.xml
+          artifacts/mace-local/
+
+  built-wheel:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Build wheel
+      run: |
+        python -m pip install build
+        python -m build --wheel --outdir dist
+    - name: Inspect wheel denylist and required package files
+      run: |
+        python scripts/ci/probe_built_wheel.py --wheel "$(find dist -name '*.whl' -print -quit)"
+    - name: Probe installed wheel outside checkout
+      run: |
+        python -m venv /tmp/qcml-wheel
+        /tmp/qcml-wheel/bin/pip install "$(find dist -name '*.whl' -print -quit)"
+        cd /tmp
+        /tmp/qcml-wheel/bin/python "$GITHUB_WORKSPACE/scripts/ci/probe_built_wheel.py" \
+          --wheel "$(find "$GITHUB_WORKSPACE/dist" -name '*.whl' -print -quit)" \
+          --checkout "$GITHUB_WORKSPACE" --installed

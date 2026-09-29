@@ -8,11 +8,12 @@ from torch_geometric.data import Data
 from torch_geometric.data import Dataset
 from collections import OrderedDict
 import os.path as osp
+import warnings
 import torch
 from torch_geometric.data import download_url
 
 from .. import util
-from ..lmdb_utils import acquire_lmdb_env, release_lmdb_env
+from ..lmdb_utils import LmdbEnvHandleMixin, acquire_lmdb_env, release_lmdb_env
 from ..AtomModels.ap2_atom_model import AtomModel
 from ..hf_pretrained import resolve_pretrained_path
 from .. import atomic_datasets
@@ -27,6 +28,15 @@ import h5py
 
 
 AP3_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9, 10})
+
+
+def _progress_percent_milestones(previous_cursor, current_cursor, total_rows):
+    """Return newly crossed integer percentages for committed raw rows."""
+    if total_rows <= 0:
+        return ()
+    previous_percent = min(100, max(0, previous_cursor) * 100 // total_rows)
+    current_percent = min(100, max(0, current_cursor) * 100 // total_rows)
+    return range(previous_percent + 1, current_percent + 1)
 
 
 def spec_type_uses_split_files(spec_type):
@@ -49,6 +59,8 @@ def qcel_dimer_to_fused_data(dimer, r_cut=5.0, r_cut_im=8.0, **kwargs):
         RB=dimer.get_fragment(1).geometry * constants.au2ang,
         ZB=dimer.get_fragment(1).atomic_numbers,
         TQB=dimer.get_fragment(1).molecular_charge,
+        total_spin_A=dimer.get_fragment(0).molecular_multiplicity,
+        total_spin_B=dimer.get_fragment(1).molecular_multiplicity,
         r_cut=r_cut,
         r_cut_im=r_cut_im,
         **kwargs,
@@ -90,6 +102,8 @@ def dimer_fused_data(
     r_cut=5.0,
     r_cut_im=8.0,
     check_validity=True,
+    total_spin_A=1,
+    total_spin_B=1,
     **kwargs,
 ):
     atomic_props_A = atomic_datasets.create_atomic_data(ZA, RA, TQA, r_cut=r_cut)
@@ -135,11 +149,65 @@ def dimer_fused_data(
         e_BB_source=e_BB_source,
         e_BB_target=e_BB_target,
         molecule_ind_B=atomic_props_B.molecule_ind,
-        # monomer charges
+        # monomer charge and MACE's input ``total_spin`` (multiplicity)
         total_charge_A=atomic_props_A.total_charge,
         total_charge_B=atomic_props_B.total_charge,
+        total_spin_A=torch.tensor(float(total_spin_A), dtype=torch.float32),
+        total_spin_B=torch.tensor(float(total_spin_B), dtype=torch.float32),
         **kwargs,  # allows for additional properties to be passed in
     )
+
+
+#: Fields already reported as missing, so a legacy store warns once rather
+#: than once per batch.
+_MISSING_METADATA_WARNED: set[str] = set()
+
+
+def _stack_monomer_metadata(batch, name, *, default, dtype):
+    """Stack one scalar per monomer without changing source data objects.
+
+    ``default`` covers stores written before the field joined
+    ``essential_attrs``. It is still applied -- refusing to collate would make
+    every such store unreadable -- but it is announced, because charge and
+    multiplicity are MACE inputs and a substituted value changes the physics
+    the featurizer is asked for without changing anything that would fail.
+    """
+
+    values = []
+    substituted = 0
+    for data in batch:
+        value = getattr(data, name, None)
+        if value is None:
+            value = default
+            substituted += 1
+        if torch.is_tensor(value):
+            value = value.detach().reshape(-1)[0].item()
+        values.append(value)
+    if substituted and name not in _MISSING_METADATA_WARNED:
+        _MISSING_METADATA_WARNED.add(name)
+        warnings.warn(
+            f"{substituted}/{len(batch)} records carry no {name}; substituting "
+            f"{default}. The MACE featurizer conditions on charge and spin, so "
+            "this is a physics substitution, not a formatting one -- rebuild "
+            "the store if the monomers are not all closed shell.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return torch.tensor(values, dtype=dtype)
+
+
+def _attach_total_spin_metadata(batched_data, batch):
+    spin_a = _stack_monomer_metadata(
+        batch, "total_spin_A", default=1.0, dtype=torch.float32
+    )
+    spin_b = _stack_monomer_metadata(
+        batch, "total_spin_B", default=1.0, dtype=torch.float32
+    )
+    batched_data.total_spin_A = spin_a
+    batched_data.total_spin_B = spin_b
+    batched_data.batch_atomic_A.total_spin = spin_a
+    batched_data.batch_atomic_B.total_spin = spin_b
+    return batched_data
 
 
 def natural_key(text):
@@ -303,6 +371,12 @@ def ap3_fused_collate_update(batch):
     total_charge_B_tensor = torch.tensor(
         [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
     )
+    total_spin_A_tensor = _stack_monomer_metadata(
+        batch, "total_spin_A", default=1.0, dtype=torch.float32
+    )
+    total_spin_B_tensor = _stack_monomer_metadata(
+        batch, "total_spin_B", default=1.0, dtype=torch.float32
+    )
 
     batch_atomic_A = Data(
         x=ZA_cat,
@@ -310,6 +384,7 @@ def ap3_fused_collate_update(batch):
         R=RA_cat,
         molecule_ind=molecule_ind_A,
         total_charge=total_charge_A_tensor,
+        total_spin=total_spin_A_tensor,
         natom_per_mol=natom_per_mol_A,
     )
 
@@ -319,6 +394,7 @@ def ap3_fused_collate_update(batch):
         R=RB_cat,
         molecule_ind=molecule_ind_B,
         total_charge=total_charge_B_tensor,
+        total_spin=total_spin_B_tensor,
         natom_per_mol=natom_per_mol_B,
     )
 
@@ -365,6 +441,8 @@ def ap3_fused_collate_update(batch):
         dimer_ind_full=dimer_ind_full_cat,
         total_charge_A=total_charge_A_tensor,
         total_charge_B=total_charge_B_tensor,
+        total_spin_A=total_spin_A_tensor,
+        total_spin_B=total_spin_B_tensor,
         batch_atomic_A=batch_atomic_A,
         batch_atomic_B=batch_atomic_B,
         indA=indA_cat,
@@ -538,7 +616,7 @@ def ap3_fused_collate_update_no_target(batch):
         batch_atomic_A=batch_atomic_A,
         batch_atomic_B=batch_atomic_B,
     )
-    return batched_data
+    return _attach_total_spin_metadata(batched_data, batch)
 
 
 def ap3_fused_collate_update_no_target_monomer_indices(batch):
@@ -704,7 +782,7 @@ def ap3_fused_collate_update_no_target_monomer_indices(batch):
         batch_atomic_A=batch_atomic_A,
         batch_atomic_B=batch_atomic_B,
     )
-    return batched_data
+    return _attach_total_spin_metadata(batched_data, batch)
 
 
 class APNet2_fused_DataLoader(torch.utils.data.DataLoader):
@@ -786,6 +864,8 @@ def save_hdf5_data_objects(data_objects, filepath):
                 "molecule_ind_B",
                 "total_charge_A",
                 "total_charge_B",
+                "total_spin_A",
+                "total_spin_B",
                 "qA",
                 "muA",
                 "quadA",
@@ -1243,7 +1323,9 @@ class ap3_fused_module_dataset(Dataset):
         idx = 0
         data_objects = []
         # Handle direct qcel_mols input
-        RAs, RBs, ZAs, ZBs, TQAs, TQBs, targets = [], [], [], [], [], [], []
+        RAs, RBs, ZAs, ZBs, TQAs, TQBs, TMAs, TMBs, targets = (
+            [], [], [], [], [], [], [], [], []
+        )
         if self.qcel_molecules is not None and self.energy_labels is not None:
             print("Processing directly from provided QCElemental molecules...")
             split_name = self.split_name
@@ -1259,7 +1341,7 @@ class ap3_fused_module_dataset(Dataset):
                 ZA = torch.tensor(monA.atomic_numbers, dtype=torch.int64)
                 ZB = torch.tensor(monB.atomic_numbers, dtype=torch.int64)
 
-                # Calculate total charges
+                # Calculate total charges and preserve spin multiplicities.
                 TQA = torch.tensor(monA.molecular_charge, dtype=torch.float32)
                 TQB = torch.tensor(monB.molecular_charge, dtype=torch.float32)
 
@@ -1269,6 +1351,8 @@ class ap3_fused_module_dataset(Dataset):
                 ZBs.append(ZB)
                 TQAs.append(TQA)
                 TQBs.append(TQB)
+                TMAs.append(int(monA.molecular_multiplicity))
+                TMBs.append(int(monB.molecular_multiplicity))
             targets = self.energy_labels
 
             if self.MAX_SIZE is not None and len(RAs) > self.MAX_SIZE:
@@ -1278,6 +1362,8 @@ class ap3_fused_module_dataset(Dataset):
                 ZBs = ZBs[: self.MAX_SIZE]
                 TQAs = TQAs[: self.MAX_SIZE]
                 TQBs = TQBs[: self.MAX_SIZE]
+                TMAs = TMAs[: self.MAX_SIZE]
+                TMBs = TMBs[: self.MAX_SIZE]
                 targets = targets[: self.MAX_SIZE]
 
             print(
@@ -1294,13 +1380,16 @@ class ap3_fused_module_dataset(Dataset):
                         continue
                 print(f"raw_path: {raw_path}")
                 print("Loading dimers...")
-                RA, RB, ZA, ZB, TQA, TQB, target = util.load_dimer_dataset(
-                    raw_path,
-                    self.MAX_SIZE,
-                    return_qcel_mols=False,
-                    return_qcel_mons=False,
-                    columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
-                    random_seed_shuffle=self.random_seed,
+                RA, RB, ZA, ZB, TQA, TQB, target, TMA, TMB = (
+                    util.load_dimer_dataset(
+                        raw_path,
+                        self.MAX_SIZE,
+                        return_qcel_mols=False,
+                        return_qcel_mons=False,
+                        return_multiplicities=True,
+                        columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
+                        random_seed_shuffle=self.random_seed,
+                    )
                 )
                 RAs.extend(RA)
                 RBs.extend(RB)
@@ -1308,6 +1397,12 @@ class ap3_fused_module_dataset(Dataset):
                 ZBs.extend(ZB)
                 TQAs.extend(TQA)
                 TQBs.extend(TQB)
+                # Multiplicity comes from the frame -- from its qcel Molecule
+                # column when it has one, from TMA/TMB when it has those, and
+                # only otherwise from the closed-shell assumption, which
+                # ``load_dimer_dataset`` names on stdout rather than hiding.
+                TMAs.extend(TMA)
+                TMBs.extend(TMB)
                 targets.extend(target)
         print("Creating data objects...")
         t1 = time()
@@ -1338,6 +1433,8 @@ class ap3_fused_module_dataset(Dataset):
                 r_cut=self.r_cut,
                 r_cut_im=self.r_cut_im,
                 check_validity=self.check_monomer_validity,
+                total_spin_A=TMAs[i],
+                total_spin_B=TMBs[i],
                 y=y,
             )
             if data is None:
@@ -1545,7 +1642,7 @@ class ap3_fused_module_dataset(Dataset):
         return self.data[idx]
 
 
-class ap3_fused_module_dataset_lmdb(Dataset):
+class ap3_fused_module_dataset_lmdb(LmdbEnvHandleMixin, Dataset):
     split_spec_types = AP3_FUSED_SPLIT_SPEC_TYPES
 
     @classmethod
@@ -2028,7 +2125,9 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         )
         data_objects = []
 
-        RAs, RBs, ZAs, ZBs, TQAs, TQBs, targets = [], [], [], [], [], [], []
+        RAs, RBs, ZAs, ZBs, TQAs, TQBs, TMAs, TMBs, targets = (
+            [], [], [], [], [], [], [], [], []
+        )
 
         if self.qcel_molecules is not None and self.energy_labels is not None:
             print("Processing directly from provided QCElemental molecules...")
@@ -2050,6 +2149,8 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 ZBs.append(ZB)
                 TQAs.append(TQA)
                 TQBs.append(TQB)
+                TMAs.append(int(monA.molecular_multiplicity))
+                TMBs.append(int(monB.molecular_multiplicity))
             targets = self.energy_labels
 
             if self.MAX_SIZE is not None and len(RAs) > self.MAX_SIZE:
@@ -2059,6 +2160,8 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 ZBs = ZBs[: self.MAX_SIZE]
                 TQAs = TQAs[: self.MAX_SIZE]
                 TQBs = TQBs[: self.MAX_SIZE]
+                TMAs = TMAs[: self.MAX_SIZE]
+                TMBs = TMBs[: self.MAX_SIZE]
                 targets = targets[: self.MAX_SIZE]
 
             print(
@@ -2075,13 +2178,16 @@ class ap3_fused_module_dataset_lmdb(Dataset):
 
                 print(f"raw_path: {raw_path}")
                 print("Loading dimers...")
-                RA, RB, ZA, ZB, TQA, TQB, target = util.load_dimer_dataset(
-                    raw_path,
-                    self.MAX_SIZE,
-                    return_qcel_mols=False,
-                    return_qcel_mons=False,
-                    columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
-                    random_seed_shuffle=self.random_seed,
+                RA, RB, ZA, ZB, TQA, TQB, target, TMA, TMB = (
+                    util.load_dimer_dataset(
+                        raw_path,
+                        self.MAX_SIZE,
+                        return_qcel_mols=False,
+                        return_qcel_mons=False,
+                        return_multiplicities=True,
+                        columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"],
+                        random_seed_shuffle=self.random_seed,
+                    )
                 )
                 RAs.extend(RA)
                 RBs.extend(RB)
@@ -2089,6 +2195,8 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 ZBs.extend(ZB)
                 TQAs.extend(TQA)
                 TQBs.extend(TQB)
+                TMAs.extend(TMA)
+                TMBs.extend(TMB)
                 targets.extend(target)
 
         print("Creating data objects...")
@@ -2096,9 +2204,34 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         t2 = time()
         print(f"{len(RAs)=}, {self.atomic_batch_size=}, {self.batch_size=}")
 
+        total_raw_rows = len(RAs)
+        progress_raw_cursor = resume_raw_cursor
+        if total_raw_rows > 0:
+            print(
+                "AP3 fused dataset progress "
+                f"[{self.split}]: resume at "
+                f"{resume_raw_cursor}/{total_raw_rows} "
+                f"({resume_raw_cursor * 100 / total_raw_rows:.2f}%) committed",
+                flush=True,
+            )
+
+        def report_committed_progress(committed_raw_cursor):
+            nonlocal progress_raw_cursor
+            for percent in _progress_percent_milestones(
+                progress_raw_cursor, committed_raw_cursor, total_raw_rows
+            ):
+                print(
+                    "AP3 fused dataset progress "
+                    f"[{self.split}]: {percent}% "
+                    f"({committed_raw_cursor}/{total_raw_rows} raw rows committed; "
+                    f"{self._length} objects stored)",
+                    flush=True,
+                )
+            progress_raw_cursor = committed_raw_cursor
+
         batch_data_objects = []
         processed_raw_cursor = resume_raw_cursor
-        for i in range(len(RAs)):
+        for i in range(total_raw_rows):
             if self.skip_processed and i < resume_raw_cursor:
                 continue
             processed_raw_cursor = i + 1
@@ -2115,6 +2248,8 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 r_cut=self.r_cut,
                 r_cut_im=self.r_cut_im,
                 check_validity=self.check_monomer_validity,
+                total_spin_A=TMAs[i],
+                total_spin_B=TMBs[i],
                 y=y,
             )
 
@@ -2141,6 +2276,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
 
             if len(data_objects) >= self.datapoint_storage_n_objects:
                 self._store_to_lmdb(data_objects, stored_idx, i + 1)
+                report_committed_progress(i + 1)
 
                 if self.print_level >= 2:
                     print(
@@ -2163,6 +2299,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
 
         if len(data_objects) > 0:
             self._store_to_lmdb(data_objects, stored_idx, processed_raw_cursor)
+            report_committed_progress(processed_raw_cursor)
 
             if self.print_level >= 2:
                 print(
@@ -2170,6 +2307,7 @@ class ap3_fused_module_dataset_lmdb(Dataset):
                 )
         elif processed_raw_cursor > resume_raw_cursor:
             self._store_to_lmdb([], stored_idx, processed_raw_cursor)
+            report_committed_progress(processed_raw_cursor)
 
         print(f"Processing complete. Total time: {time() - t1:.2f}s")
 

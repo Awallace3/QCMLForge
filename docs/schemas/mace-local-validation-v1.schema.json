@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcmlforge.local/schemas/mace-local-validation-v1.schema.json",
+  "title": "QCMLForge local MACE validation evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "requested_tier", "scope", "started_at", "ended_at", "source_commit", "dirty_tree", "platform", "python", "overall_status", "checks", "claim_boundary"],
+  "properties": {
+    "schema_version": {"const": "qcmlforge-mace-local-validation-v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "requested_tier": {"enum": ["CI-0", "CI-1", "CI-2"]},
+    "scope": {"const": "local-cpu-wiring-only"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "source_commit": {"type": "string", "minLength": 1},
+    "dirty_tree": {"type": "boolean"},
+    "platform": {"type": "string"},
+    "python": {"type": "string"},
+    "overall_status": {"enum": ["PASS", "FAIL", "SKIP", "BLOCKED"]},
+    "claim_boundary": {"$ref": "#/$defs/claims"},
+    "checks": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/check"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"overall_status": {"const": "PASS"}}, "required": ["overall_status"]},
+      "then": {
+        "properties": {
+          "dirty_tree": {"const": false},
+          "source_commit": {"not": {"const": "unknown"}},
+          "checks": {
+            "items": {
+              "if": {"properties": {"required": {"const": true}}, "required": ["required"]},
+              "then": {"properties": {"status": {"const": "PASS"}}}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"requested_tier": {"const": "CI-0"}}, "required": ["requested_tier"]},
+      "then": {"properties": {"checks": {"items": {"properties": {"ci_tier": {"const": "CI-0"}}}}}}
+    },
+    {
+      "if": {"properties": {"requested_tier": {"const": "CI-1"}}, "required": ["requested_tier"]},
+      "then": {"properties": {"checks": {"items": {"properties": {"ci_tier": {"const": "CI-1"}}}}}}
+    },
+    {
+      "if": {"properties": {"requested_tier": {"const": "CI-2"}, "overall_status": {"const": "PASS"}}, "required": ["requested_tier", "overall_status"]},
+      "then": {
+        "properties": {
+          "checks": {
+            "contains": {
+              "properties": {
+                "id": {"const": "ci2-artifact-dependency-preflight"},
+                "status": {"const": "PASS"},
+                "observations": {
+                  "type": "object",
+                  "required": ["administrator_policy_attested"],
+                  "properties": {"administrator_policy_attested": {"const": true}}
+                }
+              },
+              "required": ["id", "status", "observations"]
+            },
+            "minContains": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"requested_tier": {"const": "CI-2"}}, "required": ["requested_tier"]},
+      "then": {"properties": {"checks": {"items": {"properties": {"ci_tier": {"const": "CI-2"}}}}}}
+    }
+  ],
+  "$defs": {
+    "claims": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scientific_accuracy", "cuda_parity", "scheduler_execution", "cluster_readiness", "production_readiness"],
+      "properties": {
+        "scientific_accuracy": {"const": false}, "cuda_parity": {"const": false},
+        "scheduler_execution": {"const": false}, "cluster_readiness": {"const": false},
+        "production_readiness": {"const": false}
+      }
+    },
+    "evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "check": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "spec_refs", "ci_tier", "required", "status", "summary", "reason", "command", "started_at", "ended_at", "duration_seconds", "exit_code", "evidence", "observations", "claim_boundary"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1}, "spec_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "ci_tier": {"enum": ["CI-0", "CI-1", "CI-2"]}, "required": {"type": "boolean"},
+        "status": {"enum": ["PASS", "FAIL", "SKIP", "BLOCKED"]},
+        "summary": {"type": "string", "minLength": 1}, "reason": {"type": "string", "minLength": 1},
+        "command": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "started_at": {"type": "string", "format": "date-time"}, "ended_at": {"type": "string", "format": "date-time"},
+        "duration_seconds": {"type": "number", "minimum": 0}, "exit_code": {"type": ["integer", "null"]},
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}},
+        "observations": {"type": "object"},
+        "claim_boundary": {"$ref": "#/$defs/claims"}
+      },
+      "allOf": [{
+        "if": {"properties": {"status": {"const": "PASS"}}, "required": ["status"]},
+        "then": {
+          "properties": {"exit_code": {"const": 0}},
+          "anyOf": [
+            {"properties": {"evidence": {"minItems": 1}}},
+            {"properties": {"observations": {"minProperties": 1}}}
+          ]
+        }
+      }]
+    }
+  }
+}

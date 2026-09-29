@@ -1,0 +1,1198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Figure-first architecture study for coupling frozen MACE-POLAR-1-S representations to AP3D3 SAPT0 component prediction.">
+  <title>MACE × AP3D3 — Architecture Atlas</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Familjen+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #070b0d;
+      --bg-2: #0b1114;
+      --panel: #0d1519;
+      --panel-2: #101b20;
+      --line: #24343c;
+      --line-hi: #38505a;
+      --text: #eef5f2;
+      --muted: #8fa4a6;
+      --cyan: #49d6e5;
+      --cyan-dim: #153e47;
+      --lime: #b8ef62;
+      --lime-dim: #2b411e;
+      --amber: #ffad4a;
+      --amber-dim: #493119;
+      --pink: #ff7597;
+      --pink-dim: #4a2030;
+      --violet: #a99aff;
+      --violet-dim: #302a55;
+      --mono: "DM Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "Familjen Grotesk", "Avenir Next", sans-serif;
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 18% -10%, rgba(73, 214, 229, 0.12), transparent 28rem),
+        radial-gradient(circle at 92% 22%, rgba(169, 154, 255, 0.08), transparent 31rem),
+        linear-gradient(rgba(73, 214, 229, 0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(73, 214, 229, 0.025) 1px, transparent 1px),
+        var(--bg);
+      background-size: auto, auto, 42px 42px, 42px 42px, auto;
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+
+    ::selection { background: var(--cyan); color: var(--bg); }
+    a { color: var(--cyan); text-underline-offset: 0.2em; }
+    code { font: 400 0.88em var(--mono); color: var(--cyan); }
+
+    .progress {
+      position: fixed;
+      z-index: 50;
+      inset: 0 auto auto 0;
+      width: 0;
+      height: 3px;
+      background: linear-gradient(90deg, var(--cyan), var(--lime));
+      box-shadow: 0 0 18px var(--cyan);
+    }
+
+    .rail {
+      position: fixed;
+      z-index: 20;
+      inset: 0 auto 0 0;
+      width: 74px;
+      border-right: 1px solid var(--line);
+      background: rgba(7, 11, 13, 0.88);
+      backdrop-filter: blur(14px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 1.35rem 0;
+    }
+
+    .brandmark {
+      width: 38px;
+      height: 38px;
+      border: 1px solid var(--cyan);
+      display: grid;
+      place-items: center;
+      color: var(--cyan);
+      font: 500 0.67rem var(--mono);
+      box-shadow: inset 0 0 16px rgba(73, 214, 229, 0.12);
+    }
+
+    nav {
+      margin: auto 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+    nav a {
+      width: 36px;
+      height: 36px;
+      border: 1px solid transparent;
+      color: var(--muted);
+      display: grid;
+      place-items: center;
+      text-decoration: none;
+      font: 400 0.65rem var(--mono);
+      transition: 160ms ease;
+    }
+    nav a:hover, nav a.active {
+      color: var(--cyan);
+      border-color: var(--cyan-dim);
+      background: rgba(73, 214, 229, 0.06);
+    }
+
+    .rail-label {
+      writing-mode: vertical-rl;
+      transform: rotate(180deg);
+      color: #5e7376;
+      font: 400 0.55rem var(--mono);
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    main { margin-left: 74px; }
+    .wrap { width: min(1600px, calc(100% - 3rem)); margin: 0 auto; }
+    section { scroll-margin-top: 1rem; padding: 5rem 0; }
+
+    .hero {
+      min-height: 92vh;
+      display: grid;
+      align-content: center;
+      padding-top: 4rem;
+    }
+
+    .kicker, .fig-label, .chip, .legend span, .mini-label {
+      font-family: var(--mono);
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+    .kicker { color: var(--cyan); font-size: 0.7rem; }
+    h1 {
+      max-width: 1200px;
+      margin: 1rem 0 1.4rem;
+      font-size: clamp(3.4rem, 8.5vw, 9.2rem);
+      line-height: 0.84;
+      letter-spacing: -0.068em;
+      font-weight: 600;
+    }
+    h1 .outline {
+      color: transparent;
+      -webkit-text-stroke: 1px var(--cyan);
+      text-shadow: 0 0 36px rgba(73, 214, 229, 0.12);
+    }
+    .hero p { max-width: 790px; color: var(--muted); font-size: clamp(1rem, 1.8vw, 1.3rem); }
+
+    .hero-strip {
+      margin-top: 3.2rem;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      border: 1px solid var(--line);
+      background: rgba(13, 21, 25, 0.7);
+    }
+    .hero-strip div { min-height: 92px; padding: 1rem; border-right: 1px solid var(--line); }
+    .hero-strip div:last-child { border-right: 0; }
+    .hero-strip strong { display: block; color: var(--muted); font: 400 0.59rem var(--mono); letter-spacing: 0.1em; text-transform: uppercase; }
+    .hero-strip span { display: block; margin-top: 0.5rem; font-size: 0.94rem; }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: 120px minmax(0, 1fr);
+      gap: 1rem;
+      margin-bottom: 2rem;
+      padding-top: 1.4rem;
+      border-top: 1px solid var(--line-hi);
+    }
+    .section-index { color: var(--cyan); font: 400 0.68rem var(--mono); }
+    h2 { margin: 0; font-size: clamp(2.2rem, 4vw, 4.6rem); line-height: 0.96; letter-spacing: -0.045em; }
+    .section-copy { max-width: 750px; margin-top: 0.9rem; color: var(--muted); }
+
+    .figure-card {
+      position: relative;
+      margin: 1.3rem 0;
+      border: 1px solid var(--line-hi);
+      border-radius: var(--radius);
+      background:
+        radial-gradient(circle at 100% 0, rgba(73, 214, 229, 0.055), transparent 23rem),
+        linear-gradient(145deg, rgba(16, 27, 32, 0.96), rgba(8, 14, 17, 0.98));
+      overflow: hidden;
+      box-shadow: 0 30px 90px rgba(0, 0, 0, 0.28);
+    }
+    .figure-head {
+      min-height: 76px;
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+    .figure-head h3 { margin: 0.2rem 0 0; font-size: 1.25rem; }
+    .fig-label { color: var(--cyan); font-size: 0.58rem; }
+    .chip { padding: 0.42rem 0.65rem; border: 1px solid var(--line-hi); color: var(--muted); font-size: 0.55rem; }
+    .chip.recommended { color: var(--lime); border-color: var(--lime-dim); background: rgba(184,239,98,0.05); }
+    .chip.experimental { color: var(--pink); border-color: var(--pink-dim); background: rgba(255,117,151,0.05); }
+    .figure-scroll { overflow-x: auto; }
+    .figure-scroll svg { display: block; min-width: 1080px; width: 100%; height: auto; }
+    figcaption {
+      padding: 0.85rem 1.25rem 1rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.79rem;
+    }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; padding: 0.9rem 1.25rem; border-bottom: 1px solid var(--line); }
+    .legend span { color: var(--muted); font-size: 0.53rem; display: inline-flex; align-items: center; gap: 0.45rem; }
+    .legend i { width: 18px; height: 6px; display: inline-block; border-radius: 8px; }
+
+    /* Inline SVG system */
+    svg .gridline { stroke: #152329; stroke-width: 1; }
+    svg .lane { fill: #0b1317; stroke: #263942; stroke-width: 1.2; }
+    svg .node { fill: #101b20; stroke: #3a515b; stroke-width: 1.3; }
+    svg .node-mace { fill: #0d2025; stroke: var(--cyan); }
+    svg .node-train { fill: #25141b; stroke: var(--pink); }
+    svg .node-physics { fill: #251d12; stroke: var(--amber); }
+    svg .node-output { fill: #162312; stroke: var(--lime); }
+    svg .node-existing { fill: #18152d; stroke: var(--violet); }
+    svg .ghost { fill: none; stroke: #42606c; stroke-width: 1.2; stroke-dasharray: 7 7; }
+    svg .arrow { fill: none; stroke: #6a858a; stroke-width: 1.7; }
+    svg .arrow-cyan { stroke: var(--cyan); }
+    svg .arrow-pink { stroke: var(--pink); }
+    svg .arrow-amber { stroke: var(--amber); }
+    svg .arrow-lime { stroke: var(--lime); }
+    svg .arrow-violet { stroke: var(--violet); }
+    svg .dash { stroke-dasharray: 8 7; }
+    svg text { fill: var(--text); font-family: var(--sans); }
+    svg .svg-title { font-size: 17px; font-weight: 600; }
+    svg .svg-label { font: 500 11px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; }
+    svg .svg-small { fill: #8fa4a6; font: 400 11px var(--mono); }
+    svg .svg-tiny { fill: #789093; font: 400 9px var(--mono); }
+    svg .cyan { fill: var(--cyan); }
+    svg .pink { fill: var(--pink); }
+    svg .amber { fill: var(--amber); }
+    svg .lime { fill: var(--lime); }
+    svg .violet { fill: var(--violet); }
+    svg .badge { fill: #101b20; stroke: #38505a; }
+    svg .atom { fill: var(--cyan); opacity: 0.9; }
+    svg .bond { stroke: #557078; stroke-width: 2; }
+    svg .merge { fill: #dfe9e5; }
+
+    .split-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.2rem; }
+    .micro-card {
+      border: 1px solid var(--line);
+      background: rgba(13, 21, 25, 0.7);
+      padding: 1rem;
+      min-height: 145px;
+    }
+    .micro-card .mini-label { color: var(--cyan); font-size: 0.55rem; }
+    .micro-card h3 { margin: 0.7rem 0 0.35rem; font-size: 1.05rem; }
+    .micro-card p { margin: 0; color: var(--muted); font-size: 0.82rem; }
+
+    .decision-band {
+      display: grid;
+      grid-template-columns: 1fr 70px 1fr;
+      align-items: stretch;
+      border: 1px solid var(--line-hi);
+      background: var(--panel);
+    }
+    .decision-side { padding: 1.4rem; }
+    .decision-side h3 { margin: 0.4rem 0; font-size: 1.45rem; }
+    .decision-side p { color: var(--muted); font-size: 0.85rem; }
+    .decision-side.primary { background: linear-gradient(145deg, rgba(184,239,98,0.07), transparent); }
+    .decision-vs { display: grid; place-items: center; border-left: 1px solid var(--line); border-right: 1px solid var(--line); color: var(--muted); font: 400 0.65rem var(--mono); }
+    .metrics { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 1rem; }
+    .metrics span { border: 1px solid var(--line); padding: 0.3rem 0.45rem; color: var(--muted); font: 400 0.56rem var(--mono); }
+
+    .route {
+      display: grid;
+      grid-template-columns: 80px minmax(0, 1fr) minmax(220px, 0.35fr);
+      border-top: 1px solid var(--line);
+      min-height: 125px;
+    }
+    .route:last-child { border-bottom: 1px solid var(--line); }
+    .route-no { padding: 1.1rem; color: var(--cyan); font: 400 0.65rem var(--mono); }
+    .route-main { padding: 1rem 1.2rem; border-left: 1px solid var(--line); }
+    .route-main h3 { margin: 0 0 0.35rem; font-size: 1.05rem; }
+    .route-main p { margin: 0; color: var(--muted); font-size: 0.8rem; }
+    .route-exit { padding: 1rem; border-left: 1px solid var(--line); color: var(--muted); font-size: 0.74rem; }
+    .route-exit strong { color: var(--lime); font: 400 0.55rem var(--mono); letter-spacing: 0.1em; text-transform: uppercase; }
+
+    .source-line { display: grid; grid-template-columns: 48px 1fr; padding: 0.8rem 0; border-top: 1px solid var(--line); }
+    .source-line .n { color: var(--cyan); font: 400 0.58rem var(--mono); }
+    .source-line p { margin: 0.25rem 0 0; color: var(--muted); font-size: 0.76rem; }
+
+    footer { padding: 3rem 0 6rem; color: var(--muted); font-size: 0.78rem; border-top: 1px solid var(--line); }
+
+    @media (max-width: 960px) {
+      .rail { width: 56px; }
+      main { margin-left: 56px; }
+      .wrap { width: min(100% - 1.4rem, 1600px); }
+      .hero-strip { grid-template-columns: repeat(2, 1fr); }
+      .hero-strip div:nth-child(2) { border-right: 0; }
+      .hero-strip div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .split-grid { grid-template-columns: 1fr; }
+      .section-head { grid-template-columns: 72px 1fr; }
+      .decision-band { grid-template-columns: 1fr; }
+      .decision-vs { min-height: 44px; border: 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+      .route { grid-template-columns: 58px 1fr; }
+      .route-exit { grid-column: 2; border-top: 1px solid var(--line); }
+    }
+
+    @media (max-width: 620px) {
+      .rail { display: none; }
+      main { margin-left: 0; }
+      h1 { font-size: 3.5rem; }
+      .hero-strip { grid-template-columns: 1fr; }
+      .hero-strip div { border-right: 0; border-bottom: 1px solid var(--line); }
+      .section-head { grid-template-columns: 1fr; }
+      .figure-head { align-items: flex-start; flex-direction: column; }
+      .route { grid-template-columns: 1fr; }
+      .route-main, .route-exit { grid-column: 1; border-left: 0; border-top: 1px solid var(--line); }
+    }
+
+    @media print {
+      body { background: #070b0d; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      .rail, .progress { display: none; }
+      main { margin: 0; }
+      .wrap { width: 100%; }
+      section { break-before: page; }
+      .hero { break-before: auto; }
+      .figure-card { break-inside: avoid; box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="progress" aria-hidden="true"></div>
+  <aside class="rail" aria-label="Document navigation">
+    <div class="brandmark">M×A</div>
+    <nav>
+      <a href="#map" aria-label="System map">00</a>
+      <a href="#pure" aria-label="Direct PolarMACE architecture">01</a>
+      <a href="#hybrid" aria-label="Hybrid architecture">02</a>
+      <a href="#learned-atom" aria-label="MACE-featurized atom model">03</a>
+      <a href="#feature" aria-label="Feature extraction">04</a>
+      <a href="#pair" aria-label="Pair network">05</a>
+      <a href="#assembly" aria-label="Energy assembly">06</a>
+      <a href="#path" aria-label="Implementation path">07</a>
+    </nav>
+    <div class="rail-label">architecture atlas · qcmlforge</div>
+  </aside>
+
+  <main>
+    <header class="hero wrap">
+      <div class="kicker">QCMLForge / proposed model systems / figure study</div>
+      <h1>MACE <span class="outline">× AP3D3</span></h1>
+      <p>Three architectures for transplanting a frozen <code>polar-1-s</code> representation into AP3D3: direct PolarMACE properties, a lower-risk hybrid, and a MACE-featurized atom model with learned equivariant/invariant multipole heads.</p>
+      <div class="hero-strip">
+        <div><strong>Foundation encoder</strong><span>MACE-POLAR-1-S</span></div>
+        <div><strong>Pair architecture</strong><span>AP3D3 residual MPNN</span></div>
+        <div><strong>Long-range anchors</strong><span>MTP-MTP · classical_induction · D3</span></div>
+        <div><strong>Targets</strong><span>ELST · EXCH · IND · DISP</span></div>
+      </div>
+    </header>
+
+    <section id="map">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-index">00 / SYSTEM MAP</div>
+          <div><h2>One pair model.<br>Three atomic-property strategies.</h2></div>
+        </div>
+
+        <figure class="figure-card">
+          <div class="figure-head">
+            <div><div class="fig-label">Figure 00</div><h3>Shared topology: direct, hybrid, and learned-atom routes</h3></div>
+            <div class="chip recommended">hybrid first</div>
+          </div>
+          <div class="legend">
+            <span><i style="background:var(--cyan)"></i>frozen MACE</span>
+            <span><i style="background:var(--violet)"></i>existing AtomMPNN</span>
+            <span><i style="background:var(--pink)"></i>trainable neural module</span>
+            <span><i style="background:var(--amber)"></i>analytical physics</span>
+            <span><i style="background:var(--lime)"></i>SAPT0 output</span>
+          </div>
+          <div class="figure-scroll">
+            <svg viewBox="0 0 1450 610" role="img" aria-labelledby="map-title map-desc">
+              <title id="map-title">System-level comparison of pure MACE and hybrid MACE plus AtomMPNN architectures</title>
+              <desc id="map-desc">All architectures encode isolated monomers with frozen MACE and use AP3D3 pair residuals. Route A reuses direct PolarMACE properties, route B retains AtomMPNN, and route C learns a complete equivariant and invariant atom-property head from MACE features.</desc>
+              <defs>
+                <marker id="arr-c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#49d6e5"/></marker>
+                <marker id="arr-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#ff7597"/></marker>
+                <marker id="arr-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#ffad4a"/></marker>
+                <marker id="arr-l" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#b8ef62"/></marker>
+                <marker id="arr-v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#a99aff"/></marker>
+              </defs>
+
+              <rect class="lane" x="24" y="22" width="1402" height="250" rx="16"/>
+              <rect class="lane" x="24" y="292" width="1402" height="290" rx="16"/>
+              <text class="svg-label pink" x="48" y="54">A · FULL REPLACEMENT</text>
+              <text class="svg-small" x="48" y="73">MACE owns representations + ML multipoles + atomic response properties</text>
+              <text class="svg-label violet" x="48" y="324">B · HYBRID / RECOMMENDED FIRST</text>
+              <text class="svg-small" x="48" y="343">MACE owns representations; existing AtomMPNN keeps classical-property responsibility</text>
+
+              <!-- Inputs -->
+              <g transform="translate(55 105)">
+                <rect class="node" width="150" height="100" rx="10"/>
+                <circle class="atom" cx="38" cy="48" r="9"/><circle class="atom" cx="72" cy="32" r="6"/><circle class="atom" cx="77" cy="69" r="6"/>
+                <line class="bond" x1="43" y1="44" x2="66" y2="34"/><line class="bond" x1="45" y1="53" x2="70" y2="66"/>
+                <text class="svg-title" x="97" y="43">A</text><text class="svg-title" x="117" y="67">B</text>
+                <text class="svg-tiny" x="14" y="88">Z · R · Q · spin</text>
+              </g>
+              <g transform="translate(55 398)">
+                <rect class="node" width="150" height="100" rx="10"/>
+                <circle class="atom" cx="38" cy="48" r="9"/><circle class="atom" cx="72" cy="32" r="6"/><circle class="atom" cx="77" cy="69" r="6"/>
+                <line class="bond" x1="43" y1="44" x2="66" y2="34"/><line class="bond" x1="45" y1="53" x2="70" y2="66"/>
+                <text class="svg-title" x="97" y="43">A</text><text class="svg-title" x="117" y="67">B</text>
+                <text class="svg-tiny" x="14" y="88">Z · R · Q · spin</text>
+              </g>
+
+              <!-- A flow -->
+              <rect class="node node-mace" x="270" y="93" width="220" height="124" rx="11"/>
+              <text class="svg-label cyan" x="290" y="121">FROZEN</text>
+              <text class="svg-title" x="290" y="150">MACE-POLAR-1-S</text>
+              <text class="svg-small" x="290" y="174">local node irreps hᵢᵗ</text>
+              <text class="svg-small" x="290" y="194">density coefficients pᵢˡᵐ</text>
+              <path class="arrow arrow-cyan" d="M205 155H264" marker-end="url(#arr-c)"/>
+
+              <rect class="node node-train" x="555" y="70" width="210" height="94" rx="11"/>
+              <text class="svg-label pink" x="575" y="98">MACE PROPERTY ADAPTER</text>
+              <text class="svg-small" x="575" y="124">q · μ · Q · HFVR · V</text>
+              <text class="svg-tiny" x="575" y="145">Q + response heads required</text>
+              <path class="arrow arrow-pink" d="M490 128H549" marker-end="url(#arr-p)"/>
+
+              <rect class="node node-train" x="555" y="178" width="210" height="70" rx="11"/>
+              <text class="svg-label pink" x="575" y="207">FEATURE ADAPTER</text>
+              <text class="svg-small" x="575" y="229">irreps → pair state zᵢ</text>
+              <path class="arrow arrow-pink" d="M490 180H520V213H549" marker-end="url(#arr-p)"/>
+
+              <rect class="node node-physics" x="830" y="62" width="210" height="100" rx="11"/>
+              <text class="svg-label amber" x="850" y="90">CLASSICAL BRANCH</text>
+              <text class="svg-small" x="850" y="116">MTP-MTP damped / undamped</text>
+              <text class="svg-small" x="850" y="137">classical_induction · D3</text>
+              <path class="arrow arrow-amber" d="M765 116H824" marker-end="url(#arr-a)"/>
+
+              <rect class="node node-train" x="830" y="178" width="210" height="70" rx="11"/>
+              <text class="svg-label pink" x="850" y="207">AP3D3 PAIR MPNN</text>
+              <text class="svg-small" x="850" y="229">Δ components per A–B pair</text>
+              <path class="arrow arrow-pink" d="M765 213H824" marker-end="url(#arr-p)"/>
+
+              <circle class="merge" cx="1098" cy="154" r="7"/>
+              <path class="arrow arrow-amber" d="M1040 112H1070V154H1090"/>
+              <path class="arrow arrow-pink" d="M1040 213H1070V154H1090"/>
+              <rect class="node node-output" x="1150" y="98" width="225" height="112" rx="11"/>
+              <text class="svg-label lime" x="1171" y="126">SAPT0 COMPONENTS</text>
+              <text class="svg-title" x="1171" y="156">ELST · EXCH</text>
+              <text class="svg-title" x="1171" y="181">IND · DISP</text>
+              <path class="arrow arrow-lime" d="M1105 154H1144" marker-end="url(#arr-l)"/>
+
+              <!-- B flow -->
+              <rect class="node node-mace" x="270" y="355" width="220" height="92" rx="11"/>
+              <text class="svg-label cyan" x="290" y="383">FROZEN MACE</text>
+              <text class="svg-title" x="290" y="410">node irreps hᵢᵗ</text>
+              <text class="svg-small" x="290" y="431">representation only</text>
+              <path class="arrow arrow-cyan" d="M205 426H240V401H264" marker-end="url(#arr-c)"/>
+
+              <rect class="node node-existing" x="270" y="466" width="220" height="92" rx="11"/>
+              <text class="svg-label violet" x="290" y="494">EXISTING AtomMPNN</text>
+              <text class="svg-title" x="290" y="521">q · μ · Q</text>
+              <text class="svg-small" x="290" y="542">HFVR · V · response</text>
+              <path class="arrow arrow-violet" d="M205 470H240V512H264" marker-end="url(#arr-v)"/>
+
+              <rect class="node node-train" x="555" y="355" width="210" height="92" rx="11"/>
+              <text class="svg-label pink" x="575" y="383">FEATURE ADAPTER</text>
+              <text class="svg-title" x="575" y="411">zᵢᴹᴬᶜᴱ</text>
+              <text class="svg-small" x="575" y="432">scalar + invariant norms</text>
+              <path class="arrow arrow-pink" d="M490 401H549" marker-end="url(#arr-p)"/>
+
+              <rect class="node node-physics" x="555" y="466" width="210" height="92" rx="11"/>
+              <text class="svg-label amber" x="575" y="494">UNCHANGED CLASSICAL</text>
+              <text class="svg-small" x="575" y="520">MTP-MTP · classical_induction · D3</text>
+              <text class="svg-tiny" x="575" y="541">fed by AtomMPNN properties</text>
+              <path class="arrow arrow-amber" d="M490 512H549" marker-end="url(#arr-a)"/>
+
+              <rect class="node node-train" x="830" y="355" width="210" height="112" rx="11"/>
+              <text class="svg-label pink" x="850" y="383">AP3D3 PAIR MPNN</text>
+              <text class="svg-small" x="850" y="410">MACE zᵢ + q/HFVR/V</text>
+              <text class="svg-small" x="850" y="433">radial + directional pairs</text>
+              <text class="svg-tiny" x="850" y="453">shared A→B / B→A readout</text>
+              <path class="arrow arrow-pink" d="M765 401H824" marker-end="url(#arr-p)"/>
+              <path class="arrow arrow-violet dash" d="M490 535H792V446H824" marker-end="url(#arr-v)"/>
+
+              <circle class="merge" cx="1098" cy="459" r="7"/>
+              <path class="arrow arrow-amber" d="M765 512H1065V459H1090"/>
+              <path class="arrow arrow-pink" d="M1040 411H1065V459H1090"/>
+              <rect class="node node-output" x="1150" y="404" width="225" height="112" rx="11"/>
+              <text class="svg-label lime" x="1171" y="432">SAPT0 COMPONENTS</text>
+              <text class="svg-title" x="1171" y="462">ELST · EXCH</text>
+              <text class="svg-title" x="1171" y="487">IND · DISP</text>
+              <path class="arrow arrow-lime" d="M1105 459H1144" marker-end="url(#arr-l)"/>
+            </svg>
+          </div>
+          <figcaption>Every route preserves the same asymptotic spine: MTP-MTP electrostatics (damped or undamped), <code>classical_induction</code>, and D3, plus trainable AP3D3 pair residuals. Architectures A and B are shown above; Architecture C below learns the complete atomic-property contract from frozen MACE features.</figcaption>
+        </figure>
+
+        <div class="decision-band">
+          <div class="decision-side primary">
+            <div class="fig-label" style="color:var(--lime)">Recommended sequence</div>
+            <h3>Build B before C</h3>
+            <p>The hybrid isolates MACE representation transfer while preserving the proven long-range spine. Then train C's explicit equivariant/invariant atom head; keep A as a direct PolarMACE-output ablation.</p>
+            <div class="metrics"><span>lowest interface risk</span><span>clean ablation</span><span>existing physics retained</span></div>
+          </div>
+          <div class="decision-vs">THEN</div>
+          <div class="decision-side">
+            <div class="fig-label" style="color:var(--pink)">Full replacement</div>
+            <h3>Graduate to C</h3>
+            <p>Replace AtomMPNN only after the MACE-featurized atom head's q/μ/Q and response properties satisfy charge conservation, covariance, units, and MTP-MTP / induction parity tests.</p>
+            <div class="metrics"><span>one atomic encoder</span><span>higher novelty</span><span>more validation</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="pure">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-index">01 / ARCH A</div>
+          <div><h2>Pure MACE atomic model.</h2><p class="section-copy">Drop AtomMPNN entirely. The frozen PolarMACE backbone supplies local representations and direct low-order density coefficients; small MACE-conditioned heads complete AP3D3's required atomic-property interface.</p></div>
+        </div>
+
+        <figure class="figure-card">
+          <div class="figure-head">
+            <div><div class="fig-label">Figure 01</div><h3>Full replacement: MACE → multipoles + AP3D3 residuals</h3></div>
+            <div class="chip experimental">higher-risk target</div>
+          </div>
+          <div class="legend">
+            <span><i style="background:var(--cyan)"></i>pretrained & frozen</span>
+            <span><i style="background:var(--pink)"></i>new trainable adapter</span>
+            <span><i style="background:var(--amber)"></i>physics calculation</span>
+            <span><i style="background:var(--lime)"></i>energy output</span>
+          </div>
+          <div class="figure-scroll">
+            <svg viewBox="0 0 1500 850" role="img" aria-labelledby="pure-title pure-desc">
+              <title id="pure-title">Pure MACE atomic-property architecture</title>
+              <desc id="pure-desc">MACE encodes monomers independently. One branch extracts pair features; another derives charges, dipoles, quadrupoles and response properties for damped or undamped MTP-MTP electrostatics, classical induction and D3. Neural pair residuals and long-range terms are added into SAPT0 components.</desc>
+              <defs>
+                <marker id="pc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#49d6e5"/></marker>
+                <marker id="pp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ff7597"/></marker>
+                <marker id="pa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ffad4a"/></marker>
+                <marker id="pl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b8ef62"/></marker>
+              </defs>
+
+              <text class="svg-label" x="42" y="50">MONOMER ENCODING — SHARED WEIGHTS, INDEPENDENT GRAPHS</text>
+              <rect class="lane" x="28" y="70" width="1444" height="180" rx="15"/>
+              <rect class="node" x="55" y="105" width="190" height="108" rx="10"/>
+              <text class="svg-label" x="77" y="132">MONOMER A</text><text class="svg-title" x="77" y="162">Zᴬ, Rᴬ, Qᴬ, Sᴬ</text><text class="svg-small" x="77" y="188">isolated graph</text>
+              <rect class="node" x="55" y="280" width="190" height="108" rx="10"/>
+              <text class="svg-label" x="77" y="307">MONOMER B</text><text class="svg-title" x="77" y="337">Zᴮ, Rᴮ, Qᴮ, Sᴮ</text><text class="svg-small" x="77" y="363">isolated graph</text>
+
+              <rect class="node node-mace" x="325" y="88" width="300" height="140" rx="12"/>
+              <text class="svg-label cyan" x="350" y="119">FROZEN FOUNDATION MODEL</text>
+              <text class="svg-title" x="350" y="153">MACE-POLAR-1-S</text>
+              <text class="svg-small" x="350" y="181">interaction/product layers hᵢ¹…hᵢᵀ</text>
+              <text class="svg-small" x="350" y="202">polar density pᵢˡᵐ, l ≤ 1</text>
+              <rect class="node node-mace" x="325" y="263" width="300" height="140" rx="12"/>
+              <text class="svg-label cyan" x="350" y="294">SAME FROZEN WEIGHTS</text>
+              <text class="svg-title" x="350" y="328">MACE-POLAR-1-S</text>
+              <text class="svg-small" x="350" y="356">interaction/product layers hⱼ¹…hⱼᵀ</text>
+              <text class="svg-small" x="350" y="377">polar density pⱼˡᵐ, l ≤ 1</text>
+              <path class="arrow arrow-cyan" d="M245 159H319" marker-end="url(#pc)"/><path class="arrow arrow-cyan" d="M245 334H319" marker-end="url(#pc)"/>
+
+              <!-- split adapters -->
+              <rect class="node node-train" x="700" y="72" width="285" height="128" rx="12"/>
+              <text class="svg-label pink" x="724" y="103">PROPERTY / MULTIPOLE ADAPTER</text>
+              <text class="svg-title" x="724" y="136">q · μ · Q</text>
+              <text class="svg-small" x="724" y="162">HFVR · V · α response</text>
+              <text class="svg-tiny" x="724" y="183">q/μ direct candidates; Q from l=2 head</text>
+              <rect class="node node-train" x="700" y="219" width="285" height="104" rx="12"/>
+              <text class="svg-label pink" x="724" y="250">INVARIANT FEATURE ADAPTER</text>
+              <text class="svg-title" x="724" y="281">hᵢ → zᵢᴹᴬᶜᴱ</text>
+              <text class="svg-small" x="724" y="304">l=0 ⊕ norms(l&gt;0)</text>
+              <rect class="node node-train" x="700" y="342" width="285" height="104" rx="12"/>
+              <text class="svg-label pink" x="724" y="373">INVARIANT FEATURE ADAPTER</text>
+              <text class="svg-title" x="724" y="404">hⱼ → zⱼᴹᴬᶜᴱ</text>
+              <text class="svg-small" x="724" y="427">shared adapter weights</text>
+
+              <path class="arrow arrow-pink" d="M625 145H694" marker-end="url(#pp)"/><path class="arrow arrow-pink" d="M625 183H665V271H694" marker-end="url(#pp)"/>
+              <path class="arrow arrow-pink" d="M625 316H665V167H694" marker-end="url(#pp)"/><path class="arrow arrow-pink" d="M625 358H694" marker-end="url(#pp)"/>
+
+              <!-- physics and pair -->
+              <text class="svg-label amber" x="42" y="492">TWO ENERGY LANES</text>
+              <rect class="lane" x="28" y="512" width="1444" height="290" rx="15"/>
+
+              <rect class="node node-physics" x="75" y="550" width="255" height="206" rx="12"/>
+              <text class="svg-label amber" x="99" y="581">CLASSICAL ANCHORS</text>
+              <text class="svg-title" x="99" y="617">MTP-MTP(q, μ, Q)</text>
+              <text class="svg-small" x="99" y="642">damped / undamped → Eₑₗₛₜ</text>
+              <text class="svg-title" x="99" y="678">classical_induction</text>
+              <text class="svg-small" x="99" y="703">α + induced dipoles → Eᵢₙd</text>
+              <text class="svg-title" x="99" y="737">D3 long range</text>
+              <path class="arrow arrow-amber" d="M842 200V470H202V544" marker-end="url(#pa)"/>
+
+              <rect class="node node-train" x="405" y="550" width="265" height="206" rx="12"/>
+              <text class="svg-label pink" x="429" y="581">AP3D3 PAIR MPNN</text>
+              <text class="svg-small" x="429" y="611">zᵢ, zⱼ, qᵢ, qⱼ</text>
+              <text class="svg-small" x="429" y="633">HFVR, V, φ(rᵢⱼ)</text>
+              <line x1="429" y1="656" x2="641" y2="656" stroke="#4a303a"/>
+              <text class="svg-title" x="429" y="689">ΔEₑₗₛₜ · Eₑₓcₕ</text>
+              <text class="svg-title" x="429" y="718">ΔEᵢₙd · ΔEdisp</text>
+              <text class="svg-tiny" x="429" y="741">pair sum + r⁻³ envelope</text>
+              <path class="arrow arrow-pink" d="M842 446V482H537V544" marker-end="url(#pp)"/>
+              <path class="arrow arrow-pink dash" d="M842 323V480"/>
+
+              <rect class="node" x="745" y="566" width="235" height="176" rx="12"/>
+              <text class="svg-label" x="770" y="596">COMPONENT ASSEMBLY</text>
+              <text class="svg-small" x="770" y="629">ELST = MTP-MTP + ΔNN</text>
+              <text class="svg-small" x="770" y="655">EXCH = NN</text>
+              <text class="svg-small" x="770" y="681">IND = POL + ΔNN</text>
+              <text class="svg-small" x="770" y="707">DISP = D3 + ΔNN</text>
+              <path class="arrow arrow-amber" d="M330 620H720V622H739" marker-end="url(#pa)"/>
+              <path class="arrow arrow-pink" d="M670 690H739" marker-end="url(#pp)"/>
+
+              <rect class="node node-output" x="1060" y="566" width="330" height="176" rx="12"/>
+              <text class="svg-label lime" x="1086" y="596">FINAL SAPT0 VECTOR</text>
+              <text class="svg-title" x="1086" y="637">[ ELST, EXCH,</text>
+              <text class="svg-title" x="1086" y="671">  IND, DISP ]</text>
+              <text class="svg-small" x="1086" y="705">Eint = Σ components</text>
+              <path class="arrow arrow-lime" d="M980 654H1054" marker-end="url(#pl)"/>
+            </svg>
+          </div>
+          <figcaption><strong>Critical contract:</strong> public PolarMACE outputs document monopole + l=1 density coefficients. AP3D3's current MTP path expects q/μ/Q, while induction also needs response-related atomic properties. The pink property adapter is therefore a real trainable and validation-bearing module—not a reshape.</figcaption>
+        </figure>
+
+        <div class="split-grid">
+          <div class="micro-card"><div class="mini-label">Direct from PolarMACE</div><h3>q and dipole-like l=1 coefficients</h3><p>Candidate low-order multipoles after explicit Condon–Shortley, axis-order, unit, origin, and charge-conservation checks.</p></div>
+          <div class="micro-card"><div class="mini-label">Must be added</div><h3>Quadrupole + response heads</h3><p>Use equivariant l=2 hidden channels for a traceless Q readout; use scalar channels for HFVR/volume/polarizability proxies if AP3D3 induction retains them.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="hybrid">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-index">02 / ARCH B</div>
+          <div><h2>Keep multipoles.<br>Replace representation learning.</h2><p class="section-copy">The existing AtomMPNN/dimer-property model remains the source of q, μ, Q, HFVR, volume, electrostatics, and induction. Frozen MACE features replace or initialize AP3D3's learned-from-scratch atomic state.</p></div>
+        </div>
+
+        <figure class="figure-card">
+          <div class="figure-head">
+            <div><div class="fig-label">Figure 02</div><h3>Hybrid: existing physical properties + MACE pair featurization</h3></div>
+            <div class="chip recommended">recommended MVP</div>
+          </div>
+          <div class="figure-scroll">
+            <svg viewBox="0 0 1500 720" role="img" aria-labelledby="hybrid-title hybrid-desc">
+              <title id="hybrid-title">Hybrid MACE and AtomMPNN AP3D3 architecture</title>
+              <desc id="hybrid-desc">Monomers pass through frozen MACE for hidden representations and the existing AtomMPNN for multipoles and response properties. Both streams meet in the AP3D3 pair builder, while AtomMPNN also supplies classical electrostatics and induction.</desc>
+              <defs>
+                <marker id="hc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#49d6e5"/></marker>
+                <marker id="hv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#a99aff"/></marker>
+                <marker id="hp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ff7597"/></marker>
+                <marker id="ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ffad4a"/></marker>
+                <marker id="hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b8ef62"/></marker>
+              </defs>
+
+              <rect class="node" x="45" y="275" width="185" height="118" rx="11"/>
+              <text class="svg-label" x="68" y="305">DIMER INPUT</text>
+              <text class="svg-title" x="68" y="340">Monomer A + B</text>
+              <text class="svg-small" x="68" y="366">Z · R · Q · spin</text>
+
+              <!-- top representation lane -->
+              <rect class="lane" x="285" y="48" width="665" height="250" rx="15"/>
+              <text class="svg-label cyan" x="310" y="78">REPRESENTATION LANE</text>
+              <rect class="node node-mace" x="325" y="108" width="250" height="132" rx="11"/>
+              <text class="svg-label cyan" x="350" y="138">FROZEN</text>
+              <text class="svg-title" x="350" y="171">MACE-POLAR-1-S</text>
+              <text class="svg-small" x="350" y="198">hᴬᵢ · hᴮⱼ</text>
+              <text class="svg-tiny" x="350" y="220">energy readouts discarded</text>
+              <rect class="node node-train" x="650" y="108" width="250" height="132" rx="11"/>
+              <text class="svg-label pink" x="675" y="138">INVARIANT ADAPTER</text>
+              <text class="svg-title" x="675" y="171">h → zᴹᴬᶜᴱ</text>
+              <text class="svg-small" x="675" y="198">l=0 + ||l&gt;0||</text>
+              <text class="svg-tiny" x="675" y="220">trainable width projection</text>
+              <path class="arrow arrow-cyan" d="M575 174H644" marker-end="url(#hc)"/>
+
+              <!-- bottom classical lane -->
+              <rect class="lane" x="285" y="326" width="665" height="320" rx="15"/>
+              <text class="svg-label violet" x="310" y="356">EXISTING PROPERTY / PHYSICS LANE</text>
+              <rect class="node node-existing" x="325" y="389" width="250" height="132" rx="11"/>
+              <text class="svg-label violet" x="350" y="419">UNCHANGED AtomMPNN</text>
+              <text class="svg-title" x="350" y="452">q · μ · Q</text>
+              <text class="svg-small" x="350" y="479">HFVR · V · atom response</text>
+              <text class="svg-tiny" x="350" y="501">existing pretrained weights</text>
+              <rect class="node node-physics" x="650" y="389" width="250" height="196" rx="11"/>
+              <text class="svg-label amber" x="675" y="419">CLASSICAL COMPONENTS</text>
+              <text class="svg-title" x="675" y="455">MTP-MTP electrostatics</text>
+              <text class="svg-small" x="675" y="479">damped / undamped</text>
+              <text class="svg-title" x="675" y="516">classical_induction</text>
+              <text class="svg-small" x="675" y="540">induced dipoles</text>
+              <text class="svg-small" x="675" y="566">+ D3 long range</text>
+              <path class="arrow arrow-violet" d="M575 455H644" marker-end="url(#ha)"/>
+
+              <!-- input split -->
+              <path class="arrow arrow-cyan" d="M230 319H260V174H319" marker-end="url(#hc)"/>
+              <path class="arrow arrow-violet" d="M230 350H260V455H319" marker-end="url(#hv)"/>
+
+              <!-- pair MPNN -->
+              <rect class="node node-train" x="1030" y="126" width="275" height="308" rx="12"/>
+              <text class="svg-label pink" x="1055" y="158">AP3D3 PAIR MPNN</text>
+              <text class="svg-small" x="1055" y="192">MACE zᵢ / zⱼ</text>
+              <text class="svg-small" x="1055" y="217">AtomMPNN qᵢ / qⱼ</text>
+              <text class="svg-small" x="1055" y="242">HFVRᵢⱼ · Vᵢⱼ · φ(rᵢⱼ)</text>
+              <line x1="1055" y1="265" x2="1279" y2="265" stroke="#4a303a"/>
+              <text class="svg-title" x="1055" y="302">shared intra-MPNN</text>
+              <text class="svg-small" x="1055" y="326">optional: initialize h⁰ with MACE</text>
+              <text class="svg-small" x="1055" y="350">or bypass intra updates</text>
+              <line x1="1055" y1="372" x2="1279" y2="372" stroke="#4a303a"/>
+              <text class="svg-title" x="1055" y="407">four pair readouts</text>
+              <path class="arrow arrow-pink" d="M900 174H1024" marker-end="url(#hp)"/>
+              <path class="arrow arrow-violet dash" d="M575 498H985V239H1024" marker-end="url(#hv)"/>
+
+              <!-- output -->
+              <circle class="merge" cx="1360" cy="489" r="8"/>
+              <path class="arrow arrow-pink" d="M1305 397H1332V489H1351"/>
+              <path class="arrow arrow-amber" d="M900 535H1332V489H1351"/>
+              <rect class="node node-output" x="1055" y="530" width="350" height="125" rx="12"/>
+              <text class="svg-label lime" x="1081" y="561">CLASSICAL + NEURAL RESIDUAL</text>
+              <text class="svg-title" x="1081" y="598">ELST · EXCH · IND · DISP</text>
+              <text class="svg-small" x="1081" y="626">same AP3D3 target contract</text>
+              <path class="arrow arrow-lime" d="M1360 497V524" marker-end="url(#hl)"/>
+            </svg>
+          </div>
+          <figcaption>This path changes one scientific variable at a time: atomic representation. AP3D3's existing <code>DimerProp</code> path remains responsible for MTP-MTP electrostatics, <code>classical_induction</code>, and D3, while MACE becomes the rich chemical context entering the pair MPNN.</figcaption>
+        </figure>
+
+        <div class="split-grid">
+          <div class="micro-card"><div class="mini-label">Integration mode H1</div><h3>MACE initializes AP3D3 h⁰</h3><p>Project MACE invariants to <code>n_embed</code>, then retain AP3D3's trainable intramonomer message iterations and directional states. Closest to current implementation.</p></div>
+          <div class="micro-card"><div class="mini-label">Integration mode H2</div><h3>MACE replaces intra-MPNN</h3><p>Feed projected MACE states directly into pair construction. Faster and cleaner, but removes the current directional intramonomer path; recover angular information with invariant contractions or an equivariant pair head.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="learned-atom">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-index">03 / ARCH C</div>
+          <div><h2>MACE-featurized<br>multipole atom model.</h2><p class="section-copy">Use one frozen MACE representation twice: first as the input to a trainable equivariant/invariant atom head that predicts the complete AP3 atomic-property contract, and again as the chemical state for AP3D3 intermolecular component residuals.</p></div>
+        </div>
+
+        <figure class="figure-card">
+          <div class="figure-head">
+            <div><div class="fig-label">Figure 03</div><h3>Learned atom head: MACE features → q / μ / Q / response</h3></div>
+            <div class="chip recommended">preferred full replacement</div>
+          </div>
+          <div class="legend">
+            <span><i style="background:var(--cyan)"></i>shared frozen features</span>
+            <span><i style="background:var(--pink)"></i>trainable atom + pair heads</span>
+            <span><i style="background:var(--amber)"></i>mandatory long-range spine</span>
+            <span><i style="background:var(--lime)"></i>component outputs</span>
+          </div>
+          <div class="figure-scroll">
+            <svg viewBox="0 0 1500 820" role="img" aria-labelledby="atomhead-title atomhead-desc">
+              <title id="atomhead-title">MACE-featurized multipole atom model architecture</title>
+              <desc id="atomhead-desc">Frozen MACE monomer features feed both a trainable equivariant atom head predicting multipoles and response properties and a trainable AP3D3 pair MPNN. Predicted properties drive MTP-MTP electrostatics, classical induction, and D3; classical and neural terms assemble into SAPT0 components.</desc>
+              <defs>
+                <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#49d6e5"/></marker>
+                <marker id="ap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ff7597"/></marker>
+                <marker id="aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ffad4a"/></marker>
+                <marker id="al" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b8ef62"/></marker>
+              </defs>
+
+              <!-- shared input + backbone -->
+              <rect class="node" x="45" y="285" width="190" height="120" rx="11"/>
+              <text class="svg-label" x="69" y="316">MONOMERS A / B</text>
+              <text class="svg-title" x="69" y="353">Z · R · Q · S</text>
+              <text class="svg-small" x="69" y="380">independent graphs</text>
+
+              <rect class="node node-mace" x="310" y="250" width="290" height="190" rx="12"/>
+              <text class="svg-label cyan" x="336" y="282">SHARED FROZEN ENCODER</text>
+              <text class="svg-title" x="336" y="321">MACE-POLAR-1-S</text>
+              <text class="svg-small" x="336" y="354">hᵢ¹ … hᵢᵀ irreps</text>
+              <text class="svg-small" x="336" y="380">l=0 · l=1 · l=2 hidden blocks</text>
+              <text class="svg-tiny" x="336" y="411">MACE energy readout unused</text>
+              <path class="arrow arrow-cyan" d="M235 345H304" marker-end="url(#ac)"/>
+
+              <!-- atom head upper lane -->
+              <rect class="lane" x="665" y="45" width="785" height="326" rx="15"/>
+              <text class="svg-label pink" x="690" y="78">ATOM-MODEL LANE — TRAINED ON ATOMIC / MOLECULAR PROPERTY TARGETS</text>
+              <rect class="node node-train" x="705" y="108" width="285" height="212" rx="12"/>
+              <text class="svg-label pink" x="730" y="138">EQUIVARIANT + INVARIANT HEADS</text>
+              <text class="svg-small" x="730" y="174">l=0 → q, HFVR, V, α scale</text>
+              <text class="svg-small" x="730" y="205">l=1 → atomic dipoles μ</text>
+              <text class="svg-small" x="730" y="236">l=2 → traceless quadrupoles Q</text>
+              <text class="svg-small" x="730" y="267">scalar pair head → damping K</text>
+              <text class="svg-tiny" x="730" y="297">shared across elements after embedding</text>
+              <path class="arrow arrow-pink" d="M600 294H660V214H699" marker-end="url(#ap)"/>
+
+              <rect class="node" x="1040" y="108" width="180" height="212" rx="12"/>
+              <text class="svg-label" x="1062" y="138">CONSTRAINTS</text>
+              <text class="svg-small" x="1062" y="174">Σᵢ qᵢ = Qmol</text>
+              <text class="svg-small" x="1062" y="205">μ / Q covariance</text>
+              <text class="svg-small" x="1062" y="236">Q tracelessness</text>
+              <text class="svg-small" x="1062" y="267">αᵢ &gt; 0</text>
+              <text class="svg-tiny" x="1062" y="297">unit-schema checks</text>
+              <path class="arrow arrow-pink" d="M990 214H1034" marker-end="url(#ap)"/>
+
+              <rect class="node node-output" x="1270" y="108" width="145" height="212" rx="12"/>
+              <text class="svg-label lime" x="1292" y="138">ATOM API</text>
+              <text class="svg-title" x="1292" y="177">q</text>
+              <text class="svg-title" x="1292" y="211">μ</text>
+              <text class="svg-title" x="1292" y="245">Q</text>
+              <text class="svg-small" x="1292" y="278">HFVR · V · α</text>
+              <text class="svg-tiny" x="1292" y="301">damping params</text>
+              <path class="arrow arrow-lime" d="M1220 214H1264" marker-end="url(#al)"/>
+
+              <!-- pair lane -->
+              <rect class="lane" x="665" y="399" width="785" height="182" rx="15"/>
+              <text class="svg-label pink" x="690" y="432">INTERMOLECULAR RESIDUAL LANE — SAME MACE FEATURES, DIFFERENT HEAD</text>
+              <rect class="node node-train" x="705" y="462" width="260" height="86" rx="11"/>
+              <text class="svg-label pink" x="728" y="491">PAIR FEATURE ADAPTER</text>
+              <text class="svg-small" x="728" y="520">l=0 ⊕ norms(l&gt;0) → zᵢ</text>
+              <rect class="node node-train" x="1020" y="446" width="260" height="118" rx="11"/>
+              <text class="svg-label pink" x="1044" y="476">AP3D3 PAIR MPNN</text>
+              <text class="svg-small" x="1044" y="505">zᵢ/zⱼ + q/HFVR/V + φ(r)</text>
+              <text class="svg-small" x="1044" y="533">→ ΔELST / EXCH / ΔIND / ΔDISP</text>
+              <path class="arrow arrow-pink" d="M600 386H635V505H699" marker-end="url(#ap)"/>
+              <path class="arrow arrow-pink" d="M965 505H1014" marker-end="url(#ap)"/>
+
+              <path class="arrow arrow-pink dash" d="M1342 320V380H985V473H1014" marker-end="url(#ap)"/>
+
+              <!-- mandatory asymptotic spine -->
+              <rect class="lane" x="45" y="623" width="1405" height="150" rx="15"/>
+              <text class="svg-label amber" x="70" y="654">MANDATORY ASYMPTOTIC SPINE — USED BY ARCHITECTURES A, B, AND C</text>
+              <rect class="node node-physics" x="80" y="680" width="280" height="62" rx="10"/>
+              <text class="svg-label amber" x="102" y="705">MTP-MTP ELECTROSTATICS</text>
+              <text class="svg-tiny" x="102" y="727">damped CLIFF / AMOEBA or undamped</text>
+              <rect class="node node-physics" x="405" y="680" width="280" height="62" rx="10"/>
+              <text class="svg-label amber" x="427" y="705">CLASSICAL_INDUCTION</text>
+              <text class="svg-tiny" x="427" y="727">self-consistent induced dipoles + Thole</text>
+              <rect class="node node-physics" x="730" y="680" width="220" height="62" rx="10"/>
+              <text class="svg-label amber" x="752" y="705">D3 LONG RANGE</text>
+              <text class="svg-tiny" x="752" y="727">resolved damping parameters</text>
+              <rect class="node node-output" x="1040" y="674" width="360" height="74" rx="10"/>
+              <text class="svg-label lime" x="1064" y="701">CLASSICAL + AP3D3 RESIDUAL</text>
+              <text class="svg-title" x="1064" y="730">ELST · EXCH · IND · DISP</text>
+              <path class="arrow arrow-amber" d="M1342 320V605H220V674" marker-end="url(#aa)"/>
+              <path class="arrow arrow-amber" d="M360 711V758H990V719"/>
+              <path class="arrow arrow-amber" d="M685 711V748H990V719"/>
+              <path class="arrow arrow-amber" d="M950 711H990"/>
+              <circle class="merge" cx="999" cy="711" r="7"/>
+              <path class="arrow arrow-lime" d="M1006 711H1034" marker-end="url(#al)"/>
+              <path class="arrow arrow-pink" d="M1150 564V605H1010V674" marker-end="url(#ap)"/>
+            </svg>
+          </div>
+          <figcaption>Architecture C is distinct from direct PolarMACE-property reuse: MACE is the frozen featurizer, while a QCMLForge atom head is explicitly trained to emit AP3-compatible equivariant multipoles and invariant response properties. This gives complete q/μ/Q control while still sharing the same foundation representation with the intermolecular network.</figcaption>
+        </figure>
+
+        <div class="split-grid">
+          <div class="micro-card"><div class="mini-label">Atom-model objective</div><h3>Supervise structure, not just energy</h3><p>Use atomic multipole targets when available plus molecular charge/dipole constraints, covariance tests, traceless Q projection, response-property losses, and optional long-range energy consistency.</p></div>
+          <div class="micro-card"><div class="mini-label">Shared-feature objective</div><h3>One frozen pass, two trainable consumers</h3><p>Cache MACE node irreps once per monomer. The atom-property head and AP3D3 pair adapter consume the same cache with separately versioned schemas.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="feature">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-index">04 / FEATURE TAP</div>
+          <div><h2>Irreps-aware extraction.</h2><p class="section-copy">The adapter is not a generic flatten operation. It separates scalar invariants for the current AP3D3 MLP from covariant channels used by multipole heads.</p></div>
+        </div>
+
+        <figure class="figure-card">
+          <div class="figure-head"><div><div class="fig-label">Figure 04</div><h3>MACE node-state fan-out</h3></div><div class="chip">shared by routes A · B · C</div></div>
+          <div class="figure-scroll">
+            <svg viewBox="0 0 1450 590" role="img" aria-labelledby="feature-title feature-desc">
+              <title id="feature-title">Irreducible representation feature extraction from MACE</title>
+              <desc id="feature-desc">Per-layer MACE scalar, vector and tensor channels are concatenated. Scalars and norms form invariant pair features, vector channels inform dipoles, and tensor channels inform quadrupoles.</desc>
+              <defs>
+                <marker id="fc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#49d6e5"/></marker>
+                <marker id="fp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ff7597"/></marker>
+              </defs>
+              <text class="svg-label cyan" x="48" y="51">PRETRAINED LAYER STATES</text>
+
+              <g transform="translate(50 92)">
+                <rect class="node node-mace" width="215" height="380" rx="12"/>
+                <text class="svg-title" x="22" y="40">hᵢ¹</text>
+                <rect x="22" y="68" width="171" height="62" rx="7" fill="#153e47" stroke="#49d6e5"/>
+                <text class="svg-label cyan" x="38" y="94">l = 0</text><text class="svg-small" x="38" y="115">scalar channels</text>
+                <rect x="22" y="147" width="171" height="82" rx="7" fill="#271b30" stroke="#a99aff"/>
+                <text class="svg-label violet" x="38" y="176">l = 1</text><text class="svg-small" x="38" y="199">vector channels</text>
+                <rect x="22" y="246" width="171" height="108" rx="7" fill="#25141b" stroke="#ff7597"/>
+                <text class="svg-label pink" x="38" y="276">l = 2</text><text class="svg-small" x="38" y="299">tensor channels</text><text class="svg-tiny" x="38" y="326">if present in hidden irreps</text>
+              </g>
+              <g transform="translate(300 92)">
+                <rect class="node node-mace" width="215" height="380" rx="12"/>
+                <text class="svg-title" x="22" y="40">hᵢ²</text>
+                <rect x="22" y="68" width="171" height="62" rx="7" fill="#153e47" stroke="#49d6e5"/>
+                <text class="svg-label cyan" x="38" y="94">l = 0</text><text class="svg-small" x="38" y="115">scalar channels</text>
+                <rect x="22" y="147" width="171" height="82" rx="7" fill="#271b30" stroke="#a99aff"/>
+                <text class="svg-label violet" x="38" y="176">l = 1</text><text class="svg-small" x="38" y="199">vector channels</text>
+                <rect x="22" y="246" width="171" height="108" rx="7" fill="#25141b" stroke="#ff7597"/>
+                <text class="svg-label pink" x="38" y="276">l = 2</text><text class="svg-small" x="38" y="299">tensor channels</text>
+              </g>
+              <g transform="translate(550 92)">
+                <rect class="node node-mace" width="215" height="380" rx="12"/>
+                <text class="svg-title" x="22" y="40">hᵢᵀ</text>
+                <rect x="22" y="68" width="171" height="62" rx="7" fill="#153e47" stroke="#49d6e5"/>
+                <text class="svg-label cyan" x="38" y="94">l = 0</text><text class="svg-small" x="38" y="115">scalar channels</text>
+                <rect x="22" y="147" width="171" height="82" rx="7" fill="#271b30" stroke="#a99aff"/>
+                <text class="svg-label violet" x="38" y="176">l = 1</text><text class="svg-small" x="38" y="199">vector channels</text>
+                <rect x="22" y="246" width="171" height="108" rx="7" fill="#25141b" stroke="#ff7597"/>
+                <text class="svg-label pink" x="38" y="276">l = 2</text><text class="svg-small" x="38" y="299">tensor channels</text>
+              </g>
+
+              <path class="arrow arrow-cyan" d="M765 170H830" marker-end="url(#fc)"/>
+              <path class="arrow arrow-pink" d="M765 278H830" marker-end="url(#fp)"/>
+              <path class="arrow arrow-pink" d="M765 392H830" marker-end="url(#fp)"/>
+
+              <rect class="node node-train" x="840" y="104" width="260" height="142" rx="12"/>
+              <text class="svg-label pink" x="865" y="134">INVARIANT PATH</text>
+              <text class="svg-small" x="865" y="165">concat(l=0)</text>
+              <text class="svg-small" x="865" y="189">⊕ norms / power spectra</text>
+              <text class="svg-title" x="865" y="222">→ zᵢ for pair MLP</text>
+
+              <rect class="node node-train" x="840" y="275" width="260" height="197" rx="12"/>
+              <text class="svg-label pink" x="865" y="305">EQUIVARIANT PROPERTY PATH</text>
+              <text class="svg-small" x="865" y="338">l=0 → q, HFVR, V</text>
+              <text class="svg-small" x="865" y="366">l=1 → μ readout</text>
+              <text class="svg-small" x="865" y="394">l=2 → traceless Q readout</text>
+              <text class="svg-tiny" x="865" y="425">global charge projection after q</text>
+              <text class="svg-tiny" x="865" y="447">covariance tests required</text>
+
+              <rect class="node node-output" x="1180" y="104" width="220" height="142" rx="12"/>
+              <text class="svg-label lime" x="1204" y="134">PAIR CONTRACT</text>
+              <text class="svg-title" x="1204" y="172">zᵢ ∈ ℝᵈ</text>
+              <text class="svg-small" x="1204" y="202">rotation invariant</text>
+              <path class="arrow arrow-lime" d="M1100 175H1174" marker-end="url(#fc)"/>
+
+              <rect class="node node-output" x="1180" y="275" width="220" height="197" rx="12"/>
+              <text class="svg-label lime" x="1204" y="305">PHYSICS CONTRACT</text>
+              <text class="svg-title" x="1204" y="344">q · μ · Q</text>
+              <text class="svg-small" x="1204" y="374">+ atomic response</text>
+              <text class="svg-tiny" x="1204" y="406">units + conventions</text>
+              <text class="svg-tiny" x="1204" y="428">stored in checkpoint schema</text>
+              <path class="arrow arrow-lime" d="M1100 374H1174" marker-end="url(#fp)"/>
+            </svg>
+          </div>
+          <figcaption>The two output contracts should be versioned independently. A pair-feature schema can remain stable while multipole/property heads evolve from AtomMPNN-backed to MACE-backed.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="pair">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-index">05 / PAIR CORE</div>
+          <div><h2>Inside the AP3D3 pair block.</h2><p class="section-copy">MACE enriches the atom state; AP3D3 still owns explicit intermolecular construction, bidirectional symmetry, component readouts, and dimer aggregation.</p></div>
+        </div>
+
+        <figure class="figure-card">
+          <div class="figure-head"><div><div class="fig-label">Figure 05</div><h3>Symmetric A–B pair construction and component residuals</h3></div><div class="chip">shared by routes A · B · C</div></div>
+          <div class="figure-scroll">
+            <svg viewBox="0 0 1450 600" role="img" aria-labelledby="pair-title pair-desc">
+              <title id="pair-title">AP3D3 pair MPNN detail</title>
+              <desc id="pair-desc">MACE atom features may initialize optional intramonomer updates. Atom states and pair distances construct A-to-B and B-to-A features, which use shared readouts and are summed before dimer aggregation.</desc>
+              <defs>
+                <marker id="xp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ff7597"/></marker>
+                <marker id="xl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b8ef62"/></marker>
+              </defs>
+
+              <rect class="node node-mace" x="45" y="80" width="240" height="130" rx="12"/>
+              <text class="svg-label cyan" x="70" y="111">MONOMER A STATES</text>
+              <text class="svg-title" x="70" y="147">zᵢᴹᴬᶜᴱ</text>
+              <text class="svg-small" x="70" y="175">+ qᵢ · HFVRᵢ · Vᵢ</text>
+              <rect class="node node-mace" x="45" y="365" width="240" height="130" rx="12"/>
+              <text class="svg-label cyan" x="70" y="396">MONOMER B STATES</text>
+              <text class="svg-title" x="70" y="432">zⱼᴹᴬᶜᴱ</text>
+              <text class="svg-small" x="70" y="460">+ qⱼ · HFVRⱼ · Vⱼ</text>
+
+              <rect class="ghost" x="350" y="93" width="235" height="389" rx="13"/>
+              <text class="svg-label" x="374" y="123">OPTIONAL INTRA-MONOMER MPNN</text>
+              <text class="svg-small" x="374" y="158">h⁰ ← project(zᴹᴬᶜᴱ)</text>
+              <text class="svg-small" x="374" y="188">M iterations on A–A / B–B edges</text>
+              <text class="svg-small" x="374" y="218">directional states from r̂</text>
+              <line x1="374" y1="246" x2="556" y2="246" stroke="#38505a" stroke-dasharray="5 5"/>
+              <text class="svg-tiny" x="374" y="275">H1: keep this block</text>
+              <text class="svg-tiny" x="374" y="300">H2: bypass this block</text>
+              <text class="svg-title" x="374" y="348">hᴬᵢ</text>
+              <text class="svg-title" x="493" y="348">hᴮⱼ</text>
+              <path class="arrow arrow-pink dash" d="M285 145H344" marker-end="url(#xp)"/><path class="arrow arrow-pink dash" d="M285 430H344" marker-end="url(#xp)"/>
+
+              <rect class="node node-train" x="650" y="80" width="285" height="180" rx="12"/>
+              <text class="svg-label pink" x="675" y="111">A → B PAIR</text>
+              <text class="svg-small" x="675" y="145">[hᴬᵢ, hᴮⱼ, qᵢ, qⱼ,</text>
+              <text class="svg-small" x="675" y="170"> HFVRᵢⱼ, Vᵢⱼ, φ(rᵢⱼ),</text>
+              <text class="svg-small" x="675" y="195"> projected directional states]</text>
+              <text class="svg-title" x="675" y="234">pᵢⱼ</text>
+              <rect class="node node-train" x="650" y="325" width="285" height="180" rx="12"/>
+              <text class="svg-label pink" x="675" y="356">B → A PAIR</text>
+              <text class="svg-small" x="675" y="390">same fields, reversed order</text>
+              <text class="svg-small" x="675" y="416">shared MLP parameters</text>
+              <text class="svg-title" x="675" y="461">pⱼᵢ</text>
+              <path class="arrow arrow-pink" d="M585 190H644" marker-end="url(#xp)"/><path class="arrow arrow-pink" d="M585 400H644" marker-end="url(#xp)"/>
+
+              <rect class="node node-train" x="1000" y="135" width="210" height="310" rx="12"/>
+              <text class="svg-label pink" x="1025" y="167">SHARED READOUTS</text>
+              <text class="svg-title" x="1025" y="207">gₑₗₛₜ</text>
+              <text class="svg-title" x="1025" y="251">gₑₓcₕ</text>
+              <text class="svg-title" x="1025" y="295">gᵢₙd</text>
+              <text class="svg-title" x="1025" y="339">gdisp</text>
+              <line x1="1025" y1="365" x2="1185" y2="365" stroke="#4a303a"/>
+              <text class="svg-small" x="1025" y="395">eᵢⱼ + eⱼᵢ</text>
+              <text class="svg-tiny" x="1025" y="419">× cutoff(r)</text>
+              <path class="arrow arrow-pink" d="M935 170H994" marker-end="url(#xp)"/><path class="arrow arrow-pink" d="M935 415H994" marker-end="url(#xp)"/>
+
+              <rect class="node node-output" x="1270" y="207" width="145" height="164" rx="12"/>
+              <text class="svg-label lime" x="1292" y="237">SCATTER Σ</text>
+              <text class="svg-title" x="1292" y="278">ΔEᵏ</text>
+              <text class="svg-small" x="1292" y="306">per dimer</text>
+              <text class="svg-tiny" x="1292" y="338">k = 4 comps</text>
+              <path class="arrow arrow-lime" d="M1210 290H1264" marker-end="url(#xl)"/>
+            </svg>
+          </div>
+          <figcaption>AP3D3 currently builds hidden states from an atomic embedding and intramonomer messages. MACE can enter at <code>h⁰</code> (H1) or replace that block (H2). H1 is the minimum-change implementation and preserves the existing directional feature path.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="assembly">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-index">06 / ENERGY ASSEMBLY</div>
+          <div><h2>Physics anchors.<br>Neural corrections.</h2><p class="section-copy">All proposed architectures must preserve the same additive long-range structure: MTP-MTP electrostatics, <code>classical_induction</code>, and D3. The AP3D3 network learns component residuals around those asymptotically correct anchors.</p></div>
+        </div>
+
+        <figure class="figure-card">
+          <div class="figure-head"><div><div class="fig-label">Figure 06</div><h3>SAPT0 component ledger</h3></div><div class="chip">mandatory in every route</div></div>
+          <div class="figure-scroll">
+            <svg viewBox="0 0 1450 500" role="img" aria-labelledby="ledger-title ledger-desc">
+              <title id="ledger-title">SAPT0 component energy assembly</title>
+              <desc id="ledger-desc">Damped or undamped MTP-MTP electrostatics is added to a neural electrostatic residual; exchange is neural; classical induction is added to a neural induction residual; D3 long-range dispersion is added to an optional neural dispersion residual.</desc>
+              <defs><marker id="ll" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b8ef62"/></marker></defs>
+
+              <g transform="translate(40 82)">
+                <rect class="lane" width="315" height="320" rx="14"/>
+                <text class="svg-label amber" x="24" y="37">ELECTROSTATICS</text>
+                <rect class="node node-physics" x="24" y="64" width="267" height="78" rx="9"/>
+                <text class="svg-small" x="44" y="95">Eᴹᵀᴾ⁻ᴹᵀᴾ(q, μ, Q)</text><text class="svg-tiny" x="44" y="120">damped or undamped all-pair baseline</text>
+                <text class="svg-title" x="145" y="184">+</text>
+                <rect class="node node-train" x="24" y="206" width="267" height="78" rx="9"/>
+                <text class="svg-small" x="44" y="237">Σᵢⱼ Δeᴺᴺₑₗₛₜ</text><text class="svg-tiny" x="44" y="262">short-range correction</text>
+                <text class="svg-label lime" x="24" y="308">= Eₑₗₛₜ</text>
+              </g>
+
+              <g transform="translate(390 82)">
+                <rect class="lane" width="315" height="320" rx="14"/>
+                <text class="svg-label pink" x="24" y="37">EXCHANGE</text>
+                <rect class="node node-train" x="24" y="101" width="267" height="116" rx="9"/>
+                <text class="svg-small" x="44" y="140">Σᵢⱼ eᴺᴺₑₓcₕ</text><text class="svg-tiny" x="44" y="170">learned pair contribution</text><text class="svg-tiny" x="44" y="194">short-range envelope</text>
+                <text class="svg-label lime" x="24" y="308">= Eₑₓcₕ</text>
+              </g>
+
+              <g transform="translate(740 82)">
+                <rect class="lane" width="315" height="320" rx="14"/>
+                <text class="svg-label amber" x="24" y="37">INDUCTION</text>
+                <rect class="node node-physics" x="24" y="64" width="267" height="78" rx="9"/>
+                <text class="svg-small" x="44" y="95">Eᶜᴸᴬˢˢ_IND(α, field)</text><text class="svg-tiny" x="44" y="120">self-consistent classical_induction</text>
+                <text class="svg-title" x="145" y="184">+</text>
+                <rect class="node node-train" x="24" y="206" width="267" height="78" rx="9"/>
+                <text class="svg-small" x="44" y="237">Σᵢⱼ Δeᴺᴺᵢₙd</text><text class="svg-tiny" x="44" y="262">many-body residual</text>
+                <text class="svg-label lime" x="24" y="308">= Eᵢₙd</text>
+              </g>
+
+              <g transform="translate(1090 82)">
+                <rect class="lane" width="315" height="320" rx="14"/>
+                <text class="svg-label amber" x="24" y="37">DISPERSION</text>
+                <rect class="node node-physics" x="24" y="64" width="267" height="78" rx="9"/>
+                <text class="svg-small" x="44" y="95">Eᴰ³(geometry)</text><text class="svg-tiny" x="44" y="120">damped long-range dispersion</text>
+                <text class="svg-title" x="145" y="184">+</text>
+                <rect class="node node-train" x="24" y="206" width="267" height="78" rx="9"/>
+                <text class="svg-small" x="44" y="237">Σᵢⱼ Δeᴺᴺdisp</text><text class="svg-tiny" x="44" y="262">optional; zero if no_disp_nn</text>
+                <text class="svg-label lime" x="24" y="308">= Edisp</text>
+              </g>
+            </svg>
+          </div>
+          <figcaption>This ledger is mandatory for A, B, and C. Configure MTP-MTP electrostatics through <code>DimerProp</code> as damped (CLIFF or AMOEBA) or undamped; retain <code>classical_induction</code> and D3 in every model. Train component losses plus a total-energy consistency term and report classical/residual terms separately.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="path">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-index">07 / BUILD ORDER</div>
+          <div><h2>De-risk in five visual checkpoints.</h2></div>
+        </div>
+
+        <div class="route">
+          <div class="route-no">P0</div>
+          <div class="route-main"><h3>Feature tap + long-range parity harness</h3><p>Load pinned <code>polar-1-s</code>; identify node irreps; verify batching and symmetries. Freeze a common evaluator for MTP-MTP (damped/undamped), <code>classical_induction</code>, and D3 so every architecture is compared with the same asymptotic spine.</p></div>
+          <div class="route-exit"><strong>Figure unlocked</strong><br>Fig. 04 tensors and Fig. 06 classical terms have measured, versioned schemas.</div>
+        </div>
+        <div class="route">
+          <div class="route-no">P1</div>
+          <div class="route-main"><h3>Hybrid architecture B</h3><p>Keep existing AtomMPNN properties and <code>DimerProp</code> long-range branch. Replace AP3D3 atomic embedding with projected MACE features using H1, then ablate H2.</p></div>
+          <div class="route-exit"><strong>Decision gate</strong><br>MACE representation beats the AP3D3 baseline on identity/scaffold splits.</div>
+        </div>
+        <div class="route">
+          <div class="route-no">P2</div>
+          <div class="route-main"><h3>MACE-featurized atom model C</h3><p>Train equivariant q/μ/Q heads and invariant HFVR/volume/α/damping heads from frozen MACE irreps. Enforce charge sum and tensor covariance; compare MTP-MTP and induction energies against the existing AtomMPNN provider.</p></div>
+          <div class="route-exit"><strong>Decision gate</strong><br>Multipole, electrostatic, and induction parity pass before AtomMPNN removal.</div>
+        </div>
+        <div class="route">
+          <div class="route-no">P3</div>
+          <div class="route-main"><h3>Direct PolarMACE route A</h3><p>Validate direct density coefficients as q/μ candidates, complete Q and response properties, and compare against C. This isolates whether explicit atom-head supervision is necessary.</p></div>
+          <div class="route-exit"><strong>Ablation gate</strong><br>Direct outputs must match C's physical constraints and long-range energy accuracy.</div>
+        </div>
+        <div class="route">
+          <div class="route-no">P4</div>
+          <div class="route-main"><h3>Final architecture selection</h3><p>Benchmark A, B, and C with the same MTP-MTP / <code>classical_induction</code> / D3 configuration, pair-head capacity, splits, seeds, and component targets.</p></div>
+          <div class="route-exit"><strong>Final selection</strong><br>Choose on accuracy, asymptotics, calibration, latency, memory, and interface simplicity.</div>
+        </div>
+
+        <figure class="figure-card" style="margin-top:2rem">
+          <div class="figure-head"><div><div class="fig-label">Figure 07</div><h3>Minimum experiment matrix</h3></div></div>
+          <div class="figure-scroll">
+            <svg viewBox="0 0 1450 390" role="img" aria-labelledby="matrix-title matrix-desc">
+              <title id="matrix-title">Architecture experiment matrix</title>
+              <desc id="matrix-desc">Five experiments compare the baseline, two hybrid pair integrations, a MACE-featurized learned atom head, and direct PolarMACE properties while holding the asymptotic long-range models constant.</desc>
+              <text class="svg-label" x="45" y="47">CONTROLLED ABLATIONS — FIX MTP-MTP · CLASSICAL_INDUCTION · D3 ACROSS ALL RUNS</text>
+              <g transform="translate(45 82)">
+                <rect class="node node-existing" width="250" height="225" rx="12"/>
+                <text class="svg-label violet" x="22" y="32">BASE</text><text class="svg-title" x="22" y="70">Current AP3D3</text>
+                <text class="svg-small" x="22" y="104">AtomMPNN properties</text><text class="svg-small" x="22" y="130">scratch atom embedding</text><text class="svg-small" x="22" y="156">MTP-MTP · IND · D3</text>
+                <text class="svg-tiny" x="22" y="198">repository control</text>
+              </g>
+              <g transform="translate(320 82)">
+                <rect class="node node-train" width="250" height="225" rx="12"/>
+                <text class="svg-label pink" x="22" y="32">B1 / H1</text><text class="svg-title" x="22" y="70">MACE → h⁰</text>
+                <text class="svg-small" x="22" y="104">final-layer l=0</text><text class="svg-small" x="22" y="130">keep intra-MPNN</text><text class="svg-small" x="22" y="156">keep AtomMPNN props</text>
+                <text class="svg-tiny" x="22" y="198">minimum viable transfer</text>
+              </g>
+              <g transform="translate(595 82)">
+                <rect class="node node-train" width="250" height="225" rx="12"/>
+                <text class="svg-label pink" x="22" y="32">B2 / H2</text><text class="svg-title" x="22" y="70">Direct pair MACE</text>
+                <text class="svg-small" x="22" y="104">all l=0 + norms</text><text class="svg-small" x="22" y="130">bypass intra-MPNN</text><text class="svg-small" x="22" y="156">keep AtomMPNN props</text>
+                <text class="svg-tiny" x="22" y="198">pair-path ablation</text>
+              </g>
+              <g transform="translate(870 82)">
+                <rect class="node node-train" width="250" height="225" rx="12"/>
+                <text class="svg-label pink" x="22" y="32">C / ATOM HEAD</text><text class="svg-title" x="22" y="70">Learned q/μ/Q</text>
+                <text class="svg-small" x="22" y="104">MACE equivariant heads</text><text class="svg-small" x="22" y="130">MACE pair features</text><text class="svg-small" x="22" y="156">no AtomMPNN</text>
+                <text class="svg-tiny" x="22" y="198">preferred replacement</text>
+              </g>
+              <g transform="translate(1145 82)">
+                <rect class="node node-output" width="250" height="225" rx="12"/>
+                <text class="svg-label lime" x="22" y="32">A / DIRECT POLAR</text><text class="svg-title" x="22" y="70">Direct q/μ</text>
+                <text class="svg-small" x="22" y="104">Polar density outputs</text><text class="svg-small" x="22" y="130">Q / response completion</text><text class="svg-small" x="22" y="156">no AtomMPNN</text>
+                <text class="svg-tiny" x="22" y="198">direct-output ablation</text>
+              </g>
+            </svg>
+          </div>
+          <figcaption>Hold MTP-MTP damping mode, <code>classical_induction</code>, D3 parameters, splits, and pair-head capacity fixed. Compare per-component and total MAE/RMSE, error vs separation, charged/radical subsets, symmetry, throughput, peak memory, and three-seed variance.</figcaption>
+        </figure>
+
+        <div style="margin-top:4rem">
+          <div class="section-head" style="margin-bottom:1rem">
+            <div class="section-index">REFERENCES</div>
+            <div><h2 style="font-size:2.2rem">Code and model anchors.</h2></div>
+          </div>
+          <div class="source-line"><div class="n">01</div><div><a href="https://mace-docs.readthedocs.io/en/latest/guide/polar_mace.html">MACE-POLAR-1 guide</a><p>Canonical <code>polar-1-s</code> loader and documented charge-density / multipole outputs.</p></div></div>
+          <div class="source-line"><div class="n">02</div><div><code>src/apnet_pt/AtomPairwiseModels/apnet3_d3_fused.py</code><p>Current AP3D3 pair features, readouts, classical energy assembly, and <code>no_disp_nn</code> behavior.</p></div></div>
+          <div class="source-line"><div class="n">03</div><div><code>src/apnet_pt/AtomPairwiseModels/apnet3_fused.py</code><p>Existing AtomMPNN property provider and AP3 pair MPNN topology.</p></div></div>
+          <div class="source-line"><div class="n">04</div><div><code>src/apnet_pt/AtomPairwiseModels/mtp_mtp.py</code><p><code>DimerProp</code>, damped CLIFF/AMOEBA and undamped MTP-MTP electrostatics, induced-dipole paths, and D3 integration.</p></div></div>
+          <div class="source-line"><div class="n">05</div><div><code>src/apnet_pt/classical_induction.py</code><p>Classical induction implementation and the long-range induced-dipole contract retained by all routes.</p></div></div>
+          <div class="source-line"><div class="n">06</div><div><a href="https://github.com/ACEsuit/mace-foundations/releases/tag/mace_polar_1">MACE-POLAR-1 checkpoint release</a><p>Foundation checkpoint assets, OMol25 / ωB97M-V provenance, and model-license notice.</p></div></div>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div class="wrap">Architecture atlas · dark figure edition · proposed scope only. Exact PolarMACE tensor layouts and multipole conventions must be verified against the pinned checkpoint before implementation. <a href="./mace-apnet-implementation-spec.md">Open the implementation specification →</a></div>
+    </footer>
+  </main>
+
+  <script>
+    const bar = document.querySelector('.progress');
+    const links = [...document.querySelectorAll('nav a')];
+    const sections = links.map(a => document.querySelector(a.getAttribute('href'))).filter(Boolean);
+    function updatePageState() {
+      const max = document.documentElement.scrollHeight - innerHeight;
+      bar.style.width = `${max > 0 ? (scrollY / max) * 100 : 0}%`;
+      let active = sections[0];
+      for (const section of sections) {
+        if (section.getBoundingClientRect().top < innerHeight * 0.3) active = section;
+      }
+      links.forEach(a => a.classList.toggle('active', a.hash === `#${active?.id}`));
+    }
+    addEventListener('scroll', updatePageState, { passive: true });
+    updatePageState();
+  </script>
+</body>
+</html>

@@ -10,19 +10,19 @@ dependencies:
   - pip
   - pytest=7.4.4
   - python=3.12.8
-  - pytorch=2.10.*
-  - cuda=12.6.*
-  - pytorch-mutex=1.0
   - requests=2.32.3
   - setuptools=72.1.0
-  - torchaudio
-  - torchvision
   - matplotlib
   - pydantic==2.*
   - scipy
   - tqdm
   - h5py
+  - jsonschema
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.10.0+cu126
+      - torchaudio==2.10.0+cu126
+      - torchvision==0.25.0+cu126
       - qcelemental==0.29.0
       - qm-tools-aw==1.4.5
       # Install optional PyG wheels after env creation when you need them.

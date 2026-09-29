@@ -137,3 +137,95 @@ def test_train_signature_and_cli_expose_the_mode():
     cli = (root / "train_models.py").read_text()
     assert '"--induction_convergence_norm"' in cli
     assert 'choices=["l2", "rms", "max"]' in cli
+
+
+# ---------------------------------------------------------------------------
+# The MACE/AP3D3 route reaches induction through a different kernel in this same
+# module -- `induced_dipole_induction_optimized_no_correction`, bound by
+# `apnet_pt.mace.long_range._default_backends` -- and it carried its own copy of
+# the historical unnormalised rule.  These pin that it now shares the reduction,
+# the default, and the validator with the Rackers path.
+
+
+def test_mace_kernel_signature_accepts_the_mode():
+    import inspect
+
+    fn = mtp_mtp.induced_dipole_induction_optimized_no_correction
+    params = inspect.signature(fn).parameters
+    assert "convergence_norm" in params
+    assert params["convergence_norm"].default == "l2"
+
+
+def test_mace_kernel_uses_the_shared_reduction():
+    src = inspect_source(mtp_mtp.induced_dipole_induction_optimized_no_correction)
+    assert "_scf_residual(" in src
+    # The hand-rolled expression must be gone, not merely shadowed: leaving it
+    # behind is how the two routes drifted apart in the first place.
+    assert "delta_A = torch.norm(" not in src
+    assert "max(delta_A, delta_B)" not in src
+
+
+def test_mace_kernel_rejects_an_unknown_mode():
+    import inspect
+
+    # Validation happens before any tensor work, so a bad mode is rejected on
+    # arguments the kernel never gets far enough to use.
+    fn = mtp_mtp.induced_dipole_induction_optimized_no_correction
+    bound = {
+        name: None for name in inspect.signature(fn).parameters if name not in {
+            "max_iterations",
+            "convergence_threshold",
+            "omega",
+            "thole_damping_param",
+            "Q_const",
+            "polarizability_table",
+            "return_diagnostics",
+            "thole_damping_param_direct",
+            "thole_damping_param_mutual",
+            "convergence_norm",
+        }
+    }
+    with pytest.raises(ValueError, match="induction_convergence_norm"):
+        fn(**bound, convergence_norm="frobenius")
+
+
+# ---------------------------------------------------------------------------
+# PhysicsConfig is how the MACE route configures the solver: there is no CLI
+# flag, the physics JSON is the seam.
+
+
+def test_physics_config_defaults_to_the_historical_rule():
+    from apnet_pt.mace.schema import (
+        DEFAULT_SCF_CONVERGENCE_NORM,
+        SCF_CONVERGENCE_NORMS,
+        PhysicsConfig,
+    )
+
+    assert DEFAULT_SCF_CONVERGENCE_NORM == "l2"
+    assert SCF_CONVERGENCE_NORMS == NORMS
+    assert PhysicsConfig().scf_convergence_norm == "l2"
+
+
+@pytest.mark.parametrize("bad", ["L2", "frobenius", "", None, 2])
+def test_physics_config_rejects_everything_else(bad):
+    from apnet_pt.mace.schema import PhysicsConfig
+
+    with pytest.raises(ValueError, match="scf_convergence_norm"):
+        PhysicsConfig(scf_convergence_norm=bad)
+
+
+def test_default_physics_hash_is_unchanged_by_the_new_field():
+    import dataclasses
+
+    from apnet_pt.mace.schema import PhysicsConfig
+
+    # This literal is stamped into configs/mace-apnet/physics-v1.json in the
+    # experiment repository and into every MACE v3 checkpoint written so far.
+    # The `l2` branch reproduces the prior op sequence bit-for-bit, so a
+    # default config is the same physics and must keep the same hash.
+    assert PhysicsConfig().physics_hash == (
+        "bbaac8bc4d8f839ba73d822678fe61e63cf4abea267da0e57478a4879a02cbd0"
+    )
+    for norm in ("rms", "max"):
+        changed = dataclasses.replace(PhysicsConfig(), scf_convergence_norm=norm)
+        assert changed.physics_hash != PhysicsConfig().physics_hash, norm

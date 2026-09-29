@@ -1383,9 +1383,8 @@ def parse_param_list(param_str):
         return float(param_str)
 
 
-def main():
-    """
-    Parse command-line arguments and run configured model training routines.
+def build_parser():
+    """Build the legacy-compatible parser plus the MACE/AP3D3 contract.
 
     Parses command-line options that configure atom and pairwise (APNet) training, converts the parameter-start mean/std strings to numeric lists, sets global random seeds, prints the parsed arguments, and invokes train_atom_model and/or train_pairwise_model when the corresponding flags are provided.
     """
@@ -2113,6 +2112,72 @@ def main():
         default=False,
         help="Build/process the requested dataset and exit without training.",
     )
+    args.add_argument("--mace_model", type=str, default="polar-1-s")
+    args.add_argument("--mace_model_path", type=str, default=None)
+    args.add_argument("--mace_model_sha256", type=str, default=None)
+    args.add_argument("--mace_feature_mode", type=str, default="auto")
+    args.add_argument("--mace_default_dtype", type=str, default="float32")
+    args.add_argument(
+        "--mace_device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Explicit eager MACE execution device policy.",
+    )
+    args.add_argument("--mace_cache_dir", type=str, default=None)
+    args.add_argument("--mace_offline", action="store_true", default=False)
+    args.add_argument("--mace_atom_model_path", type=str, default=None)
+    args.add_argument("--mace_property_mode", type=str, default="learned")
+    args.add_argument("--train_atomic_heads", action="store_true", default=False)
+    args.add_argument("--long_range_elst", type=str, default="damped-cliff")
+    args.add_argument("--d3_params", type=str, default="default")
+    args.add_argument(
+        "--scf_tolerance",
+        type=float,
+        default=None,
+        help=(
+            "MACE/AP3D3 induction SCF stopping threshold. Unset keeps the "
+            "PhysicsConfig default of 1e-8."
+        ),
+    )
+    args.add_argument(
+        "--scf_max_iterations",
+        type=int,
+        default=None,
+        help=(
+            "MACE/AP3D3 induction SCF iteration cap. Unset keeps the "
+            "PhysicsConfig default of 200."
+        ),
+    )
+    args.add_argument(
+        "--scf_convergence_norm",
+        type=str,
+        default=None,
+        choices=["l2", "rms", "max"],
+        help=(
+            "how the induced-dipole change is reduced before the SCF threshold "
+            "test. 'l2' is the historical unnormalised batch-wide norm, so the "
+            "effective per-atom tolerance tightens as the batch grows; 'rms' "
+            "and 'max' are batch-size independent. Unset keeps 'l2'."
+        ),
+    )
+    args.add_argument(
+        "--induction_model",
+        type=str,
+        default=None,
+        choices=["ap3-no-correction", "cliff2-rackers"],
+        help=(
+            "which induction functional the MACE/AP3D3 classical spine solves. "
+            "'ap3-no-correction' is the historical AP3-D3 kernel; "
+            "'cliff2-rackers' is CLIFF2's Rackers/Thole induction with split "
+            "direct and mutual damping, run with the two PhysicsConfig Thole "
+            "scalars and without the overlap correction. Unset keeps "
+            "'ap3-no-correction'."
+        ),
+    )
+    args.add_argument("--smoke_data_path", type=str, default=None)
+    args.add_argument("--smoke_atom_data_path", type=str, default=None)
+    args.add_argument("--overwrite", action="store_true", default=False)
+    args.add_argument("--resume", action="store_true", default=False)
     wandb_mode_default = os.getenv("WANDB_MODE", "disabled")
     if wandb_mode_default not in {"disabled", "online", "offline"}:
         wandb_mode_default = "disabled"
@@ -2134,7 +2199,51 @@ def main():
         default=None,
         help="JSON object merged into the W&B run config for provenance",
     )
-    args = args.parse_args()
+    return args
+
+
+def dispatch_args(args, *, mace_dispatch=None):
+    """Dispatch only after route-specific validation has completed."""
+
+    # `--batch_size` defaults to None so the CLIFF routes can tell "unset" from
+    # an explicit value: `train_pairwise_model` rejects the flag outright on the
+    # routes whose shape is fixed by their store. The MACE/AP3D3 smoke and
+    # factory routes have no such distinction and have always run at 16, so
+    # resolve the sentinel for them here rather than reintroducing a second
+    # `--batch_size` with a different default.
+    if args.batch_size is None and (
+        args.smoke_data_path or args.smoke_atom_data_path
+    ):
+        args.batch_size = 16
+
+    if args.train_apnet == "APNet3-fused-d3" and args.smoke_data_path:
+        from apnet_pt.training.smoke import run_matched_ap3d3_baseline_smoke
+
+        pprint(args)
+        set_all_seeds(args.random_seed)
+        report = run_matched_ap3d3_baseline_smoke(args)
+        print(f"baseline smoke loss={report.loss:.8g}")
+        print(f"baseline component_losses={dict(report.component_losses)}")
+        print(f"baseline classical_ledger={dict(report.classical_ledger)}")
+        print(f"baseline residual_ledger={dict(report.residual_ledger)}")
+        return report
+
+    from apnet_pt.training.mace_ap3d3_factory import looks_like_mace_option
+
+    is_mace_pair = bool(args.train_apnet) and looks_like_mace_option(
+        args.train_apnet
+    )
+    is_mace_atom = bool(args.train_am) and looks_like_mace_option(args.train_am)
+    if is_mace_pair or is_mace_atom:
+        if args.batch_size is None:
+            args.batch_size = 16
+        if mace_dispatch is None:
+            from apnet_pt.training.mace_ap3d3_factory import dispatch_mace_cli
+
+            mace_dispatch = dispatch_mace_cli
+        pprint(args)
+        set_all_seeds(args.random_seed)
+        return mace_dispatch(args)
     # Parse only explicitly supplied parameter initialization values.
     if args.param_start_mean is not None:
         args.param_start_mean = parse_param_list(args.param_start_mean)
@@ -2348,6 +2457,13 @@ def main():
             wandb_config=pairwise_wandb_config,
         )
     return
+
+
+def main(argv=None):
+    """Parse arguments and dispatch legacy or normalized MACE routes."""
+
+    args = build_parser().parse_args(argv)
+    return dispatch_args(args)
 
 
 if __name__ == "__main__":

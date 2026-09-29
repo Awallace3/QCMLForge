@@ -14,7 +14,7 @@ from apnet_pt import constants
 from torch_geometric.data import Data
 from torch_geometric.data import Batch, Dataset
 from . import util
-from .lmdb_utils import acquire_lmdb_env, release_lmdb_env
+from .lmdb_utils import LmdbEnvHandleMixin, acquire_lmdb_env, release_lmdb_env
 
 import os.path as osp
 import torch
@@ -125,6 +125,7 @@ def atomic_collate_update(batch):
             - optional `edge_index_full` reindexed and concatenated when present
             - `molecule_ind` indicating molecule membership per atom
             - `total_charge` per molecule
+            - optional `total_spin` molecular multiplicity per molecule
             - `natom_per_mol` giving the number of atoms in each molecule
     """
     current_count = 0
@@ -155,12 +156,22 @@ def atomic_collate_update(batch):
         quadrupoles=torch.cat([data.quadrupoles for data in batch], dim=0),
         R=torch.cat([data.R for data in batch], dim=0),
         molecule_ind=molecule_ind,
-        total_charge=torch.tensor(
-            [data.total_charge for data in batch], dtype=batch[0].total_charge.dtype
-        ),
+        total_charge=torch.stack([data.total_charge.reshape(()) for data in batch]),
+        # Preserve legacy processed datasets; MACE production callers validate
+        # explicit multiplicity on every source item before using this fallback.
+        total_spin=torch.stack(
+            [
+                getattr(data, "total_spin", torch.tensor(1.0)).reshape(())
+                for data in batch
+            ]
+        ).float(),
         natom_per_mol=natom_per_mol,
     )
 
+    if all(hasattr(data, "total_spin") for data in batch):
+        batched_data.total_spin = torch.stack(
+            [data.total_spin.float().reshape(()) for data in batch]
+        )
     if has_full_edges:
         batched_data.edge_index_full = torch.cat(edge_indices_full, dim=1)
 
@@ -490,6 +501,7 @@ def qcel_mon_to_pyg_data(mon, r_cut=5.0, custom=False, full_indices=False):
             - R: atomic coordinates in Angstroms (tensor, float)
             - molecule_ind: per-atom molecule index (tensor, long)
             - total_charge: molecular charge (tensor, long)
+            - total_spin: molecular multiplicity passed to MACE (tensor, float)
             - natom_per_mol: number of atoms in the monomer (tensor, long)
             - edge_index_full (optional): all atom-pair indices when `full_indices=True`
     """
@@ -497,6 +509,7 @@ def qcel_mon_to_pyg_data(mon, r_cut=5.0, custom=False, full_indices=False):
     node_features = torch.tensor(np.array(Z), dtype=torch.int64)
     R = torch.tensor(np.array(mon.geometry) * constants.au2ang, dtype=torch.float32)
     total_charge = torch.tensor(np.array(mon.molecular_charge), dtype=torch.int64)
+    total_spin = torch.tensor(float(mon.molecular_multiplicity), dtype=torch.float32)
 
     edge_index_full = None
     if custom:
@@ -516,6 +529,7 @@ def qcel_mon_to_pyg_data(mon, r_cut=5.0, custom=False, full_indices=False):
         "R": R.float(),
         "molecule_ind": torch.tensor(np.full(len(R), 0), dtype=torch.int64),
         "total_charge": total_charge.long(),
+        "total_spin": total_spin,
         "natom_per_mol": torch.tensor([len(R)], dtype=torch.int64),
     }
 
@@ -757,6 +771,10 @@ class atomic_module_dataset(Dataset):
         raise ValueError("spec_type must be 1, 2, or 3!")
         return []
 
+    def _invalidate_processed_file_names(self):
+        """Drop the memoized processed-file listing after the directory changes."""
+        self._processed_file_names_cache = None
+
     @property
     def processed_file_names(self):
         if self.force_reprocess:
@@ -764,6 +782,14 @@ class atomic_module_dataset(Dataset):
         if self.testing:
             return [f"data_{i}.pt" for i in range(self.MAX_SIZE - 1)]
         else:
+            # len() consults this on every element access, so without a cache
+            # the glob and natural_key sort below run once per __getitem__.
+            # Over a 53k-file processed directory that is ~0.3 s each, which
+            # makes a single pass across the dataset quadratic. The listing
+            # only changes in process(), which invalidates the cache.
+            cached = getattr(self, "_processed_file_names_cache", None)
+            if cached is not None:
+                return cached
             if self.split == "train":
                 file_cmd = (
                     f"{self.root}/processed/data_train_spec_{self.spec_type}_*.pt"
@@ -779,9 +805,10 @@ class atomic_module_dataset(Dataset):
                 spec_files.sort(key=natural_key)
                 if self.MAX_SIZE is not None and len(spec_files) > self.MAX_SIZE:
                     spec_files = spec_files[: self.MAX_SIZE]
-                return spec_files
             else:
-                return [f"data_missing_{i}.pt" for i in range(1)]
+                spec_files = [f"data_missing_{i}.pt" for i in range(1)]
+            self._processed_file_names_cache = spec_files
+            return spec_files
 
     def download(self):
         if self.spec_type in [1, 2]:
@@ -910,6 +937,7 @@ class atomic_module_dataset(Dataset):
                 if self.MAX_SIZE is not None and idx > self.MAX_SIZE:
                     break
                 idx += 1
+        self._invalidate_processed_file_names()
         return
 
     def len(self):
@@ -1462,7 +1490,7 @@ class atomic_induced_dipole_precomputed_dataset(Dataset):
         )
 
 
-class atomic_module_dataset_lmdb(Dataset):
+class atomic_module_dataset_lmdb(LmdbEnvHandleMixin, Dataset):
     """
     LMDB-based dataset for atomic induced dipole training with efficient storage.
 
@@ -2045,7 +2073,7 @@ class atomic_module_dataset_lmdb(Dataset):
         )
 
 
-class atomic_hirshfeld_valencewdith_only_module_dataset(Dataset):
+class atomic_hirshfeld_valencewdith_only_module_dataset(LmdbEnvHandleMixin, Dataset):
     def __init__(
         self,
         root,

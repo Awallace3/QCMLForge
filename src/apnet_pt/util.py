@@ -225,6 +225,29 @@ def load_bms_dimer(file):
     return dimer, label
 
 
+#: Column pairs an AP-Net dimer frame may use to record monomer multiplicity.
+_MULTIPLICITY_COLUMNS = (("TMA", "TMB"), ("multiplicity_A", "multiplicity_B"))
+
+
+def _dimer_multiplicities(df, n):
+    """Return ``(TMA, TMB, source)`` for an array-format dimer frame.
+
+    AP-Net's array frames were written before open-shell monomers were in
+    scope, so most carry no multiplicity at all. Returning the source name
+    alongside the values lets the caller say which of the two situations it is
+    in; a bare list of ones cannot be told apart from a genuinely closed-shell
+    dataset once it leaves this function.
+    """
+    for col_a, col_b in _MULTIPLICITY_COLUMNS:
+        if col_a in df.columns and col_b in df.columns:
+            return (
+                [int(v) for v in df[col_a].tolist()],
+                [int(v) for v in df[col_b].tolist()],
+                col_a,
+            )
+    return [1] * n, [1] * n, "assumed-closed-shell"
+
+
 def load_dimer_dataset(
     file,
     max_size=None,
@@ -232,6 +255,7 @@ def load_dimer_dataset(
     return_qcel_mols=True,
     return_qcel_mons=False,
     return_fragment_indices=False,
+    return_multiplicities=False,
     random_seed_shuffle=None,
 ):
     """
@@ -291,7 +315,7 @@ def load_dimer_dataset(
     if 'qcel_molecule' in df.columns:
         def extract_mol_data(mol):
             if all([z in allowed_elements for z in mol.atomic_numbers]) is False:
-                return None, None, None, None, None, None
+                return None, None, None, None, None, None, None, None
             monA, monB = mol.get_fragment(0), mol.get_fragment(1)
 
             RA = torch.tensor(monA.geometry, dtype=torch.float32) * constants.au2ang
@@ -301,12 +325,21 @@ def load_dimer_dataset(
 
             TQA = torch.tensor(monA.molecular_charge, dtype=torch.float32)
             TQB = torch.tensor(monB.molecular_charge, dtype=torch.float32)
-            return RA.numpy(), RB.numpy(), ZA.numpy(), ZB.numpy(), TQA.item(), TQB.item()
+            # Multiplicity travels with charge. A qcel Molecule always carries
+            # one, so whenever this column exists there is no reason for a
+            # downstream consumer to assume a closed shell.
+            return (
+                RA.numpy(), RB.numpy(), ZA.numpy(), ZB.numpy(),
+                TQA.item(), TQB.item(),
+                int(monA.molecular_multiplicity),
+                int(monB.molecular_multiplicity),
+            )
         v = df['qcel_molecule'].apply(extract_mol_data).tolist()
         # Filter out any None entries due to invalid elements
         v = [entry for entry in v if entry[0] is not None]
         N = len(v)
-        RA, RB, ZA, ZB, TQA, TQB = zip(*v)
+        RA, RB, ZA, ZB, TQA, TQB, TMA, TMB = zip(*v)
+        multiplicity_source = "qcel_molecule"
     else:
         len_df_start = len(df)
         df = df[df["ZA"].apply(lambda x: all([z in allowed_elements for z in x]))].copy()
@@ -326,6 +359,10 @@ def load_dimer_dataset(
         ZB = df.ZB.tolist()
         TQA = df.TQA.tolist()
         TQB = df.TQB.tolist()
+        # AP-Net array frames predate multiplicity. Use it when a frame does
+        # carry it and record the closed-shell assumption explicitly when it
+        # does not, rather than letting a silent ``1`` reach MACE.
+        TMA, TMB, multiplicity_source = _dimer_multiplicities(df, N)
     aQA = [TQA[i] / np.sum(ZA[i] > 0) for i in range(N)]
     aQB = [TQB[i] / np.sum(ZB[i] > 0) for i in range(N)]
     try:
@@ -333,6 +370,11 @@ def load_dimer_dataset(
     except Exception:
         labels = None
 
+    if return_multiplicities and (return_qcel_mons or return_qcel_mols):
+        raise ValueError(
+            "return_multiplicities applies to the array return shapes; a qcel "
+            "Molecule already carries molecular_multiplicity"
+        )
     if return_qcel_mons:
         monAs, monBs = [], []
         for i in range(N):
@@ -373,7 +415,14 @@ def load_dimer_dataset(
                 "Ensure Frag2_indices in the dataset are 1-indexed dimer coordinates "
                 "with monB atoms starting at index nA+1."
             )
+        if return_multiplicities:
+            print(f"  monomer multiplicity source: {multiplicity_source}")
+            return (RA, RB, ZA, ZB, TQA, TQB, labels,
+                    frag1_indices, frag2_indices, TMA, TMB)
         return RA, RB, ZA, ZB, TQA, TQB, labels, frag1_indices, frag2_indices
+    if return_multiplicities:
+        print(f"  monomer multiplicity source: {multiplicity_source}")
+        return RA, RB, ZA, ZB, TQA, TQB, labels, TMA, TMB
     return RA, RB, ZA, ZB, TQA, TQB, labels
 
 

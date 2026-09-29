@@ -1,0 +1,41 @@
+name: Protected PolarMACE CPU integration (DISABLED/BLOCKED)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  protected-cpu:
+    # CI-2 is unconditionally disabled. The repository currently has no
+    # polarmace-protected Environment, protected main branch, or isolated
+    # self-hosted runner. A reviewed future change may remove `false &&` only
+    # after those external controls and a read-only mount are verified.
+    # The trusted-main clause remains defense in depth, not policy proof.
+    if: ${{ false && github.ref == 'refs/heads/main' }}
+    runs-on: [self-hosted, linux, x64, qcmlforge-polarmace-cpu]
+    environment: polarmace-protected
+    timeout-minutes: 60
+    env:
+      QCMLFORGE_POLARMACE_ARTIFACT: ${{ vars.QCMLFORGE_POLARMACE_ARTIFACT }}
+      # This value is meaningful only when supplied by the protected GitHub
+      # Environment; repository YAML or a local variable is not proof.
+      QCMLFORGE_CI2_POLICY_ATTESTED: ${{ vars.QCMLFORGE_CI2_POLICY_ATTESTED }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Run fail-closed CI-2 authority
+      run: |
+        python scripts/validate_mace_local.py \
+          --tier CI-2 \
+          --mace-artifact "$QCMLFORGE_POLARMACE_ARTIFACT" \
+          --output-dir "$RUNNER_TEMP/qcmlforge-mace-cpu"
+    - name: Publish evidence only (never the mounted artifact)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: protected-mace-cpu-evidence
+        path: ${{ runner.temp }}/qcmlforge-mace-cpu/

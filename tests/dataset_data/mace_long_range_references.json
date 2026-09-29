@@ -1,0 +1,28 @@
+{
+  "provenance": {
+    "source_fixture": "tests/dataset_data/water_dimer_pes3.pkl",
+    "source_fixture_sha256": "8fe0b2d8cb37188877e569943e25cc96d6e19c7d926d7756ecd6bb5c53496ecc",
+    "amoeba_fixture_sha256": "c9f4c891e223b1d4ea2795137defeab1bf4dd6917037e7804cf40447053a5f2a",
+    "generator_identity": "manual-reference-extraction-v1:water_dimer_pes3-row-0:amoeba_water_dimer_ref",
+    "generator_identity_sha256": "1cea8ef127c5042b69b5b4a11f8eb0697e6204cdfcee5f5b53774cdf53b2b2a3",
+    "row": 0,
+    "multipoles": "pbe0/atz distributed q, mu, theta",
+    "response": "pbe0/atz HFVR and valence widths",
+    "damping": [2.05109221104216, 1.65393856475232, 1.65393856475232],
+    "validation_basis": "Frozen numeric artifact derived from the repository fixture already validated independently against CLIFF and multipole reference paths in tests/test_classical_components.py; expected values are not computed from the implementation during the test. These CLIFF-like K values are not an independent AMOEBA reference.",
+    "amoeba_evidence": "Independent AMOEBA/HIPPO evidence uses tests/dataset_data/amoeba_water_dimer_ref.pkl with explicit alpha_A/alpha_B K values through LongRangeSAPTProvider.",
+    "dtype": "torch.float32",
+    "units": "kcal/mol",
+    "tolerance": {"atol": 0.00002, "rtol": 0.000002}
+  },
+  "damped-cliff": {
+    "electrostatics": -11.245525360107422,
+    "induction": -1.3741306066513062,
+    "d3": -3.8629777431488037
+  },
+  "undamped": {
+    "electrostatics": -7.501972198486328,
+    "induction": -1.3741306066513062,
+    "d3": -3.8629777431488037
+  }
+}
