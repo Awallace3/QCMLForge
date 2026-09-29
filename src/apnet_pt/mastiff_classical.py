@@ -180,3 +180,55 @@ def undamped_multipole_elst(
     e_uu = -torch.einsum("xy,xz,xyz->x", mua, mub, T2)
     e_qQ = (T2 * (qa[:, None, None] * Qb + qb[:, None, None] * Qa)).sum((-1, -2))
     return 627.509 * (e_qq + e_qu + e_uu + e_qQ / Q_const)
+
+
+def rackers_elst_pair_exponents(
+    ZA: Tensor,
+    RA: Tensor,
+    qA: Tensor,
+    muA: Tensor,
+    quadA: Tensor,
+    ZB: Tensor,
+    RB: Tensor,
+    qB: Tensor,
+    muB: Tensor,
+    quadB: Tensor,
+    e_AB_source: Tensor,
+    e_AB_target: Tensor,
+    alpha_source: Tensor,
+    alpha_target: Tensor,
+    Q_const: float = 3.0,
+) -> Tensor:
+    """CLIFF2's Rackers-damped elst with one damping exponent per pair END.
+
+    `mtp_elst_damping` takes one exponent per atom.  A direction-dependent
+    exponent such as eq-l3's B_i(W) differs from pair to pair, so here
+    `alpha_source[k]` damps atom e_AB_source[k] in pair k and `alpha_target[k]`
+    damps atom e_AB_target[k] (bohr^-1, as in `mtp_elst_damping`).  Each pair is
+    evaluated as its own two-atom system, so with per-atom exponents gathered
+    onto the pairs the result equals `mtp_elst_damping` edge for edge.
+
+    Runs in the dtype of `qA` and does not mutate its inputs.  Coordinates are
+    in Angstrom; pass the FULL intermolecular edge set.
+    """
+    from apnet_pt.AtomPairwiseModels.mtp_mtp import mtp_elst_damping
+
+    dtype = qA.dtype
+    pair = torch.arange(len(e_AB_source), device=e_AB_source.device)
+
+    def ends(x, index):
+        return x.to(dtype).index_select(0, index)
+
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)  # mtp_elst_damping builds eye(3) in it
+    try:
+        return mtp_elst_damping(
+            ends(ZA, e_AB_source), ends(RA, e_AB_source),
+            ends(qA.reshape(-1), e_AB_source), ends(muA, e_AB_source),
+            ends(quadA, e_AB_source), alpha_source.to(dtype),
+            ends(ZB, e_AB_target), ends(RB, e_AB_target),
+            ends(qB.reshape(-1), e_AB_target), ends(muB, e_AB_target),
+            ends(quadB, e_AB_target), alpha_target.to(dtype),
+            pair, pair, Q_const=Q_const)
+    finally:
+        torch.set_default_dtype(old)

@@ -11,6 +11,7 @@ from apnet_pt.mastiff_classical import (
     mastiff_short_range,
     racah_l3,
     racah_parity,
+    rackers_elst_pair_exponents,
     slater_overlap,
     undamped_multipole_elst,
 )
@@ -34,8 +35,8 @@ def test_racah_l3_is_unit_norm_per_degree_and_has_parity():
     u = unit_vectors(64, 2)
     c = racah_l3(u)
     degrees = torch.tensor(RACAH_L3_DEGREES)
-    for l in (1, 2, 3):
-        norm = c[:, degrees == l].square().sum(-1)
+    for deg in (1, 2, 3):
+        norm = c[:, degrees == deg].square().sum(-1)
         torch.testing.assert_close(norm, torch.ones_like(norm))
     torch.testing.assert_close(racah_l3(-u), c * racah_parity(15, DTYPE))
 
@@ -158,3 +159,38 @@ def test_rackers_damping_differs_at_short_range():
                               src, tgt)
     undamped = undamped_multipole_elst(*args)
     assert (damped.sum() - undamped.sum()).abs() > 1e-2
+
+
+def test_pair_exponent_rackers_equals_per_atom_rackers():
+    args = random_dimer(9, 2.5)
+    ZA, RA, qA, muA, QA, ZB, RB, qB, muB, QB, src, tgt = args
+    g = torch.Generator().manual_seed(9)
+    Ka = 1.5 + torch.rand(len(qA), generator=g)
+    Kb = 1.5 + torch.rand(len(qB), generator=g)
+    before = (qA.clone(), qB.clone())
+    theirs = mtp_elst_damping(ZA, RA, qA.clone(), muA, QA, Ka,
+                              ZB, RB, qB.clone(), muB, QB, Kb, src, tgt)
+    ours = rackers_elst_pair_exponents(*args, Ka[src], Kb[tgt])
+    torch.testing.assert_close((qA, qB), before)
+    assert ours.dtype == theirs.dtype
+    bound = 64 * EPS32 * nuclear_scale(ZA, RA, ZB, RB, src, tgt)
+    assert (ours.double() - theirs.double()).abs().sum() <= bound
+
+
+def test_pair_exponent_rackers_runs_in_float64_and_differentiates():
+    args = random_dimer(10, 2.5, dtype=DTYPE)
+    ZA, RA, qA, muA, QA, ZB, RB, qB, muB, QB, src, tgt = args
+    scale = torch.tensor(1.0, dtype=DTYPE, requires_grad=True)
+    alpha_i = scale * torch.full((len(src),), 1.8, dtype=DTYPE)
+    alpha_j = scale * torch.linspace(1.6, 2.0, len(src), dtype=DTYPE)
+    e = rackers_elst_pair_exponents(*args, alpha_i, alpha_j)
+    assert e.dtype == DTYPE and torch.get_default_dtype() == torch.float32
+    e.sum().backward()
+    assert torch.isfinite(scale.grad) and scale.grad != 0
+    # A per-pair exponent is a real degree of freedom: changing one pair's
+    # exponent changes that pair's energy only.
+    bumped = alpha_j.detach().clone()
+    bumped[3] *= 1.2
+    e2 = rackers_elst_pair_exponents(*args, alpha_i.detach(), bumped)
+    changed = (e2 - e.detach()).abs() > 0
+    assert changed.tolist() == [k == 3 for k in range(len(src))]
