@@ -6,14 +6,52 @@ and the graph-level scatter raises.  The bug is collation-order dependent, which
 is why an ordinary batch of dimers passes for a long time and then does not.
 """
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
-rse = pytest.importorskip("graph_longrange.realspace_electrostatics")
+# A standalone invocation must not depend on another test importing e3nn
+# under its restricted constants loader first.
+with torch.serialization.safe_globals([slice]):
+    rse = pytest.importorskip("graph_longrange.realspace_electrostatics")
 
 from apnet_pt.mace._graph_longrange_compat import (
     patch_realspace_scatter_dim_size,
 )
+
+
+def _run_pristine_case(case):
+    """Run an upstream-before-patching assertion in a fresh interpreter.
+
+    Real-checkpoint tests legitimately install process-global compatibility
+    patches. Restoring whatever happened to exist at fixture entry cannot
+    recreate pristine upstream state after those tests have run. A subprocess
+    preserves the actual upstream code and all assertions without adding
+    another mutation/restoration mechanism.
+    """
+    if os.environ.get("_QCML_PRISTINE_COMPAT_CASE") == case:
+        return False
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            f"{Path(__file__).resolve()}::{case}",
+            "-q",
+            "--tb=short",
+        ],
+        env={**os.environ, "_QCML_PRISTINE_COMPAT_CASE": case, "OMP_NUM_THREADS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return True
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +82,10 @@ def _energy(max_l, sizes):
 
 @pytest.mark.parametrize("max_l", [0, 1])
 def test_trailing_monatomic_graph_raises_without_the_patch(max_l):
+    if _run_pristine_case(
+        f"test_trailing_monatomic_graph_raises_without_the_patch[{max_l}]"
+    ):
+        return
     with pytest.raises(RuntimeError, match="expanded size of the tensor"):
         _energy(max_l, [5, 4, 1])
 
@@ -60,6 +102,10 @@ def test_patch_admits_a_trailing_monatomic_graph(max_l, sizes):
 
 @pytest.mark.parametrize("sizes", [[5, 4, 3], [5, 1, 3], [1, 5, 3], [1]])
 def test_patch_is_bit_identical_where_upstream_already_worked(sizes):
+    # Select the entire parameterized family in the child; every case must
+    # compare the actual upstream evaluator, not an already installed patch.
+    if _run_pristine_case("test_patch_is_bit_identical_where_upstream_already_worked"):
+        return
     before = _energy(1, sizes)
     patch_realspace_scatter_dim_size()
     assert torch.equal(_energy(1, sizes), before)
@@ -97,6 +143,8 @@ def test_energy_does_not_depend_on_collation_order():
 
 
 def test_patch_is_idempotent_and_self_retiring():
+    if _run_pristine_case("test_patch_is_idempotent_and_self_retiring"):
+        return
     assert patch_realspace_scatter_dim_size() is True
     assert patch_realspace_scatter_dim_size() is False
 
@@ -137,6 +185,8 @@ def _cube(edge=10.0):
 
 
 def test_kspace_patch_is_idempotent():
+    if _run_pristine_case("test_kspace_patch_is_idempotent"):
+        return
     assert patch_kspace_grid_for_nonperiodic() is True
     assert patch_kspace_grid_for_nonperiodic() is False
 
@@ -183,6 +233,9 @@ def test_elision_context_restores_an_enclosing_context():
 
 
 def test_kspace_patch_refuses_an_upstream_that_ignores_pbc(monkeypatch):
+    if _run_pristine_case("test_kspace_patch_refuses_an_upstream_that_ignores_pbc"):
+        return
+
     def precompute_geometry(self, *args, **kwargs):
         raise AssertionError("never called")
 

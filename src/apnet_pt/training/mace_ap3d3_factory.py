@@ -424,7 +424,10 @@ def _make_plan(args: Any, *, emit_warning: bool) -> MACETrainingPlan:
         raise ValueError("lr must be positive")
     if args.dataloader_num_workers is not None and args.dataloader_num_workers < 0:
         raise ValueError("dataloader_num_workers must be non-negative")
-    if args.batch_size < 1:
+    # The shared parser leaves this unset for route-specific defaults.
+    # Public plan validation must work without train_models.main mutating it.
+    batch_size = 16 if args.batch_size is None else args.batch_size
+    if batch_size < 1:
         raise ValueError("batch_size must be positive")
     if args.mace_default_dtype not in {"float32", "float64"}:
         raise ValueError("mace_default_dtype must be float32 or float64")
@@ -586,7 +589,7 @@ def _make_plan(args: Any, *, emit_warning: bool) -> MACETrainingPlan:
         r_cut=args.r_cut,
         r_cut_im=args.r_cut_im,
         neural_cutoff=physics.neural_cutoff,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         device=device,
     )
 

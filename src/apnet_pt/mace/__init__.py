@@ -33,6 +33,7 @@ __all__ = [
     "LegacyAtomMPNNPropertyProvider",
     "MACEPairResidualCore",
     "MACEExchangeCorrection",
+    "MACEMASTIFFExchange",
     "MACEAP3D3",
     "MACEAP3D3Model",
     "MACEAP3D3Result",
@@ -65,6 +66,10 @@ def __getattr__(name):
         from .exchange import MACEExchangeCorrection
 
         return MACEExchangeCorrection
+    if name == "MACEMASTIFFExchange":
+        from .mastiff import MACEMASTIFFExchange
+
+        return MACEMASTIFFExchange
     if name in {
         "MACEAP3D3",
         "MACEAP3D3Model",
