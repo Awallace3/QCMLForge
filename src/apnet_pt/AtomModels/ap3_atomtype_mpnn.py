@@ -186,6 +186,11 @@ class AtomTypeParamMPNN(nn.Module):
                 layers.append(activations[i])
         return nn.Sequential(*layers)
 
+    # Opt-in: evaluate the n_params independent networks as one stacked
+    # network (see `_forward_stacked`).  Off by default; parameters and
+    # state_dict are identical either way.
+    stacked_forward = False
+
     def forward(
         self,
         batch,
@@ -194,6 +199,8 @@ class AtomTypeParamMPNN(nn.Module):
         Use each h_list to predict a correction to the initial guess, might be
         overkill for some properties...
         """
+        if self.stacked_forward:
+            return self._forward_stacked(batch)
         x = batch.x
         edge_index = batch.edge_index
         molecule_ind = batch.molecule_ind
@@ -245,6 +252,76 @@ class AtomTypeParamMPNN(nn.Module):
         h_list = torch.stack(hlists, dim=2)
         K[keep_mask] = K_filtered
         return K.squeeze(-1) if self.n_params == 1 else K
+
+
+    def _forward_stacked(self, batch):
+        """`forward` with the n_params networks batched along a leading axis.
+
+        Each parameter p owns an independent network (embedding, message
+        updates and readouts) of identical shape, and `forward` runs them one
+        after another.  Here every layer's weights are stacked across p on
+        each call (differentiably, so the optimizer still sees the original
+        parameters) and applied with one batched matmul per layer, which
+        replaces n_params kernel launches with one.  The function is the same
+        as `forward`; results agree to floating-point reduction order.
+        """
+        Z = batch.x
+        edge_index = batch.edge_index
+        molecule_ind = batch.molecule_ind
+        P = self.n_params
+        guess = torch.stack([g.weight for g in self.guess_layer])  # [P, Zmax, 1]
+        K = guess[:, Z, 0].transpose(0, 1).contiguous()  # [natom, P]
+        natom = len(molecule_ind)
+        keep_mask = torch.zeros(natom, dtype=torch.bool, device=molecule_ind.device)
+        if edge_index.size(1) > 0:
+            keep_mask.scatter_(0, edge_index[0], True)
+            keep_mask.scatter_(0, edge_index[1], True)
+        if not keep_mask.any():
+            return K.squeeze(-1) if P == 1 else K
+        e_source, e_target = edge_index[0], edge_index[1]
+        edge_keep = keep_mask[e_source] & keep_mask[e_target]
+        idx_map = (torch.cumsum(keep_mask, dim=0) - 1).long()
+        e_source = idx_map[e_source[edge_keep]]
+        e_target = idx_map[e_target[edge_keep]]
+        R = batch.R[keep_mask, :]
+        n_kept = R.size(0)
+        dR, _ = get_distances(R, R, e_source, e_target)
+        rbf = self.distance_layer(dR)  # [E, n_rbf], shared by every p
+        n_edge = e_source.size(0)
+
+        embed = torch.stack([e.weight for e in self.embed_layer])  # [P, Zmax, e]
+        h0 = embed[:, Z[keep_mask], :]  # [P, N, e]
+        rbf_p = rbf.unsqueeze(0).expand(P, -1, -1)
+
+        def stacked_sequential(stages, x):
+            # stages: the P Sequentials for one (kind, message) slot.
+            for layer_index, layer in enumerate(stages[0]):
+                if isinstance(layer, nn.Linear):
+                    w = torch.stack([s[layer_index].weight for s in stages])
+                    b = torch.stack([s[layer_index].bias for s in stages])
+                    x = torch.baddbmm(b.unsqueeze(1), x, w.transpose(1, 2))
+                else:
+                    x = layer(x)
+            return x
+
+        h = h0
+        # Accumulated per message in the same order as `forward`.
+        kept = K[keep_mask].transpose(0, 1)  # [P, N]
+        for i in range(self.n_message):
+            h_all = torch.cat([h0[:, e_source], h0[:, e_target],
+                               h[:, e_source], h[:, e_target]], dim=-1)
+            h_all_dot = torch.einsum("pez,er->pezr", h_all, rbf).reshape(
+                P, n_edge, -1)
+            m_ij = torch.cat([h_all, h_all_dot, rbf_p], dim=-1)
+            m_i = m_ij.new_zeros((P, n_kept, m_ij.size(-1))).index_add(
+                1, e_source, m_ij)
+            h = stacked_sequential([self.param_update_layers[p][i] for p in range(P)],
+                                   m_i)
+            kept = kept + stacked_sequential(
+                [self.param_readout_layers[p][i] for p in range(P)], h).squeeze(-1)
+        K = K.clone()
+        K[keep_mask] = kept.transpose(0, 1)
+        return K.squeeze(-1) if P == 1 else K
 
 
 ### Atom Type Model Wrapper ####
