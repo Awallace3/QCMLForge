@@ -1,23 +1,8 @@
 """Regression tests for the zero-intramolecular-edge branch of ``get_messages``.
 
-A monatomic monomer (a bare ion such as ``Na+`` or ``Cl-``) contributes no
-intramolecular edges.  When *every* monomer A in a batch is monatomic,
-``e_AA_source`` is empty and ``get_messages`` takes its early-return branch.
-That branch used to build its empty message block with a bare
-``torch.zeros(0, width)``, which ignores the device and dtype of the inputs and
-so always lands on CPU in float32.  On GPU the very next line,
-
-    mA_i = scatter_sum_compile(mA_ij, e_AA_source, int(natomA))
-
-allocates ``mA_ij.new_zeros(...)`` on CPU and then scatter-adds a CUDA index
-into it, raising::
-
-    RuntimeError: Expected all tensors to be on the same device, but got index
-    is on cuda:0, different from other tensors on cpu
-
-The batch composition required is rare, so the failure surfaces deep into a
-training run rather than at step zero.  These tests pin device and dtype
-propagation for every model family that carries a copy of this method.
+When every monomer A in a batch is monatomic (a bare ion), ``get_messages``
+returned ``torch.zeros(0, width)`` on CPU, and the following scatter failed
+with a device mismatch on GPU.  Pin device and dtype for every copy.
 """
 
 from __future__ import annotations
@@ -83,62 +68,27 @@ MODEL_KEYS = (
 )
 
 
-def _empty_edge_inputs(mpnn, dtype, device):
-    """Inputs for a batch whose monomers are all single atoms: zero edges."""
-    natom = 2
-    h0 = torch.zeros(natom, mpnn.n_embed, dtype=dtype, device=device)
-    h = torch.zeros(natom, mpnn.n_embed, dtype=dtype, device=device)
+def _empty_messages(mpnn, dtype, device):
+    """Run ``get_messages`` for a batch of single-atom monomers (zero edges)."""
+    h = torch.zeros(2, mpnn.n_embed, dtype=dtype, device=device)
     rbf = torch.zeros(0, mpnn.n_rbf, dtype=dtype, device=device)
-    e_source = torch.zeros(0, dtype=torch.long, device=device)
-    e_target = torch.zeros(0, dtype=torch.long, device=device)
-    return h0, h, rbf, e_source, e_target
-
-
-def _expected_width(mpnn):
-    return mpnn.n_embed * 4 * mpnn.n_rbf + mpnn.n_embed * 4 + mpnn.n_rbf
+    edges = torch.zeros(0, dtype=torch.long, device=device)
+    return mpnn.get_messages(h, h, rbf, edges, edges), edges
 
 
 @pytest.mark.parametrize("key", MODEL_KEYS)
-def test_empty_messages_keep_the_expected_width(mpnns, key):
+def test_empty_messages_keep_width_and_dtype_and_scatter(mpnns, key):
     mpnn = mpnns[key]
-    args = _empty_edge_inputs(mpnn, torch.float32, torch.device("cpu"))
-    m_ij = mpnn.get_messages(*args)
-    assert m_ij.shape == (0, _expected_width(mpnn))
-
-
-@pytest.mark.parametrize("key", MODEL_KEYS)
-def test_empty_messages_follow_the_input_dtype(mpnns, key):
-    """The populated branch is dtype-transparent, so the empty one must be too.
-
-    ``torch.zeros(0, width)`` hardcodes the global default dtype instead, which
-    is the same class of bug as hardcoding the CPU device.
-    """
-    mpnn = mpnns[key]
-    args = _empty_edge_inputs(mpnn, torch.float64, torch.device("cpu"))
-    m_ij = mpnn.get_messages(*args)
-    assert m_ij.dtype == torch.float64
-
-
-@pytest.mark.parametrize("key", MODEL_KEYS)
-def test_empty_messages_scatter_without_a_device_mismatch(mpnns, key):
-    """The line that actually crashed: scatter the empty block back to atoms."""
-    mpnn = mpnns[key]
-    h0, h, rbf, e_source, e_target = _empty_edge_inputs(
-        mpnn, torch.float32, torch.device("cpu")
-    )
-    m_ij = mpnn.get_messages(h0, h, rbf, e_source, e_target)
-    m_i = scatter_sum_compile(m_ij, e_source, h.shape[0])
-    assert m_i.shape == (h.shape[0], _expected_width(mpnn))
-    assert torch.all(m_i == 0)
+    m_ij, edges = _empty_messages(mpnn, torch.float64, torch.device("cpu"))
+    width = mpnn.n_embed * 4 * mpnn.n_rbf + mpnn.n_embed * 4 + mpnn.n_rbf
+    assert m_ij.shape == (0, width) and m_ij.dtype == torch.float64
+    m_i = scatter_sum_compile(m_ij, edges, 2)
+    assert m_i.shape == (2, width) and torch.all(m_i == 0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 @pytest.mark.parametrize("key", MODEL_KEYS)
 def test_empty_messages_stay_on_the_input_device(mpnns, key):
-    mpnn = mpnns[key]
-    device = torch.device("cuda:0")
-    h0, h, rbf, e_source, e_target = _empty_edge_inputs(mpnn, torch.float32, device)
-    m_ij = mpnn.get_messages(h0, h, rbf, e_source, e_target)
+    m_ij, edges = _empty_messages(mpnns[key], torch.float32, torch.device("cuda:0"))
     assert m_ij.device.type == "cuda"
-    m_i = scatter_sum_compile(m_ij, e_source, h.shape[0])
-    assert m_i.device.type == "cuda"
+    assert scatter_sum_compile(m_ij, edges, 2).device.type == "cuda"

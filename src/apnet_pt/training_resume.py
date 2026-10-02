@@ -1,11 +1,9 @@
 """Resumable training state for the single-process harness loops.
 
-A preemptible queue kills a job at an arbitrary point.  The best-model
-checkpoint alone cannot continue such a run: it restarts Adam with zero
-moments, restarts the learning-rate schedule at step 0, and replays the first
-epoch's shuffle order.  The resume state holds everything the next epoch
-depends on, so a run that is interrupted and resumed reproduces the
-uninterrupted run.
+The best-model checkpoint alone cannot continue a preempted run: it restarts
+Adam, the learning-rate schedule, and the shuffle order.  The resume state holds
+everything the next epoch depends on, so a resumed run reproduces the
+uninterrupted one.
 """
 
 from __future__ import annotations
@@ -22,8 +20,7 @@ from torch import nn
 
 from . import model_io
 
-# v2 stores every RNG stream as tensors and plain Python values, so the file
-# loads with ``weights_only=True``.  v1 pickled NumPy state and cannot.
+# v2 holds only tensors and plain Python values (loads with weights_only=True).
 RESUME_STATE_FORMAT = "qcmlforge-training-resume-v2"
 
 
@@ -46,49 +43,27 @@ def describe_loss_fn(loss_fn: Callable | None) -> str | None:
     return f"{getattr(loss_fn, '__module__', '')}.{name}"
 
 
-def _numpy_rng_state() -> tuple:
-    """NumPy's global RNG state with its key array held as a tensor.
+def _plain(value: Any) -> Any:
+    """NumPy RNG keys to int64 tensors and NumPy scalars to Python numbers.
 
-    ``torch.load(weights_only=True)`` refuses NumPy arrays, so the uint32
-    Mersenne Twister keys travel as int64 and are narrowed back on restore.
+    ``torch.load(weights_only=True)`` refuses NumPy objects, which reach the
+    state through the NumPy RNG and the inverse-time schedule's learning rates.
     """
-    name, keys, position, has_gauss, cached_gaussian = np.random.get_state()
-    return (
-        name,
-        torch.from_numpy(keys.astype(np.int64)),
-        int(position),
-        int(has_gauss),
-        float(cached_gaussian),
-    )
-
-
-def _set_numpy_rng_state(state: tuple) -> None:
-    name, keys, position, has_gauss, cached_gaussian = state
-    np.random.set_state(
-        (name, keys.numpy().astype(np.uint32), position, has_gauss, cached_gaussian)
-    )
-
-
-def _plain_scalars(value: Any) -> Any:
-    """Replace NumPy scalars with the equal Python number, recursively.
-
-    The inverse-time schedule returns ``numpy.float64`` learning rates, which
-    reach the optimizer and scheduler state dicts and which
-    ``torch.load(weights_only=True)`` refuses.  The value is unchanged.
-    """
+    if isinstance(value, np.ndarray):
+        return torch.from_numpy(value.astype(np.int64))
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, dict):
-        return {key: _plain_scalars(item) for key, item in value.items()}
+        return {key: _plain(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return type(value)(_plain_scalars(item) for item in value)
+        return type(value)(_plain(item) for item in value)
     return value
 
 
 def _capture_rng_state(generator: torch.Generator) -> dict[str, Any]:
     state = {
         "torch": torch.get_rng_state(),
-        "numpy": _numpy_rng_state(),
+        "numpy": np.random.get_state(),
         "python": random.getstate(),
         "loader": generator.get_state(),
     }
@@ -99,7 +74,8 @@ def _capture_rng_state(generator: torch.Generator) -> dict[str, Any]:
 
 def _restore_rng_state(state: Mapping[str, Any], generator: torch.Generator):
     torch.set_rng_state(state["torch"])
-    _set_numpy_rng_state(state["numpy"])
+    name, keys, *rest = state["numpy"]
+    np.random.set_state((name, keys.numpy().astype(np.uint32), *rest))
     random.setstate(state["python"])
     generator.set_state(state["loader"])
     cuda = state.get("cuda")
@@ -148,15 +124,15 @@ def save_training_state(
         "best_score": float(best_score),
         "model_state_dict": _cpu_state_dict(model),
         "best_model_state_dict": _cpu_state_dict(best_model),
-        "optimizer_state_dict": _plain_scalars(optimizer.state_dict()),
+        "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": (
-            None if scheduler is None else _plain_scalars(scheduler.state_dict())
+            None if scheduler is None else scheduler.state_dict()
         ),
         "rng": _capture_rng_state(generator),
     }
     partial_path = f"{path}.partial"
     with open(partial_path, "wb") as handle:
-        torch.save(state, handle)
+        torch.save(_plain(state), handle)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(partial_path, path)
@@ -165,21 +141,10 @@ def save_training_state(
 def load_training_state(
     path: str, fingerprint: Mapping[str, Any] | None
 ) -> dict[str, Any] | None:
-    """Read a resume state, or return ``None`` when no run has started yet.
+    """Read a resume state, or ``None`` if ``path`` does not exist yet.
 
-    Parameters
-    ----------
-    path : str
-        Resume-state file written by :func:`save_training_state`.
-    fingerprint : mapping or None
-        The current run's setup.  Every key must match the stored setup;
-        ``None`` skips the comparison (for inspecting a state file).
-
-    Raises
-    ------
-    ValueError
-        If the file is not a resume state, or the setup it was written under
-        differs from ``fingerprint``.
+    Raises ``ValueError`` if the file is not a resume state or was written
+    under a setup that differs from ``fingerprint`` (``None`` skips the check).
     """
     if not os.path.exists(path):
         return None
@@ -187,24 +152,19 @@ def load_training_state(
         state = torch.load(path, map_location="cpu", weights_only=True)
     except pickle.UnpicklingError as error:
         raise ValueError(
-            f"{path} is not a {RESUME_STATE_FORMAT} file; a "
-            "qcmlforge-training-resume-v1 state must be resumed with the "
-            "source commit that wrote it"
+            f"{path} is not a {RESUME_STATE_FORMAT} file (a v1 state must be "
+            "resumed with the source commit that wrote it)"
         ) from error
     if not isinstance(state, dict) or state.get("format") != RESUME_STATE_FORMAT:
         raise ValueError(f"{path} is not a {RESUME_STATE_FORMAT} file")
     if fingerprint is not None:
         stored = state["fingerprint"]
-        mismatched = {
-            key: (stored.get(key), value)
-            for key, value in fingerprint.items()
+        details = ", ".join(
+            f"{key}: stored {stored.get(key)!r}, requested {value!r}"
+            for key, value in sorted(fingerprint.items())
             if stored.get(key) != value
-        }
-        if mismatched:
-            details = ", ".join(
-                f"{key}: stored {old!r}, requested {new!r}"
-                for key, (old, new) in sorted(mismatched.items())
-            )
+        )
+        if details:
             raise ValueError(f"Cannot resume {path}; setup changed ({details})")
     return state
 

@@ -415,11 +415,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
     def get_messages(self, h0, h, rbf, e_source, e_target):
         nedge = e_source.numel()
         if nedge == 0:
-            # No intramolecular edges.  The populated branch below is built
-            # from ``h`` and ``rbf``, so the empty block has to carry their
-            # device and dtype as well: a bare ``torch.zeros`` lands on CPU in
-            # the default dtype and makes the scatter that consumes this tensor
-            # fail with a device mismatch on GPU.
+            # No intramolecular edges; match h's device/dtype for the scatter.
             return torch.zeros(
                 0,
                 self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf,
@@ -2536,11 +2532,13 @@ units angstrom
             E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.model(batch)
             preds = E_sr_dimer.reshape(-1, 4)
             preds = torch.sum(preds, dim=1)
-            comp_errors = preds - batch.y.squeeze(-1)
+            # reshape, not broadcast: a label-count mismatch must raise.
+            labels = batch.y.reshape(preds.shape)
+            comp_errors = preds - labels
             batch_loss = (
                 torch.mean(torch.square(comp_errors))
-                if (loss_fn is None)
-                else loss_fn(preds, batch.y)
+                if loss_fn is None
+                else loss_fn(preds, labels)
             )
             batch_loss.backward()
             optimizer.step()
@@ -2564,11 +2562,13 @@ units angstrom
                 E_sr_dimer, _, _, _, _, _ = self.model(batch)
                 preds = E_sr_dimer.reshape(-1, 4)
                 preds = torch.sum(preds, dim=1)
-                comp_errors = preds - batch.y.squeeze(-1)
+                # reshape, not broadcast: a label-count mismatch must raise.
+                labels = batch.y.reshape(preds.shape)
+                comp_errors = preds - labels
                 batch_loss = (
                     torch.mean(torch.square(comp_errors))
-                    if (loss_fn is None)
-                    else loss_fn(preds.flatten(), batch.y.flatten())
+                    if loss_fn is None
+                    else loss_fn(preds, labels)
                 )
                 total_loss += batch_loss.item()
                 comp_errors_t.append(comp_errors.detach().cpu())
@@ -3315,9 +3315,7 @@ units angstrom
                 if lr_decay
                 else None
             )
-        # Without a selected loss, keep the exact criterion this loop has always
-        # used.  The transfer-learning branch calls it on ``batch.y`` without the
-        # squeeze the inlined MSE applies, so the two need not agree there.
+        # The criterion these loops have always used, unless one is selected.
         criterion = torch.nn.MSELoss() if loss_fn is None else loss_fn
 
         # (4) Set eval functions

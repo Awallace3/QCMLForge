@@ -369,11 +369,7 @@ class APNet3_MPNN(nn.Module):
     def get_messages(self, h0, h, rbf, e_source, e_target):
         nedge = e_source.numel()
         if nedge == 0:
-            # No intramolecular edges.  The populated branch below is built
-            # from ``h`` and ``rbf``, so the empty block has to carry their
-            # device and dtype as well: a bare ``torch.zeros`` lands on CPU in
-            # the default dtype and makes the scatter that consumes this tensor
-            # fail with a device mismatch on GPU.
+            # No intramolecular edges; match h's device/dtype for the scatter.
             return torch.zeros(
                 0,
                 self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf,

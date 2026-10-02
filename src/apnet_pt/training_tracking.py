@@ -897,10 +897,8 @@ _LOCAL_METRIC_VARIABLES = (
     ("valence_width", "vw_MAE_t", "vw_MAE_v"),
 )
 
-# Per-component loss locals: each component's raw mean squared error.  These are
-# always MSE, whatever objective was optimised.  Under the default unweighted
-# component MSE (without ``include_total_mse``) they average to the optimised
-# loss; under Huber, relative, or weighted losses they do not.
+# Per-component loss locals: each component's raw MSE, whatever objective was
+# optimised (so not a share of the loss under Huber, relative, or weighted).
 _LOCAL_LOSS_VARIABLES = (
     ("electrostatics", "elst_MSE_t", "elst_MSE_v"),
     ("exchange", "exch_MSE_t", "exch_MSE_v"),

@@ -176,7 +176,7 @@ def test_cli_refuses_resume_on_a_route_that_cannot_resume():
     def train(model_path=None, n_epochs=1):
         pass
 
-    with pytest.raises(ValueError, match="cannot resume"):
+    with pytest.raises(ValueError, match="does not support --resume-state"):
         train_models.resume_state_train_kwargs("APNet3", train, "/tmp/r.pt")
     assert train_models.resume_state_train_kwargs("APNet3", train, None) == {}
 

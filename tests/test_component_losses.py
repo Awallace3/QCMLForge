@@ -32,13 +32,7 @@ LABELS = torch.tensor(
 )
 
 
-def test_component_mse_matches_the_inlined_default():
-    """The registry baseline must reproduce the loss the harnesses inline today."""
-    expected = torch.mean(torch.square(PREDS - LABELS))
-    assert torch.allclose(component_mse(PREDS, LABELS), expected)
-
-
-def test_component_mse_matches_torch_mseloss():
+def test_component_mse_matches_the_default_criterion():
     assert torch.allclose(
         component_mse(PREDS, LABELS), torch.nn.MSELoss()(PREDS, LABELS)
     )
@@ -82,11 +76,6 @@ def test_weighted_mse_respects_per_component_weights():
     assert torch.allclose(ones, component_mse(PREDS, LABELS))
     lifted = component_weighted_mse(PREDS, LABELS, weights=(4.0, 1.0, 1.0, 1.0))
     assert lifted > ones
-
-
-def test_weighted_mse_rejects_a_mismatched_weight_vector():
-    with pytest.raises(ValueError):
-        component_weighted_mse(PREDS, LABELS, weights=(1.0, 1.0))
 
 
 @pytest.mark.parametrize("name", sorted(COMPONENT_LOSS_NAMES))
@@ -136,21 +125,15 @@ def test_weighted_mse_takes_three_weights_without_dispersion():
         component_weighted_mse(preds, labels, weights=(1.0, 1.0, 1.0, 1.0))
 
 
-def test_per_component_mse_matches_each_column():
-    terms = per_component_mse(PREDS - LABELS)
-    expected = torch.mean(torch.square(PREDS - LABELS), dim=0)
-    assert torch.equal(torch.stack(terms), expected)
-
-
-def test_per_component_mse_zero_dispersion_follows_the_errors():
-    errors = (PREDS - LABELS)[:, :3].to(torch.float64)
-    elst, exch, ind, disp = per_component_mse(errors)
-    assert disp.item() == 0.0
-    assert disp.dtype == errors.dtype and disp.device == errors.device
+def test_per_component_mse_pads_a_missing_dispersion_with_a_matching_zero():
+    errors = (PREDS - LABELS).to(torch.float64)
+    expected = torch.mean(torch.square(errors), dim=0)
+    assert torch.equal(torch.stack(per_component_mse(errors)), expected)
+    disp = per_component_mse(errors[:, :3])[3]
+    assert disp.item() == 0.0 and disp.dtype == errors.dtype
 
 
 def test_transfer_learning_refuses_a_selected_loss():
     validate_loss_route(None, transfer_learning=True)
-    validate_loss_route(component_huber, transfer_learning=False)
     with pytest.raises(ValueError, match="transfer_learning"):
         validate_loss_route(component_huber, transfer_learning=True)

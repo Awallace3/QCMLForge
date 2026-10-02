@@ -241,10 +241,8 @@ def train_atom_model(
     return
 
 
-# Every spelling of the AP3-D3 route accepted by ``--train_apnet``.  The
-# ``--end_lr`` validation gate and the ``train()`` kwarg dispatch must read this
-# one set: when they disagreed, ``APNet3-fused-d3 --end_lr`` passed validation
-# and was then silently replaced by ``lr_decay=None``, training at a flat rate.
+# Every spelling of the AP3-D3 route.  The --end_lr gate and the train() kwarg
+# dispatch must share it; when they disagreed, an accepted --end_lr was dropped.
 APNETD3_MODEL_TYPES = frozenset(
     {"apnetd3", "apnet3d3", "apnet3-d3-fused", "apnet3-fused-d3"}
 )
@@ -256,70 +254,36 @@ def is_apnetd3_model_type(apnet_model_type: str) -> bool:
 
 
 def lr_schedule_train_kwargs(
-    apnet_model_type: str,
-    end_lr: float | None,
-    lr_decay: float | None,
+    apnet_model_type: str, end_lr: float | None, lr_decay: float | None
 ) -> dict:
-    """The learning-rate schedule kwarg ``train()`` receives for this route.
-
-    Parameters
-    ----------
-    apnet_model_type : str
-        Value of ``--train_apnet``.
-    end_lr : float or None
-        Final learning rate for AP3-D3 exponential decay.
-    lr_decay : float or None
-        Inverse-time decay factor for every other route.
-
-    Returns
-    -------
-    dict
-        ``{"lr_decay": ...}`` for every route; AP3-D3 additionally receives
-        ``end_lr``.  Its ``train()`` prefers ``end_lr`` when both are set and
-        says so in the log, so forwarding both keeps either flag usable rather
-        than making one silently inert.
-    """
+    """``lr_decay`` for every route, plus ``end_lr`` for AP3-D3 (which logs
+    which one wins), so neither flag is silently inert."""
     kwargs = {"lr_decay": lr_decay}
     if is_apnetd3_model_type(apnet_model_type):
         kwargs["end_lr"] = end_lr
     return kwargs
 
 
+def _require_train_kwarg(
+    apnet_model_type: str, train_fn: Callable, kwarg: str, flag: str
+) -> None:
+    """Raise rather than let the unsupported-kwarg filter drop ``flag``."""
+    if kwarg not in inspect.signature(train_fn).parameters:
+        raise ValueError(
+            f"{apnet_model_type} does not support {flag}; its train() has no "
+            f"{kwarg} parameter"
+        )
+
+
 def resume_state_train_kwargs(
-    apnet_model_type: str,
-    train_fn: Callable,
-    resume_state_path: str | None,
+    apnet_model_type: str, train_fn: Callable, resume_state_path: str | None
 ) -> dict:
-    """The resume-state kwarg ``train()`` receives for this route.
-
-    Parameters
-    ----------
-    apnet_model_type : str
-        Value of ``--train_apnet``.
-    train_fn : callable
-        The harness ``train`` method the kwarg would be passed to.
-    resume_state_path : str or None
-        Value of ``--resume-state``.
-
-    Returns
-    -------
-    dict
-        ``{}`` when no resume state was requested, else
-        ``{"resume_state_path": ...}``.
-
-    Raises
-    ------
-    ValueError
-        If the route cannot resume.  Unlike other unsupported kwargs this one
-        is never dropped: a preempted job would silently restart from scratch.
-    """
+    """``{"resume_state_path": ...}``, or ``{}`` when none was requested."""
     if not resume_state_path:
         return {}
-    if "resume_state_path" not in inspect.signature(train_fn).parameters:
-        raise ValueError(
-            f"{apnet_model_type} cannot resume training; --resume-state is "
-            "only supported by routes whose train() accepts resume_state_path"
-        )
+    _require_train_kwarg(
+        apnet_model_type, train_fn, "resume_state_path", "--resume-state"
+    )
     return {"resume_state_path": resume_state_path}
 
 
@@ -331,38 +295,10 @@ def component_loss_train_kwargs(
     relative_loss_eps: float = 1.0,
     component_loss_weights: Sequence[float] | None = None,
 ) -> dict:
-    """The component-loss kwarg ``train()`` receives for this run.
+    """``{"loss_fn": ...}`` for a selected loss, or ``{}`` for the default.
 
-    Parameters
-    ----------
-    apnet_model_type : str
-        Value of ``--train_apnet``.
-    train_fn : callable
-        The harness ``train`` method the kwarg would be passed to.
-    component_loss : str
-        Name from ``apnet_pt.AtomPairwiseModels.component_losses``.
-    huber_delta : float
-        Crossover in kcal/mol for ``component_huber``.
-    relative_loss_eps : float
-        Denominator floor in kcal/mol for ``component_relative_mse``.
-    component_loss_weights : sequence of float or None
-        Per-component weights ``(elst, exch, ind, disp)`` for
-        ``component_weighted_mse``; three under ``no_disp_nn``.
-
-    Returns
-    -------
-    dict
-        ``{}`` for the ``component_mse`` baseline, so a default run calls
-        ``train()`` exactly as before, and ``{"loss_fn": <callable>}``
-        otherwise.
-
-    Raises
-    ------
-    ValueError
-        If ``component_loss`` is unknown, if ``component_weighted_mse`` is
-        selected without weights -- defaulting those to ones would make the
-        flag inert without warning -- or if the route cannot take a loss.
-        Like ``--resume-state``, a selected loss is never dropped.
+    Weighted MSE requires explicit weights: defaulting to ones would make the
+    flag inert.  Unknown names and routes without ``loss_fn`` raise.
     """
     if component_loss == "component_mse":
         return {}
@@ -376,16 +312,12 @@ def component_loss_train_kwargs(
     if component_loss == "component_weighted_mse":
         if component_loss_weights is None:
             raise ValueError(
-                "component_weighted_mse requires --component_loss_weights "
-                "(comma-separated floats in elst,exch,ind,disp order)"
+                "component_weighted_mse requires --component_loss_weights"
             )
         loss_kwargs["weights"] = tuple(float(w) for w in component_loss_weights)
-    if "loss_fn" not in inspect.signature(train_fn).parameters:
-        raise ValueError(
-            f"{apnet_model_type} cannot select a component loss; "
-            f"--component_loss {component_loss} is only supported by routes "
-            "whose train() accepts loss_fn"
-        )
+    _require_train_kwarg(
+        apnet_model_type, train_fn, "loss_fn", f"--component_loss {component_loss}"
+    )
     return {"loss_fn": build_component_loss(component_loss, **loss_kwargs)}
 
 

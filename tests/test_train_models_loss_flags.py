@@ -92,7 +92,7 @@ def test_route_without_loss_fn_refuses_a_selected_loss():
     def train(model_path=None, n_epochs=1):
         pass
 
-    with pytest.raises(ValueError, match="cannot select a component loss"):
+    with pytest.raises(ValueError, match="does not support --component_loss"):
         train_models.component_loss_train_kwargs(
             "APNet3", train, "component_huber"
         )
