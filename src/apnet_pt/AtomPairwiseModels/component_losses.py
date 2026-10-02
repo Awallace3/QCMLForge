@@ -4,8 +4,7 @@ Both pairwise harnesses default to an unweighted MSE over the four SAPT
 components in absolute kcal/mol.  On the spec-11 corpus that objective is
 dominated by ionic dimers: they hold ~95% of the electrostatics and ~91% of the
 induction squared-error mass, so the optimiser trades neutral-dimer accuracy for
-ionic accuracy and the S66-like slice regresses (see
-``docs/spec11-acceptance-metric.md`` in QCMLForge-exp).
+ionic accuracy and the S66-like slice regresses.
 
 Every loss here has the ``(preds, labels) -> scalar`` signature that
 ``APNet2Model.train`` and ``APNet3D3_AtomType_Model.train`` already thread
