@@ -16,6 +16,7 @@ from ..pt_datasets.ap2_fused_ds import (
 )
 from .. import constants
 from .. import model_io
+from .component_losses import validate_loss_route
 from ..training_tracking import (
     TrackerBackend,
     WandbConfig,
@@ -1846,9 +1847,10 @@ units angstrom
             if lr_decay
             else None
         )
-        # None falls back to the inlined unweighted component MSE, which is
-        # numerically identical to torch.nn.MSELoss().
-        criterion = loss_fn
+        # Without a selected loss, keep the exact criterion this loop has always
+        # used.  The transfer-learning branch calls it on ``batch.y`` without the
+        # squeeze the inlined MSE applies, so the two need not agree there.
+        criterion = torch.nn.MSELoss() if loss_fn is None else loss_fn
 
         # (4) Set eval functions
         if not transfer_learning:
@@ -2022,6 +2024,7 @@ units angstrom
         Returns:
             None
         """
+        validate_loss_route(loss_fn, transfer_learning=transfer_learning)
         if dataset is not None:
             self.dataset = dataset
         elif dataset is not None:

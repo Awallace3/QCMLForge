@@ -897,9 +897,10 @@ _LOCAL_METRIC_VARIABLES = (
     ("valence_width", "vw_MAE_t", "vw_MAE_v"),
 )
 
-# Per-component loss locals.  The pairwise loss is ``mean(square(comp_errors))``
-# over every component, so each component's own mean squared error is an exact
-# additive share of it and costs nothing extra to report alongside the MAEs.
+# Per-component loss locals: each component's raw mean squared error.  These are
+# always MSE, whatever objective was optimised.  Under the default unweighted
+# component MSE (without ``include_total_mse``) they average to the optimised
+# loss; under Huber, relative, or weighted losses they do not.
 _LOCAL_LOSS_VARIABLES = (
     ("electrostatics", "elst_MSE_t", "elst_MSE_v"),
     ("exchange", "exch_MSE_t", "exch_MSE_v"),
@@ -1164,7 +1165,9 @@ def log_epoch_metrics(
     if len(loss_names) != len(train_component_losses) or len(loss_names) != len(
         validation_component_losses
     ):
-        raise ValueError("Loss names and train/validation losses must have equal lengths")
+        raise ValueError(
+            "Loss names and train/validation losses must have equal lengths"
+        )
     payload = epoch_metric_payload(
         epoch=epoch,
         learning_rate=learning_rate,

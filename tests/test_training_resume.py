@@ -179,3 +179,38 @@ def test_cli_refuses_resume_on_a_route_that_cannot_resume():
     with pytest.raises(ValueError, match="cannot resume"):
         train_models.resume_state_train_kwargs("APNet3", train, "/tmp/r.pt")
     assert train_models.resume_state_train_kwargs("APNet3", train, None) == {}
+
+
+def test_resume_state_loads_without_unpickling_arbitrary_objects(dataset, tmp_path):
+    _train(dataset, tmp_path, 1, init_seed=3)
+    state = torch.load(tmp_path / "resume.pt", map_location="cpu", weights_only=True)
+    assert state["epochs_completed"] == 1
+
+
+def test_default_criterion_is_the_mse_loss_it_always_was(dataset, tmp_path):
+    """No ``loss_fn`` must train exactly as an explicit ``torch.nn.MSELoss()``."""
+    weights = []
+    for name, loss_fn in (("default", None), ("explicit", torch.nn.MSELoss())):
+        out_dir = tmp_path / name
+        out_dir.mkdir()
+        harness = _train(dataset, out_dir, 2, init_seed=5, loss_fn=loss_fn)
+        weights.append(harness.model.state_dict())
+    _assert_same_tensors(*weights)
+
+
+def test_transfer_learning_refuses_a_selected_loss(dataset, tmp_path):
+    with pytest.raises(ValueError, match="transfer_learning"):
+        APNet2Model(use_GPU=False).train(
+            dataset,
+            n_epochs=1,
+            transfer_learning=True,
+            loss_fn=torch.nn.MSELoss(),
+        )
+
+
+def test_a_v1_pickled_state_is_refused_with_an_explanation(tmp_path):
+    """v1 pickled NumPy RNG state, which ``weights_only=True`` cannot read."""
+    path = tmp_path / "resume.pt"
+    torch.save({"format": "qcmlforge-training-resume-v1", "rng": object()}, path)
+    with pytest.raises(ValueError, match="source commit that wrote it"):
+        load_training_state(str(path), None)

@@ -12,6 +12,7 @@ import os
 import random
 from dataclasses import replace
 from pprint import pprint
+from typing import Callable, Sequence
 from uuid import uuid4
 
 import numpy as np
@@ -286,7 +287,7 @@ def lr_schedule_train_kwargs(
 
 def resume_state_train_kwargs(
     apnet_model_type: str,
-    train_fn,
+    train_fn: Callable,
     resume_state_path: str | None,
 ) -> dict:
     """The resume-state kwarg ``train()`` receives for this route.
@@ -323,15 +324,21 @@ def resume_state_train_kwargs(
 
 
 def component_loss_train_kwargs(
+    apnet_model_type: str,
+    train_fn: Callable,
     component_loss: str = "component_mse",
     huber_delta: float = 1.0,
     relative_loss_eps: float = 1.0,
-    component_loss_weights=None,
+    component_loss_weights: Sequence[float] | None = None,
 ) -> dict:
     """The component-loss kwarg ``train()`` receives for this run.
 
     Parameters
     ----------
+    apnet_model_type : str
+        Value of ``--train_apnet``.
+    train_fn : callable
+        The harness ``train`` method the kwarg would be passed to.
     component_loss : str
         Name from ``apnet_pt.AtomPairwiseModels.component_losses``.
     huber_delta : float
@@ -340,45 +347,46 @@ def component_loss_train_kwargs(
         Denominator floor in kcal/mol for ``component_relative_mse``.
     component_loss_weights : sequence of float or None
         Per-component weights ``(elst, exch, ind, disp)`` for
-        ``component_weighted_mse``.
+        ``component_weighted_mse``; three under ``no_disp_nn``.
 
     Returns
     -------
     dict
-        ``{"loss_fn": None}`` for the ``component_mse`` baseline, so a default
-        run is bit-identical to the loss the harnesses inline today, and
-        ``{"loss_fn": <callable>}`` otherwise.
+        ``{}`` for the ``component_mse`` baseline, so a default run calls
+        ``train()`` exactly as before, and ``{"loss_fn": <callable>}``
+        otherwise.
 
     Raises
     ------
     ValueError
-        If ``component_loss`` is unknown, or if ``component_weighted_mse`` is
+        If ``component_loss`` is unknown, if ``component_weighted_mse`` is
         selected without weights -- defaulting those to ones would make the
-        flag inert without warning.
+        flag inert without warning -- or if the route cannot take a loss.
+        Like ``--resume-state``, a selected loss is never dropped.
     """
-    if component_loss not in COMPONENT_LOSS_NAMES:
-        raise ValueError(
-            f"unknown component loss {component_loss!r}; expected one of "
-            f"{', '.join(COMPONENT_LOSS_NAMES)}"
-        )
     if component_loss == "component_mse":
-        return {"loss_fn": None}
-    if component_loss == "component_huber":
-        return {"loss_fn": build_component_loss(component_loss, delta=huber_delta)}
-    if component_loss == "component_relative_mse":
-        return {
-            "loss_fn": build_component_loss(component_loss, eps=relative_loss_eps)
-        }
-    if component_loss_weights is None:
+        return {}
+    loss_kwargs = {
+        "component_huber": {"delta": huber_delta},
+        "component_relative_mse": {"eps": relative_loss_eps},
+        "component_weighted_mse": {"weights": component_loss_weights},
+    }.get(component_loss)
+    if loss_kwargs is None:
+        build_component_loss(component_loss)  # raises the unknown-name error
+    if component_loss == "component_weighted_mse":
+        if component_loss_weights is None:
+            raise ValueError(
+                "component_weighted_mse requires --component_loss_weights "
+                "(comma-separated floats in elst,exch,ind,disp order)"
+            )
+        loss_kwargs["weights"] = tuple(float(w) for w in component_loss_weights)
+    if "loss_fn" not in inspect.signature(train_fn).parameters:
         raise ValueError(
-            "component_weighted_mse requires --component_loss_weights "
-            "(four comma-separated floats: elst,exch,ind,disp)"
+            f"{apnet_model_type} cannot select a component loss; "
+            f"--component_loss {component_loss} is only supported by routes "
+            "whose train() accepts loss_fn"
         )
-    return {
-        "loss_fn": build_component_loss(
-            component_loss, weights=tuple(float(w) for w in component_loss_weights)
-        )
-    }
+    return {"loss_fn": build_component_loss(component_loss, **loss_kwargs)}
 
 
 def train_pairwise_model(
@@ -856,6 +864,8 @@ def train_pairwise_model(
     )
     train_kwargs.update(
         component_loss_train_kwargs(
+            apnet_model_type,
+            apnet.train,
             component_loss,
             huber_delta,
             relative_loss_eps,
@@ -1095,7 +1105,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=parse_param_list,
         default=None,
         help=(
-            "Four comma-separated weights (elst,exch,ind,disp) for "
+            "Comma-separated weights, one per predicted component in "
+            "elst,exch,ind,disp order (omit disp under no_disp_nn), for "
             "--component_loss component_weighted_mse"
         ),
     )
@@ -1336,7 +1347,9 @@ def main():
     """
     Parse command-line arguments and run configured model training routines.
 
-    Parses command-line options that configure atom and pairwise (APNet) training, converts the parameter-start mean/std strings to numeric lists, sets global random seeds, prints the parsed arguments, and invokes train_atom_model and/or train_pairwise_model when the corresponding flags are provided.
+    Converts the parameter-start mean/std strings to numeric lists, sets global
+    random seeds, prints the parsed arguments, and invokes train_atom_model
+    and/or train_pairwise_model when the corresponding flags are provided.
     """
     args = build_arg_parser().parse_args()
     # Parse param_start_mean and param_start_std

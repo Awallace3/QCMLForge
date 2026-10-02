@@ -31,9 +31,9 @@ __all__ = [
     "component_mse",
     "component_relative_mse",
     "component_weighted_mse",
+    "per_component_mse",
+    "validate_loss_route",
 ]
-
-N_COMPONENTS = 4
 
 
 def component_mse(preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -83,15 +83,54 @@ def component_weighted_mse(
     Raises
     ------
     ValueError
-        If ``weights`` does not have one entry per component.
+        If ``weights`` does not have one entry per predicted component; a model
+        built with ``no_disp_nn`` predicts three, ``(elst, exch, ind)``.
     """
-    if len(weights) != N_COMPONENTS:
+    n_components = preds.shape[-1]
+    if len(weights) != n_components:
         raise ValueError(
-            f"component_weighted_mse expects {N_COMPONENTS} weights "
-            f"(elst, exch, ind, disp), got {len(weights)}"
+            f"component_weighted_mse got {len(weights)} weights for "
+            f"{n_components} predicted components; pass one per component "
+            "in (elst, exch, ind, disp) order, omitting disp under no_disp_nn"
         )
     w = torch.as_tensor(weights, dtype=preds.dtype, device=preds.device)
     return torch.mean(w * torch.square(preds - labels))
+
+
+def per_component_mse(
+    comp_errors: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Each component's mean squared error, ``(elst, exch, ind, disp)``.
+
+    ``comp_errors`` is ``(n_dimer, 3)`` under ``no_disp_nn``; the missing
+    dispersion term is then a zero on the errors' own device and dtype.
+    """
+    mse = torch.mean(torch.square(comp_errors), dim=0)
+    if mse.numel() == 3:
+        mse = torch.cat((mse, mse.new_zeros(1)))
+    elst, exch, ind, disp = mse.unbind()
+    return elst, exch, ind, disp
+
+
+def validate_loss_route(loss_fn: Callable | None, *, transfer_learning: bool) -> None:
+    """Refuse a selected component loss on the transfer-learning route.
+
+    Transfer learning fits one summed energy per dimer, so a loss here would get
+    ``(n_dimer,)`` totals instead of ``(n_dimer, n_component)`` rows, compared
+    against labels the route never squeezes: the relative and Huber losses could
+    broadcast silently and the weighted loss fails mid-run.  Only the default
+    criterion is defined there.
+
+    Raises
+    ------
+    ValueError
+        If ``loss_fn`` is set and ``transfer_learning`` is true.
+    """
+    if loss_fn is not None and transfer_learning:
+        raise ValueError(
+            "a component loss cannot be combined with transfer_learning=True; "
+            "the transfer route fits a single summed energy per dimer"
+        )
 
 
 _COMPONENT_LOSSES: dict[str, Callable[..., torch.Tensor]] = {

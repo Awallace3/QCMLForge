@@ -37,16 +37,19 @@ def test_both_pairwise_harnesses_expose_loss_fn(model_cls):
     assert "loss_fn" in inspect.signature(model_cls.train).parameters
 
 
-def test_default_route_keeps_the_inlined_mse():
-    """The default must stay ``None`` so existing runs are bit-identical."""
-    kwargs = train_models.component_loss_train_kwargs("component_mse")
-    assert kwargs == {"loss_fn": None}
+def _loss_kwargs(component_loss, **kwargs):
+    return train_models.component_loss_train_kwargs(
+        "APNet2", APNet2Model.train, component_loss, **kwargs
+    )
+
+
+def test_default_route_passes_no_loss_fn():
+    """The default adds nothing, so ``train()`` is called exactly as before."""
+    assert _loss_kwargs("component_mse") == {}
 
 
 def test_huber_flag_builds_a_configured_loss():
-    kwargs = train_models.component_loss_train_kwargs(
-        "component_huber", huber_delta=2.5
-    )
+    kwargs = _loss_kwargs("component_huber", huber_delta=2.5)
     loss_fn = kwargs["loss_fn"]
     assert torch.allclose(
         loss_fn(PREDS, LABELS), component_huber(PREDS, LABELS, delta=2.5)
@@ -54,32 +57,49 @@ def test_huber_flag_builds_a_configured_loss():
 
 
 def test_relative_flag_forwards_eps():
-    kwargs = train_models.component_loss_train_kwargs(
-        "component_relative_mse", relative_loss_eps=3.0
+    a = _loss_kwargs("component_relative_mse", relative_loss_eps=3.0)["loss_fn"](
+        PREDS, LABELS
     )
-    a = kwargs["loss_fn"](PREDS, LABELS)
-    b = train_models.component_loss_train_kwargs(
-        "component_relative_mse", relative_loss_eps=100.0
-    )["loss_fn"](PREDS, LABELS)
+    b = _loss_kwargs("component_relative_mse", relative_loss_eps=100.0)["loss_fn"](
+        PREDS, LABELS
+    )
     assert a > b
 
 
 def test_weighted_flag_forwards_the_weight_vector():
-    kwargs = train_models.component_loss_train_kwargs(
+    kwargs = _loss_kwargs(
         "component_weighted_mse", component_loss_weights=(1.0, 1.0, 1.0, 1.0)
     )
-    assert torch.allclose(kwargs["loss_fn"](PREDS, LABELS), component_mse(PREDS, LABELS))
+    assert torch.allclose(
+        kwargs["loss_fn"](PREDS, LABELS), component_mse(PREDS, LABELS)
+    )
 
 
 def test_weighted_flag_requires_weights():
     """Silently defaulting to ones would make the flag inert without warning."""
     with pytest.raises(ValueError, match="component_loss_weights"):
-        train_models.component_loss_train_kwargs("component_weighted_mse")
+        _loss_kwargs("component_weighted_mse")
 
 
 def test_unknown_loss_name_is_rejected():
     with pytest.raises(ValueError, match="unknown component loss"):
-        train_models.component_loss_train_kwargs("not_a_loss")
+        _loss_kwargs("not_a_loss")
+
+
+def test_route_without_loss_fn_refuses_a_selected_loss():
+    """Dropping the flag would train the default objective under a loss label."""
+
+    def train(model_path=None, n_epochs=1):
+        pass
+
+    with pytest.raises(ValueError, match="cannot select a component loss"):
+        train_models.component_loss_train_kwargs(
+            "APNet3", train, "component_huber"
+        )
+    assert (
+        train_models.component_loss_train_kwargs("APNet3", train, "component_mse")
+        == {}
+    )
 
 
 def test_cli_accepts_the_loss_flags():

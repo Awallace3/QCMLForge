@@ -25,6 +25,7 @@ from .. import constants
 from ..hf_pretrained import resolve_pretrained_path
 from .. import model_io
 from ..distributed_metrics import globally_reduced_mae
+from .component_losses import per_component_mse, validate_loss_route
 from ..training_tracking import (
     TrackerBackend,
     WandbConfig,
@@ -36,7 +37,7 @@ from ..training_tracking import (
     tracked_ddp_worker,
 )
 from ..util import scatter_sum_compile
-from .apnet2_parity import _CHECKPOINT_METRICS, checkpoint_score
+from .apnet2_parity import checkpoint_score, validate_checkpoint_metric
 from ..pt_datasets.shard_locality import ShardBlockSampler
 from typing import Optional
 import os
@@ -2451,10 +2452,8 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
-        elst_MSE_t, exch_MSE_t, indu_MSE_t = comp_MSE_t[:3].unbind()
-        disp_MSE_t = (
-            torch.tensor(0.0) if self.model.no_disp_nn else comp_MSE_t[3]
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
         )
         return (
             total_loss,
@@ -2506,10 +2505,8 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
-        elst_MSE_t, exch_MSE_t, indu_MSE_t = comp_MSE_t[:3].unbind()
-        disp_MSE_t = (
-            torch.tensor(0.0) if self.model.no_disp_nn else comp_MSE_t[3]
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
         )
         return (
             total_loss,
@@ -2676,10 +2673,8 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
-        elst_MSE_t, exch_MSE_t, indu_MSE_t = comp_MSE_t[:3].unbind()
-        disp_MSE_t = (
-            torch.tensor(0.0) if self.model.no_disp_nn else comp_MSE_t[3]
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
         )
         return (
             total_loss,
@@ -2784,10 +2779,8 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
-        elst_MSE_t, exch_MSE_t, indu_MSE_t = comp_MSE_t[:3].unbind()
-        disp_MSE_t = (
-            torch.tensor(0.0) if self.model.no_disp_nn else comp_MSE_t[3]
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
         )
         return (
             total_loss,
@@ -3322,9 +3315,10 @@ units angstrom
                 if lr_decay
                 else None
             )
-        # None falls back to the inlined unweighted component MSE, which is
-        # numerically identical to torch.nn.MSELoss().
-        criterion = loss_fn
+        # Without a selected loss, keep the exact criterion this loop has always
+        # used.  The transfer-learning branch calls it on ``batch.y`` without the
+        # squeeze the inlined MSE applies, so the two need not agree there.
+        criterion = torch.nn.MSELoss() if loss_fn is None else loss_fn
 
         # (4) Set eval functions
         if is_fsapt:
@@ -3589,6 +3583,7 @@ units angstrom
         hyperparameters match the defaults in the original code:
         https://chemrxiv.org/engage/chemrxiv/article-details/65ccd41866c1381729a2b885
         """
+        validate_loss_route(loss_fn, transfer_learning=transfer_learning)
         if dataset is not None:
             self.dataset = dataset
         elif dataset is not None:
@@ -3598,11 +3593,7 @@ units angstrom
             raise ValueError("No dataset provided")
         # Checked up front: the selector is first consulted after the
         # pre-training evaluation, which is too late to find a typo.
-        if checkpoint_metric not in _CHECKPOINT_METRICS:
-            raise ValueError(
-                f"checkpoint metric must be one of {sorted(_CHECKPOINT_METRICS)}, "
-                f"got {checkpoint_metric!r}"
-            )
+        validate_checkpoint_metric(checkpoint_metric)
         np.random.seed(random_seed)
         self.model_save_path = model_path
         print(f"Saving training results to...\n{model_path}")

@@ -13,6 +13,7 @@ from ..hf_pretrained import (
 from .. import pairwise_datasets
 from .. import model_io
 from ..distributed_metrics import globally_reduced_mae
+from .component_losses import per_component_mse, validate_loss_route
 from ..training_tracking import (
     TrackerBackend,
     WandbConfig,
@@ -1982,8 +1983,9 @@ units angstrom
         exch_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 1]))
         indu_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 2]))
         disp_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 3]))
-        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
-        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = comp_MSE_t.unbind()
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
+        )
         return (
             total_loss,
             total_MAE_t,
@@ -2023,8 +2025,9 @@ units angstrom
         exch_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 1]))
         indu_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 2]))
         disp_MAE_t = torch.mean(torch.abs(comp_errors_t[:, 3]))
-        comp_MSE_t = torch.mean(torch.square(comp_errors_t), dim=0)
-        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = comp_MSE_t.unbind()
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
+        )
         return (
             total_loss,
             total_MAE_t,
@@ -2468,9 +2471,10 @@ units angstrom
             if lr_decay
             else None
         )
-        # None falls back to the inlined unweighted component MSE, which is
-        # numerically identical to torch.nn.MSELoss().
-        criterion = loss_fn
+        # Without a selected loss, keep the exact criterion this loop has always
+        # used.  The transfer-learning branch calls it on ``batch.y`` without the
+        # squeeze the inlined MSE applies, so the two need not agree there.
+        criterion = torch.nn.MSELoss() if loss_fn is None else loss_fn
 
         # (4) Set eval functions
         if not transfer_learning:
@@ -2552,16 +2556,20 @@ units angstrom
                     disp_MSE_v,
                 ) = v_out
                 print(
-                    f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} "
-                    f"{elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} {exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} "
-                    f"{indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} {disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
+                    f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: "
+                    f"{total_MAE_t:>7.3f}/{total_MAE_v:<7.3f} "
+                    f"{elst_MAE_t:>7.3f}/{elst_MAE_v:<7.3f} "
+                    f"{exch_MAE_t:>7.3f}/{exch_MAE_v:<7.3f} "
+                    f"{indu_MAE_t:>7.3f}/{indu_MAE_v:<7.3f} "
+                    f"{disp_MAE_t:>7.3f}/{disp_MAE_v:<7.3f}",
                     flush=True,
                 )
             else:
                 train_loss, total_MAE_t = t_out
                 test_loss, total_MAE_v = v_out
                 print(
-                    f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: {total_MAE_t:>7.3f}/{total_MAE_v:<7.3f}",
+                    f"  (Pre-training) ({time.time() - t0:<7.2f}s)  MAE: "
+                    f"{total_MAE_t:>7.3f}/{total_MAE_v:<7.3f}",
                     flush=True,
                 )
             track_pretraining_from_locals(self, locals())
@@ -2736,7 +2744,11 @@ units angstrom
             skip_compile (bool): If True, skip optional torch.compile model compilation in single-process training.
             transfer_learning (bool): If True, run training in transfer-learning mode (alters loss/aggregation behavior).
             include_total_mse (bool): If True, add an extra MSE term on the total energy in addition to the four component terms.
-            resume_state_path (str | None): File holding everything needed to continue training after any epoch: weights, Adam and scheduler state, RNG streams, and the best score so far. Rewritten after every epoch; if it already exists, training resumes from it instead of starting over. Single-process only.
+            resume_state_path (str | None): File holding everything needed to
+                continue training after any epoch: weights, Adam and scheduler
+                state, RNG streams, and the best score so far.  Rewritten after
+                every epoch; if it already exists, training resumes from it
+                instead of starting over.  Single-process only.
 
         Returns:
             None
@@ -2745,6 +2757,7 @@ units angstrom
             raise ValueError(
                 "resume_state_path is only supported for single-process training"
             )
+        validate_loss_route(loss_fn, transfer_learning=transfer_learning)
         if dataset is not None:
             self.dataset = dataset
         elif dataset is not None:

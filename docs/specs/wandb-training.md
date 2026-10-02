@@ -56,7 +56,7 @@ The following decisions are approved:
 
 ## 4. Non-goals
 
-- Exact restoration of optimizer, scheduler, RNG, sampler, best-loss, or epoch state.
+- Exact restoration of optimizer, scheduler, RNG, sampler, best-loss, or epoch state, except through the single-process APNet2 `resume_state_path` described in §5.3.
 - W&B Sweeps, Launch, Reports, or automated hyperparameter optimization.
 - Per-batch metrics, gradients, parameter histograms, or example molecule tables.
 - One W&B run per DDP rank.
@@ -118,7 +118,9 @@ W&B run resumption must not claim stronger semantics than the trainer provides. 
 - W&B SDK `resume` is set to `"never"`;
 - a warm-start checkpoint is recorded as lineage metadata and may be attached with `run.use_artifact()` only when it is already a W&B artifact;
 - every harness that accepts or loads a pretrained checkpoint retains sanitized source-checkpoint metadata on the harness so a later direct `.train()` call can report lineage;
-- exact run resume is deferred to a future training-state checkpoint specification.
+- exact run resume is deferred to a future training-state checkpoint specification, with one exception below.
+
+Single-process `APNet2Model.train(resume_state_path=...)` (CLI `--resume-state`) is an exact *trainer* resume. After every epoch it atomically rewrites one file in the `qcmlforge-training-resume-v2` format holding the current and best weights, Adam and scheduler state, the torch, CUDA, NumPy, Python and data-loader RNG streams, the completed-epoch count, and the best score and epoch. The file loads with `torch.load(weights_only=True)`. A setup fingerprint (dataset sizes, steps per epoch, learning-rate settings, checkpoint metric, seed, loss, and transfer mode) must match or the resume is refused. An interrupted and resumed run reproduces the uninterrupted run's weights exactly on CPU. W&B semantics are unchanged: each resumed invocation is still a new run with `resume="never"` whose epochs continue from the stored epoch count. Every other route and DDP refuses `resume_state_path` rather than ignoring it. This file is separate from, and does not change, the model checkpoint format.
 
 ## 6. Public API
 
@@ -450,7 +452,22 @@ train/mae/dispersion
 val/mae/dispersion
 ```
 
-- AP3-D3 with `no_disp_nn=True` omits dispersion training metrics.
+Single-process APNet2 and AP3-D3 also log each component's mean squared error:
+
+```text
+train/loss/electrostatics
+val/loss/electrostatics
+train/loss/exchange
+val/loss/exchange
+train/loss/induction
+val/loss/induction
+train/loss/dispersion
+val/loss/dispersion
+```
+
+- `train/loss/<component>` and `val/loss/<component>` are always the raw per-component MSE in squared target units, whatever objective was optimised. Under the default unweighted component MSE without `include_total_mse` they average to the optimised loss; under `component_huber`, `component_relative_mse`, or `component_weighted_mse` they do not, and `*/loss_sum` remains the optimised quantity.
+- DDP, APNet2-fused, APNet3-fused and its variants, and dAPNet2 do not yet return per-component MSE and so emit no `*/loss/<component>` keys. The tracker omits keys a loop does not provide, so these runs log the MAE schema above without per-component loss.
+- AP3-D3 with `no_disp_nn=True` omits dispersion training metrics, including `*/loss/dispersion`.
 - Transfer-learning/scalar branches emit total only.
 - FSAPT v1 logs only the aggregate total and SAPT-component MAEs currently returned by its evaluator. Per-fragment metrics are deferred until evaluators expose authoritative fragment labels and values.
 - `AM_DimerParam_Model` derives names from the selected target labels (`y_ind`/configured property names) and validates label/value lengths before logging.
@@ -774,7 +791,7 @@ Warm starts must be described as new runs linked to a source checkpoint, not as 
 
 ## 17. Deferred follow-ups
 
-- Exact training resume with optimizer/scheduler/RNG/sampler/global-step state.
+- Exact training resume with optimizer/scheduler/RNG/sampler/global-step state for DDP and for harnesses other than single-process APNet2 (§5.3), and W&B run continuation across a resume.
 - Optional normalized, sample-weighted loss metrics across all harnesses.
 - Per-batch logging with explicit cost controls.
 - W&B Sweeps configuration generation.
