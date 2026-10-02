@@ -656,6 +656,7 @@ def harness_tracking(
             "last_validation_loss": None,
             "epochs_completed": 0,
             "defined_metrics": None,
+            "defined_losses": None,
             "config_refreshed": False,
         }
         yield tracker
@@ -896,6 +897,15 @@ _LOCAL_METRIC_VARIABLES = (
     ("valence_width", "vw_MAE_t", "vw_MAE_v"),
 )
 
+# Per-component loss locals: each component's raw MSE, whatever objective was
+# optimised (so not a share of the loss under Huber, relative, or weighted).
+_LOCAL_LOSS_VARIABLES = (
+    ("electrostatics", "elst_MSE_t", "elst_MSE_v"),
+    ("exchange", "exch_MSE_t", "exch_MSE_v"),
+    ("induction", "indu_MSE_t", "indu_MSE_v"),
+    ("dispersion", "disp_MSE_t", "disp_MSE_v"),
+)
+
 
 def track_pretraining_from_locals(
     harness: Any,
@@ -995,14 +1005,20 @@ def _track_evaluation_boundary(
     )
     if not names:
         return
+    loss_names, train_losses, validation_losses = _component_losses_from_locals(
+        values, exclude=exclude
+    )
     if not state["config_refreshed"]:
         tracker.update_config(_resolved_training_config(harness, {}))
         state["config_refreshed"] = True
     if state["defined_metrics"] is None:
-        define_epoch_metrics(tracker, names)
+        define_epoch_metrics(tracker, names, loss_names=loss_names)
         state["defined_metrics"] = tuple(names)
+        state["defined_losses"] = tuple(loss_names)
     elif tuple(names) != state["defined_metrics"]:
         raise ValueError("Training metric shape changed during a tracked run")
+    elif tuple(loss_names) != state["defined_losses"]:
+        raise ValueError("Training loss shape changed during a tracked run")
     validation_loss = values.get("test_loss")
     optimizer = values.get("optimizer")
     if is_best:
@@ -1030,6 +1046,9 @@ def _track_evaluation_boundary(
         ),
         epoch_seconds=values.get("dt"),
         is_best=is_best,
+        loss_names=loss_names,
+        train_component_losses=train_losses,
+        validation_component_losses=validation_losses,
     )
 
 
@@ -1083,6 +1102,34 @@ def _metrics_from_locals(
     return names, train_values, validation_values
 
 
+def _component_losses_from_locals(
+    values: Mapping[str, Any],
+    *,
+    exclude: Sequence[str] = (),
+) -> tuple[list[str], list[Any], list[Any]]:
+    """Collect conventional ``*_MSE_t``/``*_MSE_v`` locals into aligned lists.
+
+    Missing names are skipped, so a harness that reports only a summed loss logs
+    no per-component loss rather than failing.  ``exclude`` drops components a
+    model does not predict, matching :func:`_metrics_from_locals`.
+    """
+
+    names: list[str] = []
+    train_values: list[Any] = []
+    validation_values: list[Any] = []
+    for name, train_name, validation_name in _LOCAL_LOSS_VARIABLES:
+        if name in exclude:
+            continue
+        if train_name not in values or validation_name not in values:
+            continue
+        if _value_width(values[train_name]) != 1:
+            raise ValueError(f"Local {train_name!r} must hold a single component loss")
+        names.append(name)
+        train_values.append(values[train_name])
+        validation_values.append(values[validation_name])
+    return names, train_values, validation_values
+
+
 def _value_width(value: Any) -> int:
     if hasattr(value, "numel"):
         return int(value.numel())
@@ -1103,6 +1150,9 @@ def log_epoch_metrics(
     learning_rate: Any | None = None,
     epoch_seconds: Any | None = None,
     is_best: bool | None = None,
+    loss_names: Sequence[str] = (),
+    train_component_losses: Sequence[Any] = (),
+    validation_component_losses: Sequence[Any] = (),
 ) -> None:
     """Log one evaluation boundary with stable train/validation metric names."""
 
@@ -1110,6 +1160,12 @@ def log_epoch_metrics(
         validation_values
     ):
         raise ValueError("Metric names and train/validation values must have equal lengths")
+    if len(loss_names) != len(train_component_losses) or len(loss_names) != len(
+        validation_component_losses
+    ):
+        raise ValueError(
+            "Loss names and train/validation losses must have equal lengths"
+        )
     payload = epoch_metric_payload(
         epoch=epoch,
         learning_rate=learning_rate,
@@ -1133,17 +1189,30 @@ def log_epoch_metrics(
         payload[validation_key] = scalar_value(
             validation_value, metric_name=validation_key
         )
+    for name, train_value, validation_value in zip(
+        loss_names, train_component_losses, validation_component_losses
+    ):
+        train_key = f"train/loss/{name}"
+        validation_key = f"val/loss/{name}"
+        payload[train_key] = scalar_value(train_value, metric_name=train_key)
+        payload[validation_key] = scalar_value(
+            validation_value, metric_name=validation_key
+        )
     tracker.log(payload)
 
 
 def define_epoch_metrics(
-    tracker: TrainingTracker, metric_names: Sequence[str]
+    tracker: TrainingTracker,
+    metric_names: Sequence[str],
+    loss_names: Sequence[str] = (),
 ) -> None:
     """Define the exact common and model-specific epoch metric namespace."""
 
     names = ["train/loss_sum", "val/loss_sum"]
     for name in metric_names:
         names.extend((f"train/mae/{name}", f"val/mae/{name}"))
+    for name in loss_names:
+        names.extend((f"train/loss/{name}", f"val/loss/{name}"))
     names.extend(
         (
             "optimizer/learning_rate",
