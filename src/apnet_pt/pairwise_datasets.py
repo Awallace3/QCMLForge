@@ -706,11 +706,12 @@ class apnet2_module_dataset(Dataset):
             None: assumes that data is passed as qcel_molecules and energy labels
         """
         self.print_level = print_level
-        try:
-            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 11, None]
-        except AssertionError:
-            print("Currently spec_type must be 1 or 2 for SAPT0/jun-cc-pVDZ")
-            raise ValueError
+        supported_spec_types = (1, 2, 5, 6, 7, 8, 9, 11, None)
+        if spec_type not in supported_spec_types:
+            raise ValueError(
+                f"spec_type must be one of {supported_spec_types}, "
+                f"got {spec_type!r}"
+            )
         self.spec_type = spec_type
 
         self.qcel_molecules = None

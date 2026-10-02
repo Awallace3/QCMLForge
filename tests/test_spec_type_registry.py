@@ -2,8 +2,7 @@
 
 Each dataset class carries its own accepted-spec assert list, its own
 ``raw_file_names`` map and its own split-spec frozenset.  A spec added to one
-copy and not another fails at dataset construction with an AssertionError that
-names neither the spec nor the class, so pin the agreement here instead.
+copy and not another fails at dataset construction, so pin the agreement here.
 """
 
 import pytest
@@ -77,3 +76,10 @@ def test_split_spec_sets_cover_every_train_test_spec(name, spec_type):
     split silently becomes training data.
     """
     assert spec_type in SPLIT_SPEC_SETS[name]
+
+
+@pytest.mark.parametrize("cls", DATASET_CLASSES, ids=lambda c: c.__name__)
+def test_unsupported_spec_type_names_itself(cls, tmp_path):
+    """A rejected spec must say which spec was asked for and which exist."""
+    with pytest.raises(ValueError, match=r"spec_type must be one of .*got 3"):
+        cls(root=str(tmp_path), spec_type=3)
