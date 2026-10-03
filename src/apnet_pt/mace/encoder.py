@@ -7,7 +7,7 @@ checkpoints.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import hashlib
 from importlib.metadata import version
@@ -447,7 +447,15 @@ def _clone_direct(outputs: PolarMACEDirectOutputs) -> PolarMACEDirectOutputs:
 
 
 class MACEPolarFeaturizer(torch.nn.Module):
-    """Frozen isolated-monomer PolarMACE feature and direct-output adapter."""
+    """Isolated-monomer PolarMACE feature and direct-output adapter.
+
+    Frozen by default.  ``trainable=True`` is the opt-in fine-tuning route: the
+    backbone parameters require gradients and the batched forward returns
+    features attached to the autograd graph, so a downstream loss reaches the
+    MACE weights.  The backbone stays in eval mode either way (PolarMACE has no
+    dropout or batch statistics), and the serial, cached and injected-graph
+    routes remain frozen-only.
+    """
 
     valid_feature_modes = {"final-layer-scalars", "all-scalars+norms"}
 
@@ -475,6 +483,7 @@ class MACEPolarFeaturizer(torch.nn.Module):
         # exists for while being immune to kernel selection.
         parity_atol: float = 1.0e-4,
         elide_energy_head: bool = True,
+        trainable: bool = False,
     ) -> None:
         super().__init__()
         if feature_mode not in self.valid_feature_modes:
@@ -494,8 +503,13 @@ class MACEPolarFeaturizer(torch.nn.Module):
             raise TypeError("production featurization requires a PolarMACE backbone")
         self.backbone = backbone
         self.backbone.to(dtype=dtype)
+        if trainable and (cache is not None or graph_builder is not None):
+            raise ValueError(
+                "a trainable featurizer runs the uncached batched route only"
+            )
+        self.trainable = bool(trainable)
         self.backbone.eval()
-        self.backbone.requires_grad_(False)
+        self.backbone.requires_grad_(self.trainable)
         self.checkpoint_sha256 = checkpoint_sha256
         self.mace_version = mace_version
         self.model_id = model_id
@@ -580,6 +594,7 @@ class MACEPolarFeaturizer(torch.nn.Module):
             "private_adapter": getattr(self.private_adapter, "version", None),
             "feature_schema": self.resolved_feature_schema,
             "multipole_contract": self.multipole_contract,
+            "trainable": self.trainable,
         }
 
     @property
@@ -738,9 +753,11 @@ class MACEPolarFeaturizer(torch.nn.Module):
         if self.resolved_feature_schema not in {None, feature_schema}:
             raise RuntimeError("PolarMACE runtime feature schema changed within a run")
         self.resolved_feature_schema = feature_schema
+        if not self.trainable:
+            invariant, equivariant = invariant.detach(), equivariant.detach()
         return MACEAtomicFeatures(
-            invariant=invariant.detach(),
-            equivariant=equivariant.detach(),
+            invariant=invariant,
+            equivariant=equivariant,
             batch=(
                 torch.zeros(natom, dtype=torch.long, device=invariant.device)
                 if node_batch is None
@@ -897,7 +914,10 @@ class MACEPolarFeaturizer(torch.nn.Module):
             positions, atomic_numbers, total_charge, total_spin, ptr
         )
         self.backbone.eval()
-        with torch.no_grad():
+        # The trainable route keeps the graph only when the caller asks for
+        # gradients: an evaluation under ``torch.no_grad`` stays graph-free.
+        context = nullcontext() if self.trainable else torch.no_grad()
+        with context:
             outputs = self._backbone_forward(graph)
             features = self._runtime_features(
                 graph,

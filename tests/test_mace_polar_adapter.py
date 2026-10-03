@@ -790,3 +790,68 @@ def test_switching_off_the_hook_route_removes_the_hooks():
     assert adapter._handles == []
     assert not backbone.interactions[0]._forward_hooks
     assert not backbone.products[0]._forward_hooks
+
+
+def test_trainable_featurizer_rejects_frozen_only_routes():
+    with pytest.raises(ValueError, match="uncached batched route"):
+        MACEPolarFeaturizer(
+            TinyBackbone(),
+            checkpoint_sha256="a" * 64,
+            graph_builder=lambda *args, **kwargs: {},
+            trainable=True,
+        )
+
+
+@pytest.mark.mace_integration
+def test_trainable_featurizer_matches_frozen_and_reaches_backbone():
+    """Fine-tuning route: same values as the frozen route, gradients reach MACE.
+
+    Under ``torch.no_grad`` the trainable route must stay graph-free, so a
+    fine-tuned model is evaluated without holding the backbone's activations.
+    """
+
+    from tests.mace_integration import polar_mace_artifact
+
+    def build(trainable):
+        backbone = load_verified_polar_mace(
+            polar_mace_artifact(), expected_sha256=POLAR_1S_SHA256, offline=True
+        )
+        return MACEPolarFeaturizer(
+            backbone,
+            checkpoint_sha256=POLAR_1S_SHA256,
+            feature_mode="all-scalars+norms",
+            trainable=trainable,
+        )
+
+    frozen, trainable = build(False), build(True)
+    assert not any(p.requires_grad for p in frozen.backbone.parameters())
+    assert all(p.requires_grad for p in trainable.backbone.parameters())
+    assert trainable.metadata["trainable"] is True
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.0, 0.757, 0.587], [0.0, -0.757, 0.587],
+         [3.0, 0.0, 0.0], [3.0, 0.94, 0.0], [3.3, -0.3, 0.9], [3.3, -0.3, -0.9]],
+        dtype=torch.float32,
+    )
+    numbers = torch.tensor([8, 1, 1, 7, 1, 1, 1])
+    batch = torch.tensor([0, 0, 0, 1, 1, 1, 1])
+    charge = torch.zeros(2)
+    spin = torch.ones(2)
+
+    reference, _ = frozen.forward_monomer(positions, numbers, charge, spin, batch=batch)
+    features, _ = trainable.forward_monomer(
+        positions, numbers, charge, spin, batch=batch
+    )
+    assert not reference.invariant.requires_grad
+    assert features.invariant.requires_grad and features.equivariant.requires_grad
+    for name in ("invariant", "equivariant"):
+        torch.testing.assert_close(
+            getattr(features, name).detach(), getattr(reference, name)
+        )
+    features.invariant.square().sum().backward()
+    gradients = [p.grad for p in trainable.backbone.parameters()]
+    assert any(g is not None and bool(g.abs().sum() > 0) for g in gradients)
+    with torch.no_grad():
+        quiet, _ = trainable.forward_monomer(
+            positions, numbers, charge, spin, batch=batch
+        )
+    assert not quiet.invariant.requires_grad
