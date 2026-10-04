@@ -210,7 +210,15 @@ def compute_component_mse_loss(preds, labels, loss_fn=None, include_total_mse=Fa
     if include_total_mse:
         total_preds = torch.sum(preds, dim=1)
         total_labels = torch.sum(labels, dim=1)
-        batch_loss = batch_loss + torch.mean(torch.square(total_preds - total_labels))
+        if isinstance(loss_fn, torch.nn.HuberLoss):
+            # A Huber objective is Huber on the total too; an MSE total would
+            # hand the outliers the components were shielded from straight
+            # back through the fifth term.
+            batch_loss = batch_loss + loss_fn(total_preds, total_labels)
+        else:
+            batch_loss = batch_loss + torch.mean(
+                torch.square(total_preds - total_labels)
+            )
     return batch_loss, comp_errors
 
 
@@ -281,6 +289,103 @@ def build_exponential_decay_scheduler(
 
     gamma = (end_lr / start_lr) ** (1.0 / (n_epochs - 1))
     return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+
+
+APNET3_OPTIMIZERS = ("adam", "adamw")
+APNET3_LOSSES = ("mse", "huber")
+APNET3_LR_SCHEDULES = ("exponential", "cosine")
+
+
+def build_optimizer(
+    parameters, lr: float, optimizer: str = "adam", weight_decay: float = 0.0
+) -> torch.optim.Optimizer:
+    """Adam (the historical default) or decoupled-weight-decay AdamW."""
+    if optimizer == "adam":
+        if weight_decay:
+            raise ValueError(
+                "weight_decay requires optimizer='adamw'; Adam's coupled L2 "
+                "penalty is not offered"
+            )
+        return torch.optim.Adam(parameters, lr=lr)
+    if optimizer == "adamw":
+        if weight_decay < 0:
+            raise ValueError("weight_decay must be >= 0")
+        return torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
+    raise ValueError(f"optimizer must be one of {APNET3_OPTIMIZERS}, got {optimizer!r}")
+
+
+def build_cosine_decay_scheduler(
+    optimizer: torch.optim.Optimizer,
+    start_lr: float,
+    end_lr: float,
+    n_epochs: int,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """
+    Epoch-wise cosine from start_lr on the first epoch to end_lr on the last,
+    with the same endpoints as build_exponential_decay_scheduler.
+    """
+    _validate_exponential_decay_args(start_lr, end_lr, n_epochs)
+    if n_epochs == 1:
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda e: 1.0)
+
+    def factor(epoch):
+        t = min(epoch, n_epochs - 1) / (n_epochs - 1)
+        lr = end_lr + 0.5 * (start_lr - end_lr) * (1.0 + np.cos(np.pi * t))
+        return lr / start_lr
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=factor)
+
+
+def build_criterion(loss: str = "mse", huber_delta: float = 1.0) -> nn.Module:
+    """Per-component training/validation loss.  MSE is the historical default."""
+    if loss == "mse":
+        return torch.nn.MSELoss()
+    if loss == "huber":
+        if not huber_delta > 0:
+            raise ValueError("huber_delta must be > 0")
+        return torch.nn.HuberLoss(delta=huber_delta)
+    raise ValueError(f"loss must be one of {APNET3_LOSSES}, got {loss!r}")
+
+
+class WeightEMA:
+    """
+    Exponential moving average of a model's floating-point state, updated
+    after every optimizer step.  Integer buffers are copied, not averaged.
+    `swap_in` loads the averaged weights (keeping the raw ones aside) and
+    `swap_out` restores the raw weights, so the optimizer only ever sees the
+    raw model.
+    """
+
+    def __init__(self, model: nn.Module, decay: float):
+        if not 0.0 < decay < 1.0:
+            raise ValueError("ema_decay must be in (0, 1)")
+        self.decay = float(decay)
+        self.shadow = {
+            k: v.detach().clone() for k, v in model.state_dict().items()
+        }
+        self._raw = None
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+            else:
+                self.shadow[k].copy_(v)
+
+    @torch.no_grad()
+    def swap_in(self, model: nn.Module) -> None:
+        if self._raw is not None:
+            raise RuntimeError("EMA weights are already swapped in")
+        self._raw = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow)
+
+    @torch.no_grad()
+    def swap_out(self, model: nn.Module) -> None:
+        if self._raw is None:
+            raise RuntimeError("EMA weights are not swapped in")
+        model.load_state_dict(self._raw)
+        self._raw = None
 
 
 class Envelope(nn.Module):
@@ -2503,6 +2608,7 @@ units angstrom
         rank_device,
         scheduler,
         include_total_mse=False,
+        ema=None,
     ):
         """
         Single-process training loop body.
@@ -2533,6 +2639,8 @@ units angstrom
             )
             batch_loss.backward()
             optimizer.step()
+            if ema is not None:
+                ema.update(self.model)
             # print(preds[0][0].item(), batch.y[0].numpy())
             # print(f"    Loss value: {batch_loss.item()}")
             total_loss += batch_loss.item()
@@ -3251,6 +3359,12 @@ units angstrom
         skip_compile=False,
         transfer_learning=False,
         include_total_mse=False,
+        optimizer_name="adam",
+        weight_decay=0.0,
+        lr_schedule="exponential",
+        loss="mse",
+        huber_delta=1.0,
+        ema_decay=None,
     ):
         # (1) Compile Model
         rank_device = self.device
@@ -3348,24 +3462,46 @@ units angstrom
         )
 
         # (3) Optim/Scheduler
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        optimizer = build_optimizer(
+            self.model.parameters(), lr, optimizer_name, weight_decay
+        )
+        if lr_schedule not in APNET3_LR_SCHEDULES:
+            raise ValueError(
+                f"lr_schedule must be one of {APNET3_LR_SCHEDULES}, got {lr_schedule!r}"
+            )
         if end_lr is not None:
             if lr_decay is not None:
-                print("Using end_lr exponential decay; ignoring lr_decay.")
-            scheduler = build_exponential_decay_scheduler(
+                print(f"Using end_lr {lr_schedule} decay; ignoring lr_decay.")
+            build = (
+                build_cosine_decay_scheduler
+                if lr_schedule == "cosine"
+                else build_exponential_decay_scheduler
+            )
+            scheduler = build(
                 optimizer=optimizer,
                 start_lr=lr,
                 end_lr=end_lr,
                 n_epochs=n_epochs,
             )
         else:
+            if lr_schedule == "cosine":
+                raise ValueError("lr_schedule='cosine' requires end_lr")
             scheduler = (
                 InverseTimeDecayLR(optimizer, lr, len(train_loader) * 2, lr_decay)
                 if lr_decay
                 else None
             )
-        # criterion = None  # defaults to MSE
-        criterion = torch.nn.MSELoss()
+        criterion = build_criterion(loss, huber_delta)
+        # With an EMA, every validation pass, checkpoint, sidecar and the final
+        # weights use the averaged model; the optimizer only steps the raw one.
+        ema = None
+        if ema_decay is not None:
+            if is_fsapt or transfer_learning:
+                raise ValueError(
+                    "ema_decay is supported on component-energy training only"
+                )
+            ema = WeightEMA(self.model, ema_decay)
+        ema_kwargs = {"ema": ema} if ema is not None else {}
 
         # (4) Set eval functions
         if is_fsapt:
@@ -3482,7 +3618,10 @@ units angstrom
                 rank_device,
                 scheduler,
                 **component_batch_kwargs,
+                **ema_kwargs,
             )
+            if ema is not None:
+                ema.swap_in(self.model)
             v_out = __evaluate_batch(
                 test_loader,
                 criterion,
@@ -3534,6 +3673,8 @@ units angstrom
                 _save_best_mae_sidecar(
                     self, mae_v, epoch, "single_proc", rank_device
                 )
+            if ema is not None:
+                ema.swap_out(self.model)
 
             dt = time.time() - t1
             track_epoch_from_locals(self, locals(), exclude=_omitted_metrics(self))
@@ -3562,6 +3703,9 @@ units angstrom
                 )
             if not self.device == "CPU":
                 torch.cuda.empty_cache()
+        if ema is not None:
+            # The final weights of an EMA run are the averaged ones.
+            ema.swap_in(self.model)
         if self.model_save_path and not model_saved:
             print(
                 "Saving final model (no validation improvement checkpoint was written)"
@@ -3601,6 +3745,12 @@ units angstrom
         transfer_learning=False,
         include_total_mse=False,
         shard_locality_block_shards=0,
+        optimizer="adam",
+        weight_decay=0.0,
+        lr_schedule="exponential",
+        loss="mse",
+        huber_delta=1.0,
+        ema_decay=None,
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
         _tracker_event_directory=None,
@@ -3665,6 +3815,28 @@ units angstrom
         print(f"  {lr_decay=}\n", flush=True)
         print(f"  {end_lr=}\n", flush=True)
         print(f"  {include_total_mse=}\n", flush=True)
+        recipe = {
+            "optimizer": optimizer,
+            "weight_decay": weight_decay,
+            "lr_schedule": lr_schedule,
+            "loss": loss,
+            "huber_delta": huber_delta,
+            "ema_decay": ema_decay,
+        }
+        print(f"  {recipe=}\n", flush=True)
+        default_recipe = {
+            "optimizer": "adam",
+            "weight_decay": 0.0,
+            "lr_schedule": "exponential",
+            "loss": "mse",
+            "huber_delta": 1.0,
+            "ema_decay": None,
+        }
+        if world_size > 1 and recipe != default_recipe:
+            raise ValueError(
+                "optimizer/weight_decay/lr_schedule/loss/huber_delta/ema_decay "
+                "are single-process only; the DDP path keeps Adam + MSE"
+            )
         # Read back off `self` by both training paths.  `ddp_train` is handed
         # to `mp.spawn` as a bound method, so `self` is pickled to every rank
         # and this travels with it -- no signature change on either worker.
@@ -3695,6 +3867,7 @@ units angstrom
             "training/transfer_learning": transfer_learning,
             "training/include_total_mse": include_total_mse,
             "training/shard_locality_block_shards": self.shard_locality_block_shards,
+            **{f"training/{k}": v for k, v in recipe.items()},
         }
         if world_size > 1:
             print("Running multi-process training", flush=True)
@@ -3744,6 +3917,12 @@ units angstrom
                     skip_compile=skip_compile,
                     transfer_learning=transfer_learning,
                     include_total_mse=include_total_mse,
+                    optimizer_name=optimizer,
+                    weight_decay=weight_decay,
+                    lr_schedule=lr_schedule,
+                    loss=loss,
+                    huber_delta=huber_delta,
+                    ema_decay=ema_decay,
                 ),
                 wandb_config,
                 model_family="pairwise",

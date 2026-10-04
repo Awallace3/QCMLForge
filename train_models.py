@@ -392,6 +392,53 @@ def train_atom_model(
     return
 
 
+def schedule_and_recipe_train_kwargs(
+    apnet_model_type,
+    supported_train_kwargs,
+    *,
+    end_lr=None,
+    lr_decay=None,
+    optimizer="adam",
+    weight_decay=0.0,
+    lr_schedule="exponential",
+    loss="mse",
+    huber_delta=1.0,
+    ema_decay=None,
+):
+    """
+    The learning-rate schedule and optimizer/loss/EMA kwargs for a pairwise
+    route's train().
+
+    "APNet3-d3-fused" names no route; "APNet3-fused-d3" is the real one and
+    its train() takes both end_lr and lr_decay, preferring end_lr.  Before it
+    was listed here a requested --end_lr was dropped on that route without a
+    word.  The recipe options are added only when they differ from their
+    defaults, so no other route's kwargs change, and a requested option the
+    route cannot honour is an error rather than a skipped kwarg.
+    """
+    out = {}
+    if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused", "APNet3-fused-d3"]:
+        out["end_lr"] = end_lr
+    if apnet_model_type not in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
+        out["lr_decay"] = lr_decay
+    recipe = {
+        "optimizer": (optimizer, "adam"),
+        "weight_decay": (weight_decay, 0.0),
+        "lr_schedule": (lr_schedule, "exponential"),
+        "loss": (loss, "mse"),
+        "huber_delta": (huber_delta, 1.0),
+        "ema_decay": (ema_decay, None),
+    }
+    requested = {k: v for k, (v, default) in recipe.items() if v != default}
+    refused = sorted(k for k in requested if k not in supported_train_kwargs)
+    if refused:
+        raise ValueError(
+            f"{apnet_model_type} train() does not support: {', '.join(refused)}"
+        )
+    out.update(requested)
+    return out
+
+
 def train_pairwise_model(
     apnet_model_type="APNet2",
     model_out="./models/ap2_ensemble/ap2_1.pt",
@@ -441,6 +488,12 @@ def train_pairwise_model(
     freeze_atom_model=True,
     build_dataset_only=False,
     include_total_mse=False,
+    optimizer="adam",
+    weight_decay=0.0,
+    lr_schedule="exponential",
+    loss="mse",
+    huber_delta=1.0,
+    ema_decay=None,
     component_gamma=None,
     total_includes_d3=False,
     grad_clip_norm=None,
@@ -1322,11 +1375,21 @@ def train_pairwise_model(
             train_kwargs["induction_convergence_norm"] = (
                 induction_convergence_norm
             )
-    if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
-        train_kwargs["end_lr"] = end_lr
-    else:
-        train_kwargs["lr_decay"] = lr_decay
     supported_train_kwargs = inspect.signature(apnet.train).parameters
+    train_kwargs.update(
+        schedule_and_recipe_train_kwargs(
+            apnet_model_type,
+            supported_train_kwargs,
+            end_lr=end_lr,
+            lr_decay=lr_decay,
+            optimizer=optimizer,
+            weight_decay=weight_decay,
+            lr_schedule=lr_schedule,
+            loss=loss,
+            huber_delta=huber_delta,
+            ema_decay=ema_decay,
+        )
+    )
     unsupported_train_kwargs = sorted(
         key for key in train_kwargs if key not in supported_train_kwargs
     )
@@ -1677,6 +1740,45 @@ def main():
         type=float,
         default=None,
         help="Final learning rate for exponential decay over n_epochs (APNetD3 only)",
+    )
+    args.add_argument(
+        "--optimizer",
+        choices=("adam", "adamw"),
+        default="adam",
+        help="APNet3-fused-d3 single-process: optimizer (default adam).",
+    )
+    args.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.0,
+        help="Decoupled weight decay; requires --optimizer adamw (default 0).",
+    )
+    args.add_argument(
+        "--lr_schedule",
+        choices=("exponential", "cosine"),
+        default="exponential",
+        help="Shape of the epoch-wise --lr -> --end_lr decay (default exponential).",
+    )
+    args.add_argument(
+        "--loss",
+        choices=("mse", "huber"),
+        default="mse",
+        help="APNet3-fused-d3 single-process: component (and total) loss.",
+    )
+    args.add_argument(
+        "--huber_delta",
+        type=float,
+        default=1.0,
+        help="Huber transition in kcal/mol for --loss huber (default 1.0).",
+    )
+    args.add_argument(
+        "--ema_decay",
+        type=float,
+        default=None,
+        help=(
+            "APNet3-fused-d3 single-process: validate, select and save an "
+            "exponential moving average of the weights with this per-step decay."
+        ),
     )
     args.add_argument(
         "--lr_decay",
@@ -2295,6 +2397,12 @@ def main():
             freeze_atom_model=not args.unfreeze_atom_model,
             build_dataset_only=args.build_dataset_only,
             include_total_mse=args.include_total_mse,
+            optimizer=args.optimizer,
+            weight_decay=args.weight_decay,
+            lr_schedule=args.lr_schedule,
+            loss=args.loss,
+            huber_delta=args.huber_delta,
+            ema_decay=args.ema_decay,
             ds_max_size=args.ds_max_size,
             ds_max_size_val=args.ds_max_size_val,
             batch_size=args.batch_size,

@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import shutil
@@ -18,7 +19,12 @@ from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import (
     _as_scalar,
     _best_mae_sidecar_floor,
     _best_mae_sidecar_paths,
+    WeightEMA,
+    build_cosine_decay_scheduler,
+    build_criterion,
     build_exponential_decay_scheduler,
+    build_optimizer,
+    compute_component_mse_loss,
     exponential_decay_lr,
 )
 from apnet_pt.pt_datasets.ap3_fused_ds import (
@@ -2045,3 +2051,180 @@ def test_a_later_chunk_does_not_overwrite_a_better_earlier_sidecar(tmp_path):
     ap3d3.train(ds, n_epochs=1, **train_kwargs)
     assert _sidecar_record(model_path)["val_total_MAE"] < 1e9
     assert np.isfinite(first)
+
+
+# --- training recipe: optimizer, loss, cosine schedule, weight EMA ----------
+
+
+def _lrs(scheduler, optimizer, n_epochs):
+    out = []
+    for _ in range(n_epochs):
+        out.append(optimizer.param_groups[0]["lr"])
+        scheduler.step()
+    return out
+
+
+def test_adam_is_the_default_and_refuses_coupled_weight_decay():
+    params = [torch.nn.Parameter(torch.zeros(3))]
+    assert type(build_optimizer(params, 1e-3)) is torch.optim.Adam
+    with pytest.raises(ValueError, match="requires optimizer='adamw'"):
+        build_optimizer(params, 1e-3, "adam", 1e-4)
+    adamw = build_optimizer(params, 1e-3, "adamw", 1e-4)
+    assert type(adamw) is torch.optim.AdamW
+    assert adamw.param_groups[0]["weight_decay"] == 1e-4
+    with pytest.raises(ValueError, match="optimizer must be one of"):
+        build_optimizer(params, 1e-3, "sgd")
+
+
+def test_cosine_schedule_shares_the_exponential_endpoints():
+    n, start, end = 7, 5e-4, 1e-5
+    opt = build_optimizer([torch.nn.Parameter(torch.zeros(1))], start)
+    cos = _lrs(build_cosine_decay_scheduler(opt, start, end, n), opt, n)
+    opt = build_optimizer([torch.nn.Parameter(torch.zeros(1))], start)
+    exp = _lrs(build_exponential_decay_scheduler(opt, start, end, n), opt, n)
+    assert cos[0] == pytest.approx(start) and exp[0] == pytest.approx(start)
+    assert cos[-1] == pytest.approx(end) and exp[-1] == pytest.approx(end)
+    assert cos[3] == pytest.approx(0.5 * (start + end))
+    assert all(a > b for a, b in itertools.pairwise(cos))
+    # cosine holds the rate up longer than the exponential in between
+    assert all(c > e for c, e in zip(cos[1:-1], exp[1:-1]))
+
+
+def test_mse_criterion_reproduces_the_historical_loss_bitwise():
+    torch.manual_seed(0)
+    preds, labels = torch.randn(9, 4), torch.randn(9, 4)
+    err = preds - labels
+    legacy = torch.mean(torch.square(err)) + torch.mean(
+        torch.square(preds.sum(1) - labels.sum(1))
+    )
+    for loss_fn in (None, build_criterion("mse")):
+        loss, _ = compute_component_mse_loss(
+            preds, labels, loss_fn=loss_fn, include_total_mse=True
+        )
+        assert torch.equal(loss, legacy)
+
+
+def test_huber_criterion_also_applies_to_the_total_term():
+    preds = torch.tensor([[3.0, 0.0], [0.0, 0.5]])
+    labels = torch.zeros(2, 2)
+    huber = build_criterion("huber", huber_delta=1.0)
+    loss, _ = compute_component_mse_loss(
+        preds, labels, loss_fn=huber, include_total_mse=True
+    )
+    components = (2.5 + 0.0 + 0.0 + 0.125) / 4
+    total = (2.5 + 0.125) / 2  # totals 3.0 and 0.5
+    assert float(loss) == pytest.approx(components + total)
+    with pytest.raises(ValueError, match="huber_delta must be > 0"):
+        build_criterion("huber", huber_delta=0.0)
+    with pytest.raises(ValueError, match="loss must be one of"):
+        build_criterion("l1")
+
+
+def test_weight_ema_averages_floats_copies_integers_and_swaps_back():
+    model = torch.nn.Linear(2, 1)
+    model.register_buffer("count", torch.tensor(0))
+    ema = WeightEMA(model, decay=0.5)
+    start = model.weight.detach().clone()
+    with torch.no_grad():
+        model.weight.add_(2.0)
+        model.count.fill_(7)
+    ema.update(model)
+    assert torch.allclose(ema.shadow["weight"], start + 1.0)
+    assert int(ema.shadow["count"]) == 7
+    raw = model.weight.detach().clone()
+    ema.swap_in(model)
+    assert torch.allclose(model.weight, start + 1.0)
+    with pytest.raises(RuntimeError, match="already swapped in"):
+        ema.swap_in(model)
+    ema.swap_out(model)
+    assert torch.equal(model.weight, raw)
+    with pytest.raises(ValueError, match="ema_decay must be in"):
+        WeightEMA(model, 1.0)
+
+
+def test_train_models_forwards_end_lr_on_the_fused_d3_route():
+    import train_models
+
+    supported = {"end_lr": 0, "lr_decay": 0, "optimizer": 0, "loss": 0}
+    kw = train_models.schedule_and_recipe_train_kwargs(
+        "APNet3-fused-d3", supported, end_lr=1e-5, lr_decay=None
+    )
+    assert kw == {"end_lr": 1e-5, "lr_decay": None}
+    kw = train_models.schedule_and_recipe_train_kwargs(
+        "APNet2", supported, end_lr=1e-5, lr_decay=0.5
+    )
+    assert kw == {"lr_decay": 0.5}
+    kw = train_models.schedule_and_recipe_train_kwargs(
+        "APNet3-fused-d3", supported, optimizer="adamw", loss="huber"
+    )
+    assert kw["optimizer"] == "adamw" and kw["loss"] == "huber"
+    with pytest.raises(ValueError, match="does not support: ema_decay"):
+        train_models.schedule_and_recipe_train_kwargs(
+            "APNet3-fused-d3", supported, ema_decay=0.999
+        )
+
+
+def _small_precomputed_ap3d3(tmp_path):
+    qcel_molecules = [mol_cliff_water_close] * 4
+    labels = [
+        np.array([-10.779292828139122, 11.390991215401051,
+                  -3.414543432719425, -2.436025699701581])
+        for _ in qcel_molecules
+    ]
+    hf_vw = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
+        ds_root=None, use_GPU=False, ignore_database_null=True,
+        atom_model_pre_trained_path=am_path, pre_trained_model_path=at_hf_vw_path,
+    )
+    elst = apnet_pt.AtomPairwiseModels.mtp_mtp.AM_DimerParam_Model(
+        ds_root=None, use_GPU=False, ignore_database_null=True,
+        atom_model=hf_vw.model, atom_model_type="AtomTypeParamNN",
+        pre_trained_model_path=at_elst_path,
+    )
+    root = tmp_path / "ds"
+    (root / "raw").mkdir(parents=True, exist_ok=True)
+    ds = ap3_fused_module_dataset(
+        root=str(root), r_cut=5.0, r_cut_im=8.0, spec_type=None, max_size=None,
+        force_reprocess=True, atomic_batch_size=4,
+        dimer_prop_model=elst.dimer_model, datapoint_storage_n_objects=6,
+        batch_size=2, num_devices=1, skip_processed=True, skip_compile=True,
+        print_level=0, qcel_molecules=qcel_molecules, energy_labels=labels,
+        in_memory=True, random_seed=None,
+    )
+    torch.manual_seed(5)
+    return ds, APNet3D3_AtomType_Model(
+        dataset=ds, ds_root=None, atom_type_model=hf_vw.model,
+        dimer_prop_model=elst.dimer_model, am_dimer_param_model=elst,
+        use_precomputed_classical=True, ignore_database_null=True,
+        use_GPU=False, no_disp_nn=False,
+    )
+
+
+@pytest.mark.parametrize("ema_decay", [None, 1.0 - 1e-9])
+def test_ema_run_selects_and_returns_the_averaged_weights(tmp_path, ema_decay):
+    ds, ap3d3 = _small_precomputed_ap3d3(tmp_path)
+    ap3d3.model(ap3d3.example_input())  # materialise the lazy parameters
+    start = {k: v.detach().clone() for k, v in ap3d3.model.state_dict().items()}
+    ap3d3.train(
+        ds, n_epochs=2, lr=5e-3, end_lr=1e-4, split_percent=0.5,
+        skip_compile=True, dataloader_num_workers=0,
+        model_path=str(tmp_path / "m.pt"),
+        optimizer="adamw", weight_decay=1e-4, lr_schedule="cosine",
+        loss="huber", huber_delta=1.0, ema_decay=ema_decay,
+    )
+    end = ap3d3.model.state_dict()
+    moved = max(float((end[k].float() - start[k].float()).abs().max())
+                for k in start if start[k].dtype.is_floating_point)
+    if ema_decay is None:
+        assert moved > 1e-4
+    else:
+        # decay 1 - 1e-9 keeps the average at its starting point, so every
+        # weight the run validates, saves and returns is the initial one.
+        assert moved < 1e-6
+    assert (tmp_path / "m.pt").exists()
+
+
+def test_recipe_options_are_refused_on_the_ddp_path(tmp_path):
+    ds, ap3d3 = _small_precomputed_ap3d3(tmp_path)
+    with pytest.raises(ValueError, match="single-process only"):
+        ap3d3.train(ds, n_epochs=1, world_size=2, loss="huber",
+                    split_percent=0.5, skip_compile=True)
