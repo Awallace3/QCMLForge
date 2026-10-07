@@ -35,8 +35,19 @@ def _to_python_float(value) -> float:
     return float(value)
 
 
+# Fitted (MAE) to SAPT0/aug-cc-pVDZ dispersion of 200k 1600K-train dimers.
+# Opt-in only: select it by name; no model or default uses it. Fit and
+# held-out validation: qcmlforge-exp branch d3-sapt0, analysis/d3-sapt0/fit-v1.
+params_intermolecular_sapt0_bj = {
+    "s6": 1.0,
+    "s8": 1.0895847941682621,
+    "a1": 0.3836034058513986,
+    "a2": 2.4363145941291755,
+}
+
 D3_DAMPING_PARAMETER_SETS = {
     "sapt-pbe0-d3i": params_intermolecular_saptpbe0_d3i,
+    "sapt0-bj": params_intermolecular_sapt0_bj,
 }
 """Named intermolecular D3(BJ) damping parameter sets."""
 

@@ -55,6 +55,16 @@ def test_default_set_is_selectable_by_name(water_batch):
     assert torch.equal(named, d3(water_batch).sum())
 
 
+def test_sapt0_bj_is_selected_only_by_name(water_batch):
+    sapt0 = resolve_d3_damping_parameters("sapt0-bj")
+    assert sapt0 == D3_DAMPING_PARAMETER_SETS["sapt0-bj"]
+    assert sapt0 != resolve_d3_damping_parameters()
+    named = d3(water_batch, params="sapt0-bj").sum()
+    assert torch.equal(named, d3(water_batch, params=sapt0).sum())
+    # SAPT0-fitted damping binds the water dimer less than the default
+    assert d3(water_batch).sum() < named < 0
+
+
 def test_resolved_named_set_is_a_copy():
     resolved = resolve_d3_damping_parameters("sapt-pbe0-d3i")
     resolved["a1"] = -1.0
@@ -68,8 +78,7 @@ def test_unknown_named_set_raises():
 
 def test_pair_terms_reproduce_d3(water_batch):
     terms = d3_pair_terms(water_batch)
-    other = {"s6": 1.0, "s8": 0.5, "a1": 0.3, "a2": 4.0}
-    for params in (SAPT_PBE0_D3I, other):
+    for params in (SAPT_PBE0_D3I, resolve_d3_damping_parameters("sapt0-bj")):
         assert torch.equal(d3_pair_energies(terms, params), d3(water_batch, params))
 
 
