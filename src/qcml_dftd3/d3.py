@@ -35,7 +35,47 @@ def _to_python_float(value) -> float:
     return float(value)
 
 
-def resolve_d3_damping_parameters(params: dict | None = None) -> dict[str, float]:
+# Fitted (MAE) to SAPT0/aug-cc-pVDZ dispersion of 200k 1600K-train dimers.
+# Opt-in only: select it by name; no model or default uses it. Fit and
+# held-out validation: qcmlforge-exp branch d3-sapt0, analysis/d3-sapt0/fit-v1.
+params_intermolecular_sapt0_bj = {
+    "s6": 1.0,
+    "s8": 1.0895847941682621,
+    "a1": 0.3836034058513986,
+    "a2": 2.4363145941291755,
+}
+
+D3_DAMPING_PARAMETER_SETS = {
+    "sapt-pbe0-d3i": params_intermolecular_saptpbe0_d3i,
+    "sapt0-bj": params_intermolecular_sapt0_bj,
+}
+"""Named intermolecular D3(BJ) damping parameter sets."""
+
+
+def resolve_d3_damping_parameters(
+    params: dict | str | None = None,
+) -> dict[str, float]:
+    """
+    Resolve D3(BJ) damping parameters, defaulting to ``"sapt-pbe0-d3i"``.
+
+    Parameters
+    ----------
+    params : dict, str or None
+        ``None`` for the default set, a key of ``D3_DAMPING_PARAMETER_SETS``,
+        or a mapping overriding any of ``s6``, ``s8``, ``a1`` and ``a2``.
+
+    Returns
+    -------
+    dict[str, float]
+        A new dictionary holding all four parameters.
+    """
+    if isinstance(params, str):
+        if params not in D3_DAMPING_PARAMETER_SETS:
+            raise ValueError(
+                f"Unknown D3 damping parameter set {params!r}; "
+                f"choose from {sorted(D3_DAMPING_PARAMETER_SETS)}"
+            )
+        return dict(D3_DAMPING_PARAMETER_SETS[params])
     resolved = dict(params_intermolecular_saptpbe0_d3i)
     if params is None:
         return resolved
@@ -189,13 +229,18 @@ def cn_d3_intermolecular(
     return cn_A, cn_B
 
 
-def d3(
-    batch,
-    params=params_intermolecular_saptpbe0_d3i,
-):
+def d3_pair_terms(batch) -> dict[str, torch.Tensor]:
+    """
+    Damping-independent intermolecular D3 pair terms of a dimer batch.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        Per A->B pair: ``c6`` (hartree bohr^6), ``qq`` (C8/C6 quotient,
+        bohr^2) and ``distances`` (bohr).
+    """
     RA = batch.RA
     dd = {"device": RA.device, "dtype": RA.dtype}
-    params = resolve_d3_damping_parameters(params)
 
     ref_c6 = _get_reference_c6(dd["device"], dd["dtype"])
 
@@ -254,6 +299,19 @@ def d3(
 
     # quotient of C8 and C6: qAqB = 3 * r4r2[A] * r4r2[B]
     qAqB = 3 * r4_over_r2[ZA] * r4_over_r2[ZB]
+    return {"c6": c6, "qq": qAqB, "distances": distances}
+
+
+def d3_pair_energies(terms: dict[str, torch.Tensor], params: dict) -> torch.Tensor:
+    """
+    Two-body D3(BJ) energies (kcal/mol) from ``d3_pair_terms`` output.
+
+    ``params`` must hold ``s6``, ``s8``, ``a1`` and ``a2``; tensor values keep
+    their autograd graph, so damping parameters can be fitted directly.
+    """
+    c6 = terms["c6"]
+    qAqB = terms["qq"]
+    distances = terms["distances"]
     c8 = c6 * qAqB
 
     t6 = rational_damping(
@@ -269,21 +327,22 @@ def d3(
         params,
     )
 
-    s6 = params.get("s6", torch.tensor(defaults.S6, **dd))
-    s8 = params.get("s8", torch.tensor(defaults.S8, **dd))
-    e6 = -1 * (c6 * t6) * s6
-    e8 = -1 * (c8 * t8) * s8
+    e6 = -1 * (c6 * t6) * params["s6"]
+    e8 = -1 * (c8 * t8) * params["s8"]
     pairwise_energies = e6 + e8
     pairwise_energies *= h2kcalmol
-
-    # print(f"{e_source_full = }")
-    # print(f"{e_target_full = }")
-    # print("rs", distances)
-    # rrij = 3*r4r2(izp)*r4r2(jzp)
-    # r0ij = self%a1 * sqrt(rrij) + self%a2
-
-    # print("r0ij", params["a1"] * torch.sqrt(qAqB) + params["a2"])
-    # print("c6", c6)
-    # print("c8", c8)
-
     return pairwise_energies
+
+
+def d3(
+    batch,
+    params=params_intermolecular_saptpbe0_d3i,
+):
+    """
+    Pairwise intermolecular D3(BJ) dispersion energies (kcal/mol).
+
+    ``params`` is anything ``resolve_d3_damping_parameters`` accepts, e.g. a
+    mapping or the name of an entry in ``D3_DAMPING_PARAMETER_SETS``.
+    """
+    params = resolve_d3_damping_parameters(params)
+    return d3_pair_energies(d3_pair_terms(batch), params)
