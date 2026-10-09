@@ -250,6 +250,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         no_disp_nn=False,
         freeze_dimer_prop_model=None,
         d3_damping_parameters=None,
+        sr_switch=False,
     ):
         super().__init__()
         self.dimer_prop_model = dimer_prop_model
@@ -263,6 +264,13 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         self.use_precomputed_classical = use_precomputed_classical
         self.use_atom_props = use_atom_props
         self.no_disp_nn = no_disp_nn
+        # Multiply each short-range pair energy by a smooth switch that reaches
+        # zero at r_cut_im, so pairs crossing the cutoff do not step the energy.
+        self.sr_switch = bool(sr_switch)
+        self.sr_switch_envelope = Envelope(5)
+        # The store fixes its short/long-range split at build time; check the
+        # first batch once that it was not cut shorter than this model.
+        self._store_cutoff_checked = False
         self.freeze_dimer_prop_model = freeze_dimer_prop_model
         self.d3_damping_parameters = resolve_d3_damping_parameters(
             d3_damping_parameters
@@ -366,6 +374,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             "no_disp_nn": self.no_disp_nn,
             "freeze_dimer_prop_model": self.freeze_dimer_prop_model,
             "d3_damping_parameters": deepcopy(self.d3_damping_parameters),
+            "sr_switch": self.sr_switch,
         }
 
     def get_model_info(self):
@@ -482,6 +491,15 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         else:
             return torch.cat([hA_source, hB_target, qA_source, qB_target, rbf], dim=-1)
 
+    def _check_store_cutoff(self, dR_lr):
+        if dR_lr.numel() and float(dR_lr.min()) < self.r_cut_im - 1e-4:
+            raise ValueError(
+                f"Store long-range AB edges start at {float(dR_lr.min()):.4f} A, "
+                f"inside model r_cut_im={self.r_cut_im}; rebuild the store at "
+                "r_cut_im >= the model's."
+            )
+        self._store_cutoff_checked = True
+
     def get_distances(self, RA, RB, e_source, e_target):
         RA_source = RA.index_select(0, e_source)
         RB_target = RB.index_select(0, e_target)
@@ -533,6 +551,16 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # interatomic distances
         dR_sr, dR_sr_xyz = self.get_distances(RA, RB, e_ABsr_source, e_ABsr_target)
         dR_lr, dR_lr_xyz = self.get_distances(RA, RB, e_ABlr_source, e_ABlr_target)
+        if not self._store_cutoff_checked:
+            self._check_store_cutoff(dR_lr)
+        # Stores built at a longer cutoff carry extra short-range edges; drop
+        # them so the NN sees only pairs within this model's r_cut_im.
+        keep = dR_sr <= self.r_cut_im
+        e_ABsr_source = e_ABsr_source[keep]
+        e_ABsr_target = e_ABsr_target[keep]
+        dimer_ind = dimer_ind[keep]
+        dR_sr = dR_sr[keep]
+        dR_sr_xyz = dR_sr_xyz[keep]
         # TODO: need to handle single atoms correctly without self edge because
         # this goes to zero causing nans later...
         dRA, dRA_xyz = self.get_distances(RA, RA, e_AA_source, e_AA_target)
@@ -666,6 +694,9 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         E_sr = EAB_sr + EBA_sr
 
         cutoff = (1.0 / (dR_sr**3)).unsqueeze(-1)
+        if self.sr_switch:
+            x = dR_sr / self.r_cut_im
+            cutoff = cutoff * (x * self.sr_switch_envelope(x)).unsqueeze(-1)
         E_sr *= cutoff
         E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
         if self.use_precomputed_classical:
@@ -875,7 +906,7 @@ class APNet3D3_AtomType_Model:
         n_rbf=8,
         n_neuron=128,
         n_embed=8,
-        r_cut_im=8.0,
+        r_cut_im=None,
         r_cut=5.0,
         use_GPU=None,
         ignore_database_null=True,
@@ -902,9 +933,13 @@ class APNet3D3_AtomType_Model:
         no_disp_nn=False,
         freeze_dimer_prop_model=True,
         d3_damping_parameters=None,
+        sr_switch=None,
     ):
         """
         the path and all other parameters will be ignored except for dataset.
+
+        r_cut_im and sr_switch left as None take the checkpoint's values
+        (8.0 and False for a fresh model).
 
         use_GPU will check for a GPU and use it if available unless set to false.
         """
@@ -1015,6 +1050,8 @@ class APNet3D3_AtomType_Model:
             config = model_io.load_config_from_checkpoint(checkpoint) or {}
             use_atom_props = config.get("use_atom_props", True)
             no_disp_nn = config.get("no_disp_nn", False)
+            if sr_switch is None:
+                sr_switch = config.get("sr_switch", False)
             if use_precomputed_classical is None:
                 use_precomputed_classical = config.get(
                     "use_precomputed_classical", False
@@ -1039,6 +1076,7 @@ class APNet3D3_AtomType_Model:
                 no_disp_nn=no_disp_nn,
                 freeze_dimer_prop_model=freeze_dimer_prop_model,
                 d3_damping_parameters=resolved_d3_damping_parameters,
+                sr_switch=sr_switch,
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)
@@ -1056,13 +1094,14 @@ class APNet3D3_AtomType_Model:
                 n_rbf=n_rbf,
                 n_neuron=n_neuron,
                 n_embed=n_embed,
-                r_cut_im=r_cut_im,
+                r_cut_im=8.0 if r_cut_im is None else r_cut_im,
                 r_cut=r_cut,
                 use_precomputed_classical=use_precomputed_classical,
                 use_atom_props=use_atom_props,
                 no_disp_nn=no_disp_nn,
                 freeze_dimer_prop_model=freeze_dimer_prop_model,
                 d3_damping_parameters=resolved_d3_damping_parameters,
+                sr_switch=bool(sr_switch),
             )
         self.use_precomputed_classical = use_precomputed_classical
         self.d3_damping_parameters = deepcopy(resolved_d3_damping_parameters)
@@ -1083,9 +1122,11 @@ class APNet3D3_AtomType_Model:
         if n_embed != self.model.n_embed:
             print(f"Changing n_embed from {self.model.n_embed} to {n_embed}")
             self.model.n_embed = n_embed
-        if r_cut_im != self.model.r_cut_im:
+        if r_cut_im is not None and r_cut_im != self.model.r_cut_im:
             print(f"Changing r_cut_im from {self.model.r_cut_im} to {r_cut_im}")
             self.model.r_cut_im = r_cut_im
+            self.model.distance_layer_im.inv_cutoff = 1.0 / r_cut_im
+        r_cut_im = self.model.r_cut_im
         if r_cut != self.model.r_cut:
             print(f"Changing r_cut from {self.model.r_cut} to {r_cut}")
             self.model.r_cut = r_cut
@@ -1702,6 +1743,12 @@ class APNet3D3_AtomType_Model:
 
         indsA_sr = inp_batch["e_ABsr_source"]
         indsB_sr = inp_batch["e_ABsr_target"]
+        if E_sr.shape[0] != indsA_sr.shape[0]:
+            raise ValueError(
+                "Pair decomposition needs the batch built at the model "
+                f"r_cut_im={self.model.r_cut_im}; the forward masked "
+                f"{indsA_sr.shape[0] - E_sr.shape[0]} wider short-range edges."
+            )
         indsA = inp_batch["e_ABfull_source"]
         indsB = inp_batch["e_ABfull_target"]
 
