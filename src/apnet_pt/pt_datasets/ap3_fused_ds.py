@@ -26,7 +26,7 @@ from apnet_pt import constants
 import h5py
 
 
-AP3_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9, 10})
+AP3_FUSED_SPLIT_SPEC_TYPES = frozenset({2, 5, 6, 7, 9, 10, 11})
 
 
 def spec_type_uses_split_files(spec_type):
@@ -876,14 +876,18 @@ class ap3_fused_module_dataset(Dataset):
             5. testing small
             6. testing 12k
             7. testing 12k but creating batch of 16 to avoid any collating and reduce large I/O issues (potentially)
+            10. SAPT(PBE0)-D4/aug-cc-pVDZ 225K totals train/test split
+            11. splinter_omol25_sapt0indu_v1 pair-disjoint 90/10 seed 42 split
+               (OMol25 + SPLINTER; SAPT(PBE0) elst/exch, SAPT0 induction, D4 dispersion)
             None: assumes that data is passed as qcel_molecules and energy labels
         """
         self.print_level = print_level
-        try:
-            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, None]
-        except Exception:
-            print("Currently spec_type must be 1 or 2 for SAPT0/jun-cc-pVDZ")
-            raise ValueError
+        supported_spec_types = (1, 2, 5, 6, 7, 8, 9, 10, 11, None)
+        if spec_type not in supported_spec_types:
+            raise ValueError(
+                f"spec_type must be one of {supported_spec_types}, "
+                f"got {spec_type!r}"
+            )
         self.spec_type = spec_type
         assert atomic_batch_size <= datapoint_storage_n_objects, (
             "atomic_batch_size must be <= datapoint_storage_n_objects, got {} and {}".format(
@@ -1049,6 +1053,11 @@ class ap3_fused_module_dataset(Dataset):
             return [
                 "225K_saptpbe0-d4_totals_train.pkl",
                 "225K_saptpbe0-d4_totals_test.pkl",
+            ]
+        elif self.spec_type == 11:
+            return [
+                "splinter_omol25_sapt0indu_v1_train.pkl",
+                "splinter_omol25_sapt0indu_v1_test.pkl",
             ]
         elif self.spec_type is None:
             os.system(f"touch {self.raw_dir}/tmp.txt")
@@ -1606,11 +1615,12 @@ class ap3_fused_module_dataset_lmdb(Dataset):
         self.lmdb = lmdb
         self.json = json
         self.print_level = print_level
-        try:
-            assert spec_type in [1, 2, 5, 6, 7, 8, 9, 10, None]
-        except Exception:
-            print("Currently spec_type must be 1 or 2 for SAPT0/jun-cc-pVDZ")
-            raise ValueError
+        supported_spec_types = (1, 2, 5, 6, 7, 8, 9, 10, 11, None)
+        if spec_type not in supported_spec_types:
+            raise ValueError(
+                f"spec_type must be one of {supported_spec_types}, "
+                f"got {spec_type!r}"
+            )
         self.spec_type = spec_type
         assert atomic_batch_size <= datapoint_storage_n_objects, (
             f"atomic_batch_size must be <= datapoint_storage_n_objects, "
@@ -1796,48 +1806,13 @@ class ap3_fused_module_dataset_lmdb(Dataset):
 
     @property
     def raw_file_names(self):
-        """Same as original implementation"""
-        if self.spec_type == 2:
-            return [
-                "1600K_train_dimers-fixed.pkl",
-                "1600K_test_dimers-fixed.pkl",
-            ]
-        elif self.spec_type == 5:
-            return [
-                "t_train.pkl",
-                "t_test.pkl",
-            ]
-        elif self.spec_type == 6:
-            return [
-                "t_train10k.pkl",
-                "t_test2k.pkl",
-            ]
-        elif self.spec_type == 7:
-            return [
-                "t_train_100.pkl",
-                "t_test_20.pkl",
-            ]
-        elif self.spec_type == 8:
-            return [
-                "t_val_19.pkl",
-            ]
-        elif self.spec_type == 9:
-            return [
-                "t_train_19.pkl",
-                "t_test_19.pkl",
-            ]
-        elif self.spec_type == 10:
-            return [
-                "225K_saptpbe0-d4_totals_train.pkl",
-                "225K_saptpbe0-d4_totals_test.pkl",
-            ]
-        elif self.spec_type is None:
-            os.system(f"touch {self.raw_dir}/tmp.txt")
-            return ["tmp.txt"]
-        else:
-            return [
-                "splinter_spec1.pkl",
-            ]
+        """The base class's map, so a new spec_type is registered once.
+
+        This was a verbatim copy of ``ap3_fused_module_dataset.raw_file_names``
+        marked "Same as original implementation" -- which is only true until
+        someone adds a spec to one of them.  ``ap2_fused_ds`` already delegates.
+        """
+        return ap3_fused_module_dataset.raw_file_names.fget(self)
 
     @property
     def processed_file_names(self):

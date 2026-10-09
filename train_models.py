@@ -1,5 +1,9 @@
 from apnet_pt import AtomModels
 from apnet_pt import AtomPairwiseModels
+from apnet_pt.AtomPairwiseModels.component_losses import (
+    COMPONENT_LOSS_NAMES,
+    build_component_loss,
+)
 from apnet_pt.training_tracking import WandbConfig
 import argparse
 import inspect
@@ -8,6 +12,7 @@ import os
 import random
 from dataclasses import replace
 from pprint import pprint
+from typing import Callable, Sequence
 from uuid import uuid4
 
 import numpy as np
@@ -236,6 +241,86 @@ def train_atom_model(
     return
 
 
+# Every spelling of the AP3-D3 route.  The --end_lr gate and the train() kwarg
+# dispatch must share it; when they disagreed, an accepted --end_lr was dropped.
+APNETD3_MODEL_TYPES = frozenset(
+    {"apnetd3", "apnet3d3", "apnet3-d3-fused", "apnet3-fused-d3"}
+)
+
+
+def is_apnetd3_model_type(apnet_model_type: str) -> bool:
+    """Whether ``apnet_model_type`` names the AP3-D3 training route."""
+    return apnet_model_type.lower() in APNETD3_MODEL_TYPES
+
+
+def lr_schedule_train_kwargs(
+    apnet_model_type: str, end_lr: float | None, lr_decay: float | None
+) -> dict:
+    """``lr_decay`` for every route, plus ``end_lr`` for AP3-D3 (which logs
+    which one wins), so neither flag is silently inert."""
+    kwargs = {"lr_decay": lr_decay}
+    if is_apnetd3_model_type(apnet_model_type):
+        kwargs["end_lr"] = end_lr
+    return kwargs
+
+
+def _require_train_kwarg(
+    apnet_model_type: str, train_fn: Callable, kwarg: str, flag: str
+) -> None:
+    """Raise rather than let the unsupported-kwarg filter drop ``flag``."""
+    if kwarg not in inspect.signature(train_fn).parameters:
+        raise ValueError(
+            f"{apnet_model_type} does not support {flag}; its train() has no "
+            f"{kwarg} parameter"
+        )
+
+
+def resume_state_train_kwargs(
+    apnet_model_type: str, train_fn: Callable, resume_state_path: str | None
+) -> dict:
+    """``{"resume_state_path": ...}``, or ``{}`` when none was requested."""
+    if not resume_state_path:
+        return {}
+    _require_train_kwarg(
+        apnet_model_type, train_fn, "resume_state_path", "--resume-state"
+    )
+    return {"resume_state_path": resume_state_path}
+
+
+def component_loss_train_kwargs(
+    apnet_model_type: str,
+    train_fn: Callable,
+    component_loss: str = "component_mse",
+    huber_delta: float = 1.0,
+    relative_loss_eps: float = 1.0,
+    component_loss_weights: Sequence[float] | None = None,
+) -> dict:
+    """``{"loss_fn": ...}`` for a selected loss, or ``{}`` for the default.
+
+    Weighted MSE requires explicit weights: defaulting to ones would make the
+    flag inert.  Unknown names and routes without ``loss_fn`` raise.
+    """
+    if component_loss == "component_mse":
+        return {}
+    loss_kwargs = {
+        "component_huber": {"delta": huber_delta},
+        "component_relative_mse": {"eps": relative_loss_eps},
+        "component_weighted_mse": {"weights": component_loss_weights},
+    }.get(component_loss)
+    if loss_kwargs is None:
+        build_component_loss(component_loss)  # raises the unknown-name error
+    if component_loss == "component_weighted_mse":
+        if component_loss_weights is None:
+            raise ValueError(
+                "component_weighted_mse requires --component_loss_weights"
+            )
+        loss_kwargs["weights"] = tuple(float(w) for w in component_loss_weights)
+    _require_train_kwarg(
+        apnet_model_type, train_fn, "loss_fn", f"--component_loss {component_loss}"
+    )
+    return {"loss_fn": build_component_loss(component_loss, **loss_kwargs)}
+
+
 def train_pairwise_model(
     apnet_model_type="APNet2",
     model_out="./models/ap2_ensemble/ap2_1.pt",
@@ -248,6 +333,10 @@ def train_pairwise_model(
     lr=5e-4,
     end_lr=None,
     lr_decay=None,
+    component_loss="component_mse",
+    huber_delta=1.0,
+    relative_loss_eps=1.0,
+    component_loss_weights=None,
     random_seed=42,
     spec_type=2,
     r_cut_im=8.0,
@@ -280,6 +369,7 @@ def train_pairwise_model(
     parameter_initialization="pytorch",
     adam_eps=1e-8,
     checkpoint_metric="component_mse",
+    resume_state_path=None,
     wandb_config=None,
 ):
     # Ensure param_start_mean and param_start_std are lists
@@ -384,14 +474,7 @@ def train_pairwise_model(
         APNet = AtomPairwiseModels.mtp_mtp.AtomTypeParamModel
     else:
         raise ValueError("Invalid Atom Model Type")
-    normalized_type = apnet_model_type.lower()
-    supports_end_lr = normalized_type in {
-        "apnetd3",
-        "apnet3d3",
-        "apnet3-d3-fused",
-        "apnet3-fused-d3",
-    }
-    if end_lr is not None and not supports_end_lr:
+    if end_lr is not None and not is_apnetd3_model_type(apnet_model_type):
         raise ValueError("end_lr is currently only supported for APNetD3 training")
     print("Training {}...".format(apnet_model_type))
     if torch.cuda.is_available():
@@ -708,10 +791,22 @@ def train_pairwise_model(
         train_kwargs["shard_locality_block_shards"] = int(
             shard_locality_block_shards
         )
-    if apnet_model_type in ["APNetD3", "APNet3D3", "APNet3-d3-fused"]:
-        train_kwargs["end_lr"] = end_lr
-    else:
-        train_kwargs["lr_decay"] = lr_decay
+    train_kwargs.update(
+        lr_schedule_train_kwargs(apnet_model_type, end_lr, lr_decay)
+    )
+    train_kwargs.update(
+        component_loss_train_kwargs(
+            apnet_model_type,
+            apnet.train,
+            component_loss,
+            huber_delta,
+            relative_loss_eps,
+            component_loss_weights,
+        )
+    )
+    train_kwargs.update(
+        resume_state_train_kwargs(apnet_model_type, apnet.train, resume_state_path)
+    )
     supported_train_kwargs = inspect.signature(apnet.train).parameters
     unsupported_train_kwargs = sorted(
         key for key in train_kwargs if key not in supported_train_kwargs
@@ -769,11 +864,11 @@ def parse_param_list(param_str):
         return float(param_str)
 
 
-def main():
-    """
-    Parse command-line arguments and run configured model training routines.
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the ``train_models.py`` command-line parser.
 
-    Parses command-line options that configure atom and pairwise (APNet) training, converts the parameter-start mean/std strings to numeric lists, sets global random seeds, prints the parsed arguments, and invokes train_atom_model and/or train_pairwise_model when the corresponding flags are provided.
+    Split out of :func:`main` so flag wiring can be exercised by tests
+    without standing up a training run.
     """
     args = argparse.ArgumentParser()
     args.add_argument(
@@ -900,10 +995,52 @@ def main():
         help="Validation metric used to choose the saved APNet2 checkpoint",
     )
     args.add_argument(
+        "--resume-state",
+        type=str,
+        default=None,
+        help=(
+            "Pairwise resume-state file, rewritten after every epoch with the "
+            "weights, optimizer, scheduler, and RNG state; an existing file is "
+            "resumed from.  Lets a preemptible job continue exactly."
+        ),
+    )
+    args.add_argument(
         "--end_lr",
         type=float,
         default=None,
         help="Final learning rate for exponential decay over n_epochs (APNetD3 only)",
+    )
+    args.add_argument(
+        "--component_loss",
+        type=str,
+        default="component_mse",
+        choices=list(COMPONENT_LOSS_NAMES),
+        help=(
+            "Component-wise training loss. The default reproduces the "
+            "unweighted MSE the pairwise harnesses have always used."
+        ),
+    )
+    args.add_argument(
+        "--huber_delta",
+        type=float,
+        default=1.0,
+        help="kcal/mol crossover for --component_loss component_huber",
+    )
+    args.add_argument(
+        "--relative_loss_eps",
+        type=float,
+        default=1.0,
+        help="kcal/mol denominator floor for --component_loss component_relative_mse",
+    )
+    args.add_argument(
+        "--component_loss_weights",
+        type=parse_param_list,
+        default=None,
+        help=(
+            "Comma-separated weights, one per predicted component in "
+            "elst,exch,ind,disp order (omit disp under no_disp_nn), for "
+            "--component_loss component_weighted_mse"
+        ),
     )
     args.add_argument(
         "--lr_decay",
@@ -1135,7 +1272,18 @@ def main():
         default=None,
         help="JSON object merged into the W&B run config for provenance",
     )
-    args = args.parse_args()
+    return args
+
+
+def main():
+    """
+    Parse command-line arguments and run configured model training routines.
+
+    Converts the parameter-start mean/std strings to numeric lists, sets global
+    random seeds, prints the parsed arguments, and invokes train_atom_model
+    and/or train_pairwise_model when the corresponding flags are provided.
+    """
+    args = build_arg_parser().parse_args()
     # Parse param_start_mean and param_start_std
     args.param_start_mean = parse_param_list(args.param_start_mean)
     args.param_start_std = parse_param_list(args.param_start_std)
@@ -1180,6 +1328,10 @@ def main():
             lr=args.lr,
             end_lr=args.end_lr,
             lr_decay=args.lr_decay,
+            component_loss=args.component_loss,
+            huber_delta=args.huber_delta,
+            relative_loss_eps=args.relative_loss_eps,
+            component_loss_weights=args.component_loss_weights,
             random_seed=args.random_seed,
             spec_type=args.spec_type_ap,
             r_cut=args.r_cut,
@@ -1212,6 +1364,7 @@ def main():
             parameter_initialization=args.parameter_initialization,
             adam_eps=args.adam_eps,
             checkpoint_metric=args.checkpoint_metric,
+            resume_state_path=args.resume_state,
             wandb_config=pairwise_wandb_config,
         )
     return
