@@ -225,13 +225,27 @@ def test_sr_switch_is_refused_on_other_routes(tmp_path):
         )
 
 
-def test_cli_sr_switch_defaults_to_checkpoint():
+def _parse_cli(monkeypatch, argv):
+    """Run train_models.main() only as far as argument parsing."""
+    import argparse
     import sys
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).parents[1]))
     import train_models
 
-    parser = train_models.build_arg_parser()
-    assert parser.parse_args([]).sr_switch is None
-    assert parser.parse_args(["--sr_switch"]).sr_switch is True
+    original = argparse.ArgumentParser.parse_args
+
+    def _capture(self, *args, **kwargs):
+        raise _Captured(original(self, *args, **kwargs))
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _capture)
+    monkeypatch.setattr(sys, "argv", ["train_models.py", *argv])
+    with pytest.raises(_Captured) as caught:
+        train_models.main()
+    return caught.value.args[0]
+
+
+def test_cli_sr_switch_defaults_to_checkpoint(monkeypatch):
+    assert _parse_cli(monkeypatch, []).sr_switch is None
+    assert _parse_cli(monkeypatch, ["--sr_switch"]).sr_switch is True
