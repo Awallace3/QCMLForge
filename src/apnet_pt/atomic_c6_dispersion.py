@@ -23,7 +23,8 @@ c_Z starts at the free-atom C6 of ``apnet_pt/data/vdw-params.csv`` (column
 <r4>/<r2> (``qcml_dftd3.data.r4r2``), which sets the C8/C6 ratio.  The MPNN
 readouts start at exactly zero, so an untrained model is its element model;
 ``prefit`` fits that element model (c_Z and the damping globals) before the
-MPNN trains.
+MPNN trains.  The MPNN's per-element guess layer is frozen at zero, so the
+deltas depend only on the environment and element C6 lives only in c_Z.
 
 Options
 -------
@@ -112,6 +113,7 @@ def _zero_offset_mpnn(n_params: int, options: dict) -> AtomTypeParamMPNN:
                 final = [m for m in stage if isinstance(m, nn.Linear)][-1]
                 final.weight.zero_()
                 final.bias.zero_()
+    model.guess_layer.requires_grad_(False)
     return model
 
 
@@ -415,6 +417,8 @@ def prefit(
     Returns the first and best loss, the step count and the L1 distance the
     parameters moved.
     """
+    if steps < 1:
+        raise ValueError(f"prefit needs steps >= 1, got {steps}")
     params = model.prefit_parameters()
     start = [p.detach().clone() for p in params]
     opt = torch.optim.Adam(params, lr=lr)

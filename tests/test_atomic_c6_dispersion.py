@@ -62,7 +62,8 @@ def perturb(model, scale=0.05, seed=0):
     gen = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for p in model.mpnn.parameters():
-            p.add_(scale * torch.randn(p.shape, generator=gen, dtype=p.dtype))
+            if p.requires_grad:
+                p.add_(scale * torch.randn(p.shape, generator=gen, dtype=p.dtype))
     return model
 
 
@@ -157,6 +158,19 @@ def test_gradients_reach_the_mpnn_and_element_parameters():
         assert p.grad is not None and torch.isfinite(p.grad).all()
 
 
+def test_guess_layer_is_frozen_so_deltas_are_environment_only():
+    model = perturb(AtomicC6Dispersion(higher_order="delta", mpnn_options=OPTIONS))
+    guess = list(model.mpnn.guess_layer.parameters())
+    assert guess and not any(p.requires_grad for p in guess)
+    model(**water_methane())[0].sum().backward()
+    assert all(p.grad is None for p in guess)
+    argon = ([18], [[0.0, 0.0, 0.0]])
+    x = dimer_inputs([(argon, argon)], [((0, 0, 0), (3.8, 0.0, 0.0))])
+    _, extra = model(**x)
+    for k in ("d6", "d8", "d10", "dbeta"):
+        assert float(extra["atom"][k].abs().max()) == 0.0
+
+
 def test_anchor_freezes_element_c6_and_learns_one_scale():
     free = AtomicC6Dispersion(mpnn_options=OPTIONS)
     anchored = AtomicC6Dispersion(c6_anchor="free-atom-ratio", mpnn_options=OPTIONS)
@@ -188,6 +202,14 @@ def test_prefit_lowers_the_loss_and_loads_the_best_values():
     assert float(dispersion_objective(pred, target, loss)) == pytest.approx(
         info["prefit_loss_best"], rel=1e-12)
     assert float(extra["atom"]["d6"].abs().max()) == 0.0
+
+
+@pytest.mark.parametrize("steps", [0, -1])
+def test_prefit_rejects_fewer_than_one_step(steps):
+    model = AtomicC6Dispersion(mpnn_options=OPTIONS)
+    with pytest.raises(ValueError, match="steps"):
+        prefit(model, water_methane(), torch.zeros(3),
+               {"name": "huber", "delta": 1.0}, steps=steps)
 
 
 def test_config_round_trips_through_a_state_dict():
