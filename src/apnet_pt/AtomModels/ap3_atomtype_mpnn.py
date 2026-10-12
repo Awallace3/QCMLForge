@@ -18,6 +18,7 @@ from apnet_pt.atomic_datasets import (
     atomic_hirshfeld_valencewdith_only_module_dataset,
 )
 import os
+from .. import ddp_launch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -925,6 +926,8 @@ class AtomTypeParamModel:
         batch_size=16,
         lr=5e-4,
         split_percent=0.9,
+        train_indices=None,
+        test_indices=None,
         model_path=None,
         skip_compile=True,
         shuffle=True,
@@ -950,12 +953,56 @@ class AtomTypeParamModel:
 
         np.random.seed(42)
         torch.manual_seed(42)
-        random_indices = np.random.permutation(len(self.dataset))
-        train_indices = random_indices[: int(len(self.dataset) * split_percent)]
-        test_indices = random_indices[int(len(self.dataset) * split_percent) :]
+        explicit_split = train_indices is not None or test_indices is not None
+        if explicit_split:
+            # A designed split, e.g. element- and charge-stratified so that
+            # rare-element held-out coverage is a property of the split rather
+            # than of the seed. Both sides are required: supplying one and
+            # letting the other fall back to a random draw would overlap them.
+            if train_indices is None or test_indices is None:
+                raise ValueError(
+                    "train_indices and test_indices must be supplied together"
+                )
+            train_indices = np.asarray(train_indices, dtype=np.int64)
+            test_indices = np.asarray(test_indices, dtype=np.int64)
+            if train_indices.size == 0 or test_indices.size == 0:
+                raise ValueError(
+                    f"explicit split has {train_indices.size} train and "
+                    f"{test_indices.size} test indices; both must be non-empty"
+                )
+            overlap = np.intersect1d(train_indices, test_indices)
+            if overlap.size:
+                raise ValueError(
+                    f"explicit split leaks {overlap.size} indices into both "
+                    f"train and test, first {overlap[:5].tolist()}"
+                )
+            n_data = len(self.dataset)
+            for name, arr in (("train", train_indices), ("test", test_indices)):
+                if arr.min() < 0 or arr.max() >= n_data:
+                    raise ValueError(
+                        f"explicit {name} indices fall outside [0, {n_data}) "
+                        f"(min {int(arr.min())}, max {int(arr.max())})"
+                    )
+            print(
+                f"Using explicit split: {train_indices.size} train, "
+                f"{test_indices.size} test "
+                f"({100.0 * test_indices.size / n_data:.2f}% of the dataset "
+                f"held out)",
+                flush=True,
+            )
+        else:
+            random_indices = np.random.permutation(len(self.dataset))
+            train_indices = random_indices[
+                : int(len(self.dataset) * split_percent)
+            ]
+            test_indices = random_indices[
+                int(len(self.dataset) * split_percent) :
+            ]
         if random_seed:
             np.random.seed(random_seed)
             torch.manual_seed(random_seed)
+            # Shuffles the order within the training set only; the split itself
+            # is untouched, so an explicit split stays exactly as designed.
             train_indices = np.random.permutation(train_indices)
         train_dataset = self.dataset[train_indices]
         test_dataset = self.dataset[test_indices]
@@ -987,11 +1034,15 @@ class AtomTypeParamModel:
             "training/learning_rate_initial": lr,
             "training/random_seed": random_seed,
             "training/skip_compile": skip_compile,
+            # Recorded so a stratified run is distinguishable from a uniform
+            # one on the dashboard. Without it the two look identical.
+            "data/split_kind": "explicit" if explicit_split else "uniform",
+            "data/split_percent": None if explicit_split else split_percent,
         }
         if world_size > 1:
             # os.environ["OMP_NUM_THREADS"] = str(dataloader_num_workers + 1)
             print("Running multi-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             configure_distributed_tracking(
                 self,
                 wandb_config,
@@ -1019,7 +1070,7 @@ class AtomTypeParamModel:
         else:
             # Run single-process training directly
             print("Running single-process training", flush=True)
-            os.environ["OMP_NUM_THREADS"] = str(omp_num_threads_per_process)
+            ddp_launch.set_omp_num_threads(omp_num_threads_per_process)
             run_tracked_single_process(
                 self,
                 lambda: self.single_proc_train(
