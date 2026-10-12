@@ -142,6 +142,13 @@ python3 ./train_models.py \
     --n_epochs 5 
 ```
 
+## MACE-fused AP-Net3-D3
+
+An AP-Net3-D3 pair model can read its atomic representation from a MACE
+foundation backbone instead of AP-Net's own atomic MPNN. The backbone is
+external and separately licensed; see
+[docs/mace-tower.md](docs/mace-tower.md).
+
 ## Experiment tracking
 
 Optional experiment tracking is documented in

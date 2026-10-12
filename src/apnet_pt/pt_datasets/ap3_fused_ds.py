@@ -8,6 +8,7 @@ from torch_geometric.data import Data
 from torch_geometric.data import Dataset
 from collections import OrderedDict
 import os.path as osp
+import warnings
 import torch
 from torch_geometric.data import download_url
 
@@ -49,6 +50,8 @@ def qcel_dimer_to_fused_data(dimer, r_cut=5.0, r_cut_im=8.0, **kwargs):
         RB=dimer.get_fragment(1).geometry * constants.au2ang,
         ZB=dimer.get_fragment(1).atomic_numbers,
         TQB=dimer.get_fragment(1).molecular_charge,
+        total_spin_A=dimer.get_fragment(0).molecular_multiplicity,
+        total_spin_B=dimer.get_fragment(1).molecular_multiplicity,
         r_cut=r_cut,
         r_cut_im=r_cut_im,
         **kwargs,
@@ -90,6 +93,8 @@ def dimer_fused_data(
     r_cut=5.0,
     r_cut_im=8.0,
     check_validity=True,
+    total_spin_A=1,
+    total_spin_B=1,
     **kwargs,
 ):
     atomic_props_A = atomic_datasets.create_atomic_data(ZA, RA, TQA, r_cut=r_cut)
@@ -135,11 +140,65 @@ def dimer_fused_data(
         e_BB_source=e_BB_source,
         e_BB_target=e_BB_target,
         molecule_ind_B=atomic_props_B.molecule_ind,
-        # monomer charges
+        # monomer charge and MACE's input ``total_spin`` (multiplicity)
         total_charge_A=atomic_props_A.total_charge,
         total_charge_B=atomic_props_B.total_charge,
+        total_spin_A=torch.tensor(float(total_spin_A), dtype=torch.float32),
+        total_spin_B=torch.tensor(float(total_spin_B), dtype=torch.float32),
         **kwargs,  # allows for additional properties to be passed in
     )
+
+
+#: Fields already reported as missing, so a legacy store warns once rather
+#: than once per batch.
+_MISSING_METADATA_WARNED: set[str] = set()
+
+
+def _stack_monomer_metadata(batch, name, *, default, dtype):
+    """Stack one scalar per monomer without changing source data objects.
+
+    ``default`` covers stores written before the field joined
+    ``essential_attrs``. It is still applied -- refusing to collate would make
+    every such store unreadable -- but it is announced, because charge and
+    multiplicity are MACE inputs and a substituted value changes the physics
+    the featurizer is asked for without changing anything that would fail.
+    """
+
+    values = []
+    substituted = 0
+    for data in batch:
+        value = getattr(data, name, None)
+        if value is None:
+            value = default
+            substituted += 1
+        if torch.is_tensor(value):
+            value = value.detach().reshape(-1)[0].item()
+        values.append(value)
+    if substituted and name not in _MISSING_METADATA_WARNED:
+        _MISSING_METADATA_WARNED.add(name)
+        warnings.warn(
+            f"{substituted}/{len(batch)} records carry no {name}; substituting "
+            f"{default}. The MACE featurizer conditions on charge and spin, so "
+            "this is a physics substitution, not a formatting one -- rebuild "
+            "the store if the monomers are not all closed shell.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return torch.tensor(values, dtype=dtype)
+
+
+def _attach_total_spin_metadata(batched_data, batch):
+    spin_a = _stack_monomer_metadata(
+        batch, "total_spin_A", default=1.0, dtype=torch.float32
+    )
+    spin_b = _stack_monomer_metadata(
+        batch, "total_spin_B", default=1.0, dtype=torch.float32
+    )
+    batched_data.total_spin_A = spin_a
+    batched_data.total_spin_B = spin_b
+    batched_data.batch_atomic_A.total_spin = spin_a
+    batched_data.batch_atomic_B.total_spin = spin_b
+    return batched_data
 
 
 def natural_key(text):
@@ -303,6 +362,12 @@ def ap3_fused_collate_update(batch):
     total_charge_B_tensor = torch.tensor(
         [data.total_charge_B for data in batch], dtype=batch[0].total_charge_B.dtype
     )
+    total_spin_A_tensor = _stack_monomer_metadata(
+        batch, "total_spin_A", default=1.0, dtype=torch.float32
+    )
+    total_spin_B_tensor = _stack_monomer_metadata(
+        batch, "total_spin_B", default=1.0, dtype=torch.float32
+    )
 
     batch_atomic_A = Data(
         x=ZA_cat,
@@ -310,6 +375,7 @@ def ap3_fused_collate_update(batch):
         R=RA_cat,
         molecule_ind=molecule_ind_A,
         total_charge=total_charge_A_tensor,
+        total_spin=total_spin_A_tensor,
         natom_per_mol=natom_per_mol_A,
     )
 
@@ -319,6 +385,7 @@ def ap3_fused_collate_update(batch):
         R=RB_cat,
         molecule_ind=molecule_ind_B,
         total_charge=total_charge_B_tensor,
+        total_spin=total_spin_B_tensor,
         natom_per_mol=natom_per_mol_B,
     )
 
@@ -365,6 +432,8 @@ def ap3_fused_collate_update(batch):
         dimer_ind_full=dimer_ind_full_cat,
         total_charge_A=total_charge_A_tensor,
         total_charge_B=total_charge_B_tensor,
+        total_spin_A=total_spin_A_tensor,
+        total_spin_B=total_spin_B_tensor,
         batch_atomic_A=batch_atomic_A,
         batch_atomic_B=batch_atomic_B,
         indA=indA_cat,
@@ -538,7 +607,7 @@ def ap3_fused_collate_update_no_target(batch):
         batch_atomic_A=batch_atomic_A,
         batch_atomic_B=batch_atomic_B,
     )
-    return batched_data
+    return _attach_total_spin_metadata(batched_data, batch)
 
 
 def ap3_fused_collate_update_no_target_monomer_indices(batch):
@@ -704,7 +773,7 @@ def ap3_fused_collate_update_no_target_monomer_indices(batch):
         batch_atomic_A=batch_atomic_A,
         batch_atomic_B=batch_atomic_B,
     )
-    return batched_data
+    return _attach_total_spin_metadata(batched_data, batch)
 
 
 class APNet2_fused_DataLoader(torch.utils.data.DataLoader):
@@ -786,6 +855,8 @@ def save_hdf5_data_objects(data_objects, filepath):
                 "molecule_ind_B",
                 "total_charge_A",
                 "total_charge_B",
+                "total_spin_A",
+                "total_spin_B",
                 "qA",
                 "muA",
                 "quadA",

@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import time
@@ -2366,6 +2367,59 @@ def induced_dipole_induction_optimized(
     return E_ind
 
 
+# Reductions the induction SCF stopping rule can apply to the induced-dipole
+# change.  ``l2`` is the historical batch-wide norm and stays the default.
+DEFAULT_INDUCTION_CONVERGENCE_NORM = "l2"
+INDUCTION_CONVERGENCE_NORMS = ("l2", "rms", "max")
+
+
+def _validate_induction_convergence_norm(convergence_norm) -> str:
+    """Validate the reduction used by the Rackers/Thole stopping rule."""
+    if not isinstance(convergence_norm, str):
+        raise ValueError(
+            "induction_convergence_norm must be one of "
+            f"{list(INDUCTION_CONVERGENCE_NORMS)}, got "
+            f"{convergence_norm!r}"
+        )
+    norm = convergence_norm.strip().lower()
+    if norm not in INDUCTION_CONVERGENCE_NORMS:
+        raise ValueError(
+            "induction_convergence_norm must be one of "
+            f"{list(INDUCTION_CONVERGENCE_NORMS)}, got "
+            f"{convergence_norm!r}"
+        )
+    return norm
+
+
+def _scf_residual(delta_A, delta_B, convergence_norm: str):
+    """Reduce a pair of induced-dipole changes to the scalar the loop tests.
+
+    The ``l2`` branch is written to emit the exact op sequence the loop used
+    before this existed -- two `torch.norm` calls and one `torch.maximum` --
+    so a default-configured run is bit-identical, not merely equivalent.
+    """
+    if convergence_norm == "l2":
+        return torch.maximum(torch.norm(delta_A), torch.norm(delta_B))
+    if convergence_norm == "rms":
+        # numel is a Python int on both branches (shapes are static within a
+        # solve), so this is a host-side scalar divide, not an extra sync.
+        n_A = max(delta_A.numel(), 1)
+        n_B = max(delta_B.numel(), 1)
+        return torch.maximum(
+            torch.norm(delta_A) / math.sqrt(n_A),
+            torch.norm(delta_B) / math.sqrt(n_B),
+        )
+    # "max": already validated, so no further branch is reachable.
+    return torch.maximum(
+        delta_A.abs().amax() if delta_A.numel() else torch.zeros(
+            (), device=delta_A.device, dtype=delta_A.dtype
+        ),
+        delta_B.abs().amax() if delta_B.numel() else torch.zeros(
+            (), device=delta_B.device, dtype=delta_B.dtype
+        ),
+    )
+
+
 # @torch.compile
 def induced_dipole_induction_optimized_no_correction(
     ZA,
@@ -2392,7 +2446,11 @@ def induced_dipole_induction_optimized_no_correction(
     thole_damping_param: float = 0.39,
     Q_const=3.0,  # set to 1.0 to agree with CLIFF
     polarizability_table=constants.polarizability_table,
-) -> float:
+    return_diagnostics: bool = False,
+    thole_damping_param_direct: float | None = None,
+    thole_damping_param_mutual: float | None = None,
+    convergence_norm: str = DEFAULT_INDUCTION_CONVERGENCE_NORM,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, bool | int | float]]:
     """
     Compute induction energy from self-consistent induced dipoles for a dimer without overlap/valence-width correction.
 
@@ -2414,22 +2472,41 @@ def induced_dipole_induction_optimized_no_correction(
         max_iterations (int): Maximum SCF iterations.
         convergence_threshold (float): Convergence threshold on induced-dipole change.
         omega (float): DIIS-like mixing factor for SCF updates (0..1).
-        thole_damping_param (float): Thole damping parameter for short-range screening.
+        thole_damping_param (float): Backward-compatible damping value used for
+            both direct and mutual fields when split controls are omitted.
         Q_const (float): Scaling constant applied in electrostatic/tensor prefactors (kept for compatibility).
         polarizability_table (Tensor): Lookup table mapping atomic number to base polarizability.
+        return_diagnostics (bool): Return SCF convergence metadata with energies.
+        thole_damping_param_direct (float, optional): Permanent-to-induced damping.
+        thole_damping_param_mutual (float, optional): Induced-to-induced damping.
+        convergence_norm (str): How the induced-dipole change is reduced before
+            it is compared against ``convergence_threshold``. ``"l2"`` is the
+            historical unnormalised batch-wide norm, so it tightens the
+            effective per-atom tolerance as the batch grows; ``"rms"`` and
+            ``"max"`` are batch-size independent.
 
     Returns:
         Tensor: Induction energy per A–B interaction edge (n_edges,) in kcal/mol.
+        When ``return_diagnostics`` is true, also returns convergence diagnostics.
     """
 
+    convergence_norm = _validate_induction_convergence_norm(convergence_norm)
+    direct_damping = (
+        thole_damping_param
+        if thole_damping_param_direct is None
+        else thole_damping_param_direct
+    )
+    mutual_damping = (
+        thole_damping_param
+        if thole_damping_param_mutual is None
+        else thole_damping_param_mutual
+    )
     delta = torch.eye(3, device=qA.device)
     h2kcalmol = constants.h2kcalmol  # Hartree to kcal/mol conversion factor
 
     alpha_0_A = torch.zeros_like(hirshfeld_volume_ratio_A)
     alpha_0_B = torch.zeros_like(hirshfeld_volume_ratio_B)
 
-    # print(f"{alpha_0_A = }")
-    # print(f"{alpha_0_B = }")
     # Use index_select for vectorized lookup
     polarizability_table = _polarizability_table_on_device(
         polarizability_table,
@@ -2437,22 +2514,22 @@ def induced_dipole_induction_optimized_no_correction(
     )
     alpha_0_A = torch.index_select(polarizability_table, 0, ZA.long())
     alpha_0_B = torch.index_select(polarizability_table, 0, ZB.long())
-    # print(f"{alpha_0_A = }")
-    # print(f"{alpha_0_A = }")
-    # print(f"{hirshfeld_volume_ratio_A = }")
-    # print(f"{hirshfeld_volume_ratio_B = }")
     alpha_A = alpha_0_A * hirshfeld_volume_ratio_A ** (4 / 3.0)
     alpha_B = alpha_0_B * hirshfeld_volume_ratio_B ** (4 / 3.0)
 
-    # Calculate interaction tensors between atoms
-    dR_AB, dR_AB_xyz, T0_AB, T1_AB, T2_AB = distance_tensors(
-        RA, RB, e_AB_source, e_AB_target, alpha_A, alpha_B, thole_damping_param
+    # Permanent-to-induced fields use direct damping; induced-to-induced SCF
+    # coupling uses mutual damping. Equal values preserve the legacy result.
+    dR_AB, dR_AB_xyz, T0_AB, T1_AB_direct, T2_AB_direct = distance_tensors(
+        RA, RB, e_AB_source, e_AB_target, alpha_A, alpha_B, direct_damping
+    )
+    _, _, _, _, T2_AB_mutual = distance_tensors(
+        RA, RB, e_AB_source, e_AB_target, alpha_A, alpha_B, mutual_damping
     )
     dR_AA, dR_AA_xyz, T0_AA, T1_AA, T2_AA = distance_tensors(
-        RA, RA, e_AA_source, e_AA_target, alpha_A, alpha_A, thole_damping_param
+        RA, RA, e_AA_source, e_AA_target, alpha_A, alpha_A, mutual_damping
     )
     dR_BB, dR_BB_xyz, T0_BB, T1_BB, T2_BB = distance_tensors(
-        RB, RB, e_BB_source, e_BB_target, alpha_B, alpha_B, thole_damping_param
+        RB, RB, e_BB_source, e_BB_target, alpha_B, alpha_B, mutual_damping
     )
 
     # Select relevant tensors for atom pairs
@@ -2480,15 +2557,22 @@ def induced_dipole_induction_optimized_no_correction(
     mu_induced_0_B = torch.zeros((n_atoms_B, 3), device=qB.device)
 
     # Calculate initial induced dipoles from molecule B's multipoles on molecule A
-    mu_charge_A = torch.einsum("a,ai,a->ai", alpha_A_source, T1_AB, qB_target)
+    mu_charge_A = torch.einsum(
+        "a,ai,a->ai", alpha_A_source, T1_AB_direct, qB_target
+    )
     mu_induced_0_A = scatter_sum_compile(mu_charge_A, e_AB_source, dim_size=n_atoms_A)
-    mu_dipole_A = torch.einsum("a,aij,aj->ai", alpha_A_source, T2_AB, muB_target)
+    mu_dipole_A = torch.einsum(
+        "a,aij,aj->ai", alpha_A_source, T2_AB_direct, muB_target
+    )
     mu_induced_0_A += scatter_sum_compile(mu_dipole_A, e_AB_source, dim_size=n_atoms_A)
 
-    # Nan is in part of T1_AB tensor...
-    mu_charge_B = torch.einsum("a,ai,a->ai", alpha_B_target, -T1_AB, qA_source)
+    mu_charge_B = torch.einsum(
+        "a,ai,a->ai", alpha_B_target, -T1_AB_direct, qA_source
+    )
     mu_induced_0_B = scatter_sum_compile(mu_charge_B, e_AB_target, dim_size=n_atoms_B)
-    mu_dipole_B = torch.einsum("a,aij,aj->ai", alpha_B_target, T2_AB, muA_source)
+    mu_dipole_B = torch.einsum(
+        "a,aij,aj->ai", alpha_B_target, T2_AB_direct, muA_source
+    )
     mu_induced_0_B += scatter_sum_compile(mu_dipole_B, e_AB_target, dim_size=n_atoms_B)
 
     # Self-consistent induced dipole iterations
@@ -2502,7 +2586,11 @@ def induced_dipole_induction_optimized_no_correction(
     mu_induced_B_at_BB_source = mu_induced_B.index_select(0, e_BB_source)
 
     # Iterative SCF procedure to converge induced dipoles
+    converged = False
+    residual = float("inf")
+    iterations = 0
     for iteration in range(max_iterations):
+        iterations = iteration + 1
         mu_induced_A_old = mu_induced_A.clone()
         mu_induced_B_old = mu_induced_B.clone()
 
@@ -2515,7 +2603,7 @@ def induced_dipole_induction_optimized_no_correction(
         ####### (A) INDUCED DIPOLES ########
         # Induced dipoles on A due to induced dipoles on B
         mu_induced_A_due_B = torch.einsum(
-            "a,aij,aj->ai", alpha_A_source, T2_AB, mu_induced_B_at_AB_target
+            "a,aij,aj->ai", alpha_A_source, T2_AB_mutual, mu_induced_B_at_AB_target
         )
         mu_induced_A_new = scatter_sum_compile(
             mu_induced_A_due_B, e_AB_source, dim_size=n_atoms_A
@@ -2532,7 +2620,7 @@ def induced_dipole_induction_optimized_no_correction(
         ####### (B) INDUCED DIPOLES ########
         # Induced dipoles on B due to induced dipoles on A
         mu_induced_B_due_A = torch.einsum(
-            "a,aij,aj->ai", alpha_B_target, T2_AB, mu_induced_A_at_AB_source
+            "a,aij,aj->ai", alpha_B_target, T2_AB_mutual, mu_induced_A_at_AB_source
         )
         mu_induced_B_new = scatter_sum_compile(
             mu_induced_B_due_A, e_AB_target, dim_size=n_atoms_B
@@ -2550,29 +2638,50 @@ def induced_dipole_induction_optimized_no_correction(
         mu_induced_A = (1 - omega) * mu_induced_A_old + omega * mu_induced_A_new
         mu_induced_B = (1 - omega) * mu_induced_B_old + omega * mu_induced_B_new
 
-        # Check convergence
-        delta_A = torch.norm(mu_induced_A - mu_induced_A_old)
-        delta_B = torch.norm(mu_induced_B - mu_induced_B_old)
-        delta = max(delta_A, delta_B)
+        # Check convergence. `delta` only ever feeds the threshold test and
+        # the diagnostics float, so reducing it through `_scf_residual` costs
+        # nothing in the backward pass.
+        delta = _scf_residual(
+            mu_induced_A - mu_induced_A_old,
+            mu_induced_B - mu_induced_B_old,
+            convergence_norm,
+        )
+        residual = delta
         if delta < convergence_threshold:
+            converged = True
             break
 
-    # Final energy calculation
+    # Final permanent/induced energy uses the direct damping tensor.
     muA_induced_source = mu_induced_A.index_select(0, e_AB_source)
     muB_induced_target = mu_induced_B.index_select(0, e_AB_target)
     qu = torch.einsum("x,xy->xy", qA_source, muB_induced_target) - torch.einsum(
         "x,xy->xy", qB_target, muA_induced_source
     )
-    E_qu = torch.einsum("xy,xy->x", T1_AB, qu) * h2kcalmol
+    E_qu = torch.einsum("xy,xy->x", T1_AB_direct, qu) * h2kcalmol
     E_uu = (
         -1.0
         * (
-            torch.einsum("xy,xz,xyz->x", muA_induced_source, muB_target, T2_AB)
-            + torch.einsum("xy,xz,xyz->x", muA_source, muB_induced_target, T2_AB)
+            torch.einsum(
+                "xy,xz,xyz->x", muA_induced_source, muB_target, T2_AB_direct
+            )
+            + torch.einsum(
+                "xy,xz,xyz->x", muA_source, muB_induced_target, T2_AB_direct
+            )
         )
         * h2kcalmol
     )
     E_ind = (E_qu + E_uu) / 2.0
+    if return_diagnostics:
+        residual_value = (
+            float(residual.detach().cpu())
+            if torch.is_tensor(residual)
+            else float(residual)
+        )
+        return E_ind, {
+            "converged": converged,
+            "iterations": iterations,
+            "residual": residual_value,
+        }
     return E_ind
 
 

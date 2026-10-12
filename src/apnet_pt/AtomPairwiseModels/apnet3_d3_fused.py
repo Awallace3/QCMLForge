@@ -413,10 +413,9 @@ class APNet3D3_AtomType_MPNN(nn.Module):
     def get_messages(self, h0, h, rbf, e_source, e_target):
         nedge = e_source.numel()
         if nedge == 0:
-            # No intramolecular edges
-            return torch.zeros(
-                0, self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf
-            )
+            # Preserve the caller's dtype/device for single-atom monomers.
+            width = self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf
+            return h0.new_zeros((0, width))
 
         h0_source = h0.index_select(0, e_source)
         h0_target = h0.index_select(0, e_target)
@@ -487,20 +486,47 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         dR = torch.sqrt(torch.sum(dR_xyz * dR_xyz, dim=-1).clamp_min(1e-10))
         return dR, dR_xyz
 
+    def smooth_pair_energy_envelope(self, distances):
+        """Cosine envelope used only by injected MACE H1/H2 forwards."""
+
+        scaled = (distances / self.r_cut_im).clamp(min=0.0, max=1.0)
+        envelope = 0.5 * (torch.cos(torch.pi * scaled) + 1.0)
+        return torch.where(distances < self.r_cut_im, envelope, 0.0)
+
     # @torch.compile
     def readouts(self, H):
+        """Apply every component head to the pair feature.
+
+        ``H`` is normally one tensor every head reads. A caller that wants each
+        head to see its own pair feature -- for instance one that gives each
+        component its own directional projection -- passes a mapping from head
+        name to tensor instead; the heads are applied in the same order and the
+        concatenated result has the same shape either way.
+        """
+
+        def feature(component):
+            return H[component] if isinstance(H, dict) else H
+
         parts = [
-            self.readout_layer_elst(H),
-            self.readout_layer_exch(H),
-            self.readout_layer_indu(H),
+            self.readout_layer_elst(feature("elst")),
+            self.readout_layer_exch(feature("exch")),
+            self.readout_layer_indu(feature("indu")),
         ]
         if not self.no_disp_nn:
-            parts.append(self.readout_layer_disp(H))
+            parts.append(self.readout_layer_disp(feature("disp")))
         return torch.cat(parts, dim=1)
 
     def forward(
         self,
         batch,
+        *,
+        initial_atom_states=None,
+        atomic_properties=None,
+        residual_only=False,
+        pair_energy_envelope=False,
+        bypass_intra_updates=False,
+        injected_pair_directional=None,
+        injected_pair_scalars=None,
     ):
         ZA = batch.ZA
         RA = batch.RA
@@ -528,41 +554,50 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # interatomic distances
         dR_sr, dR_sr_xyz = self.get_distances(RA, RB, e_ABsr_source, e_ABsr_target)
         dR_lr, dR_lr_xyz = self.get_distances(RA, RB, e_ABlr_source, e_ABlr_target)
-        # TODO: need to handle single atoms correctly without self edge because
-        # this goes to zero causing nans later...
-        dRA, dRA_xyz = self.get_distances(RA, RA, e_AA_source, e_AA_target)
-        dRB, dRB_xyz = self.get_distances(RB, RB, e_BB_source, e_BB_target)
+        if not bypass_intra_updates:
+            dRA, dRA_xyz = self.get_distances(RA, RA, e_AA_source, e_AA_target)
+            dRB, dRB_xyz = self.get_distances(RB, RB, e_BB_source, e_BB_target)
 
         # interatomic unit vectors
         dR_sr_unit = dR_sr_xyz / dR_sr.unsqueeze(1)
-        dRA_unit = dRA_xyz / dRA.unsqueeze(1)
-        dRB_unit = dRB_xyz / dRB.unsqueeze(1)
+        if not bypass_intra_updates:
+            dRA_unit = dRA_xyz / dRA.unsqueeze(1)
+            dRB_unit = dRB_xyz / dRB.unsqueeze(1)
 
         # distance encodings
         rbf_sr = self.distance_layer_im(dR_sr)
-        rbfA = self.distance_layer(dRA)
-        rbfB = self.distance_layer(dRB)
+        if not bypass_intra_updates:
+            rbfA = self.distance_layer(dRA)
+            rbfB = self.distance_layer(dRB)
 
         ##########################################################
         ### predict monomer properties w/ pretrained AtomModel ###
         ##########################################################
 
-        if self.use_precomputed_classical:
-            mA, mB = self.dimer_prop_model(batch)
+        if atomic_properties is None:
+            if self.use_precomputed_classical:
+                mA, mB = self.dimer_prop_model(batch)
+            else:
+                E_classical, mA, mB = self.dimer_prop_model(batch)
+                E_elst = E_classical[:, 0]
+                E_ind = E_classical[:, 1]
+                if not self.no_disp_nn:
+                    E_disp = E_classical[:, 2]
+            qA = mA[0].view(-1, 1)
+            qB = mB[0].view(-1, 1)
+            hfvrA = mA[-2][:, 0].view(-1, 1)
+            hfvrB = mB[-2][:, 0].view(-1, 1)
+            vwA = mA[-2][:, 1].view(-1, 1)
+            vwB = mB[-2][:, 1].view(-1, 1)
         else:
-            E_classical, mA, mB = self.dimer_prop_model(batch)
-            E_elst = E_classical[:, 0]
-            E_ind = E_classical[:, 1]
-            if not self.no_disp_nn:
-                E_disp = E_classical[:, 2]
-        qA = mA[0]
-        qB = mB[0]
-        qA = qA.view(-1, 1)
-        qB = qB.view(-1, 1)
-        hfvrA = mA[-2][:, 0].view(-1, 1)
-        hfvrB = mB[-2][:, 0].view(-1, 1)
-        vwA = mA[-2][:, 1].view(-1, 1)
-        vwB = mB[-2][:, 1].view(-1, 1)
+            if not residual_only:
+                raise ValueError(
+                    "injected atomic properties require the residual-only AP3 seam"
+                )
+            propsA, propsB = atomic_properties
+            qA, qB = propsA.q, propsB.q
+            hfvrA, hfvrB = propsA.hfvr, propsB.hfvr
+            vwA, vwB = propsA.valence_width, propsB.valence_width
         # print(f"{hfvrA.shape = }, {hfvrB.shape = }, {vwA.shape = }, {vwB.shape = }")
         # print(f"{qB.shape = }")
         # print(f"{qA.shape = }, {muA.shape = }, {quadA.shape = }")
@@ -572,65 +607,70 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         ### predict SAPT components via intramonomer message passing ###
         ################################################################
 
-        # invariant hidden state lists
-        hA_list = [self.embed_layer(ZA).view(ZA.size(0), -1)]
-        hB_list = [self.embed_layer(ZB).view(ZB.size(0), -1)]
+        # invariant hidden state lists. Injected states replace, rather than
+        # supplement, the legacy element embedding for canonical MACE H1.
+        if initial_atom_states is None:
+            hA0 = self.embed_layer(ZA).view(ZA.size(0), -1)
+            hB0 = self.embed_layer(ZB).view(ZB.size(0), -1)
+        else:
+            hA0, hB0 = initial_atom_states
+            if hA0.shape != (natomA, self.n_embed) or hB0.shape != (
+                natomB,
+                self.n_embed,
+            ):
+                raise ValueError("initial atom states must match AP3 h0 dimensions")
 
-        # directional hidden state lists
-        hA_dir_list = []
-        hB_dir_list = []
+        if bypass_intra_updates:
+            if initial_atom_states is None:
+                raise ValueError(
+                    "bypassing AP3 intramonomer updates requires injected states"
+                )
+            # H2 uses the projected MACE state directly. Repeat it across the
+            # established AP3 state slots and reserve zero directional slots so
+            # H1 and H2 retain the exact same pair/readout input capacity.
+            # H3 leaves these zeros unused and supplies the directional
+            # contraction per edge instead, via ``injected_pair_directional``.
+            hA = hA0.repeat(1, self.n_message + 1)
+            hB = hB0.repeat(1, self.n_message + 1)
+            directional_width = self.n_message * self.n_embed
+            hA_dir = hA0.new_zeros((natomA, 3, directional_width))
+            hB_dir = hB0.new_zeros((natomB, 3, directional_width))
+        else:
+            hA_list = [hA0]
+            hB_list = [hB0]
+            hA_dir_list = []
+            hB_dir_list = []
 
-        # TODO: need to determine how to handle all monA in batch having no
-        # monomer edges (single atoms)
-        for i in range(self.n_message):
-            mA_ij = self.get_messages(
-                hA_list[0], hA_list[-1], rbfA, e_AA_source, e_AA_target
-            )
-            mB_ij = self.get_messages(
-                hB_list[0], hB_list[-1], rbfB, e_BB_source, e_BB_target
-            )
-            if mA_ij is None or mB_ij is None:
-                # Single-atom corner case; skip
-                hA_list.append(hA_list[-1])
-                hB_list.append(hB_list[-1])
-                continue
+            for i in range(self.n_message):
+                mA_ij = self.get_messages(
+                    hA_list[0], hA_list[-1], rbfA, e_AA_source, e_AA_target
+                )
+                mB_ij = self.get_messages(
+                    hB_list[0], hB_list[-1], rbfB, e_BB_source, e_BB_target
+                )
 
-            #################
-            ### invariant ###
-            #################
+                mA_i = scatter_sum_compile(mA_ij, e_AA_source, int(natomA))
+                mB_i = scatter_sum_compile(mB_ij, e_BB_source, int(natomB))
+                hA_next = self.update_layers[i](mA_i)
+                hB_next = self.update_layers[i](mB_i)
+                hA_list.append(hA_next)
+                hB_list.append(hB_next)
 
-            # sum each atom's messages
-            mA_i = scatter_sum_compile(mA_ij, e_AA_source, int(natomA))
-            mB_i = scatter_sum_compile(mB_ij, e_BB_source, int(natomB))
+                mA_ij_dir = self.directional_layers[i](mA_ij)
+                mB_ij_dir = self.directional_layers[i](mB_ij)
+                mA_ij_dir = torch.einsum("ex,em->exm", dRA_unit, mA_ij_dir)
+                mB_ij_dir = torch.einsum("ex,em->exm", dRB_unit, mB_ij_dir)
+                hA_dir_list.append(
+                    scatter_sum_compile(mA_ij_dir, e_AA_source, int(natomA))
+                )
+                hB_dir_list.append(
+                    scatter_sum_compile(mB_ij_dir, e_BB_source, int(natomB))
+                )
 
-            # get the next hidden state of the atom
-            hA_next = self.update_layers[i](mA_i)
-            hB_next = self.update_layers[i](mB_i)
-
-            hA_list.append(hA_next)
-            hB_list.append(hB_next)
-
-            ###################
-            ### directional ###
-            ###################
-
-            mA_ij_dir = self.directional_layers[i](mA_ij)
-            mB_ij_dir = self.directional_layers[i](mB_ij)
-            mA_ij_dir = torch.einsum("ex,em->exm", dRA_unit, mA_ij_dir)
-            mB_ij_dir = torch.einsum("ex,em->exm", dRB_unit, mB_ij_dir)
-
-            # sum directional messages to get directional atomic hidden states
-            # NOTE: this summation must be linear to guarantee equivariance.
-            #       because of this constraint, we applied a dense net before
-            #       the summation, not after
-            hA_dir = scatter_sum_compile(mA_ij_dir, e_AA_source, int(natomA))
-            hB_dir = scatter_sum_compile(mB_ij_dir, e_BB_source, int(natomB))
-            hA_dir_list.append(hA_dir)
-            hB_dir_list.append(hB_dir)
-
-        # concatenate hidden states over MP iterations
-        hA = torch.cat(hA_list, dim=-1)
-        hB = torch.cat(hB_list, dim=-1)
+            hA = torch.cat(hA_list, dim=-1)
+            hB = torch.cat(hB_list, dim=-1)
+            hA_dir = torch.cat(hA_dir_list, dim=-1)
+            hB_dir = torch.cat(hB_dir_list, dim=-1)
 
         # atom-pair features are a combo of atomic hidden states and the interatomic distance
         hAB = self.get_pair_params(
@@ -642,28 +682,110 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # hAB = self.get_pair(hA, hB, qA, qB, rbf_sr, e_ABsr_source, e_ABsr_target)
         # hBA = self.get_pair(hB, hA, qB, qA, rbf_sr, e_ABsr_target, e_ABsr_source)
 
+        n_edge = e_ABsr_source.shape[0]
+
         # project the directional atomic hidden states along the interatomic axis
-        hA_dir = torch.cat(hA_dir_list, dim=-1)
-        hB_dir = torch.cat(hB_dir_list, dim=-1)
+        if injected_pair_directional is None:
+            hA_dir_source = hA_dir.index_select(0, e_ABsr_source)
+            hB_dir_target = hB_dir.index_select(0, e_ABsr_target)
 
-        hA_dir_source = hA_dir.index_select(0, e_ABsr_source)
-        hB_dir_target = hB_dir.index_select(0, e_ABsr_target)
+            hA_dir_blah = torch.einsum("axf,ax->af", hA_dir_source, dR_sr_unit)
+            hB_dir_blah = torch.einsum("axf,ax->af", hB_dir_target, -dR_sr_unit)
+            directional = (hA_dir_blah, hB_dir_blah)
+        else:
+            # H3 contracts MACE's equivariant atom features against the
+            # interatomic axis in the caller, which owns the spherical-harmonic
+            # convention. Only the already-contracted per-edge result arrives
+            # here, so this module keeps its l=1 einsum as its sole geometry.
+            if not bypass_intra_updates:
+                raise ValueError(
+                    "injected_pair_directional requires bypass_intra_updates; "
+                    "otherwise the AP3 directional messages are silently discarded"
+                )
+            directional = injected_pair_directional
+            # The width is the caller's to choose -- the contraction compresses
+            # however many equivariant channels it was given into whatever slot
+            # the route asked for -- so this checks the shape is a coherent
+            # per-edge pair rather than pinning it to AP3's own l=1 width. A
+            # mapping instead of a pair means each readout head gets its own
+            # directional block; every head still sees the same width.
+            candidates = (
+                tuple(directional.values())
+                if isinstance(directional, dict)
+                else (directional,)
+            )
+            for dir_a, dir_b in candidates:
+                if (
+                    dir_a.ndim != 2
+                    or dir_a.shape != dir_b.shape
+                    or dir_a.shape[0] != n_edge
+                ):
+                    raise ValueError(
+                        "injected pair directional features must be a matched "
+                        f"pair of [{n_edge}, w] tensors, got "
+                        f"{tuple(dir_a.shape)} and {tuple(dir_b.shape)}"
+                    )
 
-        hA_dir_blah = torch.einsum("axf,ax->af", hA_dir_source, dR_sr_unit)
-        hB_dir_blah = torch.einsum("axf,ax->af", hB_dir_target, -dR_sr_unit)
+        if injected_pair_scalars is not None:
+            # Per-edge monomer-level scalars (formal charge, unpaired-electron
+            # count, ...). The pair features already carry the *predicted*
+            # per-atom monopole, but never the monomer total an edge belongs
+            # to, so a -2 anion and a neutral can present the same local q.
+            # The caller owns the content; this module only requires the two
+            # halves to be the A-then-B and B-then-A views of one block, so
+            # hAB and hBA stay exact mirrors of each other as they are for
+            # every other pair feature.
+            sAB, sBA = injected_pair_scalars
+            if sAB.shape != sBA.shape or sAB.ndim != 2 or sAB.shape[0] != n_edge:
+                raise ValueError(
+                    "injected pair scalars must be a matched pair of "
+                    f"[{n_edge}, k] tensors, got {tuple(sAB.shape)} and "
+                    f"{tuple(sBA.shape)}"
+                )
 
-        hAB = torch.cat([hAB, hA_dir_blah, hB_dir_blah], dim=1)
-        hBA = torch.cat([hBA, hB_dir_blah, hA_dir_blah], dim=1)
+        pair_core_ab, pair_core_ba = hAB, hBA
+
+        def assemble(dir_a, dir_b):
+            # hBA is the mirror of hAB at every position, directional block
+            # included -- swapping the two halves is what makes the readout see
+            # the same physics from either end of the edge.
+            ab = torch.cat([pair_core_ab, dir_a, dir_b], dim=1)
+            ba = torch.cat([pair_core_ba, dir_b, dir_a], dim=1)
+            if injected_pair_scalars is not None:
+                ab = torch.cat([ab, sAB], dim=1)
+                ba = torch.cat([ba, sBA], dim=1)
+            return ab, ba
+
+        if isinstance(directional, dict):
+            assembled = {
+                component: assemble(*blocks)
+                for component, blocks in directional.items()
+            }
+            hAB = {component: ab for component, (ab, _) in assembled.items()}
+            hBA = {component: ba for component, (_, ba) in assembled.items()}
+        else:
+            hAB, hBA = assemble(*directional)
 
         EAB_sr = self.readouts(hAB)
         EBA_sr = self.readouts(hBA)
 
+        if isinstance(hAB, dict):
+            # The returned hidden states are a single tensor by contract, and
+            # every head's pair feature shares the same width and the same
+            # non-directional prefix, so the first head is a faithful
+            # representative of the shape. Callers that need all four should
+            # read the projections themselves.
+            hAB = next(iter(hAB.values()))
+            hBA = next(iter(hBA.values()))
+
         E_sr = EAB_sr + EBA_sr
 
         cutoff = (1.0 / (dR_sr**3)).unsqueeze(-1)
+        if pair_energy_envelope:
+            cutoff = cutoff * self.smooth_pair_energy_envelope(dR_sr).unsqueeze(-1)
         E_sr *= cutoff
         E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
-        if self.use_precomputed_classical:
+        if self.use_precomputed_classical or residual_only:
             E_output = E_sr_dimer
             if self.return_hidden_states:
                 return E_output, E_sr, 0, 0, 0, hAB, hBA, cutoff
