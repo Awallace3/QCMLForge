@@ -5189,6 +5189,78 @@ def _rackers_polarization_energy(
     ) + scatter_sum_compile(per_atom_B, molecule_ind_B, dim_size=n_dimers)
 
 
+def explicit_thole_induction(
+    RA: torch.Tensor, RB: torch.Tensor,
+    qA: torch.Tensor, qB: torch.Tensor,
+    muA: torch.Tensor, muB: torch.Tensor,
+    alpha_A: torch.Tensor, alpha_B: torch.Tensor,
+    edges_AB: torch.Tensor, edges_AA: torch.Tensor, edges_BB: torch.Tensor,
+    molecule_ind_A: torch.Tensor, molecule_ind_B: torch.Tensor, n_dimers: int,
+    thole_direct: float = 0.38539, thole_mutual: float = 0.38539,
+    max_iterations: int = 200, convergence_threshold: float = 1e-6,
+    convergence_norm: str = "max", omega: float = 0.7,
+) -> tuple[torch.Tensor, dict]:
+    """Interaction induction from explicit properties and global Thole constants.
+
+    Coordinates are Angstrom; charges, dipoles and polarizabilities are atomic
+    units. Edges are directed [2, n] local side indices. Permanent fields are
+    intermolecular only; mutual polarization includes AA, BB and AB relay.
+    This matches the existing no-overlap solver's energy and damping convention.
+    No quadrupoles enter this solver (as in the legacy induction implementation).
+    No widths, overlap head, pretrained model or energy rescaling is involved.
+
+    Default convergence uses the maximum dipole-component change, so a difficult
+    dimer cannot be diluted by other members of its batch.
+    Nonfinite or unconverged solves raise instead of emitting usable energies.
+    Positivity alone does not guarantee a stable polarization response.
+    """
+    if (max_iterations < 1 or n_dimers < 1 or convergence_threshold <= 0 or
+            not 0 < omega <= 1 or thole_direct <= 0 or thole_mutual <= 0 or
+            not all(math.isfinite(v) for v in (convergence_threshold, omega,
+                                               thole_direct, thole_mutual))):
+        raise ValueError("invalid induction solver or damping parameters")
+    if (not len(RA) or not len(RB) or RA.shape != (len(alpha_A), 3) or
+            RB.shape != (len(alpha_B), 3) or muA.shape != RA.shape or
+            muB.shape != RB.shape or qA.shape != alpha_A.shape or
+            qB.shape != alpha_B.shape):
+        raise ValueError("explicit induction property shapes do not align")
+    for alpha in (alpha_A, alpha_B):
+        if not bool(torch.isfinite(alpha).all() & (alpha > 0).all()):
+            raise ValueError("polarizabilities must be finite and positive")
+    ab_s, ab_t = edges_AB
+    aa_s, aa_t = edges_AA
+    bb_s, bb_t = edges_BB
+
+    def tensors(Ri, Rj, edges, ali, alj, value, kind):
+        damping = ali.new_full((edges.shape[1],), float(value))
+        return _rackers_distance_tensors(
+            Ri, Rj, edges[0], edges[1], ali, alj, damping, kind)
+
+    direct = tensors(RA, RB, edges_AB, alpha_A, alpha_B, thole_direct, "direct")
+    mutual = tensors(RA, RB, edges_AB, alpha_A, alpha_B, thole_mutual, "mutual")
+    aa = tensors(RA, RA, edges_AA, alpha_A, alpha_A, thole_mutual, "mutual")
+    bb = tensors(RB, RB, edges_BB, alpha_B, alpha_B, thole_mutual, "mutual")
+    solved = _rackers_converge_dipoles(
+        alpha_A, alpha_B, qA, muA, qB, muB, ab_s, ab_t, aa_s, aa_t, bb_s, bb_t,
+        direct[3], direct[4], None, None, None, None,
+        mutual[4], aa[4], bb[4], max_iterations, convergence_threshold, omega,
+        convergence_norm=convergence_norm, intramolecular_permanent_field=False)
+    dip_a, dip_b, initial_a, initial_b, iterations, residual, converged = solved
+    energy = _rackers_polarization_energy(
+        dip_a, initial_a, alpha_A, dip_b, initial_b, alpha_B,
+        molecule_ind_A, molecule_ind_B, n_dimers) * constants.h2kcalmol
+    if not converged or not bool(torch.isfinite(energy).all()):
+        raise RuntimeError("explicit induction failed to converge to finite energy")
+    diagnostics = {
+        "scf_converged": converged, "scf_iterations": iterations,
+        "scf_residual": float(residual.detach()),
+        "max_induced_dipole": float(torch.cat((dip_a, dip_b)).detach().norm(
+            dim=-1).max()),
+        "thole_direct": float(thole_direct), "thole_mutual": float(thole_mutual),
+    }
+    return energy, diagnostics
+
+
 def rackers_thole_induction(
     ZA: torch.Tensor,
     RA: torch.Tensor,
