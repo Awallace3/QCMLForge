@@ -1,4 +1,4 @@
-"""Absolute, energy-trained atomic multipoles and effective volume ratios.
+"""Absolute, energy-trained atomic multipoles and polarizabilities.
 
 No pretrained model or atomic-property labels are needed. R is in Angstrom;
 q, mu and symmetric-traceless quadrupoles use the package's atomic units.
@@ -12,16 +12,22 @@ from typing import Any
 import torch
 from torch import nn
 
+from apnet_pt import constants
+
 
 class DirectAtomicProperties(nn.Module):
     """Predict monomer-conditioned properties with exact charge conservation.
 
     Parameters
     ----------
-    hfvr_min, hfvr_max : float
-        Strict positive bounds on effective HFVR, not a stability guarantee.
-    hfvr_init : float
-        Initial reference ratio (the small readout perturbation is nonzero).
+    alpha_mode : {"log", "linear"}
+        ``log``: log alpha = a[Z] + delta. ``linear`` (naive): alpha =
+        b[Z] + delta, floored at ``alpha_floor``. a and b are trainable
+        per-element embeddings initialized to the neutral free-atom
+        polarizability (log of it for ``log``); delta is a readout correction.
+    alpha_floor : float
+        Positive floor (bohr^3) for ``linear``; atoms at the floor get no
+        gradient through delta. Unused by ``log``, which is positive by form.
     readout_init_scale : float
         Small, nonzero initialization avoids an all-zero neutral field.
 
@@ -40,19 +46,20 @@ class DirectAtomicProperties(nn.Module):
         n_neuron: int = 128,
         n_embed: int = 8,
         r_cut: float = 5.0,
-        hfvr_min: float = 0.001,
-        hfvr_max: float = 2.0,
-        hfvr_init: float = 1.0,
+        alpha_mode: str = "log",
+        alpha_floor: float = 1e-3,
         readout_init_scale: float = 0.01,
     ) -> None:
         super().__init__()
-        if not 0 < hfvr_min < hfvr_init < hfvr_max:
-            raise ValueError("HFVR requires 0 < min < init < max")
+        if alpha_mode not in ("log", "linear"):
+            raise ValueError("alpha_mode must be 'log' or 'linear'")
+        if not alpha_floor > 0:
+            raise ValueError("alpha_floor must be positive")
         if n_message < 1 or min(n_rbf, n_neuron, n_embed) < 1 or r_cut <= 0:
             raise ValueError("network dimensions and cutoff must be positive")
         if not 0 < readout_init_scale <= 1:
             raise ValueError("readout_init_scale must be in (0, 1]")
-        self.hfvr_min, self.hfvr_max = float(hfvr_min), float(hfvr_max)
+        self.alpha_mode, self.alpha_floor = alpha_mode, float(alpha_floor)
         self.r_cut = float(r_cut)
         self.embed = nn.Embedding(119, n_embed)
         self.charge_embed = nn.Linear(2, n_embed)
@@ -84,15 +91,21 @@ class DirectAtomicProperties(nn.Module):
         self.edge_head = nn.Sequential(
             nn.Linear(2 * n_embed + n_rbf, n_neuron), nn.SiLU(), nn.Linear(n_neuron, 2)
         )
-        fraction = (hfvr_init - hfvr_min) / (hfvr_max - hfvr_min)
-        self.hfvr_logit_init = math.log(fraction / (1 - fraction))
+        # Neutral free-atom values; elements without one start at 1 bohr^3.
+        free = torch.ones(119, dtype=torch.float64)
+        table = constants.polarizability_table.to(torch.float64)
+        free[: len(table)] = torch.where(table > 0, table, free[: len(table)])
+        self.alpha_base = nn.Embedding(119, 1)
+        with torch.no_grad():
+            init = free.log() if alpha_mode == "log" else free
+            self.alpha_base.weight.copy_(init[:, None])
         for head in (self.scalar_head, self.edge_head):
             with torch.no_grad():
                 head[-1].weight.mul_(readout_init_scale)
                 head[-1].bias.zero_()
 
     def forward(self, graph: Any) -> dict[str, torch.Tensor]:
-        """Return absolute q, mu, quad and hfvr; never return MBIS corrections."""
+        """Return absolute q, mu, quad and alpha; never return MBIS corrections."""
         z, mol, R = graph.x.long(), graph.molecule_ind.long(), graph.R
         total = graph.total_charge.to(R).reshape(-1)
         n_atoms, n_mol = len(z), total.numel()
@@ -125,7 +138,9 @@ class DirectAtomicProperties(nn.Module):
         quad = R.new_zeros((n_atoms, 3, 3)).index_add(
             0, src, weights[:, 1, None, None] * shape
         )
-        hfvr = self.hfvr_min + (self.hfvr_max - self.hfvr_min) * torch.sigmoid(
-            self.hfvr_logit_init + scalar[:, 1]
-        )
-        return {"q": q, "mu": mu, "quad": quad, "hfvr": hfvr}
+        base = self.alpha_base(z).reshape(-1).to(scalar)
+        if self.alpha_mode == "log":
+            alpha = torch.exp(base + scalar[:, 1])
+        else:
+            alpha = (base + scalar[:, 1]).clamp_min(self.alpha_floor)
+        return {"q": q, "mu": mu, "quad": quad, "alpha": alpha}

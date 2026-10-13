@@ -3,7 +3,7 @@
 `apnet_pt.AtomModels.direct_atomic_properties.DirectAtomicProperties` is a
 checkpoint-independent `nn.Module`. It takes `x`, `R`, `edge_index`,
 `molecule_ind` and `total_charge` on a monomer graph, and returns absolute
-`q [N]`, `mu [N,3]`, `quad [N,3,3]`, and `hfvr [N]`.
+`q [N]`, `mu [N,3]`, `quad [N,3,3]`, and `alpha [N]` (bohr^3).
 
 - Coordinates are Angstrom. Moments are in atomic units, with symmetric,
   traceless quadrupoles in the package's convention.
@@ -11,8 +11,13 @@ checkpoint-independent `nn.Module`. It takes `x`, `R`, `edge_index`,
   to the known monomer total, not predicted independently of charge state.
 - Vector/tensor heads contract directed intramonomer neighbor unit vectors;
   no lab-frame vector is learned. Monatomic dipoles/quadrupoles are zero.
-- HFVR is a bounded positive sigmoid (default bounds 0.001--2.0, reference 1.0).
-  Effective polarizability is `alpha_free(Z) * hfvr ** (4/3)`.
+- Polarizability is learned directly; no Hirshfeld volume ratio is involved.
+  A trainable per-element embedding starts at the neutral free-atom value
+  (`constants.polarizability_table`, `alpha_0(BG)`; Na starts at 163.08) and a
+  readout correction `delta` adjusts it per atom. `alpha_mode="log"` (default):
+  `alpha = exp(a[Z] + delta)`, positive by form. `alpha_mode="linear"` (naive):
+  `alpha = b[Z] + delta`, floored at `alpha_floor` (default 1e-3 bohr^3); atoms
+  at the floor get no gradient through `delta`.
 - Small nonzero readout initialization avoids starting every neutral field at
   zero. These properties are not trained to MBIS or Hirshfeld labels.
 - Validate graphs at the data boundary: finite coordinates/charges, valid
@@ -32,7 +37,7 @@ batch-size dilution of a difficult dimer's residual. Nonfinite/nonconverged resp
 alone are not a proof of stability. Energy and property gradients remain
 connected through the iterative solve.
 
-Energy-only fitting does not uniquely identify atomic moments or volumes.
+Energy-only fitting does not uniquely identify atomic moments or polarizabilities.
 Call the outputs effective properties. Check out-of-domain transferability,
 long-range behavior, property ranges and polarization stability separately.
 
