@@ -37,6 +37,15 @@ batch-size dilution of a difficult dimer's residual. Nonfinite/nonconverged resp
 alone are not a proof of stability. Energy and property gradients remain
 connected through the iterative solve.
 
+`solver="exact"` solves the same equations with one dense Cholesky
+factorization per dimer of `I - alpha^1/2 T alpha^1/2`. The default
+omega-damped loop (omega 0.7) diverges once any eigenvalue of that operator
+exceeds `2 / omega`, which trained polarizabilities can reach while the
+response is still physically stable; the exact solve fails only when the
+operator is not positive definite (a polarization catastrophe) and names the
+dimers. It ignores the loop's iteration settings, reports zero iterations and
+the residual of one fixed-point step, and costs O((3 n_atoms)^3) per dimer.
+
 Energy-only fitting does not uniquely identify atomic moments or polarizabilities.
 Call the outputs effective properties. Check out-of-domain transferability,
 long-range behavior, property ranges and polarization stability separately.
