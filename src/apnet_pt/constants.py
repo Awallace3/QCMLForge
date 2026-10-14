@@ -12,6 +12,8 @@ h2kcalmol = qcel.constants.conversion_factor("hartree", "kcal/mol")
 
 elem_to_z = { 
     'H'  : 1,
+    'Li' : 3,
+    'LI' : 3,
     'B'  : 5,
     'C'  : 6,
     'N'  : 7,
@@ -19,25 +21,34 @@ elem_to_z = {
     'F'  : 9,
     'NA' : 11,
     'Na' : 11,
+    'MG' : 12,
+    'Mg' : 12,
     'P'  : 15, 
     'S'  : 16, 
     'CL' : 17, 
     'Cl' : 17, 
     'BR' : 35, 
+    'K'  : 19,
+    'CA' : 20,
+    'Ca' : 20,
     'Br' : 35, 
 }
 
 z_to_elem = { 
     1  : 'H',
+    3  : 'Li',
     5  : 'B',
     6  : 'C',
     7  : 'N',
     8  : 'O',
     9  : 'F',
     11 : 'Na',
+    12 : 'Mg',
     15 : 'P', 
     16 : 'S', 
     17 : 'Cl', 
+    19 : 'K',
+    20 : 'Ca',
     35 : 'Br', 
 }
 
@@ -53,6 +64,11 @@ z_to_ind = {
     16 : 8,
     17 : 9,
     35 : 10,
+    # appended so the original indices are unchanged
+    3  : 11,
+    12 : 12,
+    19 : 13,
+    20 : 14,
 }
 
 pol_free = {
