@@ -457,6 +457,7 @@ def train_pairwise_model(
     n_rbf=8,
     n_neuron=128,
     n_embed=8,
+    n_message=None,
     n_params=2,
     m1="",
     m2="",
@@ -549,6 +550,7 @@ def train_pairwise_model(
         n_rbf (int): Number of radial basis functions in the model.
         n_neuron (int): Width of dense layers in the network.
         n_embed (int): Size of embedding vectors for atomic features.
+        n_message (int or None): APNet3-fused-d3 only: message-passing steps of the pair model. None keeps the model default (3) or a warm-start checkpoint's setting.
         n_params (int): Number of per-dimer parameters when training parametric dimer models.
         m1 (str): Optional molecular identifier or filter passed into dataset creation (used by some variants).
         m2 (str): Optional second molecular identifier or filter passed into dataset creation.
@@ -886,6 +888,10 @@ def train_pairwise_model(
             f"WARNING: --no_disp_nn applies only to APNet3-fused-d3 (requested {apnet_model_type}); ignoring flag."
         )
         no_disp_nn = False
+    if n_message is not None and apnet_model_type != "APNet3-fused-d3":
+        raise ValueError(
+            f"--n_message applies only to APNet3-fused-d3 (requested {apnet_model_type})"
+        )
     if sr_switch and apnet_model_type != "APNet3-fused-d3":
         raise ValueError(
             f"--sr_switch applies only to APNet3-fused-d3 (requested {apnet_model_type})"
@@ -1208,6 +1214,7 @@ def train_pairwise_model(
             no_disp_nn=no_disp_nn,
             r_cut_im=r_cut_im,
             sr_switch=sr_switch,
+            **({} if n_message is None else {"n_message": n_message}),
             ds_batch_size=ds_batch_size,
             freeze_dimer_prop_model=freeze_dimer_prop_model,
         )
@@ -1843,6 +1850,12 @@ def main():
         "--n_embed", type=int, default=8, help="specify AP n_embed (default: 8)"
     )
     args.add_argument(
+        "--n_message",
+        type=int,
+        default=None,
+        help="APNet3-fused-d3 only: pair-model message-passing steps (default: the model's 3)",
+    )
+    args.add_argument(
         "--n_params", type=int, default=2, help="specify AP n_params (default: 2)"
     )
     args.add_argument(
@@ -2392,6 +2405,7 @@ def main():
             n_rbf=args.n_rbf,
             n_neuron=args.n_neuron,
             n_embed=args.n_embed,
+            n_message=args.n_message,
             n_params=args.n_params,
             m1=args.m1,
             m2=args.m2,
