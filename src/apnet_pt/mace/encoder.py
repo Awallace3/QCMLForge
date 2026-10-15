@@ -446,6 +446,47 @@ def _clone_direct(outputs: PolarMACEDirectOutputs) -> PolarMACEDirectOutputs:
     )
 
 
+def _check_dipole_reconstruction(
+    direct: PolarMACEDirectOutputs,
+    num_monomers: int,
+    compute_dtype: torch.dtype,
+    atol: float = 1.0e-5,
+    rtol: float = 1.0e-6,
+) -> None:
+    """Refuse direct coefficients that do not rebuild each molecular dipole.
+
+    PolarMACE sums ``q_i r_i + p_i`` in its own (usually float32) precision, so
+    the rounding in its dipole grows with the size of the terms, not of the
+    result.  Job 14062303 found the fixed 1e-5 bound refusing neutral omol25
+    monomers 50-200 A from the origin: residuals 1.2-1.8e-5, which fall to
+    6e-8 to 2.5e-7 once the same monomers are centred.  The tolerance therefore
+    adds ``8 eps`` of ``sum_i |q_i| |r_i| + |p_i|`` per monomer; a missing or
+    misassigned term is still orders of magnitude larger.
+    """
+
+    contribution = (
+        direct.charges[:, None] * direct.positions_angstrom
+        + direct.intrinsic_dipole_eangstrom
+    )
+    magnitude = direct.charges.abs() * direct.positions_angstrom.norm(
+        dim=-1
+    ) + direct.intrinsic_dipole_eangstrom.norm(dim=-1)
+    reconstructed = contribution.new_zeros((num_monomers, 3))
+    reconstructed.index_add_(0, direct.batch, contribution)
+    scale = magnitude.new_zeros(num_monomers)
+    scale.index_add_(0, direct.batch, magnitude)
+    target = direct.molecular_dipole_eangstrom
+    tolerance = (
+        atol
+        + rtol * target.abs()
+        + 8.0 * torch.finfo(compute_dtype).eps * scale[:, None]
+    )
+    if not bool(((reconstructed - target).abs() <= tolerance).all()):
+        raise ValueError(
+            "PolarMACE direct coefficients do not reconstruct molecular dipole"
+        )
+
+
 class MACEPolarFeaturizer(torch.nn.Module):
     """Isolated-monomer PolarMACE feature and direct-output adapter.
 
@@ -805,19 +846,7 @@ class MACEPolarFeaturizer(torch.nn.Module):
             total_charge=total_charge.to(density),
             multipole_contract=self.multipole_contract,
         )
-        reconstructed = (
-            direct.charges[:, None] * direct.positions_angstrom
-            + direct.intrinsic_dipole_eangstrom
-        ).sum(0, keepdim=True)
-        if not torch.allclose(
-            reconstructed,
-            direct.molecular_dipole_eangstrom,
-            atol=1.0e-5,
-            rtol=1.0e-6,
-        ):
-            raise ValueError(
-                "PolarMACE direct coefficients do not reconstruct molecular dipole"
-            )
+        _check_dipole_reconstruction(direct, 1, outputs["dipole"].dtype)
         return features, direct
 
     def _default_batched_graph_builder(
@@ -945,25 +974,8 @@ class MACEPolarFeaturizer(torch.nn.Module):
             total_charge=total_charge.to(density),
             multipole_contract=self.multipole_contract,
         )
-        # Same reconstruction guard as the serial path, accumulated per monomer
-        # instead of over the whole batch.
-        contribution = (
-            direct.charges[:, None] * direct.positions_angstrom
-            + direct.intrinsic_dipole_eangstrom
-        )
-        reconstructed = direct.molecular_dipole_eangstrom.new_zeros(
-            direct.molecular_dipole_eangstrom.shape
-        )
-        reconstructed.index_add_(0, direct.batch, contribution)
-        if not torch.allclose(
-            reconstructed,
-            direct.molecular_dipole_eangstrom,
-            atol=1.0e-5,
-            rtol=1.0e-6,
-        ):
-            raise ValueError(
-                "PolarMACE direct coefficients do not reconstruct molecular dipole"
-            )
+        # Same reconstruction guard as the serial path, accumulated per monomer.
+        _check_dipole_reconstruction(direct, len(ptr) - 1, outputs["dipole"].dtype)
         return features, direct
 
     def _cache_key(

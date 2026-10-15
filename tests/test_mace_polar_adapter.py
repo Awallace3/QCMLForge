@@ -855,3 +855,69 @@ def test_trainable_featurizer_matches_frozen_and_reaches_backbone():
             positions, numbers, charge, spin, batch=batch
         )
     assert not quiet.invariant.requires_grad
+
+
+def _direct_for_dipole_guard(positions, charges, intrinsic, dipole_error=0.0):
+    from apnet_pt.mace.schema import PolarMACEDirectOutputs
+
+    dipole = (charges[:, None] * positions + intrinsic).sum(0, keepdim=True)
+    return PolarMACEDirectOutputs(
+        density_coefficients=torch.cat(
+            (charges[:, None], intrinsic[:, [1, 2, 0]]), dim=-1
+        ),
+        charges=charges,
+        molecular_dipole_eangstrom=dipole + dipole_error,
+        positions_angstrom=positions,
+        batch=torch.zeros(len(charges), dtype=torch.long),
+        total_charge=charges.sum().reshape(1),
+    )
+
+
+def test_dipole_guard_scales_with_the_terms_not_the_result():
+    """Job 14062303: neutral 45-atom omol25 monomers 130 A from the origin
+    reconstructed to 1.2-1.8e-5, past the old fixed 1e-5, and to < 3e-7 once
+    centred.  Rounding noise of that size must pass far out, the same error
+    must still fail at the origin, and a dropped intrinsic dipole must fail
+    everywhere."""
+
+    from apnet_pt.mace.encoder import _check_dipole_reconstruction
+
+    generator = torch.Generator().manual_seed(0)
+    local = torch.randn(45, 3, generator=generator, dtype=torch.float64) * 3.0
+    charges = 0.3 * torch.randn(45, generator=generator, dtype=torch.float64)
+    charges = charges - charges.mean()
+    intrinsic = 0.05 * torch.randn(45, 3, generator=generator, dtype=torch.float64)
+    noise = torch.tensor([[1.8e-5, -1.8e-5, 1.8e-5]], dtype=torch.float64)
+    far = local + torch.tensor([130.0, 0.0, 0.0], dtype=torch.float64)
+
+    _check_dipole_reconstruction(
+        _direct_for_dipole_guard(far, charges, intrinsic, noise), 1, torch.float32
+    )
+    centred = local - local.mean(0)
+    with pytest.raises(ValueError, match="reconstruct molecular dipole"):
+        _check_dipole_reconstruction(
+            _direct_for_dipole_guard(centred * 1.0e-3, charges, intrinsic * 0, noise),
+            1,
+            torch.float32,
+        )
+    dropped_intrinsic = -intrinsic.sum(0, keepdim=True)
+    for positions in (centred, far):
+        with pytest.raises(ValueError, match="reconstruct molecular dipole"):
+            _check_dipole_reconstruction(
+                _direct_for_dipole_guard(
+                    positions, charges, intrinsic, dropped_intrinsic
+                ),
+                1,
+                torch.float32,
+            )
+
+
+def test_protocol_featurizer_accepts_a_float32_monomer_far_from_the_origin():
+    featurizer = _protocol_featurizer(feature_mode="final-layer-scalars")
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.96], [0.93, 0.0, -0.24]]
+    ) + torch.tensor([150.0, -120.0, 90.0])
+    _, direct = featurizer.forward_monomer(
+        positions, torch.tensor([8, 1, 1]), torch.tensor([0.0]), torch.tensor([1.0])
+    )
+    assert direct.molecular_dipole_eangstrom.dtype == torch.float32
