@@ -229,6 +229,21 @@ class DistanceLayer(nn.Module):
         return d_cutoff * torch.sin(self.frequencies * d_scaled)
 
 
+def _check_sr_fade(sr_fade):
+    if sr_fade is None:
+        return None
+    lo, hi = (float(v) for v in sr_fade)
+    if not 0.0 <= lo < hi:
+        raise ValueError(f"sr_fade needs 0 <= lo < hi, got ({lo}, {hi})")
+    return (lo, hi)
+
+
+def sr_fade_factor(r, lo, hi):
+    """Quintic smootherstep: 0 for r <= lo, 1 for r >= hi, C2 in between."""
+    t = torch.clamp((r - lo) / (hi - lo), 0.0, 1.0)
+    return t * t * t * (t * (6.0 * t - 15.0) + 10.0)
+
+
 def unwrap_model(model):
     return model.module if isinstance(model, DDP) else model
 
@@ -251,6 +266,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         freeze_dimer_prop_model=None,
         d3_damping_parameters=None,
         sr_switch=False,
+        sr_fade=None,
     ):
         super().__init__()
         self.dimer_prop_model = dimer_prop_model
@@ -268,6 +284,10 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # zero at r_cut_im, so pairs crossing the cutoff do not step the energy.
         self.sr_switch = bool(sr_switch)
         self.sr_switch_envelope = Envelope(5)
+        # Fade each short-range pair energy to zero below sr_fade = (lo, hi) A,
+        # so at contacts closer than any training pair the NN correction is
+        # off and the damped classical terms (exponential exchange) decide.
+        self.sr_fade = _check_sr_fade(sr_fade)
         # The store fixes its short/long-range split at build time; check the
         # first batch once that it was not cut shorter than this model.
         self._store_cutoff_checked = False
@@ -375,6 +395,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             "freeze_dimer_prop_model": self.freeze_dimer_prop_model,
             "d3_damping_parameters": deepcopy(self.d3_damping_parameters),
             "sr_switch": self.sr_switch,
+            "sr_fade": None if self.sr_fade is None else list(self.sr_fade),
         }
 
     def get_model_info(self):
@@ -697,6 +718,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         if self.sr_switch:
             x = dR_sr / self.r_cut_im
             cutoff = cutoff * (x * self.sr_switch_envelope(x)).unsqueeze(-1)
+        if self.sr_fade is not None:
+            cutoff = cutoff * sr_fade_factor(dR_sr, *self.sr_fade).unsqueeze(-1)
         E_sr *= cutoff
         E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
         if self.use_precomputed_classical:
@@ -934,12 +957,13 @@ class APNet3D3_AtomType_Model:
         freeze_dimer_prop_model=True,
         d3_damping_parameters=None,
         sr_switch=None,
+        sr_fade=None,
     ):
         """
         the path and all other parameters will be ignored except for dataset.
 
-        r_cut_im and sr_switch left as None take the checkpoint's values
-        (8.0 and False for a fresh model).
+        r_cut_im, sr_switch and sr_fade left as None take the checkpoint's
+        values (8.0, False and no fade for a fresh model).
 
         use_GPU will check for a GPU and use it if available unless set to false.
         """
@@ -1052,6 +1076,8 @@ class APNet3D3_AtomType_Model:
             no_disp_nn = config.get("no_disp_nn", False)
             if sr_switch is None:
                 sr_switch = config.get("sr_switch", False)
+            if sr_fade is None:
+                sr_fade = config.get("sr_fade")
             if use_precomputed_classical is None:
                 use_precomputed_classical = config.get(
                     "use_precomputed_classical", False
@@ -1077,6 +1103,7 @@ class APNet3D3_AtomType_Model:
                 freeze_dimer_prop_model=freeze_dimer_prop_model,
                 d3_damping_parameters=resolved_d3_damping_parameters,
                 sr_switch=sr_switch,
+                sr_fade=sr_fade,
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)
@@ -1102,6 +1129,7 @@ class APNet3D3_AtomType_Model:
                 freeze_dimer_prop_model=freeze_dimer_prop_model,
                 d3_damping_parameters=resolved_d3_damping_parameters,
                 sr_switch=bool(sr_switch),
+                sr_fade=sr_fade,
             )
         self.use_precomputed_classical = use_precomputed_classical
         self.d3_damping_parameters = deepcopy(resolved_d3_damping_parameters)

@@ -1,4 +1,4 @@
-"""Intermolecular cutoff (``r_cut_im``) and smooth switch on APNet3-fused-d3.
+"""Intermolecular cutoff (``r_cut_im``), smooth switch and short-range fade on APNet3-fused-d3.
 
 The store bakes the short/long-range AB edge split at build time, so a model
 cutoff shorter than the store's must be applied in the forward pass.  These
@@ -36,7 +36,7 @@ units angstrom
 """)
 
 
-def _model(r_cut_im, sr_switch=False):
+def _model(r_cut_im, sr_switch=False, sr_fade=None):
     torch.manual_seed(0)
     atom_type = apnet_pt.AtomPairwiseModels.mtp_mtp.AtomTypeParamModel(
         ds_root=None,
@@ -62,6 +62,7 @@ def _model(r_cut_im, sr_switch=False):
         use_GPU=False,
         r_cut_im=r_cut_im,
         sr_switch=sr_switch,
+        sr_fade=sr_fade,
     )
     ap3d3.model.eval()
     return ap3d3
@@ -235,3 +236,148 @@ def test_cli_sr_switch_defaults_to_checkpoint():
     parser = train_models.build_arg_parser()
     assert parser.parse_args([]).sr_switch is None
     assert parser.parse_args(["--sr_switch"]).sr_switch is True
+
+
+def _paired(sr_fade):
+    """A faded model and an unfaded one with the same weights."""
+    faded = _model(8.0, sr_fade=sr_fade)
+    plain = _model(8.0)
+    with torch.no_grad():  # materialize the LazyLinear weights before copying
+        faded.model(_batch(faded, 8.0))
+        plain.model(_batch(plain, 8.0))
+    plain.model.load_state_dict(faded.model.state_dict())
+    return faded, plain
+
+
+def test_sr_fade_factor_is_a_smooth_step():
+    from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import sr_fade_factor
+
+    r = torch.tensor([0.5, 1.0, 1.25, 1.5, 2.0], requires_grad=True)
+    g = sr_fade_factor(r, 1.0, 1.5)
+    assert torch.allclose(g.detach(), torch.tensor([0.0, 0.0, 0.5, 1.0, 1.0]))
+    (dg,) = torch.autograd.grad(g.sum(), r)
+    # zero slope at both ends: no force step where the fade starts or ends
+    assert torch.allclose(dg[[0, 1, 3, 4]], torch.zeros(4), atol=1e-6)
+
+
+def test_sr_fade_below_every_pair_changes_nothing():
+    faded, plain = _paired((0.5, 1.0))
+    batch = _batch(faded, 8.0)
+    assert float(_sr_distances(batch).min()) > 1.0, "fixture pairs must sit beyond the fade"
+    with torch.no_grad():
+        assert torch.equal(faded.model(batch)[0], plain.model(batch)[0])
+
+
+def test_sr_fade_zeroes_close_pairs_and_keeps_far_ones():
+    probe = _model(8.0)
+    dR = _sr_distances(_batch(probe, 8.0))
+    lo = float(dR.min()) + 0.05
+    hi = lo + 0.5
+    assert (dR > hi).any() and (dR < lo).any(), "fixture must straddle the fade"
+    faded, plain = _paired((lo, hi))
+    batch = _batch(faded, 8.0)
+    dR = _sr_distances(batch)
+    with torch.no_grad():
+        E_faded = faded.model(batch)[1]
+        E_plain = plain.model(batch)[1]
+    close, far = dR < lo, dR >= hi
+    assert E_plain[close].abs().max() > 1e-6
+    assert torch.equal(E_faded[close], torch.zeros_like(E_faded[close]))
+    assert torch.allclose(E_faded[far], E_plain[far], atol=1e-7)
+
+
+def test_sr_fade_rejects_a_bad_window():
+    with pytest.raises(ValueError, match="sr_fade"):
+        _model(8.0, sr_fade=(1.5, 1.0))
+
+
+def test_sr_fade_round_trips_and_old_checkpoints_have_none(tmp_path):
+    ap3d3 = _model(4.0, sr_switch=True, sr_fade=(1.0, 1.5))
+    batch = _batch(ap3d3, 8.0)
+    with torch.no_grad():
+        E_saved = ap3d3.model(batch)[0]
+    path = tmp_path / "fade.pt"
+    ap3d3.save_model(str(path))
+    reloaded = _reload(ap3d3, path)
+    reloaded.model.eval()
+    assert reloaded.model.sr_fade == (1.0, 1.5)
+    assert reloaded.model.get_config()["sr_fade"] == [1.0, 1.5]
+    with torch.no_grad():
+        assert torch.allclose(E_saved, reloaded.model(batch)[0], atol=1e-6)
+
+    checkpoint = torch.load(path, weights_only=False)
+    checkpoint["config"].pop("sr_fade")
+    torch.save(checkpoint, path)
+    assert _reload(ap3d3, path).model.sr_fade is None
+
+
+def test_sr_fade_is_added_to_a_checkpoint_trained_without_it(tmp_path):
+    """Fine-tuning an unfaded head with --sr_fade must apply the fade."""
+    ap3d3 = _model(4.0, sr_switch=True)
+    with torch.no_grad():
+        ap3d3.model(_batch(ap3d3, 8.0))
+    path = tmp_path / "plain.pt"
+    ap3d3.save_model(str(path))
+    reloaded = APNet3D3_AtomType_Model(
+        ds_root=None,
+        atom_type_model=ap3d3.atom_type_model.model,
+        dimer_prop_model=ap3d3.dimer_prop_model,
+        pre_trained_model_path=str(path),
+        use_precomputed_classical=True,
+        ignore_database_null=True,
+        use_GPU=False,
+        sr_fade=(1.0, 1.5),
+    )
+    assert reloaded.model.sr_fade == (1.0, 1.5)
+    assert reloaded.model.sr_switch is True
+
+
+def test_train_models_forwards_sr_fade(monkeypatch, tmp_path):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parents[1]))
+    import train_models
+
+    captured = {}
+
+    class _Stub:
+        def __init__(self, *args, **kwargs):
+            self.model = self
+            self.dimer_model = self
+
+    def _capture(*args, **kwargs):
+        captured.update(kwargs)
+        raise _Captured
+
+    mods = train_models.AtomPairwiseModels
+    monkeypatch.setattr(mods.mtp_mtp, "AtomTypeParamModel", _Stub)
+    monkeypatch.setattr(mods.mtp_mtp, "AM_DimerParam_Model", _Stub)
+    monkeypatch.setattr(mods.apnet3_d3_fused, "APNet3D3_AtomType_Model", _capture)
+    with pytest.raises(_Captured):
+        train_models.train_pairwise_model(
+            apnet_model_type="APNet3-fused-d3",
+            model_out=str(tmp_path / "m.pt"),
+            data_dir=str(tmp_path),
+            sr_fade=(1.0, 1.5),
+        )
+    assert captured["sr_fade"] == (1.0, 1.5)
+    with pytest.raises(ValueError, match="sr_fade"):
+        train_models.train_pairwise_model(
+            apnet_model_type="APNet2",
+            model_out=str(tmp_path / "m.pt"),
+            data_dir=str(tmp_path),
+            sr_fade=(1.0, 1.5),
+        )
+
+
+def test_cli_sr_fade_defaults_to_checkpoint():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parents[1]))
+    import train_models
+
+    parser = train_models.build_arg_parser()
+    assert parser.parse_args([]).sr_fade is None
+    assert parser.parse_args(["--sr_fade", "1.0", "1.5"]).sr_fade == [1.0, 1.5]
