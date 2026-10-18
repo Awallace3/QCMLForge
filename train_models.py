@@ -485,6 +485,7 @@ def train_pairwise_model(
     ds_type="total_component_energies",
     no_disp_nn=False,
     sr_switch=None,
+    sr_fade=None,
     use_precomputed_classical=None,
     freeze_dimer_prop_model=True,
     freeze_atom_model=True,
@@ -577,6 +578,7 @@ def train_pairwise_model(
         ds_type (str): Dataset energy-type selector (e.g., "total_component_energies", "fsapt_energies").
         no_disp_nn (bool): Skip the dispersion readout when training APNet3-fused-d3 and compute D3 at predict time instead.
         sr_switch (bool | None): APNet3-fused-d3 only: smoothly switch each short-range pair energy to zero at r_cut_im. None keeps a warm-start checkpoint's setting (off for a fresh model).
+        sr_fade (tuple[float, float] | None): APNet3-fused-d3 only: fade each short-range pair energy to zero below (lo, hi) A. None keeps a warm-start checkpoint's setting (no fade for a fresh model).
         build_dataset_only (bool): If true, build/process the dataset and exit without training.
         include_total_mse (bool): If true, add an extra MSE term on the total energy in addition to the four component-wise terms. On a CLIFF route it is instead shorthand for component_gamma=0.5 and cannot be combined with an explicit component_gamma.
         component_gamma (float or None): CLIFF Eq. (23) component/total loss weight for the combined CLIFF routes. None (the default) keeps the legacy plain multi-column MSE; any float in [0.0, 1.0] selects the Eq. (23) functional. Rejected on CliffExchangeModel and on every pre-existing route.
@@ -895,6 +897,10 @@ def train_pairwise_model(
     if sr_switch and apnet_model_type != "APNet3-fused-d3":
         raise ValueError(
             f"--sr_switch applies only to APNet3-fused-d3 (requested {apnet_model_type})"
+        )
+    if sr_fade is not None and apnet_model_type != "APNet3-fused-d3":
+        raise ValueError(
+            f"--sr_fade applies only to APNet3-fused-d3 (requested {apnet_model_type})"
         )
     if apnet_model_type == "APNet2":
         APNet = AtomPairwiseModels.apnet2.APNet2Model
@@ -1215,6 +1221,7 @@ def train_pairwise_model(
             r_cut_im=r_cut_im,
             sr_switch=sr_switch,
             **({} if n_message is None else {"n_message": n_message}),
+            sr_fade=sr_fade,
             ds_batch_size=ds_batch_size,
             freeze_dimer_prop_model=freeze_dimer_prop_model,
         )
@@ -2220,6 +2227,14 @@ def main():
         help="APNet3-fused-d3 only: smoothly switch each short-range pair energy to zero at --r_cut_im (default: keep the warm-start checkpoint's setting, off for a fresh model).",
     )
     args.add_argument(
+        "--sr_fade",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("LO", "HI"),
+        help="APNet3-fused-d3 only: fade each short-range pair energy to zero below LO, fully on above HI (A); the classical terms alone act at closer contacts (default: keep the warm-start checkpoint's setting, none for a fresh model).",
+    )
+    args.add_argument(
         "--unfreeze_dimer_prop_model",
         action="store_true",
         default=False,
@@ -2421,6 +2436,7 @@ def main():
             ds_type=args.ds_type,
             no_disp_nn=args.no_disp_nn,
             sr_switch=args.sr_switch,
+            sr_fade=args.sr_fade,
             use_precomputed_classical=args.use_precomputed_classical,
             freeze_dimer_prop_model=not args.unfreeze_dimer_prop_model,
             freeze_atom_model=not args.unfreeze_atom_model,
