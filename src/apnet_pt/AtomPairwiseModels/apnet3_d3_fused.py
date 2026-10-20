@@ -448,6 +448,17 @@ def _check_sr_fade(sr_fade):
     return (lo, hi)
 
 
+def _check_r_cut_disp(r_cut_disp, r_cut_im, no_disp_nn):
+    if r_cut_disp is None:
+        return None
+    r_cut_disp = float(r_cut_disp)
+    if no_disp_nn:
+        raise ValueError("r_cut_disp needs the dispersion NN (no_disp_nn is set)")
+    if not r_cut_disp >= r_cut_im:
+        raise ValueError(f"r_cut_disp needs r_cut_disp >= r_cut_im, got {r_cut_disp} < {r_cut_im}")
+    return r_cut_disp
+
+
 def sr_fade_factor(r, lo, hi):
     """Quintic smootherstep: 0 for r <= lo, 1 for r >= hi, C2 in between."""
     t = torch.clamp((r - lo) / (hi - lo), 0.0, 1.0)
@@ -477,6 +488,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         d3_damping_parameters=None,
         sr_switch=False,
         sr_fade=None,
+        r_cut_disp=None,
     ):
         super().__init__()
         self.dimer_prop_model = dimer_prop_model
@@ -498,6 +510,10 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # so at contacts closer than any training pair the NN correction is
         # off and the damped classical terms (exponential exchange) decide.
         self.sr_fade = _check_sr_fade(sr_fade)
+        # Optional longer cutoff for the dispersion readout alone: elst, exch
+        # and ind keep r_cut_im, while the dispersion NN sees pairs out to
+        # r_cut_disp with its own distance basis and switch.  None = one cutoff.
+        self.r_cut_disp = _check_r_cut_disp(r_cut_disp, r_cut_im, no_disp_nn)
         # The store fixes its short/long-range split at build time; check the
         # first batch once that it was not cut shorter than this model.
         self._store_cutoff_checked = False
@@ -547,6 +563,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # embed interatomic distances into large orthogonal basis
         self.distance_layer_im = DistanceLayer(n_rbf, self.r_cut_im)
         self.distance_layer = DistanceLayer(n_rbf, self.r_cut)
+        if self.r_cut_disp is not None:
+            self.distance_layer_disp = DistanceLayer(n_rbf, self.r_cut_disp)
 
         # embed atom types
         self.embed_layer = nn.Embedding(max_Z + 1, n_embed)
@@ -606,6 +624,7 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             "d3_damping_parameters": deepcopy(self.d3_damping_parameters),
             "sr_switch": self.sr_switch,
             "sr_fade": None if self.sr_fade is None else list(self.sr_fade),
+            **({} if self.r_cut_disp is None else {"r_cut_disp": self.r_cut_disp}),
         }
 
     def get_model_info(self):
@@ -719,11 +738,32 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         else:
             return torch.cat([hA_source, hB_target, qA_source, qB_target, rbf], dim=-1)
 
+    def _pair_cutoff(self, dR, r_cut):
+        """1/r^3, times the switch to zero at r_cut and the short-range fade."""
+        cutoff = (1.0 / (dR**3)).unsqueeze(-1)
+        if self.sr_switch:
+            x = dR / r_cut
+            cutoff = cutoff * (x * self.sr_switch_envelope(x)).unsqueeze(-1)
+        if self.sr_fade is not None:
+            cutoff = cutoff * sr_fade_factor(dR, *self.sr_fade).unsqueeze(-1)
+        return cutoff
+
+    def _pair_features(self, hA, hB, qA, qB, hfvrA, hfvrB, vwA, vwB, hA_dir, hB_dir,
+                       rbf, src, tgt, unit):
+        """hAB and hBA for the pairs (src, tgt), as the forward builds them."""
+        hAB = self.get_pair_params(hA, hB, qA, qB, hfvrA, hfvrB, vwA, vwB, rbf, src, tgt)
+        hBA = self.get_pair_params(hB, hA, qB, qA, hfvrB, hfvrA, vwB, vwA, rbf, tgt, src)
+        a = torch.einsum("axf,ax->af", hA_dir.index_select(0, src), unit)
+        b = torch.einsum("axf,ax->af", hB_dir.index_select(0, tgt), -unit)
+        return torch.cat([hAB, a, b], dim=1), torch.cat([hBA, b, a], dim=1)
+
     def _check_store_cutoff(self, dR_lr):
-        if dR_lr.numel() and float(dR_lr.min()) < self.r_cut_im - 1e-4:
+        r_need = self.r_cut_im if self.r_cut_disp is None else self.r_cut_disp
+        if dR_lr.numel() and float(dR_lr.min()) < r_need - 1e-4:
+            what = "r_cut_im" if self.r_cut_disp is None else "r_cut_disp"
             raise ValueError(
                 f"Store long-range AB edges start at {float(dR_lr.min()):.4f} A, "
-                f"inside model r_cut_im={self.r_cut_im}; rebuild the store at "
+                f"inside model {what}={r_need}; rebuild the store at "
                 "r_cut_im >= the model's."
             )
         self._store_cutoff_checked = True
@@ -781,6 +821,11 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         dR_lr, dR_lr_xyz = self.get_distances(RA, RB, e_ABlr_source, e_ABlr_target)
         if not self._store_cutoff_checked:
             self._check_store_cutoff(dR_lr)
+        if self.r_cut_disp is not None:
+            # The dispersion readout's own pair set, out to r_cut_disp.
+            keep_d = dR_sr <= self.r_cut_disp
+            pairs_disp = (e_ABsr_source[keep_d], e_ABsr_target[keep_d],
+                          dimer_ind[keep_d], dR_sr[keep_d], dR_sr_xyz[keep_d])
         # Stores built at a longer cutoff carry extra short-range edges; drop
         # them so the NN sees only pairs within this model's r_cut_im.
         keep = dR_sr <= self.r_cut_im
@@ -916,19 +961,38 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         hAB = torch.cat([hAB, hA_dir_blah, hB_dir_blah], dim=1)
         hBA = torch.cat([hBA, hB_dir_blah, hA_dir_blah], dim=1)
 
-        EAB_sr = self.readouts(hAB)
-        EBA_sr = self.readouts(hBA)
+        if self.r_cut_disp is None:
+            EAB_sr = self.readouts(hAB)
+            EBA_sr = self.readouts(hBA)
 
-        E_sr = EAB_sr + EBA_sr
+            E_sr = EAB_sr + EBA_sr
 
-        cutoff = (1.0 / (dR_sr**3)).unsqueeze(-1)
-        if self.sr_switch:
-            x = dR_sr / self.r_cut_im
-            cutoff = cutoff * (x * self.sr_switch_envelope(x)).unsqueeze(-1)
-        if self.sr_fade is not None:
-            cutoff = cutoff * sr_fade_factor(dR_sr, *self.sr_fade).unsqueeze(-1)
-        E_sr *= cutoff
-        E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
+            cutoff = (1.0 / (dR_sr**3)).unsqueeze(-1)
+            if self.sr_switch:
+                x = dR_sr / self.r_cut_im
+                cutoff = cutoff * (x * self.sr_switch_envelope(x)).unsqueeze(-1)
+            if self.sr_fade is not None:
+                cutoff = cutoff * sr_fade_factor(dR_sr, *self.sr_fade).unsqueeze(-1)
+            E_sr *= cutoff
+            E_sr_dimer = scatter_sum_compile(E_sr, dimer_ind, ndimer)
+        else:
+            # elst, exch, ind: exactly the single-cutoff computation on the
+            # r_cut_im pairs.  disp: the same pair features on the r_cut_disp
+            # pairs, with a distance basis and switch scaled to r_cut_disp.
+            parts = (self.readout_layer_elst, self.readout_layer_exch,
+                     self.readout_layer_indu)
+            E_sr = (torch.cat([f(hAB) for f in parts], dim=1)
+                    + torch.cat([f(hBA) for f in parts], dim=1))
+            cutoff = self._pair_cutoff(dR_sr, self.r_cut_im)
+            E_sr *= cutoff
+            src_d, tgt_d, dimer_ind_d, dR_d, dR_d_xyz = pairs_disp
+            hAB_d, hBA_d = self._pair_features(
+                hA, hB, qA, qB, hfvrA, hfvrB, vwA, vwB, hA_dir, hB_dir,
+                self.distance_layer_disp(dR_d), src_d, tgt_d, dR_d_xyz / dR_d.unsqueeze(1))
+            E_d = self.readout_layer_disp(hAB_d) + self.readout_layer_disp(hBA_d)
+            E_d *= self._pair_cutoff(dR_d, self.r_cut_disp)
+            E_sr_dimer = torch.cat([scatter_sum_compile(E_sr, dimer_ind, ndimer),
+                                    scatter_sum_compile(E_d, dimer_ind_d, ndimer)], dim=1)
         if self.use_precomputed_classical:
             E_output = E_sr_dimer
             if self.return_hidden_states:
@@ -1165,12 +1229,14 @@ class APNet3D3_AtomType_Model:
         d3_damping_parameters=None,
         sr_switch=None,
         sr_fade=None,
+        r_cut_disp=None,
     ):
         """
         the path and all other parameters will be ignored except for dataset.
 
-        r_cut_im, sr_switch and sr_fade left as None take the checkpoint's
-        values (8.0, False and no fade for a fresh model).  The architecture (n_message,
+        r_cut_im, sr_switch, sr_fade and r_cut_disp left as None take the
+        checkpoint's values (8.0, False, no fade and one cutoff for a fresh
+        model).  The architecture (n_message,
         n_rbf, n_neuron, n_embed, r_cut) always comes from the checkpoint;
         None takes it (3, 8, 128, 8, 5.0 for a fresh model) and a value that
         disagrees with the checkpoint is refused.
@@ -1288,6 +1354,8 @@ class APNet3D3_AtomType_Model:
                 sr_switch = config.get("sr_switch", False)
             if sr_fade is None:
                 sr_fade = config.get("sr_fade")
+            if r_cut_disp is None:
+                r_cut_disp = config.get("r_cut_disp")
             if use_precomputed_classical is None:
                 use_precomputed_classical = config.get(
                     "use_precomputed_classical", False
@@ -1314,6 +1382,7 @@ class APNet3D3_AtomType_Model:
                 d3_damping_parameters=resolved_d3_damping_parameters,
                 sr_switch=sr_switch,
                 sr_fade=sr_fade,
+                r_cut_disp=r_cut_disp,
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)
@@ -1340,6 +1409,7 @@ class APNet3D3_AtomType_Model:
                 d3_damping_parameters=resolved_d3_damping_parameters,
                 sr_switch=bool(sr_switch),
                 sr_fade=sr_fade,
+                r_cut_disp=r_cut_disp,
             )
         self.use_precomputed_classical = use_precomputed_classical
         self.d3_damping_parameters = deepcopy(resolved_d3_damping_parameters)
