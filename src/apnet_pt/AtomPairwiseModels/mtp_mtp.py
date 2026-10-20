@@ -2158,7 +2158,9 @@ class AtomTypeParamNN(nn.Module):
             return parameters
         two_d = parameters.dim() == 2
         p2 = parameters if two_d else parameters.unsqueeze(-1)
-        logits = p2[:, :1]
+        # contiguous like the producer's checked clone: CPU softplus on the
+        # strided column takes another kernel and differs by an ulp
+        logits = p2[:, :1].contiguous()
         if logits.dtype in (torch.float16, torch.bfloat16):
             logits = logits.float()
         if not torch.isfinite(logits).all():
