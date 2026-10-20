@@ -212,3 +212,23 @@ def test_exact_solver_reports_polarization_catastrophe():
 def test_unknown_solver_is_rejected():
     with pytest.raises(ValueError, match="solver"):
         explicit_thole_induction(**inputs(), solver="cg")
+
+
+@pytest.mark.parametrize(
+    "override, match",
+    [
+        ({"convergence_norm": "maxx"}, "convergence_norm"),
+        ({"convergence_norm": None}, "convergence_norm"),
+        ({"solver": None}, "solver"),
+        ({"max_iterations": 2.5}, "max_iterations"),
+        ({"max_iterations": True}, "max_iterations"),
+        ({"convergence_threshold": "1e-6"}, "convergence_threshold"),
+        ({"convergence_threshold": 0.0}, "convergence_threshold"),
+        ({"omega": "0.7"}, "omega"),
+        ({"thole_direct": None}, "thole_direct"),
+        ({"n_dimers": 1.0}, "n_dimers"),
+    ],
+)
+def test_invalid_solver_controls_are_rejected(override, match):
+    with pytest.raises(ValueError, match=match):
+        explicit_thole_induction(**{**inputs(), **override})

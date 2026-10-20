@@ -1,5 +1,6 @@
 import hashlib
 import math
+import numbers
 import os
 import re
 import time
@@ -355,6 +356,16 @@ DEFAULT_INDUCTION_MAX_ITERATIONS = 200
 # optimizer trajectory, of any run that enables them.
 DEFAULT_INDUCTION_CONVERGENCE_NORM = "l2"
 INDUCTION_CONVERGENCE_NORMS = ("l2", "rms", "max")
+
+# `explicit_thole_induction` defaults. They differ from the historical
+# DEFAULT_INDUCTION_* controls on purpose: the max norm is batch-size
+# independent, so one hard dimer cannot hide behind its batch, and 1e-6 is
+# reachable in float32 under that norm. OMEGA is the fixed-point mixing weight.
+EXPLICIT_INDUCTION_CONVERGENCE_THRESHOLD = 1.0e-6
+EXPLICIT_INDUCTION_CONVERGENCE_NORM = "max"
+EXPLICIT_INDUCTION_OMEGA = 0.7
+EXPLICIT_INDUCTION_SOLVERS = ("iterative", "exact")
+EXPLICIT_INDUCTION_SOLVER = "iterative"
 
 # The `dimer_eval` modes whose forward calls `rackers_thole_induction`, and so
 # the ones a stale functional version applies to. The `*induced_dipole*` modes
@@ -5190,9 +5201,12 @@ def _rackers_polarization_energy(
 
 
 def _rackers_exact_dipoles(
-    alpha_A, alpha_B, mu_0_A, mu_0_B, edges_AB, edges_AA, edges_BB,
-    T2_AB, T2_AA, T2_BB, molecule_ind_A, molecule_ind_B, n_dimers,
-):
+    alpha_A: torch.Tensor, alpha_B: torch.Tensor,
+    mu_0_A: torch.Tensor, mu_0_B: torch.Tensor,
+    edges_AB: torch.Tensor, edges_AA: torch.Tensor, edges_BB: torch.Tensor,
+    T2_AB: torch.Tensor, T2_AA: torch.Tensor, T2_BB: torch.Tensor,
+    molecule_ind_A: torch.Tensor, molecule_ind_B: torch.Tensor, n_dimers: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Directly solve ``mu = mu_0 + alpha * T mu``, the fixed point that
     ``_rackers_scf_step`` relaxes, with one dense system per dimer.
 
@@ -5246,6 +5260,53 @@ def _rackers_exact_dipoles(
     return mu[:n_A], mu[n_A:]
 
 
+def _require_real(value, name: str) -> None:
+    """Reject non-numeric controls before a validator can coerce them."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+
+
+def _validate_explicit_induction_controls(
+    n_dimers: int,
+    thole_direct: float,
+    thole_mutual: float,
+    max_iterations: int,
+    convergence_threshold: float,
+    convergence_norm: str,
+    omega: float,
+    solver: str,
+) -> tuple[float, float, int, float, str, float]:
+    """Validate ``explicit_thole_induction`` controls; return them normalized.
+
+    Returns ``(thole_direct, thole_mutual, max_iterations,
+    convergence_threshold, convergence_norm, omega)``.
+    """
+    if not isinstance(solver, str) or solver not in EXPLICIT_INDUCTION_SOLVERS:
+        raise ValueError(
+            f"induction solver must be one of {list(EXPLICIT_INDUCTION_SOLVERS)},"
+            f" got {solver!r}"
+        )
+    if (isinstance(n_dimers, bool) or not isinstance(n_dimers, numbers.Integral)
+            or n_dimers < 1):
+        raise ValueError(f"n_dimers must be a positive integer, got {n_dimers!r}")
+    for value, name in (
+        (thole_direct, "thole_direct"), (thole_mutual, "thole_mutual"),
+        (convergence_threshold, "convergence_threshold"), (omega, "omega"),
+    ):
+        _require_real(value, name)
+    thole_direct = _validate_bound_scale(
+        thole_direct, "thole_direct", allow_none=False)
+    thole_mutual = _validate_bound_scale(
+        thole_mutual, "thole_mutual", allow_none=False)
+    omega = _validate_bound_scale(omega, "omega", allow_none=False)
+    if omega > 1.0:
+        raise ValueError(f"omega must lie in (0, 1], got {omega!r}")
+    threshold, iterations = _validate_induction_solver_controls(
+        convergence_threshold, max_iterations)
+    norm = _validate_induction_convergence_norm(convergence_norm)
+    return thole_direct, thole_mutual, iterations, threshold, norm, omega
+
+
 def explicit_thole_induction(
     RA: torch.Tensor, RB: torch.Tensor,
     qA: torch.Tensor, qB: torch.Tensor,
@@ -5253,11 +5314,14 @@ def explicit_thole_induction(
     alpha_A: torch.Tensor, alpha_B: torch.Tensor,
     edges_AB: torch.Tensor, edges_AA: torch.Tensor, edges_BB: torch.Tensor,
     molecule_ind_A: torch.Tensor, molecule_ind_B: torch.Tensor, n_dimers: int,
-    thole_direct: float = 0.38539, thole_mutual: float = 0.38539,
-    max_iterations: int = 200, convergence_threshold: float = 1e-6,
-    convergence_norm: str = "max", omega: float = 0.7,
-    solver: str = "iterative",
-) -> tuple[torch.Tensor, dict]:
+    thole_direct: float = CLIFF_THOLE_SMEARING,
+    thole_mutual: float = CLIFF_THOLE_SMEARING,
+    max_iterations: int = DEFAULT_INDUCTION_MAX_ITERATIONS,
+    convergence_threshold: float = EXPLICIT_INDUCTION_CONVERGENCE_THRESHOLD,
+    convergence_norm: str = EXPLICIT_INDUCTION_CONVERGENCE_NORM,
+    omega: float = EXPLICIT_INDUCTION_OMEGA,
+    solver: str = EXPLICIT_INDUCTION_SOLVER,
+) -> tuple[torch.Tensor, dict[str, bool | int | float]]:
     """Interaction induction from explicit properties and global Thole constants.
 
     Coordinates are Angstrom; charges, dipoles and polarizabilities are atomic
@@ -5282,13 +5346,12 @@ def explicit_thole_induction(
     and reports ``scf_iterations`` 0 and the residual of one fixed-point step
     from its solution. Cost grows as (3 x atoms per dimer)^3.
     """
-    if solver not in ("iterative", "exact"):
-        raise ValueError(f"unknown induction solver {solver!r}")
-    if (max_iterations < 1 or n_dimers < 1 or convergence_threshold <= 0 or
-            not 0 < omega <= 1 or thole_direct <= 0 or thole_mutual <= 0 or
-            not all(math.isfinite(v) for v in (convergence_threshold, omega,
-                                               thole_direct, thole_mutual))):
-        raise ValueError("invalid induction solver or damping parameters")
+    (
+        thole_direct, thole_mutual, max_iterations,
+        convergence_threshold, convergence_norm, omega,
+    ) = _validate_explicit_induction_controls(
+        n_dimers, thole_direct, thole_mutual, max_iterations,
+        convergence_threshold, convergence_norm, omega, solver)
     if (not len(RA) or not len(RB) or RA.shape != (len(alpha_A), 3) or
             RB.shape != (len(alpha_B), 3) or muA.shape != RA.shape or
             muB.shape != RB.shape or qA.shape != alpha_A.shape or
@@ -5301,7 +5364,10 @@ def explicit_thole_induction(
     aa_s, aa_t = edges_AA
     bb_s, bb_t = edges_BB
 
-    def tensors(Ri, Rj, edges, ali, alj, value, kind):
+    def tensors(
+        Ri: torch.Tensor, Rj: torch.Tensor, edges: torch.Tensor,
+        ali: torch.Tensor, alj: torch.Tensor, value: float, kind: str,
+    ) -> tuple[torch.Tensor, ...]:
         damping = ali.new_full((edges.shape[1],), float(value))
         return _rackers_distance_tensors(
             Ri, Rj, edges[0], edges[1], ali, alj, damping, kind)
