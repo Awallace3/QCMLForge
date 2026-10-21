@@ -43,8 +43,11 @@ omega-damped loop (omega 0.7) diverges once any eigenvalue of that operator
 exceeds `2 / omega`, which trained polarizabilities can reach while the
 response is still physically stable; the exact solve fails only when the
 operator is not positive definite (a polarization catastrophe) and names the
-dimers. It ignores the loop's iteration settings, reports zero iterations and
-the residual of one fixed-point step, and costs O((3 n_atoms)^3) per dimer.
+dimers. It ignores the loop's iteration count and omega and reports zero
+iterations, but the residual of one fixed-point step from its solution must
+still fall below `convergence_threshold`, which catches inputs (such as
+one-directional AA/BB edges) whose coupling is not symmetric. It costs
+O((3 n_atoms)^3) per dimer.
 
 Energy-only fitting does not uniquely identify atomic moments or polarizabilities.
 Call the outputs effective properties. Check out-of-domain transferability,

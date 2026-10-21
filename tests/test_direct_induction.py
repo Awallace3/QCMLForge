@@ -232,3 +232,13 @@ def test_unknown_solver_is_rejected():
 def test_invalid_solver_controls_are_rejected(override, match):
     with pytest.raises(ValueError, match=match):
         explicit_thole_induction(**{**inputs(), **override})
+
+
+def test_exact_solver_rejects_residual_above_threshold():
+    """Cholesky reads one triangle only, so one-directional AA edges solve a
+    different system without failing; the residual check must catch it."""
+    p = cube(1.0, 12.0)
+    aa = p["edges_AA"]
+    p["edges_AA"] = aa[:, aa[0] < aa[1]]
+    with pytest.raises(RuntimeError, match="converge"):
+        explicit_thole_induction(**p, solver="exact")

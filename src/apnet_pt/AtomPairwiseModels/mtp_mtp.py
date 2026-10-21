@@ -5342,9 +5342,11 @@ def explicit_thole_induction(
     of ``I - alpha^1/2 T alpha^1/2`` exceeds ``2 / omega`` even when the
     response is physically stable; the exact solve fails only when that
     operator is not positive definite (a true polarization catastrophe).
-    It ignores ``max_iterations``, ``convergence_threshold`` and ``omega``
-    and reports ``scf_iterations`` 0 and the residual of one fixed-point step
-    from its solution. Cost grows as (3 x atoms per dimer)^3.
+    It ignores ``max_iterations`` and ``omega`` and reports ``scf_iterations``
+    0. The residual of one fixed-point step from its solution must still fall
+    below ``convergence_threshold``: Cholesky reads only one triangle, so
+    edges that make the coupling asymmetric would otherwise solve a different
+    system silently. Cost grows as (3 x atoms per dimer)^3.
     """
     (
         thole_direct, thole_mutual, max_iterations,
@@ -5393,7 +5395,9 @@ def explicit_thole_induction(
             plan, ab_s, ab_t, aa_s, aa_t, bb_s, bb_t,
             dip_a, dip_b, initial_a, initial_b)
         residual = _scf_residual(step_a - dip_a, step_b - dip_b, convergence_norm)
-        iterations, converged = 0, bool(torch.isfinite(residual))
+        iterations = 0
+        converged = bool(torch.isfinite(residual)) and bool(
+            residual < convergence_threshold)
     else:
         solved = _rackers_converge_dipoles(
             alpha_A, alpha_B, qA, muA, qB, muB,
