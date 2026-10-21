@@ -610,6 +610,20 @@ class DimerProp(nn.Module):
         self.set_forward(dimer_eval)
         return
 
+    def set_induction_solver(self, solver: str = "iterative") -> None:
+        """Select the Rackers induction solve ("iterative" or "exact").
+
+        A runtime control, not part of the checkpoint config: both solve the
+        same equations, so it never changes which weights are meaningful.
+        """
+        if solver not in RACKERS_INDUCTION_SOLVERS:
+            raise ValueError(f"induction solver must be one of "
+                             f"{list(RACKERS_INDUCTION_SOLVERS)}, got {solver!r}")
+        self.induction_solver = solver
+
+    def _induction_solver(self) -> str:
+        return getattr(self, "induction_solver", "iterative")
+
     def _polarizability_table(self) -> torch.Tensor:
         """The free-atom table the induction physics should use.
 
@@ -1075,11 +1089,14 @@ class DimerProp(nn.Module):
             polarizability_table=self._polarizability_table(),
             variational_energy=self.variational_induction,
             molecule_ind_A=(
-                batch.molecule_ind_A if self.variational_induction else None
+                batch.molecule_ind_A if self.variational_induction
+                or self._induction_solver() == "exact" else None
             ),
             molecule_ind_B=(
-                batch.molecule_ind_B if self.variational_induction else None
+                batch.molecule_ind_B if self.variational_induction
+                or self._induction_solver() == "exact" else None
             ),
+            solver=self._induction_solver(),
             return_diagnostics=self.collect_induction_diagnostics,
             max_iterations=self.induction_max_iterations,
             convergence_threshold=self.induction_convergence_threshold,
@@ -5202,8 +5219,14 @@ def _rackers_converge_dipoles(
     max_iterations, convergence_threshold, omega,
     convergence_norm=DEFAULT_INDUCTION_CONVERGENCE_NORM,
     intramolecular_permanent_field=False,
+    solver="iterative", molecule_ind_A=None, molecule_ind_B=None, n_dimers=None,
 ):
     """Solve the induced dipoles and report how the solve went.
+
+    ``solver="exact"`` solves the same equations with one dense Cholesky
+    system per dimer (`_rackers_exact_dipoles`; needs ``molecule_ind_A/B`` and
+    ``n_dimers``) and reports 0 iterations and the residual of one
+    fixed-point step from the solution.
 
     Factored out so the *same* solver can be run twice: once with the
     intermolecular edges present (the dimer) and once with them removed (the
@@ -5220,6 +5243,15 @@ def _rackers_converge_dipoles(
         direct_T1_BB, direct_T2_BB,
         intramolecular_permanent_field=intramolecular_permanent_field,
     )
+    if solver == "exact":
+        mu_A, mu_B, residual = _rackers_exact_solve(
+            alpha_A, alpha_B, mu_0_A, mu_0_B,
+            e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+            e_BB_source, e_BB_target,
+            mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
+            molecule_ind_A, molecule_ind_B, n_dimers, convergence_norm)
+        return (mu_A, mu_B, mu_0_A, mu_0_B, 0, residual,
+                bool(torch.isfinite(residual)))
     mu_A, mu_B = mu_0_A.clone(), mu_0_B.clone()
     iterations = 0
     residual = torch.zeros((), device=mu_A.device, dtype=mu_A.dtype)
@@ -5330,6 +5362,42 @@ def _rackers_exact_dipoles(
     y = torch.cholesky_solve(rhs.unsqueeze(-1), factor).squeeze(-1)
     mu = (y * scale).reshape(n_dimers, n_max, 3)[dimer, slot]
     return mu[:n_A], mu[n_A:]
+
+
+RACKERS_INDUCTION_SOLVERS = ("iterative", "exact")
+
+
+def _rackers_exact_solve(
+    alpha_A, alpha_B, mu_0_A, mu_0_B,
+    e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+    e_BB_source, e_BB_target,
+    mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
+    molecule_ind_A, molecule_ind_B, n_dimers, convergence_norm,
+):
+    """Exact induced dipoles of the Rackers SCF plus the residual of one
+    fixed-point step from them (the iterative solver's convergence measure).
+
+    Raises ``RuntimeError`` on a polarization catastrophe (no positive-definite
+    response), where the damped iteration would diverge instead.
+    """
+    if molecule_ind_A is None or molecule_ind_B is None or n_dimers is None:
+        raise ValueError("the exact induction solve needs molecule_ind_A/B "
+                         "and n_dimers to form one system per dimer")
+    mu_A, mu_B = _rackers_exact_dipoles(
+        alpha_A, alpha_B, mu_0_A, mu_0_B,
+        torch.stack((e_AB_source, e_AB_target)),
+        torch.stack((e_AA_source, e_AA_target)),
+        torch.stack((e_BB_source, e_BB_target)),
+        mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
+        molecule_ind_A, molecule_ind_B, n_dimers)
+    plan = _rackers_scf_plan(alpha_A, alpha_B, e_AB_source, e_AB_target,
+                             e_AA_target, e_BB_target,
+                             mutual_T2_AB, mutual_T2_AA, mutual_T2_BB)
+    step_A, step_B = _rackers_scf_step(
+        plan, e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+        e_BB_source, e_BB_target, mu_A, mu_B, mu_0_A, mu_0_B)
+    return mu_A, mu_B, _scf_residual(step_A - mu_A, step_B - mu_B,
+                                     convergence_norm)
 
 
 def _require_real(value, name: str) -> None:
@@ -5530,8 +5598,18 @@ def rackers_thole_induction(
     molecule_ind_A: torch.Tensor | None = None,
     molecule_ind_B: torch.Tensor | None = None,
     intramolecular_permanent_field: bool = False,
+    solver: str = "iterative",
 ) -> torch.Tensor:
     """Compute Rackers induction with distinct direct and mutual damping.
+
+    ``solver="exact"`` replaces the omega-damped fixed-point loop by one dense
+    Cholesky solve per dimer of the same equations (``molecule_ind_A/B``
+    required).  The loop diverges once an eigenvalue of
+    I - alpha^1/2 T alpha^1/2 exceeds 2/omega although the response may still
+    be stable; the exact solve fails (``RuntimeError``) only on a true
+    polarization catastrophe.  Where the loop converges the two agree to its
+    threshold.  ``scf_iterations`` is then 0 and ``scf_residual`` is one
+    fixed-point step from the solution.
 
     ``return_diagnostics`` additionally returns the audit quantities that
     `ARCHITECTURE_HANDOFF.md` asks for before any induction redesign: the SCF
@@ -5555,6 +5633,14 @@ def rackers_thole_induction(
     unchanged.
     """
     del quadA, quadB
+    if solver not in RACKERS_INDUCTION_SOLVERS:
+        raise ValueError(f"induction solver must be one of "
+                         f"{list(RACKERS_INDUCTION_SOLVERS)}, got {solver!r}")
+    n_dimers_exact = None
+    if solver == "exact":
+        if molecule_ind_A is None or molecule_ind_B is None:
+            raise ValueError("solver='exact' requires molecule_ind_A/molecule_ind_B")
+        n_dimers_exact = int(torch.cat((molecule_ind_A, molecule_ind_B)).max()) + 1
     polarizability_table = _polarizability_table_on_device(
         polarizability_table,
         ZA.device,
@@ -5714,7 +5800,15 @@ def rackers_thole_induction(
         mutual_tensors_AA[4],
         mutual_tensors_BB[4],
     )
-    for _ in range(max_iterations):
+    if solver == "exact":
+        mu_induced_A, mu_induced_B, scf_residual = _rackers_exact_solve(
+            alpha_A, alpha_B, mu_induced_0_A, mu_induced_0_B,
+            e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+            e_BB_source, e_BB_target,
+            mutual_tensors_AB[4], mutual_tensors_AA[4], mutual_tensors_BB[4],
+            molecule_ind_A, molecule_ind_B, n_dimers_exact, convergence_norm)
+        scf_converged = bool(torch.isfinite(scf_residual))
+    for _ in range(0 if solver == "exact" else max_iterations):
         scf_iterations += 1
         # No clone: see _rackers_converge_dipoles. The iterates are rebound,
         # never written through.
@@ -5821,6 +5915,8 @@ def rackers_thole_induction(
             max_iterations, convergence_threshold, omega,
             convergence_norm=convergence_norm,
             intramolecular_permanent_field=intramolecular_permanent_field,
+            solver=solver, molecule_ind_A=molecule_ind_A,
+            molecule_ind_B=molecule_ind_B, n_dimers=n_dimers,
         )
         energy_dimer = _rackers_polarization_energy(
             mu_induced_A, mu_induced_0_A, alpha_A,
