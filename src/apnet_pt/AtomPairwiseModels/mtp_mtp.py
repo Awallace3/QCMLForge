@@ -1,5 +1,6 @@
 import hashlib
 import math
+import numbers
 import os
 import re
 import time
@@ -355,6 +356,16 @@ DEFAULT_INDUCTION_MAX_ITERATIONS = 200
 # optimizer trajectory, of any run that enables them.
 DEFAULT_INDUCTION_CONVERGENCE_NORM = "l2"
 INDUCTION_CONVERGENCE_NORMS = ("l2", "rms", "max")
+
+# `explicit_thole_induction` defaults. They differ from the historical
+# DEFAULT_INDUCTION_* controls on purpose: the max norm is batch-size
+# independent, so one hard dimer cannot hide behind its batch, and 1e-6 is
+# reachable in float32 under that norm. OMEGA is the fixed-point mixing weight.
+EXPLICIT_INDUCTION_CONVERGENCE_THRESHOLD = 1.0e-6
+EXPLICIT_INDUCTION_CONVERGENCE_NORM = "max"
+EXPLICIT_INDUCTION_OMEGA = 0.7
+EXPLICIT_INDUCTION_SOLVERS = ("iterative", "exact")
+EXPLICIT_INDUCTION_SOLVER = "iterative"
 
 # The `dimer_eval` modes whose forward calls `rackers_thole_induction`, and so
 # the ones a stale functional version applies to. The `*induced_dipole*` modes
@@ -5187,6 +5198,224 @@ def _rackers_polarization_energy(
     return scatter_sum_compile(
         per_atom_A, molecule_ind_A, dim_size=n_dimers
     ) + scatter_sum_compile(per_atom_B, molecule_ind_B, dim_size=n_dimers)
+
+
+def _rackers_exact_dipoles(
+    alpha_A: torch.Tensor, alpha_B: torch.Tensor,
+    mu_0_A: torch.Tensor, mu_0_B: torch.Tensor,
+    edges_AB: torch.Tensor, edges_AA: torch.Tensor, edges_BB: torch.Tensor,
+    T2_AB: torch.Tensor, T2_AA: torch.Tensor, T2_BB: torch.Tensor,
+    molecule_ind_A: torch.Tensor, molecule_ind_B: torch.Tensor, n_dimers: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Directly solve ``mu = mu_0 + alpha * T mu``, the fixed point that
+    ``_rackers_scf_step`` relaxes, with one dense system per dimer.
+
+    The four edge groups enter exactly as in ``_rackers_scf_step``: AB edges
+    act in both directions with the same tensor, AA/BB edges as target <-
+    source. Writing ``mu = alpha^1/2 y`` gives the symmetric system
+    ``(I - alpha^1/2 T alpha^1/2) y = alpha^-1/2 mu_0``, which is positive
+    definite exactly when the polarization response is stable, so a failed
+    Cholesky factorization is reported as a polarization catastrophe. Padded
+    slots are identity rows with zero right-hand side.
+    """
+    n_A = len(alpha_A)
+    alpha = torch.cat((alpha_A, alpha_B))
+    dimer = torch.cat((molecule_ind_A, molecule_ind_B))
+    counts = torch.bincount(dimer, minlength=n_dimers)
+    n_max = int(counts.max())
+    order = torch.argsort(dimer, stable=True)
+    first = torch.cumsum(counts, 0) - counts
+    slot = torch.empty_like(dimer)
+    slot[order] = (torch.arange(len(dimer), device=dimer.device)
+                   - first[dimer[order]])
+    ab_s, ab_t = edges_AB
+    aa_s, aa_t = edges_AA
+    bb_s, bb_t = edges_BB
+    rows = torch.cat((ab_s, ab_t + n_A, aa_t, bb_t + n_A))   # field felt here
+    cols = torch.cat((ab_t + n_A, ab_s, aa_s, bb_s + n_A))   # from this dipole
+    T = torch.cat((T2_AB, T2_AB, T2_AA, T2_BB))
+    edge_dimer = dimer[rows]
+    if not bool((edge_dimer == dimer[cols]).all()):
+        raise ValueError("induction edges must stay within one dimer")
+    k = torch.arange(3, device=alpha.device)
+    r = (3 * slot[rows])[:, None, None] + k[None, :, None]
+    c = (3 * slot[cols])[:, None, None] + k[None, None, :]
+    r, c = torch.broadcast_tensors(r, c)
+    n3 = 3 * n_max
+    scale = alpha.new_ones((n_dimers, n_max)).index_put(
+        (dimer, slot), alpha.sqrt()).repeat_interleave(3, dim=1)
+    coupling = alpha.new_zeros((n_dimers, n3, n3)).index_put(
+        (edge_dimer[:, None, None].expand_as(r), r, c), T, accumulate=True)
+    system = (torch.eye(n3, dtype=alpha.dtype, device=alpha.device)
+              - scale[:, :, None] * coupling * scale[:, None, :])
+    rhs = alpha.new_zeros((n_dimers, n_max, 3)).index_put(
+        (dimer, slot), torch.cat((mu_0_A, mu_0_B))).reshape(n_dimers, n3) / scale
+    factor, info = torch.linalg.cholesky_ex(system)
+    if bool((info > 0).any()):
+        raise RuntimeError(
+            "polarization catastrophe: induced-dipole response is not positive "
+            f"definite for dimers {torch.nonzero(info > 0).flatten().tolist()}")
+    y = torch.cholesky_solve(rhs.unsqueeze(-1), factor).squeeze(-1)
+    mu = (y * scale).reshape(n_dimers, n_max, 3)[dimer, slot]
+    return mu[:n_A], mu[n_A:]
+
+
+def _require_real(value, name: str) -> None:
+    """Reject non-numeric controls before a validator can coerce them."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+
+
+def _validate_explicit_induction_controls(
+    n_dimers: int,
+    thole_direct: float,
+    thole_mutual: float,
+    max_iterations: int,
+    convergence_threshold: float,
+    convergence_norm: str,
+    omega: float,
+    solver: str,
+) -> tuple[float, float, int, float, str, float]:
+    """Validate ``explicit_thole_induction`` controls; return them normalized.
+
+    Returns ``(thole_direct, thole_mutual, max_iterations,
+    convergence_threshold, convergence_norm, omega)``.
+    """
+    if not isinstance(solver, str) or solver not in EXPLICIT_INDUCTION_SOLVERS:
+        raise ValueError(
+            f"induction solver must be one of {list(EXPLICIT_INDUCTION_SOLVERS)},"
+            f" got {solver!r}"
+        )
+    if (isinstance(n_dimers, bool) or not isinstance(n_dimers, numbers.Integral)
+            or n_dimers < 1):
+        raise ValueError(f"n_dimers must be a positive integer, got {n_dimers!r}")
+    for value, name in (
+        (thole_direct, "thole_direct"), (thole_mutual, "thole_mutual"),
+        (convergence_threshold, "convergence_threshold"), (omega, "omega"),
+    ):
+        _require_real(value, name)
+    thole_direct = _validate_bound_scale(
+        thole_direct, "thole_direct", allow_none=False)
+    thole_mutual = _validate_bound_scale(
+        thole_mutual, "thole_mutual", allow_none=False)
+    omega = _validate_bound_scale(omega, "omega", allow_none=False)
+    if omega > 1.0:
+        raise ValueError(f"omega must lie in (0, 1], got {omega!r}")
+    threshold, iterations = _validate_induction_solver_controls(
+        convergence_threshold, max_iterations)
+    norm = _validate_induction_convergence_norm(convergence_norm)
+    return thole_direct, thole_mutual, iterations, threshold, norm, omega
+
+
+def explicit_thole_induction(
+    RA: torch.Tensor, RB: torch.Tensor,
+    qA: torch.Tensor, qB: torch.Tensor,
+    muA: torch.Tensor, muB: torch.Tensor,
+    alpha_A: torch.Tensor, alpha_B: torch.Tensor,
+    edges_AB: torch.Tensor, edges_AA: torch.Tensor, edges_BB: torch.Tensor,
+    molecule_ind_A: torch.Tensor, molecule_ind_B: torch.Tensor, n_dimers: int,
+    thole_direct: float = CLIFF_THOLE_SMEARING,
+    thole_mutual: float = CLIFF_THOLE_SMEARING,
+    max_iterations: int = DEFAULT_INDUCTION_MAX_ITERATIONS,
+    convergence_threshold: float = EXPLICIT_INDUCTION_CONVERGENCE_THRESHOLD,
+    convergence_norm: str = EXPLICIT_INDUCTION_CONVERGENCE_NORM,
+    omega: float = EXPLICIT_INDUCTION_OMEGA,
+    solver: str = EXPLICIT_INDUCTION_SOLVER,
+) -> tuple[torch.Tensor, dict[str, bool | int | float]]:
+    """Interaction induction from explicit properties and global Thole constants.
+
+    Coordinates are Angstrom; charges, dipoles and polarizabilities are atomic
+    units. Edges are directed [2, n] local side indices. Permanent fields are
+    intermolecular only; mutual polarization includes AA, BB and AB relay.
+    This matches the existing no-overlap solver's energy and damping convention.
+    No quadrupoles enter this solver (as in the legacy induction implementation).
+    No widths, overlap head, pretrained model or energy rescaling is involved.
+
+    Default convergence uses the maximum dipole-component change, so a difficult
+    dimer cannot be diluted by other members of its batch.
+    Nonfinite or unconverged solves raise instead of emitting usable energies.
+    Positivity alone does not guarantee a stable polarization response.
+
+    ``solver="exact"`` solves the same linear equations directly, one dense
+    Cholesky factorization per dimer (see ``_rackers_exact_dipoles``), instead
+    of the omega-damped fixed-point loop. The loop diverges once any eigenvalue
+    of ``I - alpha^1/2 T alpha^1/2`` exceeds ``2 / omega`` even when the
+    response is physically stable; the exact solve fails only when that
+    operator is not positive definite (a true polarization catastrophe).
+    It ignores ``max_iterations``, ``convergence_threshold`` and ``omega``
+    and reports ``scf_iterations`` 0 and the residual of one fixed-point step
+    from its solution. Cost grows as (3 x atoms per dimer)^3.
+    """
+    (
+        thole_direct, thole_mutual, max_iterations,
+        convergence_threshold, convergence_norm, omega,
+    ) = _validate_explicit_induction_controls(
+        n_dimers, thole_direct, thole_mutual, max_iterations,
+        convergence_threshold, convergence_norm, omega, solver)
+    if (not len(RA) or not len(RB) or RA.shape != (len(alpha_A), 3) or
+            RB.shape != (len(alpha_B), 3) or muA.shape != RA.shape or
+            muB.shape != RB.shape or qA.shape != alpha_A.shape or
+            qB.shape != alpha_B.shape):
+        raise ValueError("explicit induction property shapes do not align")
+    for alpha in (alpha_A, alpha_B):
+        if not bool(torch.isfinite(alpha).all() & (alpha > 0).all()):
+            raise ValueError("polarizabilities must be finite and positive")
+    ab_s, ab_t = edges_AB
+    aa_s, aa_t = edges_AA
+    bb_s, bb_t = edges_BB
+
+    def tensors(
+        Ri: torch.Tensor, Rj: torch.Tensor, edges: torch.Tensor,
+        ali: torch.Tensor, alj: torch.Tensor, value: float, kind: str,
+    ) -> tuple[torch.Tensor, ...]:
+        damping = ali.new_full((edges.shape[1],), float(value))
+        return _rackers_distance_tensors(
+            Ri, Rj, edges[0], edges[1], ali, alj, damping, kind)
+
+    direct = tensors(RA, RB, edges_AB, alpha_A, alpha_B, thole_direct, "direct")
+    mutual = tensors(RA, RB, edges_AB, alpha_A, alpha_B, thole_mutual, "mutual")
+    aa = tensors(RA, RA, edges_AA, alpha_A, alpha_A, thole_mutual, "mutual")
+    bb = tensors(RB, RB, edges_BB, alpha_B, alpha_B, thole_mutual, "mutual")
+    if solver == "exact":
+        initial_a, initial_b = _rackers_initial_permanent_fields(
+            alpha_A, alpha_B, qA, muA, qB, muB,
+            ab_s, ab_t, aa_s, aa_t, bb_s, bb_t,
+            direct[3], direct[4], None, None, None, None,
+            intramolecular_permanent_field=False)
+        dip_a, dip_b = _rackers_exact_dipoles(
+            alpha_A, alpha_B, initial_a, initial_b, edges_AB, edges_AA, edges_BB,
+            mutual[4], aa[4], bb[4], molecule_ind_A, molecule_ind_B, n_dimers)
+        # One fixed-point step from the solution measures how well it
+        # satisfies the same equations the iterative solver relaxes.
+        plan = _rackers_scf_plan(alpha_A, alpha_B, ab_s, ab_t, aa_t, bb_t,
+                                 mutual[4], aa[4], bb[4])
+        step_a, step_b = _rackers_scf_step(
+            plan, ab_s, ab_t, aa_s, aa_t, bb_s, bb_t,
+            dip_a, dip_b, initial_a, initial_b)
+        residual = _scf_residual(step_a - dip_a, step_b - dip_b, convergence_norm)
+        iterations, converged = 0, bool(torch.isfinite(residual))
+    else:
+        solved = _rackers_converge_dipoles(
+            alpha_A, alpha_B, qA, muA, qB, muB,
+            ab_s, ab_t, aa_s, aa_t, bb_s, bb_t,
+            direct[3], direct[4], None, None, None, None,
+            mutual[4], aa[4], bb[4], max_iterations, convergence_threshold, omega,
+            convergence_norm=convergence_norm,
+            intramolecular_permanent_field=False)
+        dip_a, dip_b, initial_a, initial_b, iterations, residual, converged = solved
+    energy = _rackers_polarization_energy(
+        dip_a, initial_a, alpha_A, dip_b, initial_b, alpha_B,
+        molecule_ind_A, molecule_ind_B, n_dimers) * constants.h2kcalmol
+    if not converged or not bool(torch.isfinite(energy).all()):
+        raise RuntimeError("explicit induction failed to converge to finite energy")
+    diagnostics = {
+        "scf_converged": converged, "scf_iterations": iterations,
+        "scf_residual": float(residual.detach()),
+        "max_induced_dipole": float(torch.cat((dip_a, dip_b)).detach().norm(
+            dim=-1).max()),
+        "thole_direct": float(thole_direct), "thole_mutual": float(thole_mutual),
+    }
+    return energy, diagnostics
 
 
 def rackers_thole_induction(
