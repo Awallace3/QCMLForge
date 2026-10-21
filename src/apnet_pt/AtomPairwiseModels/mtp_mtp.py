@@ -1890,6 +1890,7 @@ def dimer_indices_excluding_elements(
 def _infer_atomtypeparamnn_from_state_dict(
     state_dict: dict,
     r_cut: float = 5.0,
+    config: dict | None = None,
 ):
     nested_atom_type = any(
         key.startswith("atom_model.param_readout_layers.") for key in state_dict
@@ -1897,7 +1898,8 @@ def _infer_atomtypeparamnn_from_state_dict(
     atom_model_state = _substate_dict(state_dict, "atom_model.")
     if nested_atom_type:
         atom_model = _infer_atomtypeparamnn_from_state_dict(
-            atom_model_state, r_cut=r_cut
+            atom_model_state, r_cut=r_cut,
+            config=(config or {}).get("atom_model_config"),
         )
     else:
         atom_model = _infer_atommpnn_from_state_dict(atom_model_state, r_cut=r_cut)
@@ -1916,7 +1918,7 @@ def _infer_atomtypeparamnn_from_state_dict(
     n_embed = int(first_weight.shape[1])
     n_neuron = int(first_weight.shape[0] // 2)
 
-    return AtomTypeParamNN(
+    model = AtomTypeParamNN(
         atom_model=atom_model,
         n_message=n_message,
         n_neuron=n_neuron,
@@ -1926,6 +1928,14 @@ def _infer_atomtypeparamnn_from_state_dict(
         n_params=n_params,
         freeze_atom_model=False,
     )
+    # Loaded weights define the predictions; the saved config restores the
+    # output map (config-free legacy weights stay raw).
+    mode = (config or {}).get("hfvr_output_mode", "raw")
+    if mode not in HFVR_OUTPUT_MODES:
+        raise ValueError(f"hfvr_output_mode must be one of {HFVR_OUTPUT_MODES}")
+    model.hfvr_output_mode = mode
+    model.hfvr_epsilon = float((config or {}).get("hfvr_epsilon", 1e-6))
+    return model
 
 
 def load_dimer_prop_from_checkpoint(
@@ -1950,6 +1960,7 @@ def load_dimer_prop_from_checkpoint(
     inferred_atom_type_param = _infer_atomtypeparamnn_from_state_dict(
         atom_type_param_state,
         r_cut=r_cut,
+        config=atom_type_param_config,
     )
     atom_type_param = AtomTypeParamNN(
         atom_model=inferred_atom_type_param.atom_model,
@@ -1970,6 +1981,8 @@ def load_dimer_prop_from_checkpoint(
         ),
         freeze_atom_model=False,
     )
+    atom_type_param.hfvr_output_mode = inferred_atom_type_param.hfvr_output_mode
+    atom_type_param.hfvr_epsilon = inferred_atom_type_param.hfvr_epsilon
 
     dimer_prop = DimerProp(
         ATParam=atom_type_param,
@@ -1981,7 +1994,21 @@ def load_dimer_prop_from_checkpoint(
     return dimer_prop
 
 
+HFVR_OUTPUT_MODES = ("raw", "softplus")
+
+
 class AtomTypeParamNN(nn.Module):
+    """Feature-based per-atom parameter head.
+
+    ``hfvr_output_mode='raw'`` (the default) returns the readout unchanged, as
+    every checkpoint before it was trained.  ``'softplus'`` maps channel zero
+    (the Hirshfeld volume ratio) to ``softplus(logit) + hfvr_epsilon`` in
+    ``forward`` and leaves the other channels raw; it is the output of heads
+    trained with that mode (pbe0-mbis-atom-hfvr-v2, source 42262433), whose
+    saved config names it.  Loading such a head without the mode would run its
+    weights through the raw output and give wrong ratios with no error.
+    """
+
     def __init__(
         self,
         atom_model: AtomMPNN = AtomMPNN(),
@@ -1992,8 +2019,18 @@ class AtomTypeParamNN(nn.Module):
         param_start_std=0.01,
         n_params=1,
         freeze_atom_model=True,
+        hfvr_output_mode: str = "raw",
+        hfvr_epsilon: float = 1e-6,
     ):
         super().__init__()
+        if hfvr_output_mode not in HFVR_OUTPUT_MODES:
+            raise ValueError(f"hfvr_output_mode must be one of {HFVR_OUTPUT_MODES}")
+        epsilon = float(hfvr_epsilon)
+        limits = torch.finfo(torch.float32)
+        if not math.isfinite(epsilon) or not limits.tiny <= epsilon <= limits.max:
+            raise ValueError("hfvr_epsilon must be finite, positive and float32-representable")
+        self.hfvr_output_mode = hfvr_output_mode
+        self.hfvr_epsilon = epsilon
         self.atom_model = atom_model
         if freeze_atom_model:
             self.atom_model.requires_grad_(False)
@@ -2035,6 +2072,15 @@ class AtomTypeParamNN(nn.Module):
                 for p in range(n_params)
             ]
         )
+        if self.hfvr_output_mode == "softplus":
+            # The guesses are physical ratios; store their inverse softplus so
+            # the untrained head still starts at them.
+            with torch.no_grad():
+                guess = self.guess_layer[0].weight
+                physical = guess - self.hfvr_epsilon
+                if not torch.isfinite(physical).all() or (physical <= 0).any():
+                    raise ValueError("initial HFVR guesses must exceed hfvr_epsilon")
+                guess.copy_(physical + torch.log(-torch.expm1(-physical)))
         # self.set_weights_excluding_guess(0.01)
 
         # readout layers for predicting multipoles from hidden states
@@ -2109,7 +2155,30 @@ class AtomTypeParamNN(nn.Module):
             "param_start_mean": self.param_start_mean,
             "param_start_std": self.param_start_std,
             "n_params": self.n_params,
+            "hfvr_output_mode": getattr(self, "hfvr_output_mode", "raw"),
+            "hfvr_epsilon": getattr(self, "hfvr_epsilon", 1e-6),
         }
+
+    def _transform_hfvr(self, parameters: torch.Tensor) -> torch.Tensor:
+        """Apply the head's channel-zero output map (identity in raw mode).
+
+        Half/bfloat16 logits are promoted to float32 so the positive floor
+        cannot underflow; nonfinite logits raise rather than being clamped.
+        """
+        if getattr(self, "hfvr_output_mode", "raw") == "raw":
+            return parameters
+        two_d = parameters.dim() == 2
+        p2 = parameters if two_d else parameters.unsqueeze(-1)
+        # contiguous like the producer's checked clone: CPU softplus on the
+        # strided column takes another kernel and differs by an ulp
+        logits = p2[:, :1].contiguous()
+        if logits.dtype in (torch.float16, torch.bfloat16):
+            logits = logits.float()
+        if not torch.isfinite(logits).all():
+            raise FloatingPointError("HFVR logits must be finite")
+        ratio = F.softplus(logits) + self.hfvr_epsilon
+        out = torch.cat((ratio, p2[:, 1:].to(ratio.dtype)), dim=-1)
+        return out if two_d else out.squeeze(-1)
 
     def get_model_info(self):
         """Return a ModelInfo describing this module for print_model_tree."""
@@ -2148,7 +2217,10 @@ class AtomTypeParamNN(nn.Module):
         print(model_tree_string(self, unicode=True))
 
     def forward(self, batch):
-        return self._raw_head_output(batch)
+        out = self._raw_head_output(batch)
+        if getattr(self, "hfvr_output_mode", "raw") == "raw":
+            return out
+        return (*out[:-1], self._transform_hfvr(out[-1]))
 
     def _raw_head_output(
         self,
@@ -7215,6 +7287,8 @@ class AM_DimerParam_Model:
                     param_start_std=config["param_start_std"],
                     n_params=config.get("n_params", 1),
                     freeze_atom_model=freeze_atom_model,
+                    hfvr_output_mode=config.get("hfvr_output_mode", "raw"),
+                    hfvr_epsilon=config.get("hfvr_epsilon", 1e-6),
                 )
             elif model_type == "RackersTholeDampingNN":
                 self.model = RackersTholeDampingNN(
@@ -10666,6 +10740,8 @@ class AtomTypeParamModel:
                 param_start_std=config["param_start_std"],
                 n_params=config.get("n_params", 1),
                 freeze_atom_model=freeze_atom_model,
+                hfvr_output_mode=config.get("hfvr_output_mode", "raw"),
+                hfvr_epsilon=config.get("hfvr_epsilon", 1e-6),
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)
