@@ -348,8 +348,9 @@ class AtomMPNN(MessagePassing):
         # Initial guesses
         charge = self.guess_layer(Z)
 
-        dipole = torch.zeros(natom, 3, dtype=torch.float32, device=Z.device)
-        qpole = torch.zeros(natom, 3, 3, dtype=torch.float32, device=Z.device)
+        # Accumulate in the model's dtype, so a float64 model stays float64.
+        dipole = torch.zeros(natom, 3, dtype=charge.dtype, device=Z.device)
+        qpole = torch.zeros(natom, 3, 3, dtype=charge.dtype, device=Z.device)
 
         # Edgeless atoms stay in place: the loop below hands them a zero message,
         # as TensorFlow AP-Net2 does.  Filtering them renumbered the message

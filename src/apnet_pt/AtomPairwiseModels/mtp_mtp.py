@@ -610,6 +610,20 @@ class DimerProp(nn.Module):
         self.set_forward(dimer_eval)
         return
 
+    def set_induction_solver(self, solver: str = "iterative") -> None:
+        """Select the Rackers induction solve ("iterative" or "exact").
+
+        A runtime control, not part of the checkpoint config: both solve the
+        same equations, so it never changes which weights are meaningful.
+        """
+        if solver not in RACKERS_INDUCTION_SOLVERS:
+            raise ValueError(f"induction solver must be one of "
+                             f"{list(RACKERS_INDUCTION_SOLVERS)}, got {solver!r}")
+        self.induction_solver = solver
+
+    def _induction_solver(self) -> str:
+        return getattr(self, "induction_solver", "iterative")
+
     def _polarizability_table(self) -> torch.Tensor:
         """The free-atom table the induction physics should use.
 
@@ -1075,11 +1089,14 @@ class DimerProp(nn.Module):
             polarizability_table=self._polarizability_table(),
             variational_energy=self.variational_induction,
             molecule_ind_A=(
-                batch.molecule_ind_A if self.variational_induction else None
+                batch.molecule_ind_A if self.variational_induction
+                or self._induction_solver() == "exact" else None
             ),
             molecule_ind_B=(
-                batch.molecule_ind_B if self.variational_induction else None
+                batch.molecule_ind_B if self.variational_induction
+                or self._induction_solver() == "exact" else None
             ),
+            solver=self._induction_solver(),
             return_diagnostics=self.collect_induction_diagnostics,
             max_iterations=self.induction_max_iterations,
             convergence_threshold=self.induction_convergence_threshold,
@@ -1890,6 +1907,7 @@ def dimer_indices_excluding_elements(
 def _infer_atomtypeparamnn_from_state_dict(
     state_dict: dict,
     r_cut: float = 5.0,
+    config: dict | None = None,
 ):
     nested_atom_type = any(
         key.startswith("atom_model.param_readout_layers.") for key in state_dict
@@ -1897,7 +1915,8 @@ def _infer_atomtypeparamnn_from_state_dict(
     atom_model_state = _substate_dict(state_dict, "atom_model.")
     if nested_atom_type:
         atom_model = _infer_atomtypeparamnn_from_state_dict(
-            atom_model_state, r_cut=r_cut
+            atom_model_state, r_cut=r_cut,
+            config=(config or {}).get("atom_model_config"),
         )
     else:
         atom_model = _infer_atommpnn_from_state_dict(atom_model_state, r_cut=r_cut)
@@ -1916,7 +1935,7 @@ def _infer_atomtypeparamnn_from_state_dict(
     n_embed = int(first_weight.shape[1])
     n_neuron = int(first_weight.shape[0] // 2)
 
-    return AtomTypeParamNN(
+    model = AtomTypeParamNN(
         atom_model=atom_model,
         n_message=n_message,
         n_neuron=n_neuron,
@@ -1926,6 +1945,14 @@ def _infer_atomtypeparamnn_from_state_dict(
         n_params=n_params,
         freeze_atom_model=False,
     )
+    # Loaded weights define the predictions; the saved config restores the
+    # output map (config-free legacy weights stay raw).
+    mode = (config or {}).get("hfvr_output_mode", "raw")
+    if mode not in HFVR_OUTPUT_MODES:
+        raise ValueError(f"hfvr_output_mode must be one of {HFVR_OUTPUT_MODES}")
+    model.hfvr_output_mode = mode
+    model.hfvr_epsilon = float((config or {}).get("hfvr_epsilon", 1e-6))
+    return model
 
 
 def load_dimer_prop_from_checkpoint(
@@ -1950,6 +1977,7 @@ def load_dimer_prop_from_checkpoint(
     inferred_atom_type_param = _infer_atomtypeparamnn_from_state_dict(
         atom_type_param_state,
         r_cut=r_cut,
+        config=atom_type_param_config,
     )
     atom_type_param = AtomTypeParamNN(
         atom_model=inferred_atom_type_param.atom_model,
@@ -1970,6 +1998,8 @@ def load_dimer_prop_from_checkpoint(
         ),
         freeze_atom_model=False,
     )
+    atom_type_param.hfvr_output_mode = inferred_atom_type_param.hfvr_output_mode
+    atom_type_param.hfvr_epsilon = inferred_atom_type_param.hfvr_epsilon
 
     dimer_prop = DimerProp(
         ATParam=atom_type_param,
@@ -1981,7 +2011,21 @@ def load_dimer_prop_from_checkpoint(
     return dimer_prop
 
 
+HFVR_OUTPUT_MODES = ("raw", "softplus")
+
+
 class AtomTypeParamNN(nn.Module):
+    """Feature-based per-atom parameter head.
+
+    ``hfvr_output_mode='raw'`` (the default) returns the readout unchanged, as
+    every checkpoint before it was trained.  ``'softplus'`` maps channel zero
+    (the Hirshfeld volume ratio) to ``softplus(logit) + hfvr_epsilon`` in
+    ``forward`` and leaves the other channels raw; it is the output of heads
+    trained with that mode (pbe0-mbis-atom-hfvr-v2, source 42262433), whose
+    saved config names it.  Loading such a head without the mode would run its
+    weights through the raw output and give wrong ratios with no error.
+    """
+
     def __init__(
         self,
         atom_model: AtomMPNN = AtomMPNN(),
@@ -1992,8 +2036,18 @@ class AtomTypeParamNN(nn.Module):
         param_start_std=0.01,
         n_params=1,
         freeze_atom_model=True,
+        hfvr_output_mode: str = "raw",
+        hfvr_epsilon: float = 1e-6,
     ):
         super().__init__()
+        if hfvr_output_mode not in HFVR_OUTPUT_MODES:
+            raise ValueError(f"hfvr_output_mode must be one of {HFVR_OUTPUT_MODES}")
+        epsilon = float(hfvr_epsilon)
+        limits = torch.finfo(torch.float32)
+        if not math.isfinite(epsilon) or not limits.tiny <= epsilon <= limits.max:
+            raise ValueError("hfvr_epsilon must be finite, positive and float32-representable")
+        self.hfvr_output_mode = hfvr_output_mode
+        self.hfvr_epsilon = epsilon
         self.atom_model = atom_model
         if freeze_atom_model:
             self.atom_model.requires_grad_(False)
@@ -2035,6 +2089,15 @@ class AtomTypeParamNN(nn.Module):
                 for p in range(n_params)
             ]
         )
+        if self.hfvr_output_mode == "softplus":
+            # The guesses are physical ratios; store their inverse softplus so
+            # the untrained head still starts at them.
+            with torch.no_grad():
+                guess = self.guess_layer[0].weight
+                physical = guess - self.hfvr_epsilon
+                if not torch.isfinite(physical).all() or (physical <= 0).any():
+                    raise ValueError("initial HFVR guesses must exceed hfvr_epsilon")
+                guess.copy_(physical + torch.log(-torch.expm1(-physical)))
         # self.set_weights_excluding_guess(0.01)
 
         # readout layers for predicting multipoles from hidden states
@@ -2109,7 +2172,30 @@ class AtomTypeParamNN(nn.Module):
             "param_start_mean": self.param_start_mean,
             "param_start_std": self.param_start_std,
             "n_params": self.n_params,
+            "hfvr_output_mode": getattr(self, "hfvr_output_mode", "raw"),
+            "hfvr_epsilon": getattr(self, "hfvr_epsilon", 1e-6),
         }
+
+    def _transform_hfvr(self, parameters: torch.Tensor) -> torch.Tensor:
+        """Apply the head's channel-zero output map (identity in raw mode).
+
+        Half/bfloat16 logits are promoted to float32 so the positive floor
+        cannot underflow; nonfinite logits raise rather than being clamped.
+        """
+        if getattr(self, "hfvr_output_mode", "raw") == "raw":
+            return parameters
+        two_d = parameters.dim() == 2
+        p2 = parameters if two_d else parameters.unsqueeze(-1)
+        # contiguous like the producer's checked clone: CPU softplus on the
+        # strided column takes another kernel and differs by an ulp
+        logits = p2[:, :1].contiguous()
+        if logits.dtype in (torch.float16, torch.bfloat16):
+            logits = logits.float()
+        if not torch.isfinite(logits).all():
+            raise FloatingPointError("HFVR logits must be finite")
+        ratio = F.softplus(logits) + self.hfvr_epsilon
+        out = torch.cat((ratio, p2[:, 1:].to(ratio.dtype)), dim=-1)
+        return out if two_d else out.squeeze(-1)
 
     def get_model_info(self):
         """Return a ModelInfo describing this module for print_model_tree."""
@@ -2148,7 +2234,10 @@ class AtomTypeParamNN(nn.Module):
         print(model_tree_string(self, unicode=True))
 
     def forward(self, batch):
-        return self._raw_head_output(batch)
+        out = self._raw_head_output(batch)
+        if getattr(self, "hfvr_output_mode", "raw") == "raw":
+            return out
+        return (*out[:-1], self._transform_hfvr(out[-1]))
 
     def _raw_head_output(
         self,
@@ -5130,8 +5219,14 @@ def _rackers_converge_dipoles(
     max_iterations, convergence_threshold, omega,
     convergence_norm=DEFAULT_INDUCTION_CONVERGENCE_NORM,
     intramolecular_permanent_field=False,
+    solver="iterative", molecule_ind_A=None, molecule_ind_B=None, n_dimers=None,
 ):
     """Solve the induced dipoles and report how the solve went.
+
+    ``solver="exact"`` solves the same equations with one dense Cholesky
+    system per dimer (`_rackers_exact_dipoles`; needs ``molecule_ind_A/B`` and
+    ``n_dimers``) and reports 0 iterations and the residual of one
+    fixed-point step from the solution.
 
     Factored out so the *same* solver can be run twice: once with the
     intermolecular edges present (the dimer) and once with them removed (the
@@ -5148,6 +5243,15 @@ def _rackers_converge_dipoles(
         direct_T1_BB, direct_T2_BB,
         intramolecular_permanent_field=intramolecular_permanent_field,
     )
+    if solver == "exact":
+        mu_A, mu_B, residual = _rackers_exact_solve(
+            alpha_A, alpha_B, mu_0_A, mu_0_B,
+            e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+            e_BB_source, e_BB_target,
+            mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
+            molecule_ind_A, molecule_ind_B, n_dimers, convergence_norm)
+        return (mu_A, mu_B, mu_0_A, mu_0_B, 0, residual,
+                bool(torch.isfinite(residual)))
     mu_A, mu_B = mu_0_A.clone(), mu_0_B.clone()
     iterations = 0
     residual = torch.zeros((), device=mu_A.device, dtype=mu_A.dtype)
@@ -5258,6 +5362,42 @@ def _rackers_exact_dipoles(
     y = torch.cholesky_solve(rhs.unsqueeze(-1), factor).squeeze(-1)
     mu = (y * scale).reshape(n_dimers, n_max, 3)[dimer, slot]
     return mu[:n_A], mu[n_A:]
+
+
+RACKERS_INDUCTION_SOLVERS = ("iterative", "exact")
+
+
+def _rackers_exact_solve(
+    alpha_A, alpha_B, mu_0_A, mu_0_B,
+    e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+    e_BB_source, e_BB_target,
+    mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
+    molecule_ind_A, molecule_ind_B, n_dimers, convergence_norm,
+):
+    """Exact induced dipoles of the Rackers SCF plus the residual of one
+    fixed-point step from them (the iterative solver's convergence measure).
+
+    Raises ``RuntimeError`` on a polarization catastrophe (no positive-definite
+    response), where the damped iteration would diverge instead.
+    """
+    if molecule_ind_A is None or molecule_ind_B is None or n_dimers is None:
+        raise ValueError("the exact induction solve needs molecule_ind_A/B "
+                         "and n_dimers to form one system per dimer")
+    mu_A, mu_B = _rackers_exact_dipoles(
+        alpha_A, alpha_B, mu_0_A, mu_0_B,
+        torch.stack((e_AB_source, e_AB_target)),
+        torch.stack((e_AA_source, e_AA_target)),
+        torch.stack((e_BB_source, e_BB_target)),
+        mutual_T2_AB, mutual_T2_AA, mutual_T2_BB,
+        molecule_ind_A, molecule_ind_B, n_dimers)
+    plan = _rackers_scf_plan(alpha_A, alpha_B, e_AB_source, e_AB_target,
+                             e_AA_target, e_BB_target,
+                             mutual_T2_AB, mutual_T2_AA, mutual_T2_BB)
+    step_A, step_B = _rackers_scf_step(
+        plan, e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+        e_BB_source, e_BB_target, mu_A, mu_B, mu_0_A, mu_0_B)
+    return mu_A, mu_B, _scf_residual(step_A - mu_A, step_B - mu_B,
+                                     convergence_norm)
 
 
 def _require_real(value, name: str) -> None:
@@ -5462,8 +5602,18 @@ def rackers_thole_induction(
     molecule_ind_A: torch.Tensor | None = None,
     molecule_ind_B: torch.Tensor | None = None,
     intramolecular_permanent_field: bool = False,
+    solver: str = "iterative",
 ) -> torch.Tensor:
     """Compute Rackers induction with distinct direct and mutual damping.
+
+    ``solver="exact"`` replaces the omega-damped fixed-point loop by one dense
+    Cholesky solve per dimer of the same equations (``molecule_ind_A/B``
+    required).  The loop diverges once an eigenvalue of
+    I - alpha^1/2 T alpha^1/2 exceeds 2/omega although the response may still
+    be stable; the exact solve fails (``RuntimeError``) only on a true
+    polarization catastrophe.  Where the loop converges the two agree to its
+    threshold.  ``scf_iterations`` is then 0 and ``scf_residual`` is one
+    fixed-point step from the solution.
 
     ``return_diagnostics`` additionally returns the audit quantities that
     `ARCHITECTURE_HANDOFF.md` asks for before any induction redesign: the SCF
@@ -5487,6 +5637,14 @@ def rackers_thole_induction(
     unchanged.
     """
     del quadA, quadB
+    if solver not in RACKERS_INDUCTION_SOLVERS:
+        raise ValueError(f"induction solver must be one of "
+                         f"{list(RACKERS_INDUCTION_SOLVERS)}, got {solver!r}")
+    n_dimers_exact = None
+    if solver == "exact":
+        if molecule_ind_A is None or molecule_ind_B is None:
+            raise ValueError("solver='exact' requires molecule_ind_A/molecule_ind_B")
+        n_dimers_exact = int(torch.cat((molecule_ind_A, molecule_ind_B)).max()) + 1
     polarizability_table = _polarizability_table_on_device(
         polarizability_table,
         ZA.device,
@@ -5646,7 +5804,15 @@ def rackers_thole_induction(
         mutual_tensors_AA[4],
         mutual_tensors_BB[4],
     )
-    for _ in range(max_iterations):
+    if solver == "exact":
+        mu_induced_A, mu_induced_B, scf_residual = _rackers_exact_solve(
+            alpha_A, alpha_B, mu_induced_0_A, mu_induced_0_B,
+            e_AB_source, e_AB_target, e_AA_source, e_AA_target,
+            e_BB_source, e_BB_target,
+            mutual_tensors_AB[4], mutual_tensors_AA[4], mutual_tensors_BB[4],
+            molecule_ind_A, molecule_ind_B, n_dimers_exact, convergence_norm)
+        scf_converged = bool(torch.isfinite(scf_residual))
+    for _ in range(0 if solver == "exact" else max_iterations):
         scf_iterations += 1
         # No clone: see _rackers_converge_dipoles. The iterates are rebound,
         # never written through.
@@ -5753,6 +5919,8 @@ def rackers_thole_induction(
             max_iterations, convergence_threshold, omega,
             convergence_norm=convergence_norm,
             intramolecular_permanent_field=intramolecular_permanent_field,
+            solver=solver, molecule_ind_A=molecule_ind_A,
+            molecule_ind_B=molecule_ind_B, n_dimers=n_dimers,
         )
         energy_dimer = _rackers_polarization_energy(
             mu_induced_A, mu_induced_0_A, alpha_A,
@@ -7219,6 +7387,8 @@ class AM_DimerParam_Model:
                     param_start_std=config["param_start_std"],
                     n_params=config.get("n_params", 1),
                     freeze_atom_model=freeze_atom_model,
+                    hfvr_output_mode=config.get("hfvr_output_mode", "raw"),
+                    hfvr_epsilon=config.get("hfvr_epsilon", 1e-6),
                 )
             elif model_type == "RackersTholeDampingNN":
                 self.model = RackersTholeDampingNN(
@@ -10670,6 +10840,8 @@ class AtomTypeParamModel:
                 param_start_std=config["param_start_std"],
                 n_params=config.get("n_params", 1),
                 freeze_atom_model=freeze_atom_model,
+                hfvr_output_mode=config.get("hfvr_output_mode", "raw"),
+                hfvr_epsilon=config.get("hfvr_epsilon", 1e-6),
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)
