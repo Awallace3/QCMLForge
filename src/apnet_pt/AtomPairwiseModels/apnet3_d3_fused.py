@@ -36,6 +36,7 @@ from ..training_tracking import (
     tracked_ddp_worker,
 )
 from ..util import scatter_sum_compile
+from .painn_monomer import PaiNNMonomer
 from ..pt_datasets.shard_locality import ShardBlockSampler
 from typing import Optional
 import os
@@ -57,6 +58,9 @@ from .mtp_mtp import (
     isolate_atom_parameter_predictions_ap3,
     load_dimer_prop_from_checkpoint,
 )
+
+
+MONOMER_MPNNS = ("ap3", "painn")
 
 
 def _omitted_metrics(harness) -> tuple[str, ...]:
@@ -477,8 +481,17 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         d3_damping_parameters=None,
         sr_switch=False,
         sr_fade=None,
+        monomer_mpnn="ap3",
+        painn_width=128,
+        painn_layer_norm=True,
     ):
         super().__init__()
+        if monomer_mpnn not in MONOMER_MPNNS:
+            raise ValueError(f"monomer_mpnn must be one of {MONOMER_MPNNS}")
+        # The intramonomer featurization: AP3's invariant/directional MPNN, or
+        # an equivariant PaiNN (painn_monomer.py) whose scalars and vectors
+        # stand in for h and h_dir.
+        self.monomer_mpnn = monomer_mpnn
         self.dimer_prop_model = dimer_prop_model
         self.n_message = n_message
         self.n_rbf = n_rbf
@@ -546,10 +559,11 @@ class APNet3D3_AtomType_MPNN(nn.Module):
 
         # embed interatomic distances into large orthogonal basis
         self.distance_layer_im = DistanceLayer(n_rbf, self.r_cut_im)
-        self.distance_layer = DistanceLayer(n_rbf, self.r_cut)
+        if monomer_mpnn == "ap3":
+            self.distance_layer = DistanceLayer(n_rbf, self.r_cut)
 
-        # embed atom types
-        self.embed_layer = nn.Embedding(max_Z + 1, n_embed)
+            # embed atom types
+            self.embed_layer = nn.Embedding(max_Z + 1, n_embed)
 
         # readout layers for predicting final interaction energies
         self.readout_layer_elst = self._make_layers(
@@ -565,6 +579,12 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             self.readout_layer_disp = self._make_layers(
                 layer_nodes_readout, layer_activations
             )
+
+        if monomer_mpnn == "painn":
+            self.painn_monomer = PaiNNMonomer(
+                width=painn_width, n_interactions=n_message, n_rbf=n_rbf,
+                r_cut=r_cut, layer_norm=painn_layer_norm, max_z=max_Z)
+            return
 
         # update layers for hidden states
         self.update_layers = nn.ModuleList()
@@ -606,6 +626,10 @@ class APNet3D3_AtomType_MPNN(nn.Module):
             "d3_damping_parameters": deepcopy(self.d3_damping_parameters),
             "sr_switch": self.sr_switch,
             "sr_fade": None if self.sr_fade is None else list(self.sr_fade),
+            "monomer_mpnn": self.monomer_mpnn,
+            **({"painn_width": self.painn_monomer.width,
+                "painn_layer_norm": self.painn_monomer.layer_norm}
+               if self.monomer_mpnn == "painn" else {}),
         }
 
     def get_model_info(self):
@@ -687,7 +711,12 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         Messages never cross monomers, so ``Z``/``R`` may hold several
         monomers (both of a dimer, or a batch) as long as the edges stay
         within each.  ``forward`` calls this once for A and once for B.
+
+        With ``monomer_mpnn="painn"`` these are PaiNN's scalar and vector
+        channels: [natom, painn_width] and [natom, 3, painn_width].
         """
+        if self.monomer_mpnn == "painn":
+            return self.painn_monomer(Z, R, e_source, e_target)
         # TODO: need to handle single atoms correctly without self edge because
         # this goes to zero causing nans later...
         dR, dR_xyz = self.get_distances(R, R, e_source, e_target)
@@ -1281,6 +1310,9 @@ class APNet3D3_AtomType_Model:
                 d3_damping_parameters=resolved_d3_damping_parameters,
                 sr_switch=sr_switch,
                 sr_fade=sr_fade,
+                monomer_mpnn=config.get("monomer_mpnn", "ap3"),
+                painn_width=config.get("painn_width", 128),
+                painn_layer_norm=config.get("painn_layer_norm", True),
             )
             model_state_dict = model_io.load_state_dict_from_checkpoint(checkpoint)
             self.model.load_state_dict(model_state_dict)

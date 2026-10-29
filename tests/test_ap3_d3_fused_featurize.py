@@ -84,3 +84,88 @@ def test_monomers_featurize_together(ap3d3_and_batch):
                                              batch.e_BB_target)
     assert torch.allclose(h, torch.cat([hA, hB]), atol=1e-6)
     assert torch.allclose(h_dir, torch.cat([hA_dir, hB_dir]), atol=1e-6)
+
+
+# ------------------------------------------------- monomer_mpnn="painn"
+def _rotation(seed=0):
+    g = torch.Generator().manual_seed(seed)
+    q, _ = torch.linalg.qr(torch.randn(3, 3, generator=g))
+    return q * torch.sign(torch.det(q))
+
+
+def _painn_pair_model(ap3d3):
+    from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_MPNN
+
+    torch.manual_seed(1)
+    model = APNet3D3_AtomType_MPNN(
+        ap3d3.model.dimer_prop_model, r_cut_im=4.0, sr_switch=True,
+        use_precomputed_classical=True, monomer_mpnn="painn", painn_width=16)
+    model.eval()
+    return model
+
+
+def test_painn_monomer_scalars_are_invariant_and_vectors_rotate():
+    from apnet_pt.AtomPairwiseModels.painn_monomer import PaiNNMonomer
+
+    torch.manual_seed(0)
+    painn = PaiNNMonomer(width=16, n_interactions=3, n_rbf=8, r_cut=5.0)
+    Z = torch.tensor([8, 1, 1, 6, 1])
+    R = torch.randn(5, 3)
+    i, j = torch.where(~torch.eye(5, dtype=torch.bool))
+    Q = _rotation()
+    with torch.no_grad():
+        s, v = painn(Z, R, i, j)
+        s_rot, v_rot = painn(Z, R @ Q.T + 1.5, i, j)
+    assert torch.allclose(s, s_rot, atol=1e-5)
+    assert torch.allclose(torch.einsum("xy,ayf->axf", Q, v), v_rot, atol=1e-5)
+    assert float(v.abs().max()) > 0
+
+
+def test_painn_pair_model_is_rotation_invariant(ap3d3_and_batch):
+    ap3d3, batch = ap3d3_and_batch
+    model = _painn_pair_model(ap3d3)
+    assert not any(n.startswith(("update_layers", "directional_layers",
+                                 "embed_layer", "distance_layer."))
+                   for n, _ in model.named_parameters())
+    rotated = batch.clone()
+    Q = _rotation(3)
+    rotated.RA = batch.RA @ Q.T
+    rotated.RB = batch.RB @ Q.T
+    with torch.no_grad():
+        h, h_dir = model.featurize_monomer(batch.ZA, batch.RA, batch.e_AA_source,
+                                           batch.e_AA_target)
+        E = model(batch)[1]
+        E_rot = model(rotated)[1]
+    assert h.shape == (batch.ZA.size(0), 16) and h_dir.shape[1:] == (3, 16)
+    assert float(E.abs().max()) > 0
+    assert torch.allclose(E, E_rot, atol=1e-5)
+
+
+def test_painn_pair_model_trains_every_parameter_and_round_trips(ap3d3_and_batch):
+    from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_MPNN
+
+    ap3d3, batch = ap3d3_and_batch
+    model = _painn_pair_model(ap3d3)
+    model.train()
+    model(batch)[1].sum().backward()
+    dead = [n for n, p in model.named_parameters()
+            if p.requires_grad and not n.startswith(("dimer_prop_model",
+                                                     "readout_layer_disp"))
+            and (p.grad is None or not p.grad.any())]
+    assert not dead, dead
+    config = model.get_config()
+    assert config["monomer_mpnn"] == "painn" and config["painn_width"] == 16
+    kwargs = {k: config[k] for k in ("n_message", "n_rbf", "n_neuron", "n_embed",
+                                     "r_cut_im", "r_cut", "monomer_mpnn",
+                                     "painn_width", "painn_layer_norm")}
+    again = APNet3D3_AtomType_MPNN(ap3d3.model.dimer_prop_model,
+                                   use_precomputed_classical=True, **kwargs)
+    again(batch)  # materialise the lazy readouts before loading
+    again.load_state_dict(model.state_dict())
+
+
+def test_unknown_monomer_mpnn_is_refused(ap3d3_and_batch):
+    from apnet_pt.AtomPairwiseModels.apnet3_d3_fused import APNet3D3_AtomType_MPNN
+
+    with pytest.raises(ValueError, match="monomer_mpnn"):
+        APNet3D3_AtomType_MPNN(None, monomer_mpnn="schnet")
