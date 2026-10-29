@@ -678,6 +678,44 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         m_ij = torch.cat([h_all, h_all_dot, rbf], dim=-1)
         return m_ij
 
+    def featurize_monomer(self, Z, R, e_source, e_target):
+        """Intramonomer message passing: one monomer's atom features.
+
+        Returns ``(h, h_dir)``: ``h`` [natom, n_embed * (n_message + 1)] is
+        the embedding and every update's invariant state, concatenated;
+        ``h_dir`` [natom, 3, n_embed * n_message] the directional states.
+        Messages never cross monomers, so ``Z``/``R`` may hold several
+        monomers (both of a dimer, or a batch) as long as the edges stay
+        within each.  ``forward`` calls this once for A and once for B.
+        """
+        # TODO: need to handle single atoms correctly without self edge because
+        # this goes to zero causing nans later...
+        dR, dR_xyz = self.get_distances(R, R, e_source, e_target)
+        dR_unit = dR_xyz / dR.unsqueeze(1)
+        rbf = self.distance_layer(dR)
+        natom = Z.size(0)
+
+        # invariant and directional hidden state lists
+        h_list = [self.embed_layer(Z).view(natom, -1)]
+        h_dir_list = []
+        for i in range(self.n_message):
+            m_ij = self.get_messages(h_list[0], h_list[-1], rbf, e_source, e_target)
+
+            # invariant: sum each atom's messages, then update
+            m_i = scatter_sum_compile(m_ij, e_source, int(natom))
+            h_list.append(self.update_layers[i](m_i))
+
+            # directional: sum directional messages to get directional atomic
+            # hidden states.  NOTE: this summation must be linear to guarantee
+            # equivariance; because of this constraint, we applied a dense net
+            # before the summation, not after
+            m_ij_dir = self.directional_layers[i](m_ij)
+            m_ij_dir = torch.einsum("ex,em->exm", dR_unit, m_ij_dir)
+            h_dir_list.append(scatter_sum_compile(m_ij_dir, e_source, int(natom)))
+
+        # concatenate hidden states over MP iterations
+        return torch.cat(h_list, dim=-1), torch.cat(h_dir_list, dim=-1)
+
     def get_pair(self, hA, hB, qA, qB, rbf, e_source, e_target):
         hA_source = hA.index_select(0, e_source)
         hB_target = hB.index_select(0, e_target)
@@ -772,8 +810,6 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         e_BB_source = batch.e_BB_source
         e_BB_target = batch.e_BB_target
         # counts
-        natomA = ZA.size(0)
-        natomB = ZB.size(0)
         ndimer = batch.total_charge_A.size(0)
 
         # interatomic distances
@@ -789,20 +825,11 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         dimer_ind = dimer_ind[keep]
         dR_sr = dR_sr[keep]
         dR_sr_xyz = dR_sr_xyz[keep]
-        # TODO: need to handle single atoms correctly without self edge because
-        # this goes to zero causing nans later...
-        dRA, dRA_xyz = self.get_distances(RA, RA, e_AA_source, e_AA_target)
-        dRB, dRB_xyz = self.get_distances(RB, RB, e_BB_source, e_BB_target)
-
         # interatomic unit vectors
         dR_sr_unit = dR_sr_xyz / dR_sr.unsqueeze(1)
-        dRA_unit = dRA_xyz / dRA.unsqueeze(1)
-        dRB_unit = dRB_xyz / dRB.unsqueeze(1)
 
         # distance encodings
         rbf_sr = self.distance_layer_im(dR_sr)
-        rbfA = self.distance_layer(dRA)
-        rbfB = self.distance_layer(dRB)
 
         ##########################################################
         ### predict monomer properties w/ pretrained AtomModel ###
@@ -833,65 +860,8 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         ### predict SAPT components via intramonomer message passing ###
         ################################################################
 
-        # invariant hidden state lists
-        hA_list = [self.embed_layer(ZA).view(ZA.size(0), -1)]
-        hB_list = [self.embed_layer(ZB).view(ZB.size(0), -1)]
-
-        # directional hidden state lists
-        hA_dir_list = []
-        hB_dir_list = []
-
-        # TODO: need to determine how to handle all monA in batch having no
-        # monomer edges (single atoms)
-        for i in range(self.n_message):
-            mA_ij = self.get_messages(
-                hA_list[0], hA_list[-1], rbfA, e_AA_source, e_AA_target
-            )
-            mB_ij = self.get_messages(
-                hB_list[0], hB_list[-1], rbfB, e_BB_source, e_BB_target
-            )
-            if mA_ij is None or mB_ij is None:
-                # Single-atom corner case; skip
-                hA_list.append(hA_list[-1])
-                hB_list.append(hB_list[-1])
-                continue
-
-            #################
-            ### invariant ###
-            #################
-
-            # sum each atom's messages
-            mA_i = scatter_sum_compile(mA_ij, e_AA_source, int(natomA))
-            mB_i = scatter_sum_compile(mB_ij, e_BB_source, int(natomB))
-
-            # get the next hidden state of the atom
-            hA_next = self.update_layers[i](mA_i)
-            hB_next = self.update_layers[i](mB_i)
-
-            hA_list.append(hA_next)
-            hB_list.append(hB_next)
-
-            ###################
-            ### directional ###
-            ###################
-
-            mA_ij_dir = self.directional_layers[i](mA_ij)
-            mB_ij_dir = self.directional_layers[i](mB_ij)
-            mA_ij_dir = torch.einsum("ex,em->exm", dRA_unit, mA_ij_dir)
-            mB_ij_dir = torch.einsum("ex,em->exm", dRB_unit, mB_ij_dir)
-
-            # sum directional messages to get directional atomic hidden states
-            # NOTE: this summation must be linear to guarantee equivariance.
-            #       because of this constraint, we applied a dense net before
-            #       the summation, not after
-            hA_dir = scatter_sum_compile(mA_ij_dir, e_AA_source, int(natomA))
-            hB_dir = scatter_sum_compile(mB_ij_dir, e_BB_source, int(natomB))
-            hA_dir_list.append(hA_dir)
-            hB_dir_list.append(hB_dir)
-
-        # concatenate hidden states over MP iterations
-        hA = torch.cat(hA_list, dim=-1)
-        hB = torch.cat(hB_list, dim=-1)
+        hA, hA_dir = self.featurize_monomer(ZA, RA, e_AA_source, e_AA_target)
+        hB, hB_dir = self.featurize_monomer(ZB, RB, e_BB_source, e_BB_target)
 
         # atom-pair features are a combo of atomic hidden states and the interatomic distance
         hAB = self.get_pair_params(
@@ -904,9 +874,6 @@ class APNet3D3_AtomType_MPNN(nn.Module):
         # hBA = self.get_pair(hB, hA, qB, qA, rbf_sr, e_ABsr_target, e_ABsr_source)
 
         # project the directional atomic hidden states along the interatomic axis
-        hA_dir = torch.cat(hA_dir_list, dim=-1)
-        hB_dir = torch.cat(hB_dir_list, dim=-1)
-
         hA_dir_source = hA_dir.index_select(0, e_ABsr_source)
         hB_dir_target = hB_dir.index_select(0, e_ABsr_target)
 
