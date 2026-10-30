@@ -116,15 +116,20 @@ def elst_uQ_QQ(dR, dR_xyz, oodR, delta, muA, muB, quadA, quadB):
     return E_uQ + E_QQ
 
 
+def validate_checkpoint_metric(metric: str) -> None:
+    """Raise ``ValueError`` unless ``metric`` names a checkpoint selector."""
+    if metric not in _CHECKPOINT_METRICS:
+        raise ValueError(
+            f"checkpoint metric must be one of {sorted(_CHECKPOINT_METRICS)}, "
+            f"got {metric!r}"
+        )
+
+
 def checkpoint_score(
     metric: str,
     component_mse: torch.Tensor,
     total_mae: torch.Tensor,
 ) -> torch.Tensor:
     """Return the configured validation quantity used to select a checkpoint."""
-    if metric not in _CHECKPOINT_METRICS:
-        raise ValueError(
-            f"checkpoint metric must be one of {sorted(_CHECKPOINT_METRICS)}, "
-            f"got {metric!r}"
-        )
+    validate_checkpoint_metric(metric)
     return component_mse if metric == "component_mse" else total_mae

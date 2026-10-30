@@ -25,6 +25,7 @@ from .. import constants
 from ..hf_pretrained import resolve_pretrained_path
 from .. import model_io
 from ..distributed_metrics import globally_reduced_mae
+from .component_losses import per_component_mse, validate_loss_route
 from ..training_tracking import (
     TrackerBackend,
     WandbConfig,
@@ -36,6 +37,7 @@ from ..training_tracking import (
     tracked_ddp_worker,
 )
 from ..util import scatter_sum_compile
+from .apnet2_parity import checkpoint_score, validate_checkpoint_metric
 from ..pt_datasets.shard_locality import ShardBlockSampler
 from typing import Optional
 import os
@@ -413,9 +415,12 @@ class APNet3D3_AtomType_MPNN(nn.Module):
     def get_messages(self, h0, h, rbf, e_source, e_target):
         nedge = e_source.numel()
         if nedge == 0:
-            # No intramolecular edges
+            # No intramolecular edges; match h's device/dtype for the scatter.
             return torch.zeros(
-                0, self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf
+                0,
+                self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf,
+                dtype=h.dtype,
+                device=h.device,
             )
 
         h0_source = h0.index_select(0, e_source)
@@ -2443,7 +2448,21 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
+        )
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     # @torch.inference_mode()
     def __evaluate_batches_single_proc(
@@ -2482,7 +2501,21 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
+        )
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     def __train_batches_single_proc_transfer(
         self, dataloader, loss_fn, optimizer, rank_device, scheduler
@@ -2499,11 +2532,13 @@ units angstrom
             E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.model(batch)
             preds = E_sr_dimer.reshape(-1, 4)
             preds = torch.sum(preds, dim=1)
-            comp_errors = preds - batch.y.squeeze(-1)
+            # reshape, not broadcast: a label-count mismatch must raise.
+            labels = batch.y.reshape(preds.shape)
+            comp_errors = preds - labels
             batch_loss = (
                 torch.mean(torch.square(comp_errors))
-                if (loss_fn is None)
-                else loss_fn(preds, batch.y)
+                if loss_fn is None
+                else loss_fn(preds, labels)
             )
             batch_loss.backward()
             optimizer.step()
@@ -2527,11 +2562,13 @@ units angstrom
                 E_sr_dimer, _, _, _, _, _ = self.model(batch)
                 preds = E_sr_dimer.reshape(-1, 4)
                 preds = torch.sum(preds, dim=1)
-                comp_errors = preds - batch.y.squeeze(-1)
+                # reshape, not broadcast: a label-count mismatch must raise.
+                labels = batch.y.reshape(preds.shape)
+                comp_errors = preds - labels
                 batch_loss = (
                     torch.mean(torch.square(comp_errors))
-                    if (loss_fn is None)
-                    else loss_fn(preds.flatten(), batch.y.flatten())
+                    if loss_fn is None
+                    else loss_fn(preds, labels)
                 )
                 total_loss += batch_loss.item()
                 comp_errors_t.append(comp_errors.detach().cpu())
@@ -2636,7 +2673,21 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
+        )
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     def __evaluate_batches_fsapt_single_proc(
         self, dataloader, loss_fn, rank_device, include_total_mse=False
@@ -2728,7 +2779,21 @@ units angstrom
             if self.model.no_disp_nn
             else torch.mean(torch.abs(comp_errors_t[:, 3]))
         )
-        return total_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t
+        elst_MSE_t, exch_MSE_t, indu_MSE_t, disp_MSE_t = per_component_mse(
+            comp_errors_t
+        )
+        return (
+            total_loss,
+            total_MAE_t,
+            elst_MAE_t,
+            exch_MAE_t,
+            indu_MAE_t,
+            disp_MAE_t,
+            elst_MSE_t,
+            exch_MSE_t,
+            indu_MSE_t,
+            disp_MSE_t,
+        )
 
     ########################################################################
     # SINGLE-PROCESS TRAINING
@@ -2877,6 +2942,8 @@ units angstrom
         lr_decay=None,
         end_lr=None,
         include_total_mse=False,
+        loss_fn=None,
+        checkpoint_metric="component_mse",
     ):
         print(f"{self.device.type=}")
         if self.device.type == "cpu":
@@ -2974,7 +3041,8 @@ units angstrom
             )
         else:
             scheduler = None
-        criterion = None
+        # None falls back to the inlined unweighted component MSE.
+        criterion = loss_fn
         lowest_test_loss = torch.tensor(float("inf"))
         self.model = self.model.to(rank_device)
 
@@ -3059,8 +3127,11 @@ units angstrom
             )
 
             if rank == 0:
-                if test_loss < lowest_test_loss:
-                    lowest_test_loss = test_loss
+                validation_score = checkpoint_score(
+                    checkpoint_metric, test_loss, total_MAE_v
+                )
+                if validation_score < lowest_test_loss:
+                    lowest_test_loss = validation_score
                     test_lowered = "*"
                     if self.model_save_path:
                         print("Saving model")
@@ -3129,6 +3200,8 @@ units angstrom
         skip_compile=False,
         transfer_learning=False,
         include_total_mse=False,
+        loss_fn=None,
+        checkpoint_metric="component_mse",
     ):
         # (1) Compile Model
         rank_device = self.device
@@ -3242,8 +3315,8 @@ units angstrom
                 if lr_decay
                 else None
             )
-        # criterion = None  # defaults to MSE
-        criterion = torch.nn.MSELoss()
+        # The criterion these loops have always used, unless one is selected.
+        criterion = torch.nn.MSELoss() if loss_fn is None else loss_fn
 
         # (4) Set eval functions
         if is_fsapt:
@@ -3300,12 +3373,30 @@ units angstrom
             **component_batch_kwargs,
         )
         if is_fsapt or not transfer_learning:
-            train_loss, total_MAE_t, elst_MAE_t, exch_MAE_t, indu_MAE_t, disp_MAE_t = (
-                t_out
-            )
-            test_loss, total_MAE_v, elst_MAE_v, exch_MAE_v, indu_MAE_v, disp_MAE_v = (
-                v_out
-            )
+            (
+                train_loss,
+                total_MAE_t,
+                elst_MAE_t,
+                exch_MAE_t,
+                indu_MAE_t,
+                disp_MAE_t,
+                elst_MSE_t,
+                exch_MSE_t,
+                indu_MSE_t,
+                disp_MSE_t,
+            ) = t_out
+            (
+                test_loss,
+                total_MAE_v,
+                elst_MAE_v,
+                exch_MAE_v,
+                indu_MAE_v,
+                disp_MAE_v,
+                elst_MSE_v,
+                exch_MSE_v,
+                indu_MSE_v,
+                disp_MSE_v,
+            ) = v_out
             if self.model.no_disp_nn:
                 print(
                     f"  (Pre-training)({time.time() - t0: < 7.2f}s)  MAE: {
@@ -3335,7 +3426,9 @@ units angstrom
         )
 
         # (6) Main training loop
-        lowest_test_loss = test_loss
+        lowest_test_loss = checkpoint_score(
+            checkpoint_metric, test_loss, total_MAE_v
+        )
         model_saved = False
         for epoch in range(n_epochs):
             # Re-draw which shards share a block, so a dimer's batch-mates
@@ -3370,6 +3463,10 @@ units angstrom
                     exch_MAE_t,
                     indu_MAE_t,
                     disp_MAE_t,
+                    elst_MSE_t,
+                    exch_MSE_t,
+                    indu_MSE_t,
+                    disp_MSE_t,
                 ) = t_out
                 (
                     test_loss,
@@ -3378,6 +3475,10 @@ units angstrom
                     exch_MAE_v,
                     indu_MAE_v,
                     disp_MAE_v,
+                    elst_MSE_v,
+                    exch_MSE_v,
+                    indu_MSE_v,
+                    disp_MSE_v,
                 ) = v_out
             else:
                 train_loss, total_MAE_t = t_out
@@ -3385,8 +3486,11 @@ units angstrom
 
             # Track best model
             star_marker = " "
-            if test_loss < lowest_test_loss:
-                lowest_test_loss = test_loss
+            validation_score = checkpoint_score(
+                checkpoint_metric, test_loss, total_MAE_v
+            )
+            if validation_score < lowest_test_loss:
+                lowest_test_loss = validation_score
                 star_marker = "*"
                 cpu_model = model_io.unwrap_model(self.model).to("cpu")
                 best_model = deepcopy(cpu_model)
@@ -3466,6 +3570,8 @@ units angstrom
         skip_compile=True,
         transfer_learning=False,
         include_total_mse=False,
+        loss_fn=None,
+        checkpoint_metric="component_mse",
         shard_locality_block_shards=0,
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
@@ -3475,6 +3581,7 @@ units angstrom
         hyperparameters match the defaults in the original code:
         https://chemrxiv.org/engage/chemrxiv/article-details/65ccd41866c1381729a2b885
         """
+        validate_loss_route(loss_fn, transfer_learning=transfer_learning)
         if dataset is not None:
             self.dataset = dataset
         elif dataset is not None:
@@ -3482,6 +3589,9 @@ units angstrom
             self.dataset = dataset
         if self.dataset is None:
             raise ValueError("No dataset provided")
+        # Checked up front: the selector is first consulted after the
+        # pre-training evaluation, which is too late to find a typo.
+        validate_checkpoint_metric(checkpoint_metric)
         np.random.seed(random_seed)
         self.model_save_path = model_path
         print(f"Saving training results to...\n{model_path}")
@@ -3531,6 +3641,7 @@ units angstrom
         print(f"  {lr_decay=}\n", flush=True)
         print(f"  {end_lr=}\n", flush=True)
         print(f"  {include_total_mse=}\n", flush=True)
+        print(f"  {checkpoint_metric=}", flush=True)
         # Read back off `self` by both training paths.  `ddp_train` is handed
         # to `mp.spawn` as a bound method, so `self` is pickled to every rank
         # and this travels with it -- no signature change on either worker.
@@ -3561,6 +3672,7 @@ units angstrom
             "training/transfer_learning": transfer_learning,
             "training/include_total_mse": include_total_mse,
             "training/shard_locality_block_shards": self.shard_locality_block_shards,
+            "training/checkpoint_metric": checkpoint_metric,
         }
         if world_size > 1:
             print("Running multi-process training", flush=True)
@@ -3588,6 +3700,8 @@ units angstrom
                     lr_decay,
                     end_lr,
                     include_total_mse,
+                    loss_fn,
+                    checkpoint_metric,
                 ),
                 nprocs=world_size,
                 join=True,
@@ -3610,6 +3724,8 @@ units angstrom
                     skip_compile=skip_compile,
                     transfer_learning=transfer_learning,
                     include_total_mse=include_total_mse,
+                    loss_fn=loss_fn,
+                    checkpoint_metric=checkpoint_metric,
                 ),
                 wandb_config,
                 model_family="pairwise",

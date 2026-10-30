@@ -1401,7 +1401,8 @@ def test_ap3_d3_precomputed_checkpoint_does_not_add_d3_twice():
     )
 
 
-def test_ap3_d3_precomputed_train_and_infer_small_dataset(tmp_path):
+def _small_precomputed_ap3d3(tmp_path):
+    """Four close CLIFF waters, precomputed classical terms, cheap to train."""
     batch_size = 2
     qcel_molecules = [mol_cliff_water_close] * 4
     energy_labels = [
@@ -1469,6 +1470,13 @@ def test_ap3_d3_precomputed_train_and_infer_small_dataset(tmp_path):
         use_GPU=False,
         no_disp_nn=False,
     )
+    return ap3d3, ds, qcel_molecules, atom_type_elst_model, batch_size
+
+
+def test_ap3_d3_precomputed_train_and_infer_small_dataset(tmp_path):
+    ap3d3, ds, qcel_molecules, atom_type_elst_model, batch_size = (
+        _small_precomputed_ap3d3(tmp_path)
+    )
 
     assert ap3d3.use_precomputed_classical is True
     assert ap3d3.model.no_disp_nn is False
@@ -1516,6 +1524,48 @@ def test_ap3_d3_precomputed_train_and_infer_small_dataset(tmp_path):
         (E_residual[:, 3] + disp_dimer).detach().cpu().numpy(),
         atol=1e-5,
     )
+
+
+def _flat_valued_mse(preds, labels):
+    """MSE gradients with a constant value, so the loss can never improve."""
+    mse = torch.mean(torch.square(preds - labels))
+    return mse - mse.detach() + 1.0
+
+
+def _train_small_ap3d3(tmp_path, checkpoint_metric):
+    torch.manual_seed(0)
+    ap3d3, ds, *_ = _small_precomputed_ap3d3(tmp_path)
+    model_path = tmp_path / "ap3d3.pt"
+    ap3d3.train(
+        ds,
+        n_epochs=3,
+        skip_compile=True,
+        lr=5e-3,
+        split_percent=0.5,
+        model_path=str(model_path),
+        dataloader_num_workers=0,
+        loss_fn=_flat_valued_mse,
+        checkpoint_metric=checkpoint_metric,
+    )
+    return torch.load(model_path, weights_only=False)["metadata"]
+
+
+def test_ap3_d3_checkpoint_selection_defaults_to_the_configured_loss(tmp_path):
+    """A loss that never improves never triggers an improvement checkpoint."""
+    metadata = _train_small_ap3d3(tmp_path, "component_mse")
+    assert metadata["checkpoint_reason"] == "final_no_improvement"
+
+
+def test_ap3_d3_total_mae_checkpoint_metric_selects_on_mae(tmp_path):
+    """Selecting on total MAE must ignore the configured loss's value."""
+    metadata = _train_small_ap3d3(tmp_path, "total_mae")
+    assert "checkpoint_reason" not in metadata
+
+
+def test_ap3_d3_train_rejects_unknown_checkpoint_metric(tmp_path):
+    ap3d3, ds, *_ = _small_precomputed_ap3d3(tmp_path)
+    with pytest.raises(ValueError, match="checkpoint metric"):
+        ap3d3.train(ds, n_epochs=1, skip_compile=True, checkpoint_metric="nope")
 
 
 def test_ap3_d3_live_classical_forward_includes_all_classical_terms():

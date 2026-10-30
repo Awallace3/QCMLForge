@@ -385,9 +385,12 @@ class APNet3_AtomType_MPNN(nn.Module):
         """
         nedge = e_source.numel()
         if nedge == 0:
-            # No intramolecular edges
+            # No intramolecular edges; match h's device/dtype for the scatter.
             return torch.zeros(
-                0, self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf
+                0,
+                self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf,
+                dtype=h.dtype,
+                device=h.device,
             )
 
         h0_source = h0.index_select(0, e_source)

@@ -16,6 +16,7 @@ from ..pt_datasets.ap2_fused_ds import (
 )
 from .. import constants
 from .. import model_io
+from .component_losses import validate_loss_route
 from ..training_tracking import (
     TrackerBackend,
     WandbConfig,
@@ -335,9 +336,12 @@ class APNet2_AM_MPNN(nn.Module):
     def get_messages(self, h0, h, rbf, e_source, e_target):
         nedge = e_source.numel()
         if nedge == 0:
-            # No intramolecular edges
+            # No intramolecular edges; match h's device/dtype for the scatter.
             return torch.zeros(
-                0, self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf
+                0,
+                self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf,
+                dtype=h.dtype,
+                device=h.device,
             )
 
         h0_source = h0.index_select(0, e_source)
@@ -1404,11 +1408,13 @@ units angstrom
             E_sr_dimer, E_sr, E_elst_sr, E_elst_lr, hAB, hBA = self.model(batch)
             preds = E_sr_dimer.reshape(-1, 4)
             preds = torch.sum(preds, dim=1)
-            comp_errors = preds - batch.y.squeeze(-1)
+            # reshape, not broadcast: a label-count mismatch must raise.
+            labels = batch.y.reshape(preds.shape)
+            comp_errors = preds - labels
             batch_loss = (
                 torch.mean(torch.square(comp_errors))
-                if (loss_fn is None)
-                else loss_fn(preds, batch.y)
+                if loss_fn is None
+                else loss_fn(preds, labels)
             )
             batch_loss.backward()
             optimizer.step()
@@ -1432,11 +1438,13 @@ units angstrom
                 E_sr_dimer, _, _, _, _, _ = self.model(batch)
                 preds = E_sr_dimer.reshape(-1, 4)
                 preds = torch.sum(preds, dim=1)
-                comp_errors = preds - batch.y.squeeze(-1)
+                # reshape, not broadcast: a label-count mismatch must raise.
+                labels = batch.y.reshape(preds.shape)
+                comp_errors = preds - labels
                 batch_loss = (
                     torch.mean(torch.square(comp_errors))
-                    if (loss_fn is None)
-                    else loss_fn(preds.flatten(), batch.y.flatten())
+                    if loss_fn is None
+                    else loss_fn(preds, labels)
                 )
                 total_loss += batch_loss.item()
                 comp_errors_t.append(comp_errors.detach().cpu())
@@ -1576,6 +1584,7 @@ units angstrom
         lr_decay=None,
         adam_eps=1e-8,
         checkpoint_metric="component_mse",
+        loss_fn=None,
     ):
         """
         Run a distributed-data-parallel (DDP) training loop for the model, evaluate on validation data, and save the best checkpoint to self.model_save_path.
@@ -1677,7 +1686,8 @@ units angstrom
             )
         else:
             scheduler = None
-        criterion = None
+        # None falls back to the inlined unweighted component MSE.
+        criterion = loss_fn
         lowest_test_loss = torch.tensor(float("inf"))
         self.model = self.model.to(rank_device)
 
@@ -1769,6 +1779,7 @@ units angstrom
         adam_eps=1e-8,
         checkpoint_metric="component_mse",
         random_seed=42,
+        loss_fn=None,
     ):
         # (1) Compile Model
         """
@@ -1836,8 +1847,8 @@ units angstrom
             if lr_decay
             else None
         )
-        # criterion = None  # defaults to MSE
-        criterion = torch.nn.MSELoss()
+        # The criterion these loops have always used, unless one is selected.
+        criterion = torch.nn.MSELoss() if loss_fn is None else loss_fn
 
         # (4) Set eval functions
         if not transfer_learning:
@@ -1981,6 +1992,7 @@ units angstrom
         pretrain_test_loss=True,
         adam_eps=1e-8,
         checkpoint_metric="component_mse",
+        loss_fn=None,
         wandb_config: WandbConfig | None = None,
         _tracker_backend=TrackerBackend.WANDB,
         _tracker_event_directory=None,
@@ -2010,6 +2022,7 @@ units angstrom
         Returns:
             None
         """
+        validate_loss_route(loss_fn, transfer_learning=transfer_learning)
         if dataset is not None:
             self.dataset = dataset
         elif dataset is not None:
@@ -2111,6 +2124,7 @@ units angstrom
                     lr_decay,
                     adam_eps,
                     checkpoint_metric,
+                    loss_fn,
                 ),
                 nprocs=world_size,
                 join=True,
@@ -2135,6 +2149,7 @@ units angstrom
                     adam_eps=adam_eps,
                     checkpoint_metric=checkpoint_metric,
                     random_seed=random_seed,
+                    loss_fn=loss_fn,
                 ),
                 wandb_config,
                 model_family="pairwise",

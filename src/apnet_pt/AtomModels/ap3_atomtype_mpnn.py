@@ -304,7 +304,7 @@ class AtomTypeParamModel:
                 param_start_mean=checkpoint["config"]["param_start_mean"],
                 param_start_std=checkpoint["config"]["param_start_std"],
                 n_params=checkpoint["config"].get("n_params", 1),
-                r_cut=checkpoint["config"]["r_cut"],
+                r_cut=checkpoint["config"].get("r_cut", r_cut),
             )
             model_state_dict = {
                 k.replace("_orig_mod.", ""): v
