@@ -24,6 +24,8 @@ dependencies:
   - h5py
   - pip:
       - qcelemental==0.29.0
+      # pint 0.26.2 breaks qcelemental 0.29.0's unit registry at import.
+      - pint<0.26.2
       - qm-tools-aw==1.4.5
       # Install optional PyG wheels after env creation when you need them.
       # CPU example:
