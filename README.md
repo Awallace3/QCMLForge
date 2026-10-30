@@ -133,8 +133,72 @@ what each weight set contains and how they score, and
 [docs/apnet2-tensorflow-weights.md](docs/apnet2-tensorflow-weights.md) for the
 TensorFlow parity data and the loading caveats.
 
-## Training
-To train the model, run the following command:
+### ΔAP-Net2 error and compute-time estimates
+`dapnet2_model_predict` estimates the interaction-energy error (kcal/mol) of a
+level of theory (`m1`) relative to CCSD(T)/CBS/CP (the only `m2`). Models are
+downloaded from Hugging Face on first use.
+
+```py
+import apnet_pt
+import qcelemental
+from pprint import pprint as pp
+
+mol_dimer = qcelemental.models.Molecule.from_data("""
+0 1
+O 0.000000 0.000000  0.000000
+H 0.758602 0.000000  0.504284
+H 0.260455 0.000000 -0.872893
+--
+0 1
+O 3.000000 0.500000  0.000000
+H 3.758602 0.500000  0.504284
+H 3.260455 0.500000 -0.872893
+""")
+mols = [mol_dimer for _ in range(3)] # example of using multiple molecules
+# Valid m1 values, e.g. "MP2/aug-cc-pVTZ/CP", "B3LYP-D3/aug-cc-pVTZ/unCP"
+pp(apnet_pt.pretrained_models.dapnet2_levels_of_theory_pretrained())
+
+errors = apnet_pt.pretrained_models.dapnet2_model_predict(
+    mols, m1="MP2/aug-cc-pVTZ/CP", m2="CCSD(T)/CBS/CP", compile=False
+)
+print(errors)
+# [0.28017625 0.28017625 0.28017625]  (kcal/mol, one per dimer)
+```
+
+To tabulate error estimates and estimated Psi4 CPU times (log10 s) across many
+methods and basis sets, pass the same dimers to the estimator. It needs `psi4`,
+which the main `qcml` environment does not include, so use the estimator
+environment:
+
+```bash
+conda env create -f environment-estimator.yml
+conda activate qcml-estimator
+```
+
+If you get `ModuleNotFoundError: No module named 'psi4'`, you are not in the
+`qcml-estimator` environment.
+
+```py
+# continuing from previous snippet
+from qcml_mcp import ie_time_esimator_script as est
+
+df = est.main(mols=mols, methods=["MP2", "wB97X-V"],
+              bases=["aug-cc-pVTZ"], using_cp=True, auto_download=True)
+# columns: "Level of Theory", "ERROR ESTIMATES (kcal/mol)",
+#          "ESTIMATED CPU TIMES (log10(s))"
+print(df[["Level of Theory", "ERROR ESTIMATES (kcal/mol)",
+          "ESTIMATED CPU TIMES (log10(s))"]].to_string())
+#           Level of Theory  ERROR ESTIMATES (kcal/mol)  ESTIMATED CPU TIMES (log10(s))
+# 0      MP2/aug-cc-pVTZ/CP                    0.280176                        1.033484
+# 0      MP2/aug-cc-pVTZ/CP                    0.280176                        1.033484
+# 0      MP2/aug-cc-pVTZ/CP                    0.280176                        1.033484
+# 1  wB97X-V/aug-cc-pVTZ/CP                    0.062213                        1.368516
+# 1  wB97X-V/aug-cc-pVTZ/CP                    0.062213                        1.368516
+# 1  wB97X-V/aug-cc-pVTZ/CP                    0.062213                        1.368516
+```
+
+## Training Models
+To train models, run the following command:
 ```bash
 python3 ./train_models.py \
     --train_ap2 \

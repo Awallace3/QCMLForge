@@ -89,3 +89,30 @@ def test_many_geom():
         auto_download=True,
         )
     _check_df_shape_and_cols(df, 420, "7 geoms, 6 bases, 10 methods")
+
+
+def test_mols_input():
+    import qcelemental as qcel
+
+    mol = qcel.models.Molecule.from_data("""
+0 1
+O 0.000000 0.000000  0.000000
+H 0.758602 0.000000  0.504284
+H 0.260455 0.000000 -0.872893
+--
+0 1
+O 3.000000 0.500000  0.000000
+H 3.758602 0.500000  0.504284
+H 3.260455 0.500000 -0.872893
+units angstrom
+""")
+    df = main(
+        mols=[mol, mol],
+        n_threads=4,
+        using_cp=True,
+        methods=["MP2", "wB97X-V"],
+        bases=["aug-cc-pVTZ"],
+        auto_download=True,
+        )
+    _check_df_shape_and_cols(df, 4, "2 mols, 1 basis, 2 methods")
+    assert df["ERROR ESTIMATES (kcal/mol)"].notna().all()

@@ -8,7 +8,6 @@ import qcelemental as qcel
 import apnet_pt
 from qcml_mcp.timings.polynomial_fit_data import polynomial_expressions
 from importlib import resources
-from pprint import pprint as pp
 
 
 def load_coeffs(
@@ -55,10 +54,7 @@ def parse_geoms(
     qcel_monB:    qcelemental.models.Molecule representation of second monomer
     """
     id = []
-    n_atoms = []
-    qcel_dimer = []
-    qcel_monA = []
-    qcel_monB = []
+    mols = []
 
     chgmult_pattern = re.compile(r'^\s*[-+]?\d+\s+[-+]?\d+\s*$')
     for file in os.listdir(path):
@@ -94,26 +90,40 @@ def parse_geoms(
                     continue
 
                 id.append(file.strip().split(".")[0])
-                n_atoms.append(len(mol_qcel.atomic_numbers))
+                mols.append(mol_qcel)
+                print(f"succesfully built molecule for geometry found at {filepath}")
+
+    return build_geom_table(mols, cp, id)
 
 
-                fragments = mol_qcel.fragments
-                if len(fragments) != 2:
-                    raise ValueError("input geometry must be a dimer")
+def build_geom_table(
+    mols: list[qcel.models.Molecule],
+    cp: bool,
+    ids: list[str] | None = None,
+    ) -> pd.DataFrame:
+    """
+    Builds the geometry table that parse_geoms returns from a list of
+    qcelemental.models.Molecule dimers. ids default to the list index.
+    """
+    if ids is None:
+        ids = [str(i) for i in range(len(mols))]
 
-                qcel_dimer.append(mol_qcel)
-                if cp:
-                    qcel_monA.append(mol_qcel.get_fragment(0, 1))
-                    qcel_monB.append(mol_qcel.get_fragment(1, 0))
-                else:
-                    qcel_monA.append(mol_qcel.get_fragment(0))
-                    qcel_monB.append(mol_qcel.get_fragment(1))
-                print(f"succesfully built molecule and fragments for geometry found at {filepath}")
+    qcel_monA = []
+    qcel_monB = []
+    for mol_qcel in mols:
+        if len(mol_qcel.fragments) != 2:
+            raise ValueError("input geometry must be a dimer")
+        if cp:
+            qcel_monA.append(mol_qcel.get_fragment(0, 1))
+            qcel_monB.append(mol_qcel.get_fragment(1, 0))
+        else:
+            qcel_monA.append(mol_qcel.get_fragment(0))
+            qcel_monB.append(mol_qcel.get_fragment(1))
 
     return pd.DataFrame({
-        "id": id,
-        "n_atoms": n_atoms,
-        "qcel_dimer": qcel_dimer,
+        "id": ids,
+        "n_atoms": [len(m.atomic_numbers) for m in mols],
+        "qcel_dimer": list(mols),
         "qcel_monA": qcel_monA,
         "qcel_monB": qcel_monB,
         })
@@ -147,7 +157,6 @@ def compute_psi4_time_estimation_variables(
     wfn = psi4.core.Wavefunction.build(mol, psi4.core.get_global_option("BASIS"))
     bs = wfn.basisset()
     grid = psi4.core.DFTGrid.build(mol, bs)
-    print("compute vars: built wfn & grid")
 
     n_occupied = math.ceil((wfn.nalpha() + wfn.nbeta()) / 2)
     n_virtual = bs.nbf() - n_occupied
@@ -160,7 +169,6 @@ def compute_psi4_time_estimation_variables(
         "JKFIT",
         psi4.core.get_global_option("BASIS"),
     )
-    print("compute vars: built aux basis")
 
     nbf_aux = aux_basis.nbf()
     psi4.core.clean()
@@ -185,7 +193,6 @@ def build_inference_table(
     cp_str = "/unCP"
 
     if cp:
-        # print("Warning: using un-counterpoise corrected models for counterpoise corrected timing predictions")
         cp_str = "/CP"
 
     lotr_strings = [m + "/" + b + cp_str for b in bases for m in methods] # pretty sure everything I ran was not CP-corrected
@@ -270,7 +277,6 @@ def predict_ie_errors_batch(
                 m2="CCSD(T)/CBS/CP",
             )
             errors.extend(IE_pred.tolist())
-            print(f"completed interaction energy error estimation for all geometries at {lotr}")
 
         except Exception as e:
             print(f"dAPNet Error: \n {e}")
@@ -296,8 +302,6 @@ def predict_timing(
     global _coeffs
     if _coeffs is None:
         _coeffs = load_coeffs(0)
-        # print(_coeffs.columns)
-        # print(_coeffs.index.name)
 
     fit_label = "Augmented" if "aug" in basis else "Non-augmented"
     mask = (_coeffs.index == method) & (_coeffs["fit_label"] == fit_label)
@@ -383,9 +387,10 @@ def main(
     methods: list[str] | None = None,
     bases: list[str] | None = None,
     auto_download: bool = False,    # set to True to avoid TTY prompting
+    mols: list[qcel.models.Molecule] | None = None,
 ) -> pd.DataFrame:
-    if geom_path is None:
-        raise ValueError("geom_path must be set")
+    if (geom_path is None) == (mols is None):
+        raise ValueError("set exactly one of geom_path or mols")
     if methods is None:
         methods = default_methods
     if bases is None:
@@ -396,7 +401,10 @@ def main(
     psi4.core.be_quiet()
     psi4.set_num_threads(n_threads)
 
-    df1 = parse_geoms(geom_path, using_cp)
+    if mols is not None:
+        df1 = build_geom_table(mols, using_cp)
+    else:
+        df1 = parse_geoms(geom_path, using_cp)
 
     df2 = build_inference_table(df1, methods, bases, using_cp)
 
@@ -404,8 +412,6 @@ def main(
     predict_timings_batch(df2)
     pd.set_option("display.max_rows", None)
     pd.set_option("display.max_columns", None)
-    pp(df2)
-
     return df2
 
 if __name__ == "__main__":

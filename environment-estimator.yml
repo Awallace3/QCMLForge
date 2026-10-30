@@ -1,0 +1,22 @@
+# CPU environment for the ΔAP-Net2 error and Psi4 compute-time estimators
+# (qcml_mcp.ie_time_esimator_script), which need psi4 alongside qcmlforge.
+#   conda env create -f environment-estimator.yml
+#   conda activate qcml-estimator
+name: qcml-estimator
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - psi4=1.11
+  - numpy=2.*
+  - pandas=2.*
+  - scipy
+  - h5py
+  - matplotlib
+  - pytest
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch==2.10.*
+      - torch-geometric==2.7.0
+      - -e .[mcp]
