@@ -10,8 +10,11 @@ Code re-implemented from TensorFlow version located [here](https://github.com/za
 
 ## Installation
 
-To install the package, run the following command:
+To install the package, run the following commands:
 ```bash
+# --depth 1 skips the multi-GB git history; drop it if you need the history
+git clone --depth 1 https://github.com/Awallace3/QCMLForge.git
+cd QCMLForge
 conda env create -f environment.yml
 conda activate qcml
 pip install -e .
@@ -54,6 +57,22 @@ demonstrates a complete workflow of using QCArchive to generate QM data and
 then training AP-Net models with QCMLForge.
 
 ## Inference
+### Pretrained weights
+Pretrained weights are not shipped with the package. They are downloaded from
+[Hugging Face](https://huggingface.co/awallace3/qcmlforge) on first use (about
+80 MB for the default APNet2 ensemble) and cached in `~/.cache/huggingface`.
+Enable the download before running the examples below:
+
+```bash
+export QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED=1
+```
+
+Without this variable, a script run from a terminal asks `Download now? [y/N]`,
+and a non-interactive run (Jupyter, SLURM/batch jobs, `python script.py <
+/dev/null`) fails with `RuntimeError: Missing pretrained model in local cache`.
+After the first download the weights load from the cache and the variable is
+no longer needed.
+
 ### AtomModel multipole example
 To run the AtomModel inference, run the following command:
 ```py
@@ -76,8 +95,11 @@ multipoles = apnet_pt.pretrained_models.atom_model_predict(
     compile=False,
     batch_size=2,
 )
-print(multipoles)
-# multipoles = [[np.array(q) for q in qs], [[np.array(d) for d in ds], [np.array(qp) for qp in qps]]]
+charges, dipoles, quadrupoles = multipoles
+# Each is a list with one array per molecule:
+# charges[i].shape == (n_atoms,), dipoles[i].shape == (n_atoms, 3),
+# quadrupoles[i].shape == (n_atoms, 3, 3)
+print(charges[0])
 ```
 ### APNet2Model example
 To run the APNet2Model inference, run the following command:
@@ -104,7 +126,8 @@ interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
     batch_size=2,
 )
 print(interaction_energies)
-# interaction_energies = np.array((N, 5)), where [[E_total, E_elst, E_exch, E_ind, E_disp]...]
+# interaction_energies: np.ndarray of shape (N, 5) in kcal/mol, columns
+# [E_total, E_elst, E_exch, E_ind, E_disp]; last digits vary run to run
 # [[-2.67262248 -3.41546969  2.33096213 -0.61418158 -0.97393334]
 #  [-2.67262368 -3.41547084  2.33096209 -0.61418151 -0.97393341]
 #  [-2.67261759 -3.41546469  2.33096199 -0.61418152 -0.97393337]]

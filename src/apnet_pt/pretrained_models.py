@@ -215,14 +215,10 @@ def atom_model_predict(
     data = [
         atomic_datasets.qcel_mon_to_pyg_data(mol, r_cut=am.model.r_cut) for mol in mols
     ]
-    print(data)
     batched_data = [
         atomic_datasets.atomic_collate_update_no_target(data[i : i + batch_size])
         for i in range(0, len(data), batch_size)
     ]
-    print(f"Number of batches: {len(batched_data)}")
-    print(f"{batched_data = }")
-    print(f"{batched_data[0].x = }")
     print("Predicting...")
     atom_count = sum([len(d.x) for d in data])
     pred_qs = np.zeros((atom_count))
