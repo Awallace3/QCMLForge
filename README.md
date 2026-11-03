@@ -1,5 +1,3 @@
-
-
 # QCMLForge
 
 [![Tests](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml/badge.svg)](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml)
@@ -206,11 +204,6 @@ python3 ./train_models.py \
     --n_epochs 5 
 ```
 
-## Experiment tracking
-
-Optional experiment tracking is documented in
-[Training with Weights & Biases](docs/training-with-wandb.md).
-
 ## Reproducing the original TensorFlow AP-Net2
 
 `models/ap2_tf_paper/` holds the published TensorFlow ensemble converted to PyTorch
@@ -229,11 +222,6 @@ python3 ./train_models.py \
     --am_model_path ./models/example/am_example.pt \
     --n_epochs 5 
 ```
-
-# Objectives
-
-- [X] Extend AtomMPNN to predict Hirshfeld ratios
-- [ ] Add classical induction model for AP3
 
 # Acknowledgements
 
