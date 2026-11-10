@@ -55,6 +55,18 @@ _TRUE_ENV_VALUES = {"1", "true", "yes", "y"}
 
 
 @pytest.fixture(autouse=True)
+def require_cuda(request):
+    """Skip tests marked ``gpu`` on hosts without a CUDA device."""
+    if request.node.get_closest_marker("gpu") is None:
+        return
+
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+
+@pytest.fixture(autouse=True)
 def require_pretrained_models(request):
     """Skip marked tests unless all requested pretrained artifacts resolve."""
     marker = request.node.get_closest_marker("pretrained_models")
