@@ -20,6 +20,16 @@ conda activate qcml
 pip install -e .
 ```
 
+For NVIDIA GPUs, use `environment-gpu.yml` instead. It pins a CUDA 12.9 build of
+PyTorch and includes the CUDA headers and compilers that `torch.compile` needs
+on the GPU (driver must support CUDA >= 12.9):
+
+```bash
+conda env create -f environment-gpu.yml
+conda activate qcml-gpu
+pip install -e . --no-deps
+```
+
 ### Running tests
 
 Some tests require pretrained model artifacts from the QCMLForge Hugging Face
@@ -33,6 +43,8 @@ python -m pytest tests/
 Pretrained-model tests are skipped when this environment variable is not
 enabled or when their required artifacts cannot be resolved. Tests that do not
 need pretrained models still run normally.
+
+Tests marked `gpu` also run on CUDA and are skipped when no GPU is available.
 
 ### Common Issues
 If you get an OS.Error when running qcml related to torch-geometric, you likely need
