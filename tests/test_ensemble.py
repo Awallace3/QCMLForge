@@ -266,8 +266,6 @@ def test_ap2_fused_ensemble():
         batch_size=2,
         ap2_fused=True,
     )
-    torch.save(interaction_energies, os.path.join(os.path.dirname(
-        __file__), "dataset_data/ap2_fused_ensemble_test.pt"))
     assert np.allclose(interaction_energies, ref, atol=1e-5), f"{ref=}\n{interaction_energies = }"
 
 
