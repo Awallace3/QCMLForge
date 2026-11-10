@@ -186,11 +186,14 @@ def atom_model_predict(
     batch_size: int = 3,
     return_mol_arrays: bool = True,
     weights: str = DEFAULT_APNET2_WEIGHTS,
+    use_GPU: bool | None = None,
 ):
     """Ensemble-average atomic multipoles over a pretrained atom-model ensemble.
 
     ``weights`` names the ensemble: QCMLForge-trained by default, or
     ``"ap2_tf_paper"`` for the atom models published with the AP-Net2 paper.
+    ``use_GPU`` is passed to the model harness: None uses CUDA when available,
+    False forces the CPU.
     """
     num_models = apnet2_weight_set_size(weights)
     atom_rel_paths = [
@@ -199,6 +202,7 @@ def atom_model_predict(
     model_paths = _resolve_pretrained_paths(atom_rel_paths)
     am = AtomModels.ap2_atom_model.AtomModel(
         pre_trained_model_path=model_paths[atom_rel_paths[0]],
+        use_GPU=use_GPU,
     )
     models = [copy.deepcopy(am) for _ in range(num_models)]
     for i in range(1, num_models):
@@ -271,6 +275,7 @@ def apnet2_model_predict(
     ensemble_model_dir: str = model_dir,
     ap2_fused: bool = False,
     weights: str = DEFAULT_APNET2_WEIGHTS,
+    use_GPU: bool | None = None,
 ):
     """Ensemble-average APNet2 interaction energies for ``mols``.
 
@@ -280,6 +285,9 @@ def apnet2_model_predict(
     ``ap2_fused=True`` ignores ``weights`` and loads the only published fused
     ensemble, which is the ``"qcmlforge_v1"`` generation; see
     :data:`FUSED_APNET2_WEIGHTS`.
+
+    ``use_GPU`` is passed to the model harnesses, as in
+    :func:`atom_model_predict`.
     """
     if ap2_fused:
         _check_fused_weights(weights)
@@ -290,7 +298,8 @@ def apnet2_model_predict(
             + [f"ap2-fused_ensemble/ap2_{i}.pt" for i in range(2, num_models)]
         )
         ap2 = AtomPairwiseModels.apnet2_fused.APNet2_AM_Model(
-            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
+            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"],
+            use_GPU=use_GPU,
         )
     else:
         num_models = apnet2_weight_set_size(weights)
@@ -303,6 +312,7 @@ def apnet2_model_predict(
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
             pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
             atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
+            use_GPU=use_GPU,
         )
     models = [copy.deepcopy(ap2) for _ in range(num_models)]
     for i in range(additional_models_start, num_models):
@@ -344,6 +354,7 @@ def apnet2_model_predict_pairs(
     print_results: bool = False,
     ap2_fused: bool = True,
     weights: str = DEFAULT_APNET2_WEIGHTS,
+    use_GPU: bool | None = None,
 ):
     """
     Compute ensemble-averaged APNet2 pairwise interaction energies for specified fragment pairs and return per-molecule energies, per-atom pairwise arrays, and a fragment-pair breakdown DataFrame.
@@ -372,6 +383,9 @@ def apnet2_model_predict_pairs(
             Named weight set from ``apnet_pt.hf_pretrained.apnet2_weight_sets()``.
             Defaults to the QCMLForge-trained ensemble; ``"ap2_tf_paper"`` selects
             the ensemble published with the AP-Net2 paper and requires ap2_fused=False.
+        use_GPU: bool | None, optional
+            Passed to the model harnesses: None uses CUDA when available,
+            False forces the CPU.
 
     Returns:
         pred_IEs (numpy.ndarray):
@@ -398,7 +412,8 @@ def apnet2_model_predict_pairs(
             + [f"ap2-fused_ensemble/ap2_{i}.pt" for i in range(2, num_models)]
         )
         ap2 = AtomPairwiseModels.apnet2_fused.APNet2_AM_Model(
-            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
+            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"],
+            use_GPU=use_GPU,
         )
     else:
         # models[0] is member 0, so loading must start at 1; starting at 2
@@ -413,6 +428,7 @@ def apnet2_model_predict_pairs(
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
             pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
             atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
+            use_GPU=use_GPU,
         )
     models = [copy.deepcopy(ap2) for _ in range(num_models)]
     for i in range(additional_models_start, num_models):
