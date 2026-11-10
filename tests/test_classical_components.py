@@ -1692,6 +1692,9 @@ def test_elst_damping_AMOEBA_mtp_mtp_torch():
         ds_root=None,
         atom_type_model=atom_type_hf_vw_model.model,
         dimer_prop_model=atom_type_elst_model.dimer_model,
+        # Shares dimer_model with the CPU-scoped harness above, which is
+        # called next with CPU batches, so it must stay on the CPU too.
+        use_GPU=False,
     )
     print(ref_data)
     energies = ap3.predict_qcel_mols([mol], batch_size=1)

@@ -50,6 +50,17 @@ def scatter_sum_compile(src, index, dim_size, reduce="sum", dim=0):
     if dim != 0:
         raise ValueError(f"Only dim=0 is supported, got dim={dim}")
 
+    if (
+        torch.compiler.is_compiling()
+        and isinstance(dim_size, (int, torch.SymInt))
+        and dim_size == 1
+    ):
+        # Inductor (torch 2.10) specializes a size-1 output and then
+        # miscompiles the atomic-add scatter into it: wrong values or NaN on
+        # CUDA, a codegen error on CPU. Every valid index is 0 here, so the
+        # scatter is a plain sum. Eager execution keeps scatter_add_ below.
+        return src.sum(dim=0, keepdim=True)
+
     output = src.new_zeros((dim_size, *src.shape[1:]))
     
     index_shape = (index.size(0),) + (1,) * (src.dim() - 1)

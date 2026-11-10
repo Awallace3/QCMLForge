@@ -43,7 +43,10 @@ dev_template = "{tag}.{ccount}+git.{sha}"
 dirty_template = "{tag}.{ccount}+git.{sha}.dirty"
 
 [tool.pytest.ini_options]
+# Bare `pytest` only collects tests/, not scratch copies such as agent_scratch/.
+testpaths = ["tests"]
 markers = [
+    "gpu: tests that run on CUDA; skipped when no CUDA device is available",
     "mcp: tests requiring the optional MCP server dependency",
     "pretrained_models(*groups): tests requiring downloadable pretrained models",
     "slow: tests with long-running model or integration workloads",

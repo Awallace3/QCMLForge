@@ -83,8 +83,14 @@ def test_weight_set_registry():
 @pytest.mark.pretrained_models("ap2_tf_paper_ensemble", local=TF_MODELS)
 def test_paper_ensemble_reproduces_reference_interaction_energy():
     """Pinned five-member ensemble SAPT0/aug-cc-pV(D+d)Z prediction, kcal/mol."""
+    # Pinned on the CPU at tight tolerance; test_ensemble.py::test_ap2_ensemble
+    # covers the APNet2 ensemble on CUDA.
     pred = pretrained_models.apnet2_model_predict(
-        [mol_water_dimer], compile=False, ap2_fused=False, weights="ap2_tf_paper"
+        [mol_water_dimer],
+        compile=False,
+        ap2_fused=False,
+        weights="ap2_tf_paper",
+        use_GPU=False,
     )
     # total, elst, exch, indu, disp
     expected = [[-2.61708314, -3.52547402, 2.46066155, -0.58232477, -0.96994591]]

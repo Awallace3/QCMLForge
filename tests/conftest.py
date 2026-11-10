@@ -55,6 +55,30 @@ _TRUE_ENV_VALUES = {"1", "true", "yes", "y"}
 
 
 @pytest.fixture(autouse=True)
+def require_cuda(request):
+    """Skip tests marked ``gpu`` on hosts without a CUDA device."""
+    if request.node.get_closest_marker("gpu") is None:
+        return
+
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(False, id="cpu"),
+        pytest.param(True, id="cuda", marks=pytest.mark.gpu),
+    ]
+)
+def use_gpu(request):
+    """``use_GPU`` value for model harnesses: run on the CPU everywhere and
+    again on CUDA when a device is available."""
+    return request.param
+
+
+@pytest.fixture(autouse=True)
 def require_pretrained_models(request):
     """Skip marked tests unless all requested pretrained artifacts resolve."""
     marker = request.node.get_closest_marker("pretrained_models")

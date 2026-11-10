@@ -336,8 +336,8 @@ class APNet2_AM_MPNN(nn.Module):
         nedge = e_source.numel()
         if nedge == 0:
             # No intramolecular edges
-            return torch.zeros(
-                0, self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf
+            return h.new_zeros(
+                (0, self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf)
             )
 
         h0_source = h0.index_select(0, e_source)
@@ -1123,16 +1123,19 @@ class APNet2_AM_Model:
         indB_to_atom = []
         pair_energies_batch = []
 
-        indsA_sr = inp_batch["e_ABsr_source"]
-        indsB_sr = inp_batch["e_ABsr_target"]
-        indsA_lr = inp_batch["e_ABlr_source"]
-        indsB_lr = inp_batch["e_ABlr_target"]
+        # Pair tables are assembled on the host with NumPy.
+        E_elst_sr = E_elst_sr.cpu()
+        E_elst_lr = E_elst_lr.cpu()
+        indsA_sr = inp_batch["e_ABsr_source"].cpu()
+        indsB_sr = inp_batch["e_ABsr_target"].cpu()
+        indsA_lr = inp_batch["e_ABlr_source"].cpu()
+        indsB_lr = inp_batch["e_ABlr_target"].cpu()
 
         dimer_inds, atoms_per_dimer = torch.unique(
-            inp_batch.dimer_ind, return_counts=True
+            inp_batch.dimer_ind.cpu(), return_counts=True
         )
-        indsA_monomer = inp_batch.indA
-        indsB_monomer = inp_batch.indB
+        indsA_monomer = inp_batch.indA.cpu()
+        indsB_monomer = inp_batch.indB.cpu()
 
         for i in dimer_inds:
             size_A = torch.sum(indsA_monomer == i)

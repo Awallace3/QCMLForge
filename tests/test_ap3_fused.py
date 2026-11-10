@@ -313,7 +313,7 @@ def test_ap3_fused_train_qcel_molecules_in_memory_precompute():
 
 
 @pytest.mark.xdist_group(name="io_operations")
-def test_classical_ap3():
+def test_classical_ap3(use_gpu):
     df = pd.read_pickle(
         current_file_path  + os.sep + os.path.join("dataset_data", "water_dimer_pes3.pkl")
     )
@@ -343,6 +343,9 @@ def test_classical_ap3():
         atom_type_model=atom_type_hf_vw_model.model,
         dimer_prop_model=atom_type_elst_model.dimer_model,
         am_dimer_param_model=atom_type_elst_model,
+        # CUDA vs. the CPU torch reference: measured max |diff| 3.8e-5 on an
+        # RTX 3090 (0 on the CPU), inside the atol=1e-4 used below.
+        use_GPU=use_gpu,
     )
     monA_props, monB_props = atom_type_elst_model.predict_qcel_mols_monomer_props([mol], model_type="model", am_type="ap3")
     
