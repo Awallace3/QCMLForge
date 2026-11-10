@@ -934,6 +934,9 @@ def test_classical_ap3_dispersion():
         dimer_prop_model=atom_type_elst_model.dimer_model,
         am_dimer_param_model=atom_type_elst_model,
         # use_precomputed_classical=False,
+        # Shares dimer_model with the CPU-scoped harness above and feeds it
+        # the CPU batch built here, so it must stay on the CPU too.
+        use_GPU=False,
     )
     print(f"{batch.dimer_ind=}")
     E_classical, mA, mB = ap3.dimer_prop_model(batch)
