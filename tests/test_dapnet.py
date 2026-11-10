@@ -138,14 +138,14 @@ def test_dapnet2_adz_level_resolves_from_user_facing_name():
     ],
 )
 @pytest.mark.pretrained_models("dapnet2")
-def test_dapnet2_pretrained_error_estimators(m1, ref):
+def test_dapnet2_pretrained_error_estimators(m1, ref, use_gpu):
     qcel_mols = [mol3, mol3]
     v = apnet_pt.pretrained_models.dapnet2_model_predict(
         qcel_mols,
         m1=m1,
         m2="CCSD(T)/CBS/CP",
         compile=False,
-        use_GPU=False,
+        use_GPU=use_gpu,
     )
     print(v)
     assert np.allclose(v, ref, atol=1e-6), f"Expected {ref}, but got {v}"

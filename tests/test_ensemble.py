@@ -69,7 +69,7 @@ no_com
 
 
 @pytest.mark.pretrained_models("am_ensemble")
-def test_am_ensemble():
+def test_am_ensemble(use_gpu):
     """Pinned multipoles of the ``qcmlforge_v1`` atom ensemble.
 
     The stored reference is a property of those five checkpoints, so it stays
@@ -88,6 +88,7 @@ def test_am_ensemble():
         compile=False,
         batch_size=2,
         weights="qcmlforge_v1",
+        use_GPU=use_gpu,
     )
     q_ref = ref[0]
     q = multipoles[0]
@@ -133,7 +134,7 @@ def test_am_ensemble_default_weights():
 
 
 @pytest.mark.pretrained_models("qcmlforge_ensemble")
-def test_ap2_ensemble():
+def test_ap2_ensemble(use_gpu):
     """Pinned five-member SAPT0 prediction from the default weight set.
 
     Also guards the embedded-submodel path: every published pair checkpoint
@@ -147,6 +148,7 @@ def test_ap2_ensemble():
             mols,
             compile=False,
             batch_size=2,
+            use_GPU=use_gpu,
         )
     override_warnings = [
         str(w.message)
@@ -157,7 +159,10 @@ def test_ap2_ensemble():
 
     # total, elst, exch, indu, disp
     expected = [[-2.67262248, -3.41546969, 2.33096213, -0.61418158, -0.97393334]] * 3
-    np.testing.assert_allclose(interaction_energies, expected, atol=1e-5)
+    # The reference is from the CPU. CUDA float32 reductions sum in a
+    # different order; the measured max deviation on an RTX 3090 is 1.3e-5.
+    atol = 5e-5 if use_gpu else 1e-5
+    np.testing.assert_allclose(interaction_energies, expected, atol=atol)
 
 
 @pytest.mark.pretrained_models("am_ensemble")

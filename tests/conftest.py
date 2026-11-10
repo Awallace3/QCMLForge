@@ -66,6 +66,18 @@ def require_cuda(request):
         pytest.skip("requires CUDA")
 
 
+@pytest.fixture(
+    params=[
+        pytest.param(False, id="cpu"),
+        pytest.param(True, id="cuda", marks=pytest.mark.gpu),
+    ]
+)
+def use_gpu(request):
+    """``use_GPU`` value for model harnesses: run on the CPU everywhere and
+    again on CUDA when a device is available."""
+    return request.param
+
+
 @pytest.fixture(autouse=True)
 def require_pretrained_models(request):
     """Skip marked tests unless all requested pretrained artifacts resolve."""
