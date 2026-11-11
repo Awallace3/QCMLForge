@@ -67,7 +67,8 @@ def phi_tau(u: Tensor, tau: float = TAU_AUF) -> Tensor:
 
 def psi(x: Tensor, gamma: Tensor, eps: float = EPS_N) -> Tensor:
     """(x^2 + eps^2)^(gamma/2) - eps^gamma: autograd-safe x^gamma, psi(0) = 0."""
-    return (x * x + eps * eps) ** (0.5 * gamma) - eps**gamma
+    # eps^g expm1((g/2) log1p(x^2/eps^2)): no cancellation, exactly 0 at x = 0
+    return eps**gamma * torch.expm1(0.5 * gamma * torch.log1p((x / eps) ** 2))
 
 
 class FF1Model(nn.Module):
