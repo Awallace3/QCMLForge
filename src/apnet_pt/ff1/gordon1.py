@@ -76,10 +76,19 @@ def gauss_jacobi_11(n: int = N_QUAD) -> tuple[tuple[float, ...], tuple[float, ..
 
 
 def _tails(x: Tensor) -> list[Tensor]:
-    """[R_0(x), ..., R_K_MAX(x)] for 0 <= x <= X_SWITCH (all positive)."""
-    acc = torch.zeros_like(x)
-    for m in range(N_SERIES - 1, -1, -1):
-        acc = acc * x + 1.0 / math.factorial(m + K_MAX)
+    """[R_0(x), ..., R_K_MAX(x)] for 0 <= x <= X_SWITCH (all positive).
+
+    R_K_MAX is summed by the forward term recurrence
+    t_{m+1} = t_m x / (m + K_MAX + 1), whose factors are <= X_SWITCH /
+    (K_MAX + 1) < 1, so neither the sum nor its backward pass can overflow.
+    (A Horner loop multiplies the gradient by x once per term: ~x^40, past
+    the float32 range at x ~ 8.)
+    """
+    term = torch.full_like(x, 1.0 / math.factorial(K_MAX))
+    acc = term
+    for m in range(1, N_SERIES):
+        term = term * (x / (m + K_MAX))
+        acc = acc + term
     out = [acc]
     for k in range(K_MAX - 1, -1, -1):
         out.append(1.0 / math.factorial(k) + x * out[-1])
@@ -166,9 +175,10 @@ def _bilinear(a: Tensor, m: Tensor, b: Tensor) -> Tensor:
 
 
 def safe_unit(vec: Tensor, eps: float = 1e-300) -> tuple[Tensor, Tensor]:
-    """(|vec|, vec/|vec|), finite with finite gradients at vec = 0."""
+    """(|vec|, vec/|vec|), finite with finite gradients at vec = 0.  The floor
+    is at least the dtype's smallest normal (1e-300 is 0 in float32)."""
     r2 = (vec * vec).sum(-1)
-    r = torch.sqrt(r2.clamp_min(eps))
+    r = torch.sqrt(r2.clamp_min(max(eps, torch.finfo(vec.dtype).tiny)))
     return r, vec / r[..., None]
 
 

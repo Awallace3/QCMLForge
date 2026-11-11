@@ -316,3 +316,59 @@ def test_loss_terms_and_gradients():
     assert parts["nu_l2"] > 0
     assert all(p.grad is None or torch.isfinite(p.grad).all()
                for p in model.parameters())
+
+
+# --- float32 physics --------------------------------------------------------
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_float32_kernel_gradients_are_finite(device):
+    """The tail series' backward pass stays in range in float32 over
+    contact-to-long-range distances and core-to-diffuse exponents (a Horner
+    loop overflowed at beta R ~ 8)."""
+    f32 = torch.float32
+    b = torch.tensor([0.5, 1, 2, 4, 8, 15, 30], dtype=f32, device=device)
+    b1, b2, r = torch.meshgrid(b, b, torch.linspace(0.3, 40, 300, dtype=f32,
+                                                    device=device), indexing="ij")
+    b1, b2, r = (t.reshape(-1).clone().requires_grad_(True) for t in (b1, b2, r))
+    for key, val in gordon1.two_center(b1, b2, r, gordon1.ELST_AA_SPECS).items():
+        weight = torch.rand_like(val) * 1e4  # large upstream gradients
+        for g in torch.autograd.grad((weight * val).sum(), (b1, b2, r),
+                                     retain_graph=True):
+            assert torch.isfinite(g).all(), key
+
+
+def _f32_pair(seed, scale, device):
+    m64 = make_model(seed, device, scale)
+    m32 = FF1Model(n_feat=32, n_chan=4, n_layers=2, n_rbf=8, trunk_dtype=F64,
+                   physics_dtype=torch.float32).to(device)
+    m32.load_state_dict(m64.state_dict())
+    return m64, m32
+
+
+def _f32_dimers():
+    out = [{"zA": [8, 1, 1], "RA": WATER, "zB": [7, 1, 1, 1],
+            "RB": shift(NH3, 0.3, 0.4, dz)} for dz in (1.6, 2.5, 4.0, 10.0)]
+    out += [{"zA": ACETATE[0], "RA": ACETATE[1], "qA": -1, "zB": GLYCINE_ZW[0],
+             "RB": shift(GLYCINE_ZW[1], 0, 0, dz)} for dz in (2.2, 5.0)]
+    out.append({"zA": [8, 1, 1], "RA": WATER, "zB": [11], "RB": [[0, 0, -2.3]],
+                "qB": 1})
+    return out
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("seed,scale", [(0, 0.15), (3, 0.5)])
+def test_float32_physics_tracks_float64(device, seed, scale):
+    m64, m32 = _f32_pair(seed, scale, device)
+    batch = batch_from_dimers(_f32_dimers(), device=device)
+    p64, f64, _ = energy_and_forces(m64, batch)
+    p32, f32, x32 = energy_and_forces(m32, batch)
+    assert p32.dtype == torch.float32 and torch.isfinite(f32).all()
+    tol = 1e-4 * p64.abs().clamp_min(1.0)
+    assert ((p32.double() - p64).abs() <= tol).all()
+    assert (f32.double() - f64).abs().max() <= 1e-4 * f64.abs().max()
+    # charges are solved in float64 in either mode: exactly conserved
+    assert float(x32["q"][:3].sum()) == pytest.approx(0.0, abs=1e-12)
+    pred, _ = m32(batch)
+    grads = torch.autograd.grad(pred.sum(), list(m32.parameters()),
+                                allow_unused=True)
+    assert all(g is None or torch.isfinite(g).all() for g in grads)
