@@ -3,11 +3,17 @@
 import pytest
 import torch
 
-from apnet_pt.AtomPairwiseModels.mtp_mtp import mtp_elst, mtp_elst_damping
+from apnet_pt.AtomPairwiseModels.mtp_mtp import (
+    _rackers_converge_dipoles,
+    _rackers_distance_tensors,
+    mtp_elst,
+    mtp_elst_damping,
+)
 from apnet_pt.mastiff import RacahHarmonics
 from apnet_pt.mastiff_classical import (
     RACAH_L3_DEGREES,
     anisotropic_log_scale,
+    mastiff_donor_acceptor_short_range,
     mastiff_short_range,
     racah_l3,
     racah_parity,
@@ -194,3 +200,256 @@ def test_pair_exponent_rackers_runs_in_float64_and_differentiates():
     e2 = rackers_elst_pair_exponents(*args, alpha_i.detach(), bumped)
     changed = (e2 - e.detach()).abs() > 0
     assert changed.tolist() == [k == 3 for k in range(len(src))]
+
+
+def _axial_quadrupole_stencil(center, axis, q_tip, s, dtype=DTYPE):
+    """Exact 3-site point-charge stencil (+q_tip at +-s*axis, -2*q_tip at center).
+
+    `center` and `s` are in Angstrom; Buckingham's quadrupole tensor `theta` is
+    returned in atomic units (`e * bohr^2`) to match `AtomMPNN` / `mtp_elst`:
+    Theta = q_tip * s_bohr^2 * (3 axis (x) axis - I), with O(s^4) hexadecapole error.
+    """
+    from apnet_pt import constants
+
+    axis = axis / axis.norm()
+    coords = torch.stack([center + s * axis, center - s * axis, center], dim=0)
+    charges = torch.tensor([q_tip, q_tip, -2.0 * q_tip], dtype=dtype)
+    s_bohr = s / constants.au2ang
+    theta = q_tip * (s_bohr * s_bohr) * (3.0 * torch.outer(axis, axis) - torch.eye(3, dtype=dtype))
+    return coords, charges, theta
+
+
+def test_equal_exponent_damping_is_symmetric_and_smooth_in_float32():
+    """Both cliff and gordon1 damping must give identical dE/d(alpha_i) and
+    dE/d(alpha_j) on a symmetric homodimer at alpha_i == alpha_j, and vary
+    smoothly across alpha_i -> alpha_j in float32 without 1/(a2^2 - a1^2) spikes."""
+    for damping, uq_qq in [("cliff", False), ("gordon1", True)]:
+        ZA = torch.tensor([6.0], dtype=DTYPE)
+        RA = torch.tensor([[0.0, 0.0, 0.0]], dtype=DTYPE)
+        RB = torch.tensor([[2.2, 0.0, 0.0]], dtype=DTYPE)
+        q = torch.tensor([-0.15], dtype=DTYPE)
+        mu = torch.tensor([[0.25, 0.1, -0.05]], dtype=DTYPE)
+        mu_mirror = torch.tensor([[-0.25, 0.1, -0.05]], dtype=DTYPE)
+        Q = torch.tensor([[[0.4, 0.05, 0.0], [0.05, -0.2, 0.0], [0.0, 0.0, -0.2]]], dtype=DTYPE)
+        src = torch.tensor([0])
+        tgt = torch.tensor([0])
+
+        ai = torch.tensor([1.85], dtype=DTYPE, requires_grad=True)
+        aj = torch.tensor([1.85], dtype=DTYPE, requires_grad=True)
+        e = rackers_elst_pair_exponents(
+            ZA, RA, q, mu, Q, ZA, RB, q, mu_mirror, Q, src, tgt, ai, aj,
+            damping=damping, include_uq_qq=uq_qq,
+        )
+        e.sum().backward()
+        torch.testing.assert_close(ai.grad, aj.grad, rtol=1e-12, atol=1e-12)
+
+        # Float32 scan across u = (ai - aj)/(ai + aj) in [-0.15, 0.15]: compare to float64.
+        deltas = torch.logspace(-7, -0.8, 64, dtype=DTYPE)
+        deltas = torch.cat([-deltas.flip(0), torch.zeros(1, dtype=DTYPE), deltas])
+        ai64 = 1.85 * (1.0 + deltas)
+        aj64 = 1.85 * (1.0 - deltas)
+        n = len(deltas)
+        rep = lambda t: t.expand(n, *t.shape[1:]).contiguous()  # noqa: E731
+        idx = torch.arange(n)
+        ref64 = rackers_elst_pair_exponents(
+            rep(ZA), rep(RA), rep(q), rep(mu), rep(Q),
+            rep(ZA), rep(RB), rep(q), rep(mu_mirror), rep(Q),
+            idx, idx, ai64, aj64, damping=damping, include_uq_qq=uq_qq,
+        )
+        got32 = rackers_elst_pair_exponents(
+            rep(ZA.float()), rep(RA.float()), rep(q.float()), rep(mu.float()), rep(Q.float()),
+            rep(ZA.float()), rep(RB.float()), rep(q.float()), rep(mu_mirror.float()), rep(Q.float()),
+            idx, idx, ai64.float(), aj64.float(), damping=damping, include_uq_qq=uq_qq,
+        )
+        assert torch.isfinite(got32).all()
+        assert (got32.double() - ref64).abs().max() < 5e-3
+
+
+def test_full_multipole_uq_qq_and_ipd_quad_field_match_point_charge_stencils():
+    """Verify signs and Q_const=3.0 prefactors of E_uQ, E_QQ, and IPD's
+    permanent quadrupole field against exact finite-size point-charge stencils."""
+    s = 1e-2  # Angstrom stencil arm -> O(10 * s^2/R^2) ~ 5e-5 relative hexadecapole error
+    RA = torch.tensor([[0.0, 0.0, 0.0]], dtype=DTYPE)
+    RB = torch.tensor([[4.2, 0.7, -0.5]], dtype=DTYPE)
+    axis_a = torch.tensor([0.6, -0.7, 0.3872983346], dtype=DTYPE)
+    axis_b = torch.tensor([-0.3, 0.5, 0.8124038405], dtype=DTYPE)
+    pts_a, q_a, theta_a = _axial_quadrupole_stencil(RA[0], axis_a, 500.0, s)
+    pts_b, q_b, theta_b = _axial_quadrupole_stencil(RB[0], axis_b, -360.0, s)
+    zero1 = torch.zeros(1, dtype=DTYPE)
+    zero3 = torch.zeros(1, 3, dtype=DTYPE)
+    zero33 = torch.zeros(1, 3, 3, dtype=DTYPE)
+    z_dummy = torch.ones(1, dtype=DTYPE)
+    src0, tgt0 = torch.tensor([0]), torch.tensor([0])
+
+    # 1. Quadrupole-Quadrupole (E_QQ): compare analytical vs 3x3 point-charge Coulomb.
+    s9 = torch.arange(3).repeat_interleave(3)
+    t9 = torch.arange(3).repeat(3)
+    e_qq_stencil = undamped_multipole_elst(
+        torch.ones(3, dtype=DTYPE), pts_a, q_a, torch.zeros(3, 3, dtype=DTYPE),
+        torch.zeros(3, 3, 3, dtype=DTYPE),
+        torch.ones(3, dtype=DTYPE), pts_b, q_b, torch.zeros(3, 3, dtype=DTYPE),
+        torch.zeros(3, 3, 3, dtype=DTYPE), s9, t9,
+    ).sum()
+    e_qq_analytic = undamped_multipole_elst(
+        z_dummy, RA, zero1, zero3, theta_a[None],
+        z_dummy, RB, zero1, zero3, theta_b[None], src0, tgt0,
+        include_uq_qq=True,
+    ).sum()
+    assert abs(float(e_qq_analytic)) > 1e-4
+    torch.testing.assert_close(e_qq_analytic, e_qq_stencil, rtol=1e-4, atol=1e-9)
+
+    # 2. Dipole-Quadrupole (E_uQ): dipole on A vs quadrupole stencil on B, and vice versa.
+    delta = 1e-2
+    u_dir = torch.tensor([0.4, 0.8, -0.4472135955], dtype=DTYPE)
+    # Note: dipole in apnet_pt is in e*bohr, while coordinates are in Angstrom!
+    from apnet_pt import constants
+    q_dip = 50.0
+    mu_vec = (q_dip * (delta / constants.au2ang) * u_dir)[None]
+    dip_a_pts = torch.stack([RA[0] + 0.5 * delta * u_dir, RA[0] - 0.5 * delta * u_dir])
+    dip_q = torch.tensor([q_dip, -q_dip], dtype=DTYPE)
+    s6 = torch.arange(2).repeat_interleave(3)
+    t6 = torch.arange(3).repeat(2)
+    e_uq_ab_stencil = undamped_multipole_elst(
+        torch.ones(2, dtype=DTYPE), dip_a_pts, dip_q, torch.zeros(2, 3, dtype=DTYPE),
+        torch.zeros(2, 3, 3, dtype=DTYPE),
+        torch.ones(3, dtype=DTYPE), pts_b, q_b, torch.zeros(3, 3, dtype=DTYPE),
+        torch.zeros(3, 3, 3, dtype=DTYPE), s6, t6,
+    ).sum()
+    e_uq_ab_analytic = undamped_multipole_elst(
+        z_dummy, RA, zero1, mu_vec, zero33,
+        z_dummy, RB, zero1, zero3, theta_b[None], src0, tgt0,
+        include_uq_qq=True,
+    ).sum()
+    assert abs(float(e_uq_ab_analytic)) > 1e-3
+    torch.testing.assert_close(e_uq_ab_analytic, e_uq_ab_stencil, rtol=1e-4, atol=1e-9)
+
+    # Swap: quadrupole stencil on A, dipole on B.
+    dip_b_pts = torch.stack([RB[0] + 0.5 * delta * u_dir, RB[0] - 0.5 * delta * u_dir])
+    e_uq_ba_stencil = undamped_multipole_elst(
+        torch.ones(3, dtype=DTYPE), pts_a, q_a, torch.zeros(3, 3, dtype=DTYPE),
+        torch.zeros(3, 3, 3, dtype=DTYPE),
+        torch.ones(2, dtype=DTYPE), dip_b_pts, dip_q, torch.zeros(2, 3, dtype=DTYPE),
+        torch.zeros(2, 3, 3, dtype=DTYPE), t6, s6,
+    ).sum()
+    e_uq_ba_analytic = undamped_multipole_elst(
+        z_dummy, RA, zero1, zero3, theta_a[None],
+        z_dummy, RB, zero1, mu_vec, zero33, src0, tgt0,
+        include_uq_qq=True,
+    ).sum()
+    torch.testing.assert_close(e_uq_ba_analytic, e_uq_ba_stencil, rtol=1e-4, atol=1e-9)
+
+    # 3. Gordon1 damped full multipoles converge to undamped full multipoles at long range.
+    args_lr = random_dimer(21, 30.0, dtype=DTYPE)
+    ZA, RA_lr, qA, muA, QA, ZB, RB_lr, qB, muB, QB, src, tgt = args_lr
+    ai = torch.full((len(src),), 2.1, dtype=DTYPE)
+    aj = torch.full((len(src),), 1.9, dtype=DTYPE)
+    damped_lr = rackers_elst_pair_exponents(
+        *args_lr, ai, aj, damping="gordon1", include_uq_qq=True,
+    )
+    undamped_lr = undamped_multipole_elst(*args_lr, include_uq_qq=True)
+    torch.testing.assert_close(damped_lr, undamped_lr, rtol=1e-9, atol=1e-9)
+
+    # 4. Permanent quadrupole field in IPD matches 3-point-charge stencil on both sides.
+    alpha1 = torch.tensor([4.5], dtype=DTYPE)
+    alpha3 = torch.tensor([4.5, 0.0, 0.0], dtype=DTYPE)  # polarize site 0 only
+    empty = torch.zeros(0, dtype=torch.long)
+    thole_big = torch.tensor([1e6], dtype=DTYPE)  # undamped limit
+    d_ab = _rackers_distance_tensors(
+        RA, RB, src0, tgt0, alpha1, alpha1, thole_big, "direct",
+        direct_exponent=3.0, include_t3=True,
+    )
+    m_ab = _rackers_distance_tensors(
+        RA, RB, src0, tgt0, alpha1, alpha1, thole_big, "mutual",
+    )
+    empty_t2 = torch.zeros((0, 3, 3), dtype=DTYPE)
+    _, _, mu0_a, mu0_b, *_ = _rackers_converge_dipoles(
+        alpha1, alpha1, zero1, zero3, zero1, zero3,
+        src0, tgt0, empty, empty, empty, empty,
+        d_ab[3], d_ab[4], None, None, None, None,
+        m_ab[4], empty_t2, empty_t2,
+        50, 1e-12, 0.7,
+        quadA=theta_a[None], quadB=theta_b[None],
+        direct_T3_AB=(d_ab[1], d_ab[2], d_ab[5], d_ab[6]),
+    )
+    # Stencil field at RA due to B's 3 point charges:
+    s13, t13 = torch.zeros(3, dtype=torch.long), torch.arange(3)
+    d_st_b = _rackers_distance_tensors(
+        RA, pts_b, s13, t13, alpha1, torch.ones(3, dtype=DTYPE),
+        torch.full((3,), 1e6, dtype=DTYPE), "direct", direct_exponent=3.0,
+    )
+    _, _, mu0_a_st, _, *_ = _rackers_converge_dipoles(
+        alpha1, torch.ones(3, dtype=DTYPE), zero1, zero3, q_b, torch.zeros(3, 3, dtype=DTYPE),
+        s13, t13, empty, empty, empty, empty,
+        d_st_b[3], d_st_b[4], None, None, None, None,
+        d_st_b[4], empty_t2, empty_t2, 1, 1e-12, 0.7,
+    )
+    # Stencil field at RB due to A's 3 point charges:
+    d_st_a = _rackers_distance_tensors(
+        pts_a, RB, t13, s13, torch.ones(3, dtype=DTYPE), alpha1,
+        torch.full((3,), 1e6, dtype=DTYPE), "direct", direct_exponent=3.0,
+    )
+    _, _, _, mu0_b_st, *_ = _rackers_converge_dipoles(
+        torch.ones(3, dtype=DTYPE), alpha1, q_a, torch.zeros(3, 3, dtype=DTYPE), zero1, zero3,
+        t13, s13, empty, empty, empty, empty,
+        d_st_a[3], d_st_a[4], None, None, None, None,
+        d_st_a[4], empty_t2, empty_t2, 1, 1e-12, 0.7,
+    )
+    del alpha3
+    torch.testing.assert_close(mu0_a, mu0_a_st, rtol=1e-5, atol=1e-9)
+    torch.testing.assert_close(mu0_b, mu0_b_st, rtol=1e-5, atol=1e-9)
+
+
+def test_gordon1_full_multipoles_have_pure_repulsive_nuclear_wall_at_short_range():
+    """With Gordon1 1-center & 2-center Slater damping, all cloud-cloud (including
+    Theta-Theta) and core-cloud (including Z-Theta) terms stay O(1) as r -> 0,
+    so r * E_elst(r) -> +627.509 * Z_A * Z_B (in bohr) even for huge hostile quadrupoles."""
+    from apnet_pt import constants
+
+    ZA = torch.tensor([6.0], dtype=DTYPE)
+    ZB = torch.tensor([8.0], dtype=DTYPE)
+    qA = torch.tensor([-0.4], dtype=DTYPE)
+    qB = torch.tensor([-0.6], dtype=DTYPE)
+    muA = torch.tensor([[1.5, -0.8, 0.4]], dtype=DTYPE)
+    muB = torch.tensor([[-1.2, 0.9, -0.3]], dtype=DTYPE)
+    # Hostile large quadrupoles that would diverge to -infinity as -1/r under CLIFF T4!
+    QA = torch.tensor([[[4.0, 0.0, 0.0], [0.0, -2.0, 0.0], [0.0, 0.0, -2.0]]], dtype=DTYPE)
+    QB = torch.tensor([[[-4.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]], dtype=DTYPE)
+    RA = torch.zeros(1, 3, dtype=DTYPE)
+    src0, tgt0 = torch.tensor([0]), torch.tensor([0])
+    ai = torch.tensor([2.3], dtype=DTYPE)
+    aj = torch.tensor([2.7], dtype=DTYPE)
+
+    for r_bohr in (0.05, 0.01, 1e-3):
+        RB = torch.tensor([[r_bohr * constants.au2ang, 0.0, 0.0]], dtype=DTYPE)
+        e = rackers_elst_pair_exponents(
+            ZA, RA, qA, muA, QA, ZB, RB, qB, muB, QB,
+            src0, tgt0, ai, aj, damping="gordon1", include_uq_qq=True,
+        )
+        assert float(e) > 0.0
+    # Check asymptotic limit lim_{r->0} r_bohr * E_elst(r) = 627.509 * ZA * ZB.
+    r_tiny = 1e-4
+    RB_tiny = torch.tensor([[r_tiny * constants.au2ang, 0.0, 0.0]], dtype=DTYPE)
+    e_tiny = rackers_elst_pair_exponents(
+        ZA, RA, qA, muA, QA, ZB, RB_tiny, qB, muB, QB,
+        src0, tgt0, ai, aj, damping="gordon1", include_uq_qq=True,
+    )
+    expected_z_wall = 627.509 * float(ZA * ZB)
+    assert abs(float(e_tiny) * r_tiny - expected_z_wall) / expected_z_wall < 1e-3
+
+
+def test_donor_acceptor_short_range_cancels_like_pairs_and_keeps_attraction():
+    """-(D_i C_j + C_i D_j) P(x) exp(-x) is <= 0, symmetric under i <-> j, and
+    strictly zero for cation-cation (D=0, C>0) while attractive for cation-donor."""
+    b = torch.tensor([3.5, 3.5], dtype=DTYPE)
+    r = torch.tensor([2.2, 2.2], dtype=DTYPE)
+    # Edge 0: Na+..Na+ (D=0, C=4 -> zero!). Edge 1: Na+..OH2 (D_i=0, C_i=4; D_j=3, C_j=0.5 -> < 0!).
+    d_i = torch.tensor([0.0, 0.0], dtype=DTYPE)
+    c_i = torch.tensor([4.0, 4.0], dtype=DTYPE)
+    d_j = torch.tensor([0.0, 3.0], dtype=DTYPE)
+    c_j = torch.tensor([4.0, 0.5], dtype=DTYPE)
+    e = mastiff_donor_acceptor_short_range(d_i, c_i, d_j, c_j, b, b, r)
+    assert float(e[0]) == 0.0
+    assert float(e[1]) < 0.0
+    e_swap = mastiff_donor_acceptor_short_range(d_j, c_j, d_i, c_i, b, b, r)
+    torch.testing.assert_close(e, e_swap)
+

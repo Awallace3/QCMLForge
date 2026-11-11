@@ -1381,7 +1381,9 @@ def thole_damping_torch(r_ij, alpha_i, alpha_j, a):
     return au3, l3, l5
 
 
-def thole_damping_direct_torch(r_ij, alpha_i, alpha_j, a, exponent=1.5):
+def thole_damping_direct_torch(
+    r_ij, alpha_i, alpha_j, a, exponent=1.5, include_l7: bool = False
+):
     """
     Apply Thole damping to interaction tensor for direct (permanent-induced) interactions.
     From AMOEBA+: https://pubs.acs.org/doi/suppl/10.1021/acs.jctc.7b00225/suppl_file/ct7b00225_si_001.pdf
@@ -1395,24 +1397,36 @@ def thole_damping_direct_torch(r_ij, alpha_i, alpha_j, a, exponent=1.5):
     """
     u = r_ij / ((alpha_i * alpha_j) ** (1.0 / 6.0))
     au3 = a * (u ** exponent)
-    l3 = 1 - torch.exp(-au3)
+    exp_neg = torch.exp(-au3)
+    l3 = 1 - exp_neg
     # Thole's rho(u) ~ exp(-a u**n) integrates to
     # l5 = 1 - (1 + (n/3) a u**n) exp(-a u**n), so the coefficient is tied to
     # the same exponent as the exponential. It read 0.5 while the exponent was
     # hard-wired to 1.5, which is that formula evaluated at n = 1.5; once
     # `exponent` became an argument the constant no longer followed it, and
     # asking for CLIFF's n = 3 gave l3 from n = 3 with l5 from n = 1.5.
-    l5 = 1 - (1 + (exponent / 3.0) * au3) * torch.exp(-au3)
-    return au3, l3, l5
+    n = float(exponent)
+    l5 = 1 - (1 + (n / 3.0) * au3) * exp_neg
+    if not include_l7:
+        return au3, l3, l5
+    # Stone's recurrence l_{2m+1} = l_{2m-1} - u/(2m-1) dl_{2m-1}/du gives
+    # exact rational coefficients for any exponent n (39/60, 9/60 at n=1.5;
+    # 1, 3/5 at n=3.0).
+    l7 = 1 - (1 + (n * (8.0 - n) / 15.0) * au3 + (n * n / 15.0) * au3 * au3) * exp_neg
+    return au3, l3, l5, l7
 
 
-def thole_damping_mutual_torch(r_ij, alpha_i, alpha_j, a):
+def thole_damping_mutual_torch(r_ij, alpha_i, alpha_j, a, include_l7: bool = False):
     """Apply Thole damping to interaction tensor for mutual (induced-induced) interactions"""
     u = r_ij / ((alpha_i * alpha_j) ** (1.0 / 6.0))
     au3 = a * (u**3)
-    l3 = 1 - torch.exp(-au3)
-    l5 = 1 - (1 + au3) * torch.exp(-au3)
-    return au3, l3, l5
+    exp_neg = torch.exp(-au3)
+    l3 = 1 - exp_neg
+    l5 = 1 - (1 + au3) * exp_neg
+    if not include_l7:
+        return au3, l3, l5
+    l7 = 1 - (1 + au3 + 0.6 * au3 * au3) * exp_neg
+    return au3, l3, l5, l7
 
 
 def dimer_induced_dipole_torch(

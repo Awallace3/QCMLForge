@@ -128,6 +128,45 @@ def mastiff_short_range(
     return -prefactor * slater_overlap(torch.sqrt(width) * distance)
 
 
+def mastiff_donor_acceptor_short_range(
+    donor_i: Tensor,
+    acceptor_i: Tensor,
+    donor_j: Tensor,
+    acceptor_j: Tensor,
+    b_i: Tensor,
+    b_j: Tensor,
+    distance: Tensor,
+    log_width_i: Tensor | None = None,
+    log_width_j: Tensor | None = None,
+    log_donor_i: Tensor | None = None,
+    log_acceptor_i: Tensor | None = None,
+    log_donor_j: Tensor | None = None,
+    log_acceptor_j: Tensor | None = None,
+) -> Tensor:
+    """Complementary donor-acceptor short-range pair energy,
+    -(D_i C_j + C_i D_j) P(x) exp(-x) <= 0.
+
+    All inputs are aligned per edge with ``donor_* >= 0``, ``acceptor_* >= 0``,
+    and ``b_* > 0``. Permutation symmetric in ``i <-> j`` while breaking
+    like-pair homodimer false attraction (e.g. cation-cation has ``D = 0``).
+    """
+    width = b_i * b_j
+    if log_width_i is not None:
+        width = width * torch.exp(log_width_i + log_width_j)
+    di, ci = donor_i, acceptor_i
+    dj, cj = donor_j, acceptor_j
+    if log_donor_i is not None:
+        di = di * torch.exp(log_donor_i)
+    if log_acceptor_i is not None:
+        ci = ci * torch.exp(log_acceptor_i)
+    if log_donor_j is not None:
+        dj = dj * torch.exp(log_donor_j)
+    if log_acceptor_j is not None:
+        cj = cj * torch.exp(log_acceptor_j)
+    prefactor = di * cj + ci * dj
+    return -prefactor * slater_overlap(torch.sqrt(width) * distance)
+
+
 def undamped_multipole_elst(
     ZA: Tensor,
     RA: Tensor,
@@ -142,21 +181,16 @@ def undamped_multipole_elst(
     e_AB_source: Tensor,
     e_AB_target: Tensor,
     Q_const: float = 3.0,
+    include_uq_qq: bool = False,
 ) -> Tensor:
-    """Undamped per-edge multipole electrostatics in kcal/mol, CLIFF2's term set.
+    """Undamped per-edge multipole electrostatics in kcal/mol.
 
-    The terms and conventions are those of the Rackers-damped
-    `mtp_elst_damping` that CLIFF2 evaluates (q-q, q-mu, mu-mu, q-Theta; no
-    mu-Theta or Theta-Theta; Theta contracted with T2 / Q_const; 627.509
-    hartree -> kcal/mol), with every damping factor equal to one.  Undamped,
-    the nucleus/cloud split `mtp_elst` performs is exact, so only the net
-    charge q enters.
-
-    Unlike `mtp_elst` this is dtype-generic (no default-dtype identity) and
-    does not mutate its inputs, so it can run in float64.  Coordinates are in
-    Angstrom; pass the FULL intermolecular edge set.
+    With ``include_uq_qq=False`` (default), evaluates CLIFF2's truncated term
+    set (q-q, q-mu, mu-mu, q-Theta). With ``include_uq_qq=True``, adds exact
+    dipole-quadrupole (u-Q) and quadrupole-quadrupole (Q-Q) interactions.
     """
     from apnet_pt import constants
+    from apnet_pt.AtomPairwiseModels.mtp_mtp import _contract_uq_qq_damped
 
     dtype = qA.dtype
     RA, RB = RA.to(dtype), RB.to(dtype)
@@ -179,7 +213,14 @@ def undamped_multipole_elst(
           - (d * d)[:, None, None] * eye) * ood[:, None, None] ** 5
     e_uu = -torch.einsum("xy,xz,xyz->x", mua, mub, T2)
     e_qQ = (T2 * (qa[:, None, None] * Qb + qb[:, None, None] * Qa)).sum((-1, -2))
-    return 627.509 * (e_qq + e_qu + e_uu + e_qQ / Q_const)
+    total = e_qq + e_qu + e_uu + e_qQ / Q_const
+    if include_uq_qq:
+        ones = torch.ones_like(ood)
+        e_uQ, e_QQ = _contract_uq_qq_damped(
+            d_xyz, ood, mua, Qa, mub, Qb, ones, ones, ones, Q_const=Q_const,
+        )
+        total = total + e_uQ + e_QQ
+    return 627.509 * total
 
 
 def rackers_elst_pair_exponents(
@@ -198,20 +239,21 @@ def rackers_elst_pair_exponents(
     alpha_source: Tensor,
     alpha_target: Tensor,
     Q_const: float = 3.0,
+    damping: str = "cliff",
+    include_uq_qq: bool = False,
 ) -> Tensor:
-    """CLIFF2's Rackers-damped elst with one damping exponent per pair END.
+    """Damped multipole electrostatics with one damping exponent per pair END.
 
-    `mtp_elst_damping` takes one exponent per atom.  A direction-dependent
-    exponent such as eq-l3's B_i(W) differs from pair to pair, so here
-    `alpha_source[k]` damps atom e_AB_source[k] in pair k and `alpha_target[k]`
-    damps atom e_AB_target[k] (bohr^-1, as in `mtp_elst_damping`).  Each pair is
-    evaluated as its own two-atom system, so with per-atom exponents gathered
-    onto the pairs the result equals `mtp_elst_damping` edge for edge.
-
-    Runs in the dtype of `qA` and does not mutate its inputs.  Coordinates are
-    in Angstrom; pass the FULL intermolecular edge set.
+    ``damping="cliff"`` (default, ``include_uq_qq=False``) evaluates CLIFF2's
+    ``mtp_elst_damping``; ``damping="gordon1"`` evaluates Poisson-consistent
+    1-center & 2-center 1s Slater charge penetration
+    (:func:`mtp_elst_damping_gordon1_full`), optionally including ``u-Q`` and
+    ``Q-Q`` terms.
     """
-    from apnet_pt.AtomPairwiseModels.mtp_mtp import mtp_elst_damping
+    from apnet_pt.AtomPairwiseModels.mtp_mtp import (
+        mtp_elst_damping,
+        mtp_elst_damping_gordon1_full,
+    )
 
     dtype = qA.dtype
     pair = torch.arange(len(e_AB_source), device=e_AB_source.device)
@@ -219,9 +261,12 @@ def rackers_elst_pair_exponents(
     def ends(x, index):
         return x.to(dtype).index_select(0, index)
 
-    old = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)  # mtp_elst_damping builds eye(3) in it
-    try:
+    if damping == "cliff":
+        if include_uq_qq:
+            raise ValueError(
+                "include_uq_qq=True requires damping='gordon1' (CLIFF 1-center "
+                "damping has an r^3 cusp whose T_4 diverges as 1/r at r -> 0)"
+            )
         return mtp_elst_damping(
             ends(ZA, e_AB_source), ends(RA, e_AB_source),
             ends(qA.reshape(-1), e_AB_source), ends(muA, e_AB_source),
@@ -229,6 +274,16 @@ def rackers_elst_pair_exponents(
             ends(ZB, e_AB_target), ends(RB, e_AB_target),
             ends(qB.reshape(-1), e_AB_target), ends(muB, e_AB_target),
             ends(quadB, e_AB_target), alpha_target.to(dtype),
-            pair, pair, Q_const=Q_const)
-    finally:
-        torch.set_default_dtype(old)
+            pair, pair, Q_const=Q_const,
+        )
+    if damping == "gordon1":
+        return mtp_elst_damping_gordon1_full(
+            ends(ZA, e_AB_source), ends(RA, e_AB_source),
+            ends(qA.reshape(-1), e_AB_source), ends(muA, e_AB_source),
+            ends(quadA, e_AB_source), alpha_source.to(dtype),
+            ends(ZB, e_AB_target), ends(RB, e_AB_target),
+            ends(qB.reshape(-1), e_AB_target), ends(muB, e_AB_target),
+            ends(quadB, e_AB_target), alpha_target.to(dtype),
+            pair, pair, Q_const=Q_const, include_uq_qq=include_uq_qq,
+        )
+    raise ValueError(f"Unknown electrostatic damping mode: {damping!r}")

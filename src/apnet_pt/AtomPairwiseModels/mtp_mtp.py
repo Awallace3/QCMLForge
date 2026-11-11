@@ -4246,36 +4246,63 @@ def elst_damping_mtp_mtp_torch(
     # need to have alpha_i repeated for each atom in j and vice versa
     alpha_i = alpha_i.index_select(0, e_source)
     alpha_j = alpha_j.index_select(0, e_target)
-    r2 = r**2
-    r3 = r2 * r
+    r2 = r * r
     a1_2 = alpha_i * alpha_i
     a2_2 = alpha_j * alpha_j
-    a1_3 = a1_2 * alpha_i
-    lam1 = torch.ones_like(r)
-    lam3 = torch.ones_like(r)
-    lam5 = torch.ones_like(r)
-    e1r = torch.exp(-1.0 * alpha_i * r)
-    e2r = torch.exp(-1.0 * alpha_j * r)
-    diff = torch.abs(alpha_i - alpha_j) > 1e-6
-    # Add small epsilon to denominator to prevent NaN during backprop
-    # (torch.where evaluates both branches, so division happens even when diff=False)
-    eps = 1e-10
+    e1r = torch.exp(-alpha_i * r)
+    e2r = torch.exp(-alpha_j * r)
+
+    alpha_sum = torch.clamp(alpha_i + alpha_j, min=1e-12)
+    u = (alpha_i - alpha_j) / alpha_sum
+    u_thresh = 0.05 if r.dtype in (torch.float16, torch.bfloat16, torch.float32) else 1e-4
+    diff = torch.abs(u) >= u_thresh
+
+    # Guard denominator in the unused branch so neither forward nor backward overflows
     denom = a2_2 - a1_2
-    safe_denom = torch.where(torch.abs(denom) > eps, denom, torch.full_like(denom, eps))
+    safe_denom = torch.where(diff, denom, torch.ones_like(denom))
     A = torch.where(diff, a2_2 / safe_denom, torch.zeros_like(r))
     B = torch.where(diff, a1_2 / (-safe_denom), torch.zeros_like(r))
-    lam1 = torch.where(diff, 1 - A * e1r - B * e2r, 1 - (1.0 + 0.5 * alpha_i * r) * e1r)
+
+    # Symmetric O(u^4) Taylor series around x = 0.5 * (alpha_i + alpha_j) * r
+    x = 0.5 * alpha_sum * r
+    x2 = x * x
+    x3 = x2 * x
+    x4 = x2 * x2
+    x5 = x3 * x2
+    x6 = x3 * x3
+    x7 = x4 * x3
+    u2 = u * u
+    u4 = u2 * u2
+    ex = torch.exp(-x)
+
+    lam1_sym = 1.0 - ex * (
+        (1.0 + 0.5 * x)
+        + u2 * (0.5 * x + 0.5 * x2 + x3 / 12.0)
+        + u4 * (x3 / 12.0 + x4 / 24.0 + x5 / 240.0)
+    )
+    lam3_sym = 1.0 - ex * (
+        (1.0 + x + 0.5 * x2)
+        + u2 * (x3 / 3.0 + x4 / 12.0)
+        + u4 * (-x3 / 6.0 - x4 / 24.0 + x5 / 40.0 + x6 / 240.0)
+    )
+    lam5_sym = 1.0 - ex * (
+        (1.0 + x + 0.5 * x2 + x3 / 6.0)
+        + u2 * (x4 / 12.0 + x5 / 36.0)
+        + u4 * (-x4 / 24.0 - 11.0 * x5 / 360.0 + x6 / 240.0 + x7 / 720.0)
+    )
+
+    lam1 = torch.where(diff, 1.0 - A * e1r - B * e2r, lam1_sym)
     lam3 = torch.where(
         diff,
-        1 - (1.0 + alpha_i * r) * A * e1r - (1.0 + alpha_j * r) * B * e2r,
-        1 - (1.0 + alpha_i * r + 0.5 * a1_2 * r2) * e1r,
+        1.0 - (1.0 + alpha_i * r) * A * e1r - (1.0 + alpha_j * r) * B * e2r,
+        lam3_sym,
     )
     lam5 = torch.where(
         diff,
-        1
+        1.0
         - (1.0 + alpha_i * r + (1.0 / 3.0) * a1_2 * r2) * A * e1r
         - (1.0 + alpha_j * r + (1.0 / 3.0) * a2_2 * r2) * B * e2r,
-        1 - (1.0 + alpha_i * r + 0.5 * a1_2 * r2 + (1.0 / 6.0) * a1_3 * r3) * e1r,
+        lam5_sym,
     )
     return lam1, lam3, lam5
 
@@ -4633,7 +4660,7 @@ def mtp_elst_damping(
     dR = dR_ang / constants.au2ang
     dR_xyz = dR_xyz_ang / constants.au2ang
     oodR = 1.0 / dR
-    delta = torch.eye(3, device=qA_0.device)
+    delta = torch.eye(3, device=qA_0.device, dtype=qA_0.dtype)
 
     lam1, lam3, lam5 = elst_damping_mtp_mtp_torch(Ka, Kb, dR, e_AB_source, e_AB_target)
     lam1_ZA_MB, lam3_ZA_MB, lam5_ZA_MB, lam1_ZB_MA, lam3_ZB_MA, lam5_ZB_MA = (
@@ -4761,7 +4788,7 @@ def mtp_elst_damping_AMOEBA(
     dR = dR_ang / constants.au2ang
     dR_xyz = dR_xyz_ang / constants.au2ang
     oodR = 1.0 / dR
-    delta = torch.eye(3, device=qA_0.device)
+    delta = torch.eye(3, device=qA_0.device, dtype=qA_0.dtype)
 
     lam1, lam3, lam5 = elst_damping_AMOEBA_mtp_mtp_torch(
         Ka, Kb, dR, e_AB_source, e_AB_target
@@ -4848,6 +4875,411 @@ def mtp_elst_damping_AMOEBA(
     return E_elst
 
 
+def elst_damping_gordon1_z_mtp_torch(
+    alpha_i: torch.Tensor,
+    alpha_j: torch.Tensor,
+    r: torch.Tensor,
+    e_source: torch.Tensor,
+    e_target: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Exact 1-center 1s Slater (Gordon1) core-cloud Z-MTP damping factors.
+
+    Evaluates the Poisson potential of ``rho(r) = (alpha^3 / 8pi) exp(-alpha r)``
+    independently on each edge end with no ``alpha_i ~ alpha_j`` branch and a
+    cancellation-free small-``z`` series near ``r -> 0``.
+    """
+    alpha_i = alpha_i.index_select(0, e_source)
+    alpha_j = alpha_j.index_select(0, e_target)
+    zi = alpha_i * r
+    zj = alpha_j * r
+    z_small = 0.25 if r.dtype in (torch.float16, torch.bfloat16, torch.float32) else 0.05
+
+    def _side(z: torch.Tensor):
+        z2 = z * z
+        z3 = z2 * z
+        z4 = z2 * z2
+        z5 = z3 * z2
+        z6 = z3 * z3
+        z7 = z4 * z3
+        ex = torch.exp(-z)
+        small = z < z_small
+        l1 = torch.where(
+            small,
+            0.5 * z - z3 / 6.0 + z4 / 12.0 - z5 / 40.0,
+            1.0 - (1.0 + 0.5 * z) * ex,
+        )
+        l3 = torch.where(
+            small,
+            z3 / 6.0 - z4 / 8.0 + z5 / 20.0 - z6 / 72.0,
+            1.0 - (1.0 + z + 0.5 * z2) * ex,
+        )
+        l5 = torch.where(
+            small,
+            z4 / 24.0 - z5 / 30.0 + z6 / 72.0 - z7 / 252.0,
+            1.0 - (1.0 + z + 0.5 * z2 + z3 / 6.0) * ex,
+        )
+        return l1, l3, l5
+
+    lam1_j, lam3_j, lam5_j = _side(zj)
+    lam1_i, lam3_i, lam5_i = _side(zi)
+    return lam1_j, lam3_j, lam5_j, lam1_i, lam3_i, lam5_i
+
+
+def elst_damping_gordon1_mtp_mtp_torch(
+    alpha_i: torch.Tensor,
+    alpha_j: torch.Tensor,
+    r: torch.Tensor,
+    e_source: torch.Tensor,
+    e_target: torch.Tensor,
+    include_l7_l9: bool = False,
+):
+    """Exact 2-center 1s-1s Slater (Gordon1) cloud-cloud damping factors.
+
+    Uses a symmetric ``O(u^4)`` series near ``alpha_i ~ alpha_j`` and an exact
+    cancellation-free small-``x`` polynomial series near ``r -> 0`` so values,
+    short-range ``T_4`` limits, and ``d/d(alpha)`` gradients stay smooth and
+    accurate in ``float32`` and ``float64``.
+    """
+    alpha_i = alpha_i.index_select(0, e_source)
+    alpha_j = alpha_j.index_select(0, e_target)
+    zi = alpha_i * r
+    zk = alpha_j * r
+    zi2 = zi * zi
+    zi3 = zi2 * zi
+    zk2 = zk * zk
+    zk3 = zk2 * zk
+    exi = torch.exp(-zi)
+    exk = torch.exp(-zk)
+
+    is_f32 = r.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    alpha_sum = torch.clamp(alpha_i + alpha_j, min=1e-12)
+    alpha_sum3 = alpha_sum * alpha_sum * alpha_sum
+    alpha_prod = alpha_i * alpha_j
+    alpha_prod3 = alpha_prod * alpha_prod * alpha_prod
+    alpha_prod4 = alpha_prod3 * alpha_prod
+
+    u = (alpha_i - alpha_j) / alpha_sum
+    u_thresh = 0.08 if is_f32 else 0.005
+    diff = torch.abs(u) >= u_thresh
+
+    a1_2 = alpha_i * alpha_i
+    a2_2 = alpha_j * alpha_j
+    denom = a2_2 - a1_2
+    safe_denom = torch.where(diff, denom, torch.ones_like(denom))
+    ti = torch.where(diff, a2_2 / safe_denom, torch.zeros_like(r))
+    tk = torch.where(diff, a1_2 / (-safe_denom), torch.zeros_like(r))
+    ti2 = ti * ti
+    tk2 = tk * tk
+    two_ti2_tk = 2.0 * ti2 * tk
+    two_tk2_ti = 2.0 * tk2 * ti
+
+    x = 0.5 * alpha_sum * r
+    x2 = x * x
+    x3 = x2 * x
+    x4 = x2 * x2
+    x5 = x3 * x2
+    x6 = x3 * x3
+    x7 = x4 * x3
+    x8 = x4 * x4
+    x9 = x5 * x4
+    u2 = u * u
+    u4 = u2 * u2
+    ex = torch.exp(-x)
+
+    r2 = r * r
+    r3 = r2 * r
+    r5 = r3 * r2
+    r7 = r5 * r2
+    sym_quad = a1_2 + 3.0 * alpha_prod + a2_2
+    small_low = x < (0.25 if is_f32 else 0.05)
+
+    lam1_small = (
+        alpha_prod * sym_quad / (2.0 * alpha_sum3) * r
+        - alpha_prod3 / (12.0 * alpha_sum3) * r3
+    )
+    lam3_small = (
+        alpha_prod3 / (6.0 * alpha_sum3) * r3
+        - alpha_prod4 / (60.0 * alpha_sum3) * r5
+    )
+    lam5_small = (
+        alpha_prod4 / (90.0 * alpha_sum3) * r5
+        - alpha_prod4 * sym_quad / (1260.0 * alpha_sum3) * r7
+    )
+
+    lam1_sym = 1.0 - ex * (
+        (1.0 + (11.0 / 16.0) * x + (3.0 / 16.0) * x2 + x3 / 48.0)
+        + u2 * ((3.0 / 8.0) * x + (3.0 / 8.0) * x2 + (5.0 / 32.0) * x3 + x4 / 32.0 + x5 / 480.0)
+        + u4 * (-x / 16.0 - x2 / 16.0 + x4 / 48.0 + (19.0 / 1920.0) * x5 + x6 / 640.0 + x7 / 13440.0)
+    )
+    lam3_sym = 1.0 - ex * (
+        (1.0 + x + 0.5 * x2 + (7.0 / 48.0) * x3 + x4 / 48.0)
+        + u2 * (x3 / 16.0 + x4 / 16.0 + (11.0 / 480.0) * x5 + x6 / 480.0)
+        + u4 * (-x3 / 16.0 - x4 / 16.0 - (3.0 / 160.0) * x5 + x6 / 480.0 + x7 / 896.0 + x8 / 13440.0)
+    )
+    lam5_sym = 1.0 - ex * (
+        (1.0 + x + 0.5 * x2 + x3 / 6.0 + x4 / 24.0 + x5 / 144.0)
+        + u2 * (x5 / 180.0 + x6 / 180.0 + x7 / 1440.0)
+        + u4 * (-x5 / 120.0 - x6 / 120.0 - x7 / 1260.0 + x8 / 4032.0 + x9 / 40320.0)
+    )
+
+    lam1_diff = (
+        1.0
+        - (ti2 * (1.0 + 0.5 * zi) + two_ti2_tk) * exi
+        - (tk2 * (1.0 + 0.5 * zk) + two_tk2_ti) * exk
+    )
+    lam3_diff = (
+        1.0
+        - (ti2 * (1.0 + zi + 0.5 * zi2) + two_ti2_tk * (1.0 + zi)) * exi
+        - (tk2 * (1.0 + zk + 0.5 * zk2) + two_tk2_ti * (1.0 + zk)) * exk
+    )
+    lam5_diff = (
+        1.0
+        - (ti2 * (1.0 + zi + 0.5 * zi2 + zi3 / 6.0) + two_ti2_tk * (1.0 + zi + zi2 / 3.0)) * exi
+        - (tk2 * (1.0 + zk + 0.5 * zk2 + zk3 / 6.0) + two_tk2_ti * (1.0 + zk + zk2 / 3.0)) * exk
+    )
+
+    lam1 = torch.where(small_low, lam1_small, torch.where(diff, lam1_diff, lam1_sym))
+    lam3 = torch.where(small_low, lam3_small, torch.where(diff, lam3_diff, lam3_sym))
+    lam5 = torch.where(small_low, lam5_small, torch.where(diff, lam5_diff, lam5_sym))
+    if not include_l7_l9:
+        return lam1, lam3, lam5
+
+    zi4 = zi2 * zi2
+    zi5 = zi3 * zi2
+    zk4 = zk2 * zk2
+    zk5 = zk3 * zk2
+    x10 = x5 * x5
+    x11 = x6 * x5
+
+    r8 = r5 * r3
+    r9 = r7 * r2
+    r10 = r5 * r5
+    sym_quart = (
+        3.0 * a1_2 * a1_2
+        + 9.0 * a1_2 * alpha_prod
+        + 11.0 * alpha_prod * alpha_prod
+        + 9.0 * a2_2 * alpha_prod
+        + 3.0 * a2_2 * a2_2
+    )
+    small_high = x < (0.45 if is_f32 else 0.15)
+    lam7_small = (
+        alpha_prod4 * sym_quad / (3150.0 * alpha_sum3) * r7
+        - (alpha_prod4 / 5760.0) * r8
+        + alpha_prod4 * sym_quart / (56700.0 * alpha_sum3) * r9
+    )
+    lam9_small = (
+        (alpha_prod4 / 40320.0) * r8
+        - alpha_prod4 * sym_quart / (198450.0 * alpha_sum3) * r9
+        + alpha_prod4 * (a1_2 + a2_2) / 201600.0 * r10
+    )
+
+    lam7_sym = 1.0 - ex * (
+        (1.0 + x + 0.5 * x2 + x3 / 6.0 + x4 / 24.0 + x5 / 120.0 + x6 / 720.0)
+        + u2 * (x7 / 1200.0 + x8 / 7200.0)
+        + u4 * ((-17.0 / 12600.0) * x7 - (31.0 / 100800.0) * x8 + x9 / 33600.0 + x10 / 201600.0)
+    )
+    lam9_sym = 1.0 - ex * (
+        (1.0 + x + 0.5 * x2 + x3 / 6.0 + x4 / 24.0 + x5 / 120.0 + x6 / 720.0 + x7 / 5040.0)
+        + u2 * (x8 / 10080.0 + x9 / 50400.0)
+        + u4 * (-x8 / 6720.0 - (37.0 / 705600.0) * x9 + x10 / 470400.0 + x11 / 1411200.0)
+    )
+
+    lam7_diff = (
+        1.0
+        - (
+            ti2 * (1.0 + zi + 0.5 * zi2 + zi3 / 6.0 + zi4 / 30.0)
+            + two_ti2_tk * (1.0 + zi + 0.4 * zi2 + zi3 / 15.0)
+        )
+        * exi
+        - (
+            tk2 * (1.0 + zk + 0.5 * zk2 + zk3 / 6.0 + zk4 / 30.0)
+            + two_tk2_ti * (1.0 + zk + 0.4 * zk2 + zk3 / 15.0)
+        )
+        * exk
+    )
+    lam9_diff = (
+        1.0
+        - (
+            ti2 * (1.0 + zi + 0.5 * zi2 + zi3 / 6.0 + (4.0 / 105.0) * zi4 + zi5 / 210.0)
+            + two_ti2_tk * (1.0 + zi + (3.0 / 7.0) * zi2 + (2.0 / 21.0) * zi3 + zi4 / 105.0)
+        )
+        * exi
+        - (
+            tk2 * (1.0 + zk + 0.5 * zk2 + zk3 / 6.0 + (4.0 / 105.0) * zk4 + zk5 / 210.0)
+            + two_tk2_ti * (1.0 + zk + (3.0 / 7.0) * zk2 + (2.0 / 21.0) * zk3 + zk4 / 105.0)
+        )
+        * exk
+    )
+    lam7 = torch.where(small_high, lam7_small, torch.where(diff, lam7_diff, lam7_sym))
+    lam9 = torch.where(small_high, lam9_small, torch.where(diff, lam9_diff, lam9_sym))
+    return lam1, lam3, lam5, lam7, lam9
+
+
+def _contract_t3_theta(
+    dR_xyz: torch.Tensor,
+    oodR: torch.Tensor,
+    lam5: torch.Tensor,
+    lam7: torch.Tensor,
+    quad: torch.Tensor,
+) -> torch.Tensor:
+    """Allocation-free contraction ``(T_3(dR_xyz) : quad)_i`` of shape ``(E, 3)``."""
+    v = (quad * dR_xyz.unsqueeze(-2)).sum(-1)
+    s = (dR_xyz * v).sum(-1)
+    tr = quad.diagonal(dim1=-2, dim2=-1).sum(-1)
+    r2 = 1.0 / (oodR * oodR)
+    oodR7 = (oodR ** 7).unsqueeze(-1)
+    term7 = -15.0 * (lam7 * s).unsqueeze(-1) * dR_xyz
+    term5 = 3.0 * (lam5 * r2).unsqueeze(-1) * (2.0 * v + tr.unsqueeze(-1) * dR_xyz)
+    return oodR7 * (term7 + term5)
+
+
+def _contract_uq_qq_damped(
+    dR_xyz: torch.Tensor,
+    oodR: torch.Tensor,
+    muA: torch.Tensor,
+    quadA: torch.Tensor,
+    muB: torch.Tensor,
+    quadB: torch.Tensor,
+    lam5: torch.Tensor,
+    lam7: torch.Tensor,
+    lam9: torch.Tensor,
+    Q_const: float = 3.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocation-free damped dipole-quadrupole and quadrupole-quadrupole energies (au)."""
+    t3_qb = _contract_t3_theta(dR_xyz, oodR, lam5, lam7, quadB)
+    t3_qa = _contract_t3_theta(dR_xyz, oodR, lam5, lam7, quadA)
+    e_uq = -((muA * t3_qb).sum(-1) - (muB * t3_qa).sum(-1)) / Q_const
+
+    va = (quadA * dR_xyz.unsqueeze(-2)).sum(-1)
+    vb = (quadB * dR_xyz.unsqueeze(-2)).sum(-1)
+    sa = (dR_xyz * va).sum(-1)
+    sb = (dR_xyz * vb).sum(-1)
+    ta = quadA.diagonal(dim1=-2, dim2=-1).sum(-1)
+    tb = quadB.diagonal(dim1=-2, dim2=-1).sum(-1)
+    qa_qb = (quadA * quadB).sum((-1, -2))
+    va_vb = (va * vb).sum(-1)
+
+    r2 = 1.0 / (oodR * oodR)
+    r4 = r2 * r2
+    oodR9 = oodR ** 9
+    e_qq_quad = (
+        oodR9
+        * (
+            105.0 * lam9 * sa * sb
+            - 15.0 * lam7 * r2 * (sa * tb + ta * sb + 4.0 * va_vb)
+            + 3.0 * lam5 * r4 * (ta * tb + 2.0 * qa_qb)
+        )
+        / (Q_const * Q_const)
+    )
+    return e_uq, e_qq_quad
+
+
+def mtp_elst_damping_gordon1_full(
+    ZA: torch.Tensor,
+    RA: torch.Tensor,
+    qA_0: torch.Tensor,
+    muA: torch.Tensor,
+    quadA: torch.Tensor,
+    Ka: torch.Tensor,
+    ZB: torch.Tensor,
+    RB: torch.Tensor,
+    qB_0: torch.Tensor,
+    muB: torch.Tensor,
+    quadB: torch.Tensor,
+    Kb: torch.Tensor,
+    e_AB_source: torch.Tensor,
+    e_AB_target: torch.Tensor,
+    Q_const: float = 3.0,
+    include_uq_qq: bool = True,
+) -> torch.Tensor:
+    """Poisson-consistent 1-center & 2-center 1s Slater (Gordon1) multipole elst (kcal/mol)."""
+    dR_ang, dR_xyz_ang = get_distances(RA, RB, e_AB_source, e_AB_target)
+    dR = dR_ang / constants.au2ang
+    dR_xyz = dR_xyz_ang / constants.au2ang
+    oodR = 1.0 / dR
+    delta = torch.eye(3, device=qA_0.device, dtype=qA_0.dtype)
+
+    if include_uq_qq:
+        lam1, lam3, lam5, lam7, lam9 = elst_damping_gordon1_mtp_mtp_torch(
+            Ka, Kb, dR, e_AB_source, e_AB_target, include_l7_l9=True
+        )
+    else:
+        lam1, lam3, lam5 = elst_damping_gordon1_mtp_mtp_torch(
+            Ka, Kb, dR, e_AB_source, e_AB_target, include_l7_l9=False
+        )
+        lam7 = lam9 = lam5
+    lam1_ZA_MB, lam3_ZA_MB, lam5_ZA_MB, lam1_ZB_MA, lam3_ZB_MA, lam5_ZB_MA = (
+        elst_damping_gordon1_z_mtp_torch(Ka, Kb, dR, e_AB_source, e_AB_target)
+    )
+
+    ZA_q = ZA.index_select(0, e_AB_source)
+    ZB_q = ZB.index_select(0, e_AB_target)
+    qA = qA_0 - ZA
+    qB = qB_0 - ZB
+    qA_source = qA.reshape(-1).index_select(0, e_AB_source)
+    qB_source = qB.reshape(-1).index_select(0, e_AB_target)
+    muA_source = muA.index_select(0, e_AB_source)
+    muB_source = muB.index_select(0, e_AB_target)
+    quadA_source = quadA.index_select(0, e_AB_source)
+    quadB_source = quadB.index_select(0, e_AB_target)
+
+    E_qq = qA_source * qB_source * oodR * lam1
+    T1 = -dR_xyz * (oodR ** 3).unsqueeze(-1)
+    qu = qA_source.unsqueeze(-1) * muB_source - qB_source.unsqueeze(-1) * muA_source
+    E_qu = (T1 * qu).sum(-1) * lam3
+
+    dR_outer = dR_xyz.unsqueeze(-1) * dR_xyz.unsqueeze(-2)
+    dR_squared_delta = (dR * dR).unsqueeze(-1).unsqueeze(-1) * delta
+    oodR5 = (oodR ** 5).unsqueeze(-1).unsqueeze(-1)
+    T2_main = oodR5 * (
+        3.0 * dR_outer * lam5.unsqueeze(-1).unsqueeze(-1)
+        - dR_squared_delta * lam3.unsqueeze(-1).unsqueeze(-1)
+    )
+    E_uu = -torch.einsum("xy,xz,xyz->x", muA_source, muB_source, T2_main)
+    E_qQ = (
+        (T2_main * (qA_source[:, None, None] * quadB_source + qB_source[:, None, None] * quadA_source)).sum((-1, -2))
+        / Q_const
+    )
+
+    E_ZA_ZB = ZA_q * ZB_q * oodR
+
+    T2_ZA_MB = oodR5 * (
+        3.0 * dR_outer * lam5_ZA_MB[:, None, None]
+        - dR_squared_delta * lam3_ZA_MB[:, None, None]
+    )
+    E_ZA_MB = (
+        ZA_q * qB_source * oodR * lam1_ZA_MB
+        + (T1 * muB_source).sum(-1) * lam3_ZA_MB * ZA_q
+        + (T2_ZA_MB * quadB_source).sum((-1, -2)) * ZA_q / Q_const
+    )
+
+    T2_ZB_MA = oodR5 * (
+        3.0 * dR_outer * lam5_ZB_MA[:, None, None]
+        - dR_squared_delta * lam3_ZB_MA[:, None, None]
+    )
+    E_ZB_MA = (
+        ZB_q * qA_source * oodR * lam1_ZB_MA
+        + (-T1 * muA_source).sum(-1) * lam3_ZB_MA * ZB_q
+        + (T2_ZB_MA * quadA_source).sum((-1, -2)) * ZB_q / Q_const
+    )
+
+    total = E_qq + E_qu + E_qQ + E_uu + E_ZA_ZB + E_ZA_MB + E_ZB_MA
+    if include_uq_qq:
+        E_uQ, E_QQ = _contract_uq_qq_damped(
+            dR_xyz, oodR, muA_source, quadA_source, muB_source, quadB_source,
+            lam5, lam7, lam9, Q_const=Q_const,
+        )
+        total = total + E_uQ + E_QQ
+    return 627.509 * total
+
+
 # @torch.compile
 def distance_tensors(
     Ri, Rj, e_source, e_target, alpha_A=None, alpha_B=None, thole_damping_param=0.39
@@ -4900,13 +5332,8 @@ def _rackers_distance_tensors(
     thole_edge_values: torch.Tensor,
     damping_type: str,
     direct_exponent: float = THOLE_DIRECT_EXPONENT_AMOEBA_PLUS,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
+    include_t3: bool = False,
+):
     """Build direct or mutual Thole tensors from edge damping values."""
     dR_ang, dR_xyz_ang = get_distances(Ri, Rj, e_source, e_target)
     dR_xyz = dR_xyz_ang / constants.au2ang
@@ -4915,20 +5342,41 @@ def _rackers_distance_tensors(
     alpha_target = alpha_j.index_select(0, e_target)
 
     if damping_type == "direct":
-        _, lam_3, lam_5 = thole_damping_direct_torch(
-            dR,
-            alpha_source,
-            alpha_target,
-            thole_edge_values,
-            exponent=direct_exponent,
-        )
+        if include_t3:
+            _, lam_3, lam_5, lam_7 = thole_damping_direct_torch(
+                dR,
+                alpha_source,
+                alpha_target,
+                thole_edge_values,
+                exponent=direct_exponent,
+                include_l7=True,
+            )
+        else:
+            _, lam_3, lam_5 = thole_damping_direct_torch(
+                dR,
+                alpha_source,
+                alpha_target,
+                thole_edge_values,
+                exponent=direct_exponent,
+            )
+            lam_7 = lam_5
     elif damping_type == "mutual":
-        _, lam_3, lam_5 = thole_damping_mutual_torch(
-            dR,
-            alpha_source,
-            alpha_target,
-            thole_edge_values,
-        )
+        if include_t3:
+            _, lam_3, lam_5, lam_7 = thole_damping_mutual_torch(
+                dR,
+                alpha_source,
+                alpha_target,
+                thole_edge_values,
+                include_l7=True,
+            )
+        else:
+            _, lam_3, lam_5 = thole_damping_mutual_torch(
+                dR,
+                alpha_source,
+                alpha_target,
+                thole_edge_values,
+            )
+            lam_7 = lam_5
     else:
         raise ValueError(
             f"Invalid Rackers damping type: {damping_type!r}"
@@ -4943,7 +5391,17 @@ def _rackers_distance_tensors(
         "xy,xz,x->xyz", dR_xyz, dR_xyz, lam_5
     ) - torch.einsum("x,x,yz,x->xyz", dR, dR, delta, lam_3)
     T2 = torch.einsum("x,xyz->xyz", oodR**5, T2)
+    if include_t3:
+        return dR, dR_xyz, oodR, T1, T2, lam_5, lam_7
     return dR, dR_xyz, oodR, T1, T2
+
+
+def _eval_t3_theta(t3_spec, quad_edge: torch.Tensor) -> torch.Tensor:
+    """Evaluate ``T_3 : quad_edge`` from either ``(dR_xyz, oodR, lam5, lam7)`` or dense ``(E,3,3,3)``."""
+    if isinstance(t3_spec, tuple):
+        dR_xyz, oodR, lam_5, lam_7 = t3_spec
+        return _contract_t3_theta(dR_xyz, oodR, lam_5, lam_7, quad_edge)
+    return torch.einsum("aijk,ajk->ai", t3_spec, quad_edge)
 
 
 def _rackers_initial_permanent_fields(
@@ -4966,6 +5424,12 @@ def _rackers_initial_permanent_fields(
     T1_BB: torch.Tensor,
     T2_BB: torch.Tensor,
     intramolecular_permanent_field: bool = False,
+    quadA: torch.Tensor | None = None,
+    quadB: torch.Tensor | None = None,
+    direct_T3_AB=None,
+    direct_T3_AA=None,
+    direct_T3_BB=None,
+    Q_const: float = 3.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the permanent-multipole field that drives the induced dipoles.
 
@@ -5029,6 +5493,22 @@ def _rackers_initial_permanent_fields(
         mu_dipole_B, e_AB_target, dim_size=n_atoms_B
     )
 
+    if quadA is not None and quadB is not None and direct_T3_AB is not None:
+        quadA_source = quadA.index_select(0, e_AB_source)
+        quadB_target = quadB.index_select(0, e_AB_target)
+        field_quad_A = _eval_t3_theta(direct_T3_AB, quadB_target) / Q_const
+        field_quad_B = -_eval_t3_theta(direct_T3_AB, quadA_source) / Q_const
+        mu_induced_0_A += scatter_sum_compile(
+            alpha_A_source.unsqueeze(-1) * field_quad_A,
+            e_AB_source,
+            dim_size=n_atoms_A,
+        )
+        mu_induced_0_B += scatter_sum_compile(
+            alpha_B_target.unsqueeze(-1) * field_quad_B,
+            e_AB_target,
+            dim_size=n_atoms_B,
+        )
+
     if not intramolecular_permanent_field:
         return mu_induced_0_A, mu_induced_0_B
 
@@ -5041,8 +5521,14 @@ def _rackers_initial_permanent_fields(
     mu_dipole_AA = torch.einsum(
         "a,aij,aj->ai", alpha_AA_target, T2_AA, muA_AA_source
     )
+    mu_AA_total = mu_charge_AA + mu_dipole_AA
+    if quadA is not None and direct_T3_AA is not None:
+        quadA_AA_source = quadA.index_select(0, e_AA_source)
+        mu_AA_total = mu_AA_total + alpha_AA_target.unsqueeze(-1) * (
+            -_eval_t3_theta(direct_T3_AA, quadA_AA_source) / Q_const
+        )
     mu_induced_0_A += scatter_sum_compile(
-        mu_charge_AA + mu_dipole_AA,
+        mu_AA_total,
         e_AA_target,
         dim_size=n_atoms_A,
     )
@@ -5056,8 +5542,14 @@ def _rackers_initial_permanent_fields(
     mu_dipole_BB = torch.einsum(
         "a,aij,aj->ai", alpha_BB_target, T2_BB, muB_BB_source
     )
+    mu_BB_total = mu_charge_BB + mu_dipole_BB
+    if quadB is not None and direct_T3_BB is not None:
+        quadB_BB_source = quadB.index_select(0, e_BB_source)
+        mu_BB_total = mu_BB_total + alpha_BB_target.unsqueeze(-1) * (
+            -_eval_t3_theta(direct_T3_BB, quadB_BB_source) / Q_const
+        )
     mu_induced_0_B += scatter_sum_compile(
-        mu_charge_BB + mu_dipole_BB,
+        mu_BB_total,
         e_BB_target,
         dim_size=n_atoms_B,
     )
@@ -5220,6 +5712,9 @@ def _rackers_converge_dipoles(
     convergence_norm=DEFAULT_INDUCTION_CONVERGENCE_NORM,
     intramolecular_permanent_field=False,
     solver="iterative", molecule_ind_A=None, molecule_ind_B=None, n_dimers=None,
+    quadA=None, quadB=None,
+    direct_T3_AB=None, direct_T3_AA=None, direct_T3_BB=None,
+    Q_const=3.0,
 ):
     """Solve the induced dipoles and report how the solve went.
 
@@ -5242,6 +5737,9 @@ def _rackers_converge_dipoles(
         direct_T1_AB, direct_T2_AB, direct_T1_AA, direct_T2_AA,
         direct_T1_BB, direct_T2_BB,
         intramolecular_permanent_field=intramolecular_permanent_field,
+        quadA=quadA, quadB=quadB,
+        direct_T3_AB=direct_T3_AB, direct_T3_AA=direct_T3_AA,
+        direct_T3_BB=direct_T3_BB, Q_const=Q_const,
     )
     if solver == "exact":
         mu_A, mu_B, residual = _rackers_exact_solve(
