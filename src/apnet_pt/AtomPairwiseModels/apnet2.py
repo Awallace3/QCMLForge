@@ -386,8 +386,8 @@ class APNet2_MPNN(nn.Module):
         nedge = e_source.numel()
         if nedge == 0:
             # No intramolecular edges
-            return torch.zeros(
-                0, self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf
+            return h.new_zeros(
+                (0, self.n_embed * 4 * self.n_rbf + self.n_embed * 4 + self.n_rbf)
             )
 
         h0_source = h0.index_select(0, e_source)
@@ -803,7 +803,14 @@ class APNet2Model:
             if version >= 2 and model_io.has_embedded_submodel(
                 checkpoint, "atom_model"
             ):
-                if atom_model_pre_trained_path:
+                if atom_model_pre_trained_path and not (
+                    model_io.embedded_submodel_matches_external(
+                        checkpoint,
+                        "atom_model",
+                        atom_model_pre_trained_path,
+                        map_location=device,
+                    )
+                ):
                     model_io.warn_submodel_override(
                         "atom_model",
                         embedded_type="AtomMPNN",
@@ -1082,8 +1089,13 @@ class APNet2Model:
         """
         Load pretrained weights for the APNet2 and AtomMPNN models.
 
-        For v2 checkpoints with embedded atom_model, the embedded submodel will
-        be used and am_model_path will be ignored (with a warning).
+        For v2 checkpoints with an embedded atom_model, the embedded submodel
+        is used and am_model_path is ignored. A warning is emitted only when the
+        two actually differ: the published ensembles ship each pair checkpoint
+        with a bit-identical copy of its atom model embedded *and* publish that
+        atom model as its own file, so passing both agrees with the checkpoint
+        rather than overriding it. See
+        ``model_io.embedded_submodel_matches_external``.
 
         Parameters
         ----------
@@ -1091,7 +1103,8 @@ class APNet2Model:
             Path to APNet2 checkpoint file.
         am_model_path : str or Path, optional
             Path to AtomMPNN checkpoint file. Ignored if ap2_model_path is a v2
-            checkpoint with embedded atom_model.
+            checkpoint with an embedded atom_model; warns only if it names
+            different weights than the embedded ones.
         model_id : int, optional
             If provided, loads ensemble member ``model_id`` of ``weights``:
             the pair model together with the atom model it was trained
@@ -1123,7 +1136,14 @@ class APNet2Model:
         # Check for embedded atom_model in v2 checkpoint
         atom_model_loaded_from_embed = False
         if version >= 2 and model_io.has_embedded_submodel(checkpoint, "atom_model"):
-            if am_model_path is not None:
+            if am_model_path is not None and not (
+                model_io.embedded_submodel_matches_external(
+                    checkpoint,
+                    "atom_model",
+                    str(am_model_path),
+                    map_location=self.device,
+                )
+            ):
                 model_io.warn_submodel_override(
                     "atom_model",
                     embedded_type="AtomMPNN",
@@ -1462,16 +1482,19 @@ class APNet2Model:
         indB_to_atom = []
         pair_energies_batch = []
 
-        indsA_sr = inp_batch["e_ABsr_source"]
-        indsB_sr = inp_batch["e_ABsr_target"]
-        indsA_lr = inp_batch["e_ABlr_source"]
-        indsB_lr = inp_batch["e_ABlr_target"]
+        # Pair tables are assembled on the host with NumPy.
+        E_elst_sr = E_elst_sr.cpu()
+        E_elst_lr = E_elst_lr.cpu()
+        indsA_sr = inp_batch["e_ABsr_source"].cpu()
+        indsB_sr = inp_batch["e_ABsr_target"].cpu()
+        indsA_lr = inp_batch["e_ABlr_source"].cpu()
+        indsB_lr = inp_batch["e_ABlr_target"].cpu()
 
         dimer_inds, atoms_per_dimer = torch.unique(
-            inp_batch.dimer_ind, return_counts=True
+            inp_batch.dimer_ind.cpu(), return_counts=True
         )
-        indsA_monomer = inp_batch.indA
-        indsB_monomer = inp_batch.indB
+        indsA_monomer = inp_batch.indA.cpu()
+        indsB_monomer = inp_batch.indB.cpu()
 
         for i in dimer_inds:
             size_A = torch.sum(indsA_monomer == i)

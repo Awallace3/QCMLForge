@@ -2,6 +2,7 @@ import copy
 import logging
 import os
 import sys
+import warnings
 from importlib import resources
 
 import numpy as np
@@ -143,14 +144,40 @@ def _resolve_pretrained_paths(rel_paths: list[str]) -> dict[str, str]:
     return resolved
 
 
-def _reject_fused_weights(weights: str) -> None:
-    """Refuse named weight sets that ship no single fused state dict."""
-    if weights != DEFAULT_APNET2_WEIGHTS:
-        raise ValueError(
-            f"weights={weights!r} has no fused ensemble; the fused "
-            "APNet2_AM_MPNN state dict is incompatible with the separate "
-            "atom/pair checkpoints. Pass ap2_fused=False."
+# The only published fused APNet2_AM_MPNN checkpoints (``ap2-fused_ensemble/``)
+# belong to the ``qcmlforge_v1`` generation: their atom weights predate the
+# ``AtomMPNN`` scatter fix, and no fused counterpart of the current default
+# ensemble exists yet.
+FUSED_APNET2_WEIGHTS = "qcmlforge_v1"
+
+
+def _check_fused_weights(weights: str) -> None:
+    """Validate ``weights`` against the one fused ensemble that is published.
+
+    The fused route ignores the weight-set registry and always loads
+    ``ap2-fused_ensemble/``, so it cannot honour a ``weights=`` request. Asking
+    for the default set warns instead of silently passing pre-fix weights off as
+    the current default; asking for anything else with no fused counterpart
+    raises.
+    """
+    if weights == FUSED_APNET2_WEIGHTS:
+        return
+    if weights == DEFAULT_APNET2_WEIGHTS:
+        warnings.warn(
+            f"ap2_fused=True has no {DEFAULT_APNET2_WEIGHTS!r} checkpoints, so "
+            f"the {FUSED_APNET2_WEIGHTS!r} fused ensemble is loaded instead. "
+            "Its atom weights predate the AtomMPNN scatter fix (0.4351 vs "
+            "0.2043 kcal/mol total MAE on the paper's test split). Pass "
+            "ap2_fused=False to use the default weights.",
+            UserWarning,
+            stacklevel=3,
         )
+        return
+    raise ValueError(
+        f"weights={weights!r} has no fused ensemble; the fused "
+        "APNet2_AM_MPNN state dict is incompatible with the separate "
+        "atom/pair checkpoints. Pass ap2_fused=False."
+    )
 
 
 def atom_model_predict(
@@ -159,11 +186,14 @@ def atom_model_predict(
     batch_size: int = 3,
     return_mol_arrays: bool = True,
     weights: str = DEFAULT_APNET2_WEIGHTS,
+    use_GPU: bool | None = None,
 ):
     """Ensemble-average atomic multipoles over a pretrained atom-model ensemble.
 
     ``weights`` names the ensemble: QCMLForge-trained by default, or
     ``"ap2_tf_paper"`` for the atom models published with the AP-Net2 paper.
+    ``use_GPU`` is passed to the model harness: None uses CUDA when available,
+    False forces the CPU.
     """
     num_models = apnet2_weight_set_size(weights)
     atom_rel_paths = [
@@ -172,6 +202,7 @@ def atom_model_predict(
     model_paths = _resolve_pretrained_paths(atom_rel_paths)
     am = AtomModels.ap2_atom_model.AtomModel(
         pre_trained_model_path=model_paths[atom_rel_paths[0]],
+        use_GPU=use_GPU,
     )
     models = [copy.deepcopy(am) for _ in range(num_models)]
     for i in range(1, num_models):
@@ -188,14 +219,10 @@ def atom_model_predict(
     data = [
         atomic_datasets.qcel_mon_to_pyg_data(mol, r_cut=am.model.r_cut) for mol in mols
     ]
-    print(data)
     batched_data = [
         atomic_datasets.atomic_collate_update_no_target(data[i : i + batch_size])
         for i in range(0, len(data), batch_size)
     ]
-    print(f"Number of batches: {len(batched_data)}")
-    print(f"{batched_data = }")
-    print(f"{batched_data[0].x = }")
     print("Predicting...")
     atom_count = sum([len(d.x) for d in data])
     pred_qs = np.zeros((atom_count))
@@ -248,14 +275,22 @@ def apnet2_model_predict(
     ensemble_model_dir: str = model_dir,
     ap2_fused: bool = False,
     weights: str = DEFAULT_APNET2_WEIGHTS,
+    use_GPU: bool | None = None,
 ):
     """Ensemble-average APNet2 interaction energies for ``mols``.
 
     ``weights`` names the ensemble, as in :func:`atom_model_predict`. Returns an
     ``(N, 5)`` array: total, elst, exch, indu, disp, all in kcal/mol.
+
+    ``ap2_fused=True`` ignores ``weights`` and loads the only published fused
+    ensemble, which is the ``"qcmlforge_v1"`` generation; see
+    :data:`FUSED_APNET2_WEIGHTS`.
+
+    ``use_GPU`` is passed to the model harnesses, as in
+    :func:`atom_model_predict`.
     """
     if ap2_fused:
-        _reject_fused_weights(weights)
+        _check_fused_weights(weights)
         num_models = 4
         additional_models_start = 2
         model_paths = _resolve_pretrained_paths(
@@ -263,7 +298,8 @@ def apnet2_model_predict(
             + [f"ap2-fused_ensemble/ap2_{i}.pt" for i in range(2, num_models)]
         )
         ap2 = AtomPairwiseModels.apnet2_fused.APNet2_AM_Model(
-            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
+            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"],
+            use_GPU=use_GPU,
         )
     else:
         num_models = apnet2_weight_set_size(weights)
@@ -276,6 +312,7 @@ def apnet2_model_predict(
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
             pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
             atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
+            use_GPU=use_GPU,
         )
     models = [copy.deepcopy(ap2) for _ in range(num_models)]
     for i in range(additional_models_start, num_models):
@@ -317,6 +354,7 @@ def apnet2_model_predict_pairs(
     print_results: bool = False,
     ap2_fused: bool = True,
     weights: str = DEFAULT_APNET2_WEIGHTS,
+    use_GPU: bool | None = None,
 ):
     """
     Compute ensemble-averaged APNet2 pairwise interaction energies for specified fragment pairs and return per-molecule energies, per-atom pairwise arrays, and a fragment-pair breakdown DataFrame.
@@ -338,10 +376,16 @@ def apnet2_model_predict_pairs(
             If True, print a formatted per-fragment summary to stdout.
         ap2_fused: bool, optional
             If True, use the fused APNet2 variant; otherwise use the standard APNet2 ensemble.
+            The fused variant ignores ``weights`` and always loads the only
+            published fused ensemble, whose atom weights predate the AtomMPNN
+            scatter fix; pass ap2_fused=False to get the default weights.
         weights: str, optional
             Named weight set from ``apnet_pt.hf_pretrained.apnet2_weight_sets()``.
             Defaults to the QCMLForge-trained ensemble; ``"ap2_tf_paper"`` selects
             the ensemble published with the AP-Net2 paper and requires ap2_fused=False.
+        use_GPU: bool | None, optional
+            Passed to the model harnesses: None uses CUDA when available,
+            False forces the CPU.
 
     Returns:
         pred_IEs (numpy.ndarray):
@@ -352,7 +396,7 @@ def apnet2_model_predict_pairs(
             Fragment-pair breakdown with columns ["fA-fB", "total", "elst", "exch", "indu", "disp"], one row per fragment-A/fragment-B pair.
     """
     if ap2_fused:
-        _reject_fused_weights(weights)
+        _check_fused_weights(weights)
     assert fAs is not None, (
         "fAs must be provided. Example: [{'Methyl1_A': [1, 2, 7, 8], 'Methyl2_A': [3, 4, 5, 6]}...]"
     )
@@ -368,7 +412,8 @@ def apnet2_model_predict_pairs(
             + [f"ap2-fused_ensemble/ap2_{i}.pt" for i in range(2, num_models)]
         )
         ap2 = AtomPairwiseModels.apnet2_fused.APNet2_AM_Model(
-            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"]
+            pre_trained_model_path=model_paths["ap2-fused_ensemble/ap2_1.pt"],
+            use_GPU=use_GPU,
         )
     else:
         # models[0] is member 0, so loading must start at 1; starting at 2
@@ -383,6 +428,7 @@ def apnet2_model_predict_pairs(
         ap2 = AtomPairwiseModels.apnet2.APNet2Model(
             pre_trained_model_path=model_paths[rel_paths[0]["pair"]],
             atom_model_pre_trained_path=model_paths[rel_paths[0]["atom"]],
+            use_GPU=use_GPU,
         )
     models = [copy.deepcopy(ap2) for _ in range(num_models)]
     for i in range(additional_models_start, num_models):

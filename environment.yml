@@ -1,22 +1,17 @@
 name: qcml
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
-  - defaults
 dependencies:
   - numpy=2.*
   - pandas=2.*
   - pip
   - pytest=7.4.4
   - python=3.12.8
+  # conda-forge picks a CUDA build when an NVIDIA driver is present and a CPU
+  # build otherwise; the CUDA build pulls in the runtime libraries it needs.
   - pytorch=2.10.*
-  - cuda=12.6.*
-  - pytorch-mutex=1.0
   - requests=2.32.3
   - setuptools=72.1.0
-  - torchaudio
-  - torchvision
   - matplotlib
   - pydantic==2.*
   - scipy
@@ -24,6 +19,8 @@ dependencies:
   - h5py
   - pip:
       - qcelemental==0.29.0
+      # pint 0.26.2 breaks qcelemental 0.29.0's unit registry at import.
+      - pint<0.26.2
       - qm-tools-aw==1.4.5
       # Install optional PyG wheels after env creation when you need them.
       # CPU example:

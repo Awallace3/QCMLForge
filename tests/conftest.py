@@ -12,7 +12,19 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+#: Hugging Face-relative artifacts each ``pretrained_models`` group needs.
+#: The ``qcmlforge_*`` groups are the current default weight set; the bare
+#: ``am_ensemble/``/``ap2_ensemble/`` paths are the ``qcmlforge_v1`` set, still
+#: downloaded by tests that pin values to those specific checkpoints.
 _PRETRAINED_MODEL_GROUPS = {
+    "qcmlforge_am": ["qcmlforge/atom_models/am_0.pt"],
+    "qcmlforge_am_ensemble": [
+        f"qcmlforge/atom_models/am_{index}.pt" for index in range(5)
+    ],
+    "qcmlforge_ensemble": [
+        *[f"qcmlforge/atom_models/am_{index}.pt" for index in range(5)],
+        *[f"qcmlforge/pair_models/ap2_{index}.pt" for index in range(5)],
+    ],
     "am": ["am_ensemble/am_0.pt"],
     "am_ensemble": [f"am_ensemble/am_{index}.pt" for index in range(5)],
     "ap2": ["am_ensemble/am_0.pt", "ap2_ensemble/ap2_0.pt"],
@@ -40,6 +52,30 @@ _PRETRAINED_MODEL_GROUPS = {
     ],
 }
 _TRUE_ENV_VALUES = {"1", "true", "yes", "y"}
+
+
+@pytest.fixture(autouse=True)
+def require_cuda(request):
+    """Skip tests marked ``gpu`` on hosts without a CUDA device."""
+    if request.node.get_closest_marker("gpu") is None:
+        return
+
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(False, id="cpu"),
+        pytest.param(True, id="cuda", marks=pytest.mark.gpu),
+    ]
+)
+def use_gpu(request):
+    """``use_GPU`` value for model harnesses: run on the CPU everywhere and
+    again on CUDA when a device is available."""
+    return request.param
 
 
 @pytest.fixture(autouse=True)

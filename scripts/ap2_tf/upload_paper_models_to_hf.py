@@ -40,20 +40,42 @@ def sha256(path) -> str:
     return digest.hexdigest()
 
 
+def local_candidates(rel_path: str, weights: str, models_dir: Path) -> list[Path]:
+    """Local paths that could hold the checkpoint published at ``rel_path``.
+
+    Two layouts are supported because the registry templates are inconsistent:
+    some start with the weight-set name (``ap2_tf_paper/atom_models/atom0.pt``)
+    and some do not (``am_ensemble/am_0.pt``, the ``qcmlforge_v1`` set).
+
+    * ``models_dir`` mirrors the remote tree -- the default, and how ``models/``
+      is laid out in this repository, so it works for either template style.
+    * ``models_dir`` *is* the weight set's own directory, with the set name
+      stripped. This is what a staging directory outside the repo looks like.
+    """
+    rel = Path(rel_path)
+    candidates = [models_dir / rel]
+    if rel.parts[0] == weights:
+        candidates.append(models_dir / rel.relative_to(weights))
+    return candidates
+
+
 def planned_uploads(weights: str, models_dir: Path) -> list[tuple[Path, str]]:
     """Pair every local checkpoint with the repo path the loader expects.
 
-    The local tree mirrors the remote one, so the basename of each registry
-    path is enough to locate the file; a mismatch means the rename that
-    produced ``models/ap2_tf_paper`` and the registry have diverged.
+    Raises ``FileNotFoundError`` naming every path tried, so a registry that has
+    drifted from the local tree fails loudly instead of uploading a partial set.
     """
     uploads = []
     for model_id in range(apnet2_weight_set_size(weights)):
         for rel_path in apnet2_weight_paths(model_id, weights).values():
-            local_path = models_dir / Path(rel_path).relative_to(weights)
-            if not local_path.is_file():
+            candidates = local_candidates(rel_path, weights, models_dir)
+            local_path = next(
+                (path for path in candidates if path.is_file()), None
+            )
+            if local_path is None:
+                tried = " or ".join(str(path) for path in candidates)
                 raise FileNotFoundError(
-                    f"{local_path} is missing but the registry maps "
+                    f"{tried} is missing but the registry maps "
                     f"{weights}/{model_id} to '{rel_path}'"
                 )
             uploads.append((local_path, rel_path))
@@ -61,6 +83,7 @@ def planned_uploads(weights: str, models_dir: Path) -> list[tuple[Path, str]]:
 
 
 def main():
+    """Upload a named weight set to Hugging Face and verify it by sha256."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights", default="ap2_tf_paper")
     parser.add_argument("--repo-id", default=HF_REPO_ID)
@@ -68,7 +91,11 @@ def main():
         "--models-dir",
         type=Path,
         default=None,
-        help="Local directory holding the weight set (default models/<weights>).",
+        help=(
+            "Local directory to upload from. Defaults to models/, which mirrors "
+            "the remote tree; may also point directly at a weight set's own "
+            "directory, with the set name stripped."
+        ),
     )
     parser.add_argument(
         "--commit-message",
@@ -83,7 +110,9 @@ def main():
     )
     args = parser.parse_args()
 
-    models_dir = args.models_dir or REPO_ROOT / "models" / args.weights
+    # models/ mirrors the remote layout for every tracked weight set, including
+    # the ones whose registry paths do not start with the set name.
+    models_dir = args.models_dir or REPO_ROOT / "models"
     uploads = planned_uploads(args.weights, models_dir)
 
     print(f"repo: {args.repo_id}")
@@ -91,7 +120,12 @@ def main():
     for local_path, rel_path in uploads:
         size = local_path.stat().st_size
         total += size
-        print(f"  {local_path.relative_to(REPO_ROOT)} -> {rel_path} "
+        # --models-dir may point outside the repo (e.g. a staging directory).
+        try:
+            shown = local_path.relative_to(REPO_ROOT)
+        except ValueError:
+            shown = local_path
+        print(f"  {shown} -> {rel_path} "
               f"({size / 1e6:.1f} MB, sha256 {sha256(local_path)[:12]})")
     print(f"{len(uploads)} files, {total / 1e6:.1f} MB")
 

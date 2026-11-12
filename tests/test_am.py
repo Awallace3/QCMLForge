@@ -31,6 +31,11 @@ def set_weights_to_value(model, value=0.9):
 
 @pytest.mark.pretrained_models("am")
 def test_am():
+    """Pinned multipoles of ``qcmlforge_v1``'s am_0; see docs/apnet2-pretrained-weights.md.
+
+    Kept on the v1 checkpoint because the references are properties of that
+    specific state dict, not of the loader.
+    """
     # Test Values
     qA_ref = torch.load(
         f"{current_file_path}/dataset_data/mol_charges_A.pt", weights_only=False
@@ -59,7 +64,7 @@ def test_am():
 
     am = AtomModel(
         use_GPU=False,
-    ).set_pretrained_model(model_id=0)
+    ).set_pretrained_model(model_id=0, weights="qcmlforge_v1")
     # Batch A: All full molecules
     batch_A = torch.load(
         f"{current_file_path}/dataset_data/batch_A.pt", weights_only=False
@@ -274,7 +279,7 @@ def test_edgeless_atoms_are_batch_independent():
             ), f"{name} changed for {tag}"
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_edgeless_atom_multipoles_are_small_readout_biases():
     """A lone atom's multipoles are the readout biases, not exact zeros.
 
@@ -296,7 +301,7 @@ def test_edgeless_atom_multipoles_are_small_readout_biases():
     assert torch.as_tensor(qpole).abs().max() < 1e-2
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_am_element():
     atom_model = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,

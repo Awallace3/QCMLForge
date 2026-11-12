@@ -166,15 +166,27 @@ def resolve_pretrained_path(rel_path: str) -> str:
 DEFAULT_APNET2_WEIGHTS = "qcmlforge"
 
 #: Named APNet2 weight sets: Hugging Face-relative path templates for the atom
-#: (multipole) and pair models plus ensemble sizes. ``ap2_tf_paper`` is the
-#: ensemble published with the paper (``zachglick/apnet``), converted from
-#: TensorFlow; see docs/apnet2-tensorflow-weights.md.
+#: (multipole) and pair models plus ensemble sizes.
+#:
+#: * ``qcmlforge`` -- the default: five members trained by this project with the
+#:   paper's hyperparameters on top of a corrected ``AtomMPNN``. Total MAE 0.204
+#:   kcal/mol on 150k Splinter dimers; see docs/apnet2-pretrained-weights.md.
+#: * ``qcmlforge_v1`` -- the previous default, kept for reproducing older
+#:   results. Its atom models predate the ``AtomMPNN`` scatter fix, which costs
+#:   it roughly 2x in electrostatics MAE.
+#: * ``ap2_tf_paper`` -- the ensemble published with the paper
+#:   (``zachglick/apnet``), converted from TensorFlow; see
+#:   docs/apnet2-tensorflow-weights.md.
 APNET2_WEIGHT_SETS = {
     "qcmlforge": {
+        "atom": "qcmlforge/atom_models/am_{model_id}.pt",
+        "pair": "qcmlforge/pair_models/ap2_{model_id}.pt",
+        "n_models": 5,
+    },
+    "qcmlforge_v1": {
         "atom": "am_ensemble/am_{model_id}.pt",
         "pair": "ap2_ensemble/ap2_{model_id}.pt",
         "n_models": 5,
-        "n_atom_models": 10,
     },
     "ap2_tf_paper": {
         "atom": "ap2_tf_paper/atom_models/atom{model_id}.pt",

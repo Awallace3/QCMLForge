@@ -1,0 +1,52 @@
+# CUDA environment for running and testing QCMLForge on NVIDIA GPUs.
+#
+#   conda env create -f environment-gpu.yml
+#   conda activate qcml-gpu
+#   pip install -e . --no-deps
+#   python -c "import torch; assert torch.cuda.is_available()"
+#
+# The CPU-only environment (and CI) stays in environment.yml.
+#
+# cuda-version pins the CUDA 12.9 toolkit packages; it needs an NVIDIA driver
+# that supports CUDA >= 12.9 (``nvidia-smi`` "CUDA Version"). To solve on a
+# machine without a GPU driver (e.g. a login node), prefix the create command
+# with CONDA_OVERRIDE_CUDA=12.9.
+name: qcml-gpu
+channels:
+  - conda-forge
+dependencies:
+  - numpy=2.*
+  - pandas=2.*
+  - pip
+  - pytest=7.4.4
+  - pytest-cov
+  - python=3.12.8
+  - cuda-version=12.9
+  # Force the CUDA build instead of relying on driver detection.
+  - pytorch=2.10.*=cuda*
+  # torch.compile on CUDA compiles a launcher with Triton at runtime; that
+  # needs the CUDA headers and a C/C++ compiler inside the environment.
+  - cuda-cudart-dev
+  - cuda-driver-dev
+  - c-compiler
+  - cxx-compiler
+  - huggingface_hub
+  - requests=2.32.3
+  - setuptools=72.1.0
+  - matplotlib
+  - pydantic==2.*
+  - scipy
+  - tqdm
+  - h5py
+  - pip:
+      - qcelemental==0.29.0
+      # pint 0.26.2 breaks qcelemental 0.29.0's unit registry at import.
+      - pint<0.26.2
+      - qm-tools-aw==1.4.5
+      # Pure-Python wheel; works with the CUDA pytorch build above.
+      - torch-geometric==2.7.0
+      - waitress==3.0.2
+      - yarl==1.18.3
+      - pytorch-minimize
+      - qcportal==0.59
+      - lmdb==2.1.1

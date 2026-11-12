@@ -378,7 +378,7 @@ def test_ap3_fused_train_qcel_molecules_in_memory_precompute():
 
 
 @pytest.mark.xdist_group(name="io_operations")
-def test_classical_ap3():
+def test_classical_ap3(use_gpu):
     df = pd.read_pickle(
         current_file_path
         + os.sep
@@ -410,6 +410,9 @@ def test_classical_ap3():
         atom_type_model=atom_type_hf_vw_model.model,
         dimer_prop_model=atom_type_elst_model.dimer_model,
         am_dimer_param_model=atom_type_elst_model,
+        # CUDA vs. the CPU torch reference: measured max |diff| 3.8e-5 on an
+        # RTX 3090 (0 on the CPU), inside the atol=1e-4 used below.
+        use_GPU=use_gpu,
     )
     monA_props, monB_props = atom_type_elst_model.predict_qcel_mols_monomer_props(
         [mol], model_type="model", am_type="ap3"
@@ -945,6 +948,9 @@ def test_classical_ap3_dispersion():
         dimer_prop_model=atom_type_elst_model.dimer_model,
         am_dimer_param_model=atom_type_elst_model,
         # use_precomputed_classical=False,
+        # Shares dimer_model with the CPU-scoped harness above and feeds it
+        # the CPU batch built here, so it must stay on the CPU too.
+        use_GPU=False,
     )
     print(f"{batch.dimer_ind=}")
     E_classical, mA, mB = ap3.dimer_prop_model(batch)

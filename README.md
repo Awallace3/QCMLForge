@@ -1,5 +1,3 @@
-
-
 # QCMLForge
 
 [![Tests](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml/badge.svg)](https://github.com/Awallace3/QCMLForge/actions/workflows/test.yml)
@@ -12,11 +10,24 @@ Code re-implemented from TensorFlow version located [here](https://github.com/za
 
 ## Installation
 
-To install the package, run the following command:
+To install the package, run the following commands:
 ```bash
+# --depth 1 skips the multi-GB git history; drop it if you need the history
+git clone --depth 1 https://github.com/Awallace3/QCMLForge.git
+cd QCMLForge
 conda env create -f environment.yml
 conda activate qcml
 pip install -e .
+```
+
+For NVIDIA GPUs, use `environment-gpu.yml` instead. It pins a CUDA 12.9 build of
+PyTorch and includes the CUDA headers and compilers that `torch.compile` needs
+on the GPU (driver must support CUDA >= 12.9):
+
+```bash
+conda env create -f environment-gpu.yml
+conda activate qcml-gpu
+pip install -e . --no-deps
 ```
 
 ### Running tests
@@ -32,6 +43,8 @@ python -m pytest tests/
 Pretrained-model tests are skipped when this environment variable is not
 enabled or when their required artifacts cannot be resolved. Tests that do not
 need pretrained models still run normally.
+
+Tests marked `gpu` also run on CUDA and are skipped when no GPU is available.
 
 ### Common Issues
 If you get an OS.Error when running qcml related to torch-geometric, you likely need
@@ -56,6 +69,22 @@ demonstrates a complete workflow of using QCArchive to generate QM data and
 then training AP-Net models with QCMLForge.
 
 ## Inference
+### Pretrained weights
+Pretrained weights are not shipped with the package. They are downloaded from
+[Hugging Face](https://huggingface.co/awallace3/qcmlforge) on first use (about
+80 MB for the default APNet2 ensemble) and cached in `~/.cache/huggingface`.
+Enable the download before running the examples below:
+
+```bash
+export QCMLFORGE_AUTO_DOWNLOAD_PRETRAINED=1
+```
+
+Without this variable, a script run from a terminal asks `Download now? [y/N]`,
+and a non-interactive run (Jupyter, SLURM/batch jobs, `python script.py <
+/dev/null`) fails with `RuntimeError: Missing pretrained model in local cache`.
+After the first download the weights load from the cache and the variable is
+no longer needed.
+
 ### AtomModel multipole example
 To run the AtomModel inference, run the following command:
 ```py
@@ -78,8 +107,11 @@ multipoles = apnet_pt.pretrained_models.atom_model_predict(
     compile=False,
     batch_size=2,
 )
-print(multipoles)
-# multipoles = [[np.array(q) for q in qs], [[np.array(d) for d in ds], [np.array(qp) for qp in qps]]]
+charges, dipoles, quadrupoles = multipoles
+# Each is a list with one array per molecule:
+# charges[i].shape == (n_atoms,), dipoles[i].shape == (n_atoms, 3),
+# quadrupoles[i].shape == (n_atoms, 3, 3)
+print(charges[0])
 ```
 ### APNet2Model example
 To run the APNet2Model inference, run the following command:
@@ -106,16 +138,19 @@ interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
     batch_size=2,
 )
 print(interaction_energies)
-# interaction_energies = np.array((N, 5)), where [[E_total, E_elst, E_exch, E_ind, E_disp]...]
-# [[-1.4542807  -2.25828605  2.25395055 -0.49102123 -0.95892397]
-#  [-1.45427967 -2.258285    2.25395055 -0.49102128 -0.95892394]
-#  [-1.45428585 -2.25829129  2.25395064 -0.49102129 -0.95892391]]
+# interaction_energies: np.ndarray of shape (N, 5) in kcal/mol, columns
+# [E_total, E_elst, E_exch, E_ind, E_disp]; last digits vary run to run
+# [[-2.67262248 -3.41546969  2.33096213 -0.61418158 -0.97393334]
+#  [-2.67262368 -3.41547084  2.33096209 -0.61418151 -0.97393341]
+#  [-2.67261759 -3.41546469  2.33096199 -0.61418152 -0.97393337]]
 ```
 
-By default this uses the APNet2 ensemble trained by QCMLForge. Pass
+By default this uses the APNet2 ensemble trained by QCMLForge, which reaches
+0.204 kcal/mol total MAE on the paper's 150 000-dimer Splinter test split. Pass
 `weights="ap2_tf_paper"` to use the ensemble published with the AP-Net2 paper
 instead, converted from TensorFlow and verified against the original
-predictions:
+predictions, or `weights="qcmlforge_v1"` for the pre-`AtomMPNN`-fix ensemble
+that used to be the default:
 
 ```py
 interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
@@ -126,22 +161,83 @@ interaction_energies = apnet_pt.pretrained_models.apnet2_model_predict(
 )
 ```
 
-See [docs/apnet2-tensorflow-weights.md](docs/apnet2-tensorflow-weights.md) for
-the parity data and the loading caveats.
+See [docs/apnet2-pretrained-weights.md](docs/apnet2-pretrained-weights.md) for
+what each weight set contains and how they score, and
+[docs/apnet2-tensorflow-weights.md](docs/apnet2-tensorflow-weights.md) for the
+TensorFlow parity data and the loading caveats.
 
-## Training
-To train the model, run the following command:
+### ΔAP-Net2 error and compute-time estimates
+`dapnet2_model_predict` estimates the interaction-energy error (kcal/mol) of a
+level of theory (`m1`) relative to CCSD(T)/CBS/CP (the only `m2`). Models are
+downloaded from Hugging Face on first use.
+
+```py
+import apnet_pt
+import qcelemental
+from pprint import pprint as pp
+
+mol_dimer = qcelemental.models.Molecule.from_data("""
+0 1
+O 0.000000 0.000000  0.000000
+H 0.758602 0.000000  0.504284
+H 0.260455 0.000000 -0.872893
+--
+0 1
+O 3.000000 0.500000  0.000000
+H 3.758602 0.500000  0.504284
+H 3.260455 0.500000 -0.872893
+""")
+mols = [mol_dimer for _ in range(3)] # example of using multiple molecules
+# Valid m1 values, e.g. "MP2/aug-cc-pVTZ/CP", "B3LYP-D3/aug-cc-pVTZ/unCP"
+pp(apnet_pt.pretrained_models.dapnet2_levels_of_theory_pretrained())
+
+errors = apnet_pt.pretrained_models.dapnet2_model_predict(
+    mols, m1="MP2/aug-cc-pVTZ/CP", m2="CCSD(T)/CBS/CP", compile=False
+)
+print(errors)
+# [0.28017625 0.28017625 0.28017625]  (kcal/mol, one per dimer)
+```
+
+To tabulate error estimates and estimated Psi4 CPU times (log10 s) across many
+methods and basis sets, pass the same dimers to the estimator. It needs `psi4`,
+which the main `qcml` environment does not include, so use the estimator
+environment:
+
+```bash
+conda env create -f environment-estimator.yml
+conda activate qcml-estimator
+```
+
+If you get `ModuleNotFoundError: No module named 'psi4'`, you are not in the
+`qcml-estimator` environment.
+
+```py
+# continuing from previous snippet
+from qcml_mcp import ie_time_esimator_script as est
+
+df = est.main(mols=mols, methods=["MP2", "wB97X-V"],
+              bases=["aug-cc-pVTZ"], using_cp=True, auto_download=True)
+# columns: "Level of Theory", "ERROR ESTIMATES (kcal/mol)",
+#          "ESTIMATED CPU TIMES (log10(s))"
+print(df[["Level of Theory", "ERROR ESTIMATES (kcal/mol)",
+          "ESTIMATED CPU TIMES (log10(s))"]].to_string())
+#           Level of Theory  ERROR ESTIMATES (kcal/mol)  ESTIMATED CPU TIMES (log10(s))
+# 0      MP2/aug-cc-pVTZ/CP                    0.280176                        1.033484
+# 0      MP2/aug-cc-pVTZ/CP                    0.280176                        1.033484
+# 0      MP2/aug-cc-pVTZ/CP                    0.280176                        1.033484
+# 1  wB97X-V/aug-cc-pVTZ/CP                    0.062213                        1.368516
+# 1  wB97X-V/aug-cc-pVTZ/CP                    0.062213                        1.368516
+# 1  wB97X-V/aug-cc-pVTZ/CP                    0.062213                        1.368516
+```
+
+## Training Models
+To train models, run the following command:
 ```bash
 python3 ./train_models.py \
     --train_ap2 \
     --ap_model_path ./models/example/ap2_example.pt \
     --n_epochs 5 
 ```
-
-## Experiment tracking
-
-Optional experiment tracking is documented in
-[Training with Weights & Biases](docs/training-with-wandb.md).
 
 ## Reproducing the original TensorFlow AP-Net2
 
@@ -161,11 +257,6 @@ python3 ./train_models.py \
     --am_model_path ./models/example/am_example.pt \
     --n_epochs 5 
 ```
-
-# Objectives
-
-- [X] Extend AtomMPNN to predict Hirshfeld ratios
-- [ ] Add classical induction model for AP3
 
 # Acknowledgements
 

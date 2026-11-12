@@ -552,7 +552,7 @@ def test_dapnet2_train_qcel_molecules_in_memory_transfer():
     assert np.allclose(v, np.ones(2), atol=1e-1)
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_apnet2_train_qcel_molecules_in_memory():
     batch_size = 2
     atomic_batch_size = 4
@@ -1237,7 +1237,7 @@ def test_AtomTypeParamModel_train():
     )
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_AtomTypeParamModel_elst_train():
     """
     AtomTypeParamModel hirsfhfeld_valencewidth uses atomic_hirshfeld_module_dataset with ap2_atom_model
@@ -1734,7 +1734,7 @@ def test_atomhirshfeld_model_train():
     return
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_mtp_mtp_elst_qcel_mols():
     qcel_molecules = [mol_dimer] * 4
     energy_labels = [
@@ -1769,7 +1769,7 @@ def test_mtp_mtp_elst_qcel_mols():
     )
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_mtp_mtp_elst_dataset():
     am = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
@@ -1797,7 +1797,7 @@ def test_mtp_mtp_elst_dataset():
     )
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_mtp_mtp_elst_eval():
     am = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
@@ -1933,7 +1933,7 @@ def test_induced_dipole_eval():
     return
 
 
-@pytest.mark.pretrained_models("am")
+@pytest.mark.pretrained_models("qcmlforge_am")
 def test_ap2_elst_dataset():
     am = apnet_pt.AtomModels.ap2_atom_model.AtomModel(
         ds_root=None,
