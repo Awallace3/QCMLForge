@@ -40,9 +40,20 @@ TAU_AUF = 1e-2
 EPS_N = 1e-6
 PSI_L_SPLIT = 20.0  # psi takes the direct power difference above this L
 EPS_ALPHA = 1e-12
-# bond-share logit g_ik in (-8, 4), starting at -6 (p ~ 0.2%: near-neutral prior)
+# bond-share logit g_ik in (-8, 4), starting at g0_init (default -6: p ~ 0.2%,
+# a near-neutral prior); raw_g = 0 maps to g0_init through the shift
 G_CENTER, G_HALF = -2.0, 6.0
 G_SHIFT = G_HALF * math.atanh((G_CENTER + 6.0) / G_HALF)
+BETA_DEF_BOUND = 0.7  # |log(beta_def/beta)| from the per-atom head
+SR_SHELL_CAP = 0.35  # norm cap of the zero-moment short-range shell moments
+
+
+def g_shift(g0_init: float) -> float:
+    """Shift with g(raw_g = 0) = g0_init; G_SHIFT for the default -6."""
+    if not G_CENTER - G_HALF < g0_init < G_CENTER + G_HALF:
+        raise ValueError(f"g0_init {g0_init} outside ({G_CENTER - G_HALF}, "
+                         f"{G_CENTER + G_HALF})")
+    return G_HALF * math.atanh((G_CENTER - g0_init) / G_HALF)
 # head name -> (bound on the scalar delta)
 SCALAR_HEADS = {"beta": 0.5, "A": 1.5, "B": 0.4, "alpha": 0.7, "eta": 0.5,
                 "D": 1.5, "C": 1.5, "eta_B": 4.0}
@@ -96,6 +107,16 @@ class FF1Model(nn.Module):
         Precision of the neural trunk and of the physics kernels.
     s_cut : (float, float), optional
         Septic switch window (Angstrom) for condensed phase; None = 1.
+    g0_init : float
+        Initial bond-flow logit (``raw_g = 0`` maps here); -6 by default.
+    elst_beta_def : bool
+        Put each site's l = 1, 2 density on its own Slater exponent
+        ``beta_def = beta exp(guess_def(Z) + delta)`` (equal to ``beta`` at
+        init); moments, forces and R -> 0 behaviour are unchanged in kind.
+    elst_sr_shell : bool
+        Add a zero-moment short-range l <= 2 shell
+        ``[-d . grad + Q : grad grad / 3] (f0(beta_def) - f0(beta))`` per site
+        (needs ``elst_beta_def``; zero at init, no 1/R^k tail).
     """
 
     components = ("elst", "exch", "ind", "disp")
@@ -105,8 +126,15 @@ class FF1Model(nn.Module):
                  element_init: dict | None = None,
                  trunk_dtype: torch.dtype = torch.float32,
                  physics_dtype: torch.dtype = torch.float64,
-                 s_cut: tuple[float, float] | None = None):
+                 s_cut: tuple[float, float] | None = None,
+                 g0_init: float = -6.0, elst_beta_def: bool = False,
+                 elst_sr_shell: bool = False):
         super().__init__()
+        if elst_sr_shell and not elst_beta_def:
+            raise ValueError("elst_sr_shell needs elst_beta_def")
+        self.g0_init = float(g0_init)
+        self.g_shift = g_shift(self.g0_init)
+        self.elst_beta_def, self.elst_sr_shell = bool(elst_beta_def), bool(elst_sr_shell)
         self.trunk_dtype, self.physics_dtype = trunk_dtype, physics_dtype
         self.s_cut_window = s_cut
         self.trunk = FF1MonomerTrunk(n_feat, n_chan, n_layers, n_rbf, r_cut, rho_tr)
@@ -144,6 +172,19 @@ class FF1Model(nn.Module):
         for mod in (self.edge_head, self.charge_head, self.prop_head,
                     self.vec_readout, self.ten_readout):
             mod.to(trunk_dtype)
+        # Optional electrostatics extensions, built after every default layer
+        # so the default model's parameters and init RNG stream are untouched.
+        if self.elst_beta_def:
+            self.beta_def_guess = nn.Embedding(elements.MAX_Z + 1, 1)
+            nn.init.zeros_(self.beta_def_guess.weight)
+            self.beta_def_head = mlp(F + 4, F, 1, 2).to(trunk_dtype)
+            nn.init.zeros_(self.beta_def_head[-1].weight)
+            nn.init.zeros_(self.beta_def_head[-1].bias)
+        if self.elst_sr_shell:
+            self.sr_vec_readout = nn.Linear(C, 1, bias=False).to(trunk_dtype)
+            self.sr_ten_readout = nn.Linear(C, 1, bias=False).to(trunk_dtype)
+            nn.init.zeros_(self.sr_vec_readout.weight)
+            nn.init.zeros_(self.sr_ten_readout.weight)
 
     # -- parameters ----------------------------------------------------------
     def gammas(self) -> tuple[Tensor, Tensor]:
@@ -159,7 +200,15 @@ class FF1Model(nn.Module):
         return {"a1": sp[0], "a2": 0.5 + sp[1], "s8": sp[2]}
 
     def element_parameters(self) -> list[nn.Parameter]:
-        return [self.guess.weight, self.gamma_raw, self.disp_raw]
+        out = [self.guess.weight, self.gamma_raw, self.disp_raw]
+        if self.elst_beta_def:
+            out.append(self.beta_def_guess.weight)
+        return out
+
+    def config(self) -> dict:
+        """The constructor options that change parameters or physics."""
+        return {"g0_init": self.g0_init, "elst_beta_def": self.elst_beta_def,
+                "elst_sr_shell": self.elst_sr_shell}
 
     # -- forward -------------------------------------------------------------
     def forward(self, batch: dict, return_matrix: bool = False):
@@ -181,6 +230,7 @@ class FF1Model(nn.Module):
         pred = torch.stack([elst, exch, e_pol + ct, disp], dim=1) * H2KCAL
         extras = {**{k: atoms[k] for k in ("q", "mu", "th", "alpha_iso", "nu",
                                            "n_act", "beta", "g_el", "cn")},
+                  **{k: atoms[k] for k in ("beta_def", "d_sr", "Q_sr") if k in atoms},
                   "e_pol": e_pol * H2KCAL, "e_ct": ct * H2KCAL,
                   "c6_pair": pairs["c6"], "exch_pair": pairs["exch"] * H2KCAL,
                   "disp_pair": pairs["disp"] * H2KCAL, "ct_pair": pairs["ct"] * H2KCAL,
@@ -189,6 +239,16 @@ class FF1Model(nn.Module):
         if return_matrix:
             extras["pol_matrix"] = pol["matrix"]
         return pred, extras
+
+    def forward_monomers(self, batch: dict):
+        """Monomer-only forward: ``(R in bohr, atoms)`` with ``q``, ``mu``,
+        ``th``, ``beta``, ``alpha_iso``, ``nu``, ``n_act``, ... per atom.
+
+        ``batch`` needs ``z``, ``R`` (Angstrom), intramonomer ``edges``
+        (within ``r_cut``), ``monomer`` and ``monomer_charge`` (optional
+        ``fragment``/``fragment_charge``); no dimer pairs.
+        """
+        return self._forward_atoms(batch)
 
     def _forward_atoms(self, batch: dict):
         """(R in bohr, per-atom charges, moments and response properties)."""
@@ -211,7 +271,7 @@ class FF1Model(nn.Module):
         same = (frag[src] == frag[dst]).to(pd)
         raw_g = self.edge_head(
             torch.cat([h[src], h[dst], geo["rbf"]], dim=1)).squeeze(-1).to(pd)
-        g = G_CENTER + G_HALF * torch.tanh((raw_g - G_SHIFT) / G_HALF)
+        g = G_CENTER + G_HALF * torch.tanh((raw_g - self.g_shift) / G_HALF)
         w = geo["fc"].to(pd) * torch.exp(g) * same
         den = 1.0 + torch.zeros_like(zact).index_add(0, src, w)
         p = THETA_MAX * w / den[src]
@@ -270,13 +330,24 @@ class FF1Model(nn.Module):
             return torch.exp(getattr(self, f"log_{name}0")[z].to(pd) + gz[name]
                              + delta[name])
 
-        return {"mu": mu, "th": th, "g_el": g_el, "alpha_iso": alpha_iso,
-                "sqrt_alpha": sqrt_alpha, "beta_pol": physics.beta_pol(alpha_iso),
-                "eta": eta, "beta": amp("beta"),
-                "A": g_el * amp("A"), "B": amp("B"),
-                "D": g_el * amp("D"), "C": amp("C"),
-                "eta_B": 0.8 + 0.2 * torch.sigmoid(delta["eta_B"]),
-                "vec": vecs, "ten": tens}
+        out = {"mu": mu, "th": th, "g_el": g_el, "alpha_iso": alpha_iso,
+               "sqrt_alpha": sqrt_alpha, "beta_pol": physics.beta_pol(alpha_iso),
+               "eta": eta, "beta": amp("beta"),
+               "A": g_el * amp("A"), "B": amp("B"),
+               "D": g_el * amp("D"), "C": amp("C"),
+               "eta_B": 0.8 + 0.2 * torch.sigmoid(delta["eta_B"]),
+               "vec": vecs, "ten": tens}
+        if self.elst_beta_def:
+            raw_def = self.beta_def_head(feats).to(pd)[:, 0]
+            d_def = BETA_DEF_BOUND * torch.tanh(raw_def / BETA_DEF_BOUND)
+            out["beta_def"] = out["beta"] * torch.exp(
+                self.beta_def_guess(z).to(pd)[:, 0] + d_def)
+        if self.elst_sr_shell:
+            out["d_sr"] = g_el[:, None] * norm_cap(
+                self.sr_vec_readout(u).to(pd)[..., 0], SR_SHELL_CAP, (1,))
+            out["Q_sr"] = g_el[:, None, None] * norm_cap(
+                self.sr_ten_readout(Q).to(pd)[..., 0], SR_SHELL_CAP, (1, 2))
+        return out
 
     def _s_cut(self, r_bohr):
         if self.s_cut_window is None:
@@ -294,10 +365,16 @@ class FF1Model(nn.Module):
         zf = z.to(pd)
 
         def side(idx):
-            return {"z": zf[idx], "nc": self.n_core[z[idx]].to(pd),
-                    "bc": self.beta_core[z[idx]].to(pd), "n": at["n_act"][idx].to(pd),
-                    "b": at["beta"][idx], "q": at["q"][idx].to(pd),
-                    "mu": at["mu"][idx], "th": at["th"][idx]}
+            out = {"z": zf[idx], "nc": self.n_core[z[idx]].to(pd),
+                   "bc": self.beta_core[z[idx]].to(pd), "n": at["n_act"][idx].to(pd),
+                   "b": at["beta"][idx], "q": at["q"][idx].to(pd),
+                   "mu": at["mu"][idx], "th": at["th"][idx]}
+            for key in ("d_sr", "Q_sr"):
+                if key in at:
+                    out[key] = at[key][idx]
+            if "beta_def" in at:
+                out["b_def"] = at["beta_def"][idx]
+            return out
 
         si, sj = side(i), side(j)
         elst = gordon1.elst_pairs(r, rhat, si, sj)

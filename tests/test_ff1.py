@@ -395,3 +395,353 @@ def test_float32_physics_tracks_float64(device, seed, scale):
     grads = torch.autograd.grad(pred.sum(), list(m32.parameters()),
                                 allow_unused=True)
     assert all(g is None or torch.isfinite(g).all() for g in grads)
+
+
+# --- configurable bond-flow prior, deformation shells (ff1-v4) ---------------
+
+from apnet_pt.ff1 import model as ff1_model  # noqa: E402
+
+
+def _sites(r_dtype=F64, device="cpu", seed=0, sr=True):
+    """Two realistic Eq. 7 sites (rot_m-like i, H-like j) with deformation shells."""
+    g = torch.Generator().manual_seed(seed)
+
+    def sym0(a):
+        a = 0.5 * (a + a.T)
+        return a - torch.trace(a) / 3 * torch.eye(3, dtype=a.dtype)
+
+    def site(z, nc, bc, n, b, bdef):
+        s = {"z": torch.tensor([z]), "nc": torch.tensor([nc]),
+             "bc": torch.tensor([bc]), "n": torch.tensor([n]),
+             "b": torch.tensor([b]), "q": torch.tensor([z - nc - n]),
+             "mu": 0.3 * torch.randn(1, 3, generator=g, dtype=F64),
+             "th": sym0(0.4 * torch.randn(3, 3, generator=g, dtype=F64))[None],
+             "b_def": torch.tensor([bdef])}
+        if sr:
+            s["d_sr"] = 0.2 * torch.randn(1, 3, generator=g, dtype=F64)
+            s["Q_sr"] = sym0(0.25 * torch.randn(3, 3, generator=g, dtype=F64))[None]
+        return {k: v.to(dtype=r_dtype, device=device) for k, v in s.items()}
+
+    return (site(8.0, 2.0, 13.0, 6.5, 2.2, 1.6), site(1.0, 0.0, 1.0, 0.6, 2.5, 3.1))
+
+
+def _place(r, direction=(0.3, -0.5, 0.8), dtype=F64, device="cpu"):
+    v = torch.tensor([direction], dtype=dtype, device=device)
+    v = v / v.norm() * r
+    return gordon1.safe_unit(v)
+
+
+def test_default_model_has_no_new_parameters_and_same_shift():
+    m = FF1Model(n_feat=32, n_chan=4, n_layers=2, n_rbf=8)
+    keys = set(m.state_dict())
+    assert not any(k.startswith(("beta_def", "sr_")) for k in keys)
+    assert m.g_shift == ff1_model.G_SHIFT  # bit-identical default
+    assert m.config() == {"g0_init": -6.0, "elst_beta_def": False,
+                          "elst_sr_shell": False}
+    torch.manual_seed(5)
+    a = FF1Model(n_feat=32, n_chan=4, n_layers=2, n_rbf=8)
+    torch.manual_seed(5)
+    b = FF1Model(n_feat=32, n_chan=4, n_layers=2, n_rbf=8, elst_beta_def=True,
+                 elst_sr_shell=True)
+    sb = b.state_dict()
+    for k, v in a.state_dict().items():  # same init stream for every old tensor
+        assert torch.equal(v, sb[k]), k
+    with pytest.raises(ValueError):
+        FF1Model(elst_sr_shell=True)
+    with pytest.raises(ValueError):
+        FF1Model(g0_init=-8.5)
+
+
+@pytest.mark.parametrize("g0", [-6.0, -2.5, 1.0])
+def test_g0_init_is_the_logit_at_zero_readout(g0):
+    s = ff1_model.g_shift(g0)
+    raw = torch.zeros(3, dtype=F64)
+    g = ff1_model.G_CENTER + ff1_model.G_HALF * torch.tanh(
+        (raw - s) / ff1_model.G_HALF)
+    assert torch.allclose(g, torch.full_like(g, g0), atol=1e-14)
+
+
+def test_unbottlenecked_prior_moves_charge_at_init():
+    batch = batch_from_dimers([water_ammonia()])
+    q = {}
+    for g0 in (-6.0, -2.5):
+        torch.manual_seed(0)
+        m = FF1Model(n_feat=32, n_chan=4, n_layers=2, n_rbf=8, trunk_dtype=F64,
+                     g0_init=g0)
+        q[g0] = m(batch)[1]["q"].abs().mean()
+    assert float(q[-2.5]) > 5 * float(q[-6.0])
+
+
+def test_forward_monomers_matches_dimer_atoms():
+    model = make_model(11)
+    batch = batch_from_dimers([water_ammonia()])
+    mono = {k: batch[k] for k in ("z", "R", "edges", "monomer", "monomer_charge")}
+    R_b, atoms = model.forward_monomers(mono)
+    _, extra = model(batch)
+    for k in ("q", "mu", "th", "beta", "alpha_iso", "nu", "n_act"):
+        assert torch.equal(atoms[k], extra[k]), k
+    assert torch.allclose(R_b, batch["R"] * ff1_model.ANG2BOHR)
+
+
+def _with_extensions(seed=0, sr=False, device="cpu"):
+    base = make_model(seed, device)
+    ext = FF1Model(n_feat=32, n_chan=4, n_layers=2, n_rbf=8, trunk_dtype=F64,
+                   physics_dtype=F64, elst_beta_def=True, elst_sr_shell=sr).to(device)
+    missing, unexpected = ext.load_state_dict(base.state_dict(), strict=False)
+    assert not unexpected
+    assert all(k.startswith(("beta_def", "sr_")) for k in missing)
+    return base, ext
+
+
+@pytest.mark.parametrize("sr", [False, True])
+@pytest.mark.parametrize("device", DEVICES)
+def test_deformation_shell_at_init_is_the_default_model(sr, device):
+    base, ext = _with_extensions(12, sr, device)
+    batch = batch_from_dimers(_f32_dimers(), device=device)
+    p0, x0 = base(batch)
+    p1, x1 = ext(batch)
+    assert torch.equal(x1["beta_def"], x1["beta"])
+    assert torch.allclose(p0, p1, atol=1e-11, rtol=1e-12)
+    assert torch.allclose(x0["induced_dipole"], x1["induced_dipole"], atol=1e-12)
+
+
+def _split(side, part):
+    """One piece of a site for the bilinear decomposition, as a single-exponent
+    site: 'charges' (z, nc/bc, n/b, q) or each multipole shell on its exponent."""
+    zero = torch.zeros_like(side["z"])
+    if part == "charges":
+        return {**{k: side[k] for k in ("z", "nc", "bc", "n", "b", "q")},
+                "mu": torch.zeros_like(side["mu"]), "th": torch.zeros_like(side["th"])}
+    mu, th, b = gordon1.multipole_shells(side)[part]
+    return {"z": zero, "nc": zero, "bc": side["bc"], "n": zero, "b": b, "q": zero,
+            "mu": mu, "th": th}
+
+
+@pytest.mark.parametrize("sr", [False, True])
+@pytest.mark.parametrize("r", [0.0, 0.7, 2.5, 6.0])
+def test_shell_energy_is_the_bilinear_sum_of_single_exponent_pieces(sr, r):
+    """The two-exponent energy equals the old (Fourier-verified) single-exponent
+    kernel applied to each (charge | multipole shell) x (charge | shell) piece."""
+    i, j = _sites(sr=sr)
+    rr, rh = _place(r)
+    if r == 0.0:
+        rh = torch.tensor([[0.0, 0.0, 1.0]], dtype=F64)
+    got = gordon1.elst_pairs(rr, rh, i, j)
+    parts = ["charges"] + list(range(len(gordon1.multipole_shells(i))))
+    ref = sum(gordon1.elst_pairs(rr, rh, _split(i, a), _split(j, b))
+              for a in parts for b in parts)
+    assert torch.allclose(got, ref, rtol=1e-12, atol=1e-13)
+    f_got = gordon1.permanent_field(rr, rh, torch.tensor([1.9], dtype=F64), j)
+    f_ref = sum(gordon1.permanent_field(rr, rh, torch.tensor([1.9], dtype=F64),
+                                        _split(j, b)) for b in parts)
+    assert torch.allclose(f_got, f_ref, rtol=1e-12, atol=1e-13)
+
+
+def _fourier_energy(i, j, R, n_k=400001, k_max=4000.0):
+    """Exact Coulomb energy of two axial Eq. 7 two-exponent densities (z axis,
+    j at +R z) by quadrature of E = int d^3k/(2pi)^3 4pi/k^2 rho_i(-k)
+    rho_j(k) e^{-ik.R}.  The angular integral is analytic: the integrand is a
+    degree-4 polynomial in c = cos(k, z), expanded in Legendre P_l with
+    int P_l(c) e^{-ixc} dc = 2 (-i)^l j_l(x); nucleus-nucleus is z_i z_j / R."""
+    import numpy as np
+    from scipy.special import spherical_jn
+
+    k = np.linspace(1e-9, k_max, n_k)
+
+    def slater(b):
+        return b**4 / (b * b + k * k) ** 2
+
+    def poly(s, sign):  # rho(sign k) as monomial coefficients in c (c^0..c^2)
+        fd = slater(s["b_def"])
+        a = s["z"] - s["nc"] * slater(s["bc"]) - s["n"] * slater(s["b"]) + 0j
+        c2 = -s["t"] * k * k * fd / 3.0  # times P2 = (3c^2 - 1)/2
+        return [a - 0.5 * c2, -1j * sign * s["mu_z"] * k * fd, 1.5 * c2]
+
+    pi_, pj = poly(i, -1), poly(j, 1)
+    prod = [0j * k for _ in range(5)]
+    for m, x in enumerate(pi_):
+        for n, y in enumerate(pj):
+            prod[m + n] = prod[m + n] + x * y
+    prod[0] = prod[0] - i["z"] * j["z"]
+    to_leg = np.zeros((5, 5))  # (monomial, legendre)
+    for m in range(5):
+        c = np.polynomial.legendre.poly2leg(np.eye(5)[m])
+        to_leg[m, :len(c)] = c
+    leg = np.einsum("mk,ml->lk", np.stack(prod), to_leg)
+    ang = sum(leg[ell] * 2 * (-1j) ** ell * spherical_jn(ell, k * R) for ell in range(5))
+    e = np.trapezoid(ang.real, k) / np.pi
+    return e + i["z"] * j["z"] / R
+
+
+@pytest.mark.parametrize("R", [1.2, 2.5, 4.0])
+def test_two_exponent_density_matches_fourier_quadrature(R):
+    def axial(t):
+        return torch.tensor([[[-t / 2, 0, 0], [0, -t / 2, 0], [0, 0, t]]], dtype=F64)
+
+    spec = [dict(z=8.0, nc=2.0, bc=13.0, n=6.5, b=2.2, b_def=1.6, mu_z=0.3, t=0.4),
+            dict(z=1.0, nc=0.0, bc=1.0, n=0.6, b=2.5, b_def=3.1, mu_z=-0.2, t=0.15)]
+    sides = []
+    for s in spec:
+        t = {k: torch.tensor([v], dtype=F64) for k, v in s.items()
+             if k not in ("mu_z", "t")}
+        t["q"] = t["z"] - t["nc"] - t["n"]
+        t["mu"] = torch.tensor([[0.0, 0.0, s["mu_z"]]], dtype=F64)
+        t["th"] = axial(s["t"])
+        sides.append(t)
+    rr = torch.tensor([R], dtype=F64)
+    rh = torch.tensor([[0.0, 0.0, 1.0]], dtype=F64)
+    got = float(gordon1.elst_pairs(rr, rh, *sides))
+    ref = _fourier_energy(spec[0], spec[1], R)
+    assert got == pytest.approx(ref, abs=2e-7, rel=1e-6)
+
+
+@pytest.mark.parametrize("sr", [False, True])
+def test_shells_keep_the_point_multipole_tail(sr):
+    """At 25 bohr the two-exponent energy is the undamped Buckingham one."""
+    from apnet_pt.mastiff_classical import undamped_multipole_elst
+
+    i, j = _sites(sr=sr)
+    rr, rh = _place(25.0)
+    got = float(gordon1.elst_pairs(rr, rh, i, j)) * ff1_model.H2KCAL
+    R = torch.cat([torch.zeros(1, 3, dtype=F64), rh * rr[:, None]]) / ff1_model.ANG2BOHR
+    z = torch.tensor([8.0, 1.0], dtype=F64)
+    q = torch.cat([i["q"], j["q"]])
+    mu = torch.cat([i["mu"], j["mu"]])
+    th = torch.cat([i["th"], j["th"]])
+    ref = undamped_multipole_elst(z, R, q, mu, th, z, R, q, mu, th,
+                                  torch.tensor([0]), torch.tensor([1]),
+                                  include_uq_qq=True)
+    assert got == pytest.approx(float(ref.sum()), rel=1e-6, abs=1e-9)
+
+
+def test_sr_shell_gradcheck_energy_and_field():
+    i, j = _sites(seed=3)
+    v = torch.tensor([[0.4, -0.9, 1.7]], dtype=F64, requires_grad=True)
+
+    def energy(vec):
+        r, rh = gordon1.safe_unit(vec)
+        return gordon1.elst_pairs(r, rh, i, j)
+
+    assert torch.autograd.gradcheck(energy, (v,), eps=1e-6, atol=1e-8)
+
+    def field(vec):
+        r, rh = gordon1.safe_unit(vec)
+        return gordon1.permanent_field(r, rh, torch.tensor([1.9], dtype=F64), j)
+
+    assert torch.autograd.gradcheck(field, (v,), eps=1e-6, atol=1e-8)
+    # the field is the energy gradient seen by a pure probe dipole on
+    # Slater(beta_probe): E = -mu_p . F
+    mu_p = torch.tensor([[0.3, -0.1, 0.25]], dtype=F64)
+    zero = torch.zeros(1, dtype=F64)
+    probe = {"z": zero, "nc": zero, "bc": torch.ones(1, dtype=F64), "n": zero,
+             "b": torch.tensor([1.9], dtype=F64), "q": zero, "mu": mu_p,
+             "th": torch.zeros(1, 3, 3, dtype=F64)}
+    for r_ in (0.8, 2.0, 5.0):
+        rr, rh = _place(r_)
+        # rhat points from source j to the probe; elst_pairs' from i (probe) to j
+        f = gordon1.permanent_field(rr, rh, torch.tensor([1.9], dtype=F64), j)
+        e = gordon1.elst_pairs(rr, -rh, probe, j)
+        assert torch.allclose(e, -(mu_p * f).sum(-1), rtol=1e-12, atol=1e-14)
+
+
+@pytest.mark.parametrize("det", [1.0, -1.0])
+def test_sr_shell_is_o3_invariant(det):
+    rot_m = random_orthogonal(det, seed=4)
+    i, j = _sites(seed=4)
+    rr, rh = _place(1.7)
+
+    def rot(s):
+        out = dict(s)
+        for k in ("mu", "d_sr"):
+            out[k] = s[k] @ rot_m.T
+        for k in ("th", "Q_sr"):
+            out[k] = rot_m @ s[k] @ rot_m.T
+        return out
+
+    e0 = gordon1.elst_pairs(rr, rh, i, j)
+    e1 = gordon1.elst_pairs(rr, rh @ rot_m.T, rot(i), rot(j))
+    assert torch.allclose(e0, e1, rtol=1e-13, atol=1e-14)
+    bp = torch.tensor([1.9], dtype=F64)
+    f0 = gordon1.permanent_field(rr, rh, bp, j)
+    f1 = gordon1.permanent_field(rr, rh @ rot_m.T, bp, rot(j))
+    assert torch.allclose(f0 @ rot_m.T, f1, rtol=1e-13, atol=1e-14)
+
+
+def test_sr_shell_is_smooth_at_r0():
+    i, j = _sites(seed=5)
+    for r_ in (0.0, 1e-6, 1e-3):
+        v = (torch.tensor([[0.3, -0.2, 0.9]], dtype=F64) * r_).requires_grad_(True)
+        r, rh = gordon1.safe_unit(v)
+        if r_ == 0.0:
+            rh = torch.tensor([[0.0, 0.0, 1.0]], dtype=F64)
+        e = gordon1.elst_pairs(r, rh, i, j)
+        f = gordon1.permanent_field(r, rh, torch.tensor([1.9], dtype=F64), j)
+        assert torch.isfinite(e).all() and torch.isfinite(f).all()
+        if r_ > 0:
+            (g,) = torch.autograd.grad(e.sum(), v)
+            assert torch.isfinite(g).all()
+
+
+@pytest.mark.parametrize("dtype,tail", [(F64, 1e-13), (torch.float32, 1e-7)])
+@pytest.mark.parametrize("device", DEVICES)
+def test_sr_shell_has_no_multipole_tail(dtype, tail, device):
+    """The zero-moment shell moves contact electrostatics and decays
+    exponentially: no 1/R^k leakage, in float64 and float32."""
+    i, j = _sites(dtype, device, seed=6)
+    off_i = {**i, "d_sr": torch.zeros_like(i["d_sr"]),
+             "Q_sr": torch.zeros_like(i["Q_sr"])}
+    off_j = {**j, "d_sr": torch.zeros_like(j["d_sr"]),
+             "Q_sr": torch.zeros_like(j["Q_sr"])}
+    bp = torch.tensor([1.9], dtype=dtype, device=device)
+
+    def diff(r_):
+        rr, rh = _place(r_, dtype=dtype, device=device)
+        de = gordon1.elst_pairs(rr, rh, i, j) - gordon1.elst_pairs(rr, rh, off_i, off_j)
+        df = (gordon1.permanent_field(rr, rh, bp, j)
+              - gordon1.permanent_field(rr, rh, bp, off_j)).abs().max()
+        return float(de.abs()), float(df)
+
+    near, _ = diff(4.0)
+    assert near > 1e-4
+    e25, f25 = diff(25.0)
+    assert e25 < tail and f25 < tail
+    if dtype == F64:
+        beta_min = 1.6
+        e8, e16 = diff(8.0)[0], diff(16.0)[0]
+        assert e16 < e8 * math.exp(-0.5 * beta_min * 8.0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_extended_model_symmetry_forces_and_gradients(device):
+    _, ext = _with_extensions(13, True, device)
+    with torch.no_grad():
+        for mod in (ext.beta_def_head[-1], ext.sr_vec_readout, ext.sr_ten_readout):
+            for p in mod.parameters():
+                p.add_(0.3 * torch.randn_like(p))
+        ext.beta_def_guess.weight.add_(0.2 * torch.randn_like(ext.beta_def_guess.weight))
+    batch = batch_from_dimers([water_ammonia()], device=device)
+    _, x = ext(batch)
+    assert not torch.equal(x["beta_def"], x["beta"])
+    assert float(x["d_sr"].abs().max()) > 0
+    tr = torch.diagonal(x["Q_sr"], dim1=1, dim2=2).sum(-1)
+    assert float(tr.abs().max()) < 1e-12
+    assert torch.allclose(x["Q_sr"], x["Q_sr"].transpose(1, 2), atol=1e-14)
+    rot_m = random_orthogonal(-1.0).to(device)
+    e0, f0, _ = energy_and_forces(ext, batch)
+    e1, f1, _ = energy_and_forces(ext, with_coordinates(batch, batch["R"] @ rot_m.T))
+    assert torch.allclose(e0, e1, atol=1e-9, rtol=1e-10)
+    assert torch.allclose(f0 @ rot_m.T, f1, atol=1e-8)
+    R0 = batch["R"].clone()
+    h = 1e-4
+    a, x_ = 4, 2
+    vals = []
+    for kk in (-1, 1):
+        R = R0.clone()
+        R[a, x_] += kk * h
+        with torch.no_grad():
+            vals.append(float(ext(with_coordinates(batch, R))[0].sum()))
+    assert -(vals[1] - vals[0]) / (2 * h) == pytest.approx(float(f0[a, x_]), abs=1e-6)
+    pred, _ = ext(batch)
+    grads = torch.autograd.grad(pred.sum(), list(ext.parameters()), allow_unused=True)
+    assert all(g is None or torch.isfinite(g).all() for g in grads)
+    assert any(p is ext.beta_def_guess.weight for p in ext.element_parameters())

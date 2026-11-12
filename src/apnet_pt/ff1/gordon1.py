@@ -187,14 +187,105 @@ ELST_AA_SPECS = (("bar1", 1), (3, 2), (5, 3), (3, 3), (7, 4), (5, 4), (9, 5),
 CHARGE_SPECS = (("bar1", 1), (3, 2), (5, 3))
 
 
+def _has_deformation(side: dict) -> bool:
+    return side.get("b_def") is not None
+
+
+def multipole_shells(side: dict) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """``[(mu, th, beta), ...]``: the site's l = 1, 2 density as Slater shells.
+
+    Without ``b_def`` the moments sit on the valence exponent ``b``.  With
+    ``b_def`` they sit on ``b_def``; a zero-moment short-range shell
+    ``(d_sr, Q_sr)`` adds ``(+d, +Q)`` on ``b_def`` and ``(-d, -Q)`` on ``b``,
+    i.e. ``[-d . grad + Q : grad grad / 3] (f0(b_def) - f0(b))``, whose every
+    multipole moment vanishes (its exterior potential decays as exp(-beta R)).
+    """
+    if not _has_deformation(side):
+        return [(side["mu"], side["th"], side["b"])]
+    d, Q = side.get("d_sr"), side.get("Q_sr")
+    if d is None:
+        return [(side["mu"], side["th"], side["b_def"])]
+    return [(side["mu"] + d, side["th"] + Q, side["b_def"]), (-d, -Q, side["b"])]
+
+
+def _charges_vs_shell(src: dict, beta_shell: Tensor, r: Tensor, specs) -> dict:
+    """sum_a c_a lambda_n / R^p of src's three charges (nucleus z, core -nc
+    on bc, active -n on b) against a Slater(beta_shell) multipole."""
+    nuc = one_center(beta_shell, r, specs)
+    core = two_center(src["bc"], beta_shell, r, specs)
+    act = two_center(src["b"], beta_shell, r, specs)
+    return {key: src["z"] * nuc[key] - src["nc"] * core[key] - src["n"] * act[key]
+            for key in specs}
+
+
+MM_SPECS = ((5, 3), (3, 3), (7, 4), (5, 4), (9, 5), (7, 5), (5, 5))
+
+
+def _monopole_energy(r: Tensor, i: dict, j: dict) -> Tensor:
+    """q_i q_j / R minus the decaying complements of the three-charge sites."""
+    bar1 = (("bar1", 1),)
+    aa = two_center(i["b"], j["b"], r, bar1)
+    ci_cj = two_center(i["bc"], j["b"], r, bar1)
+    ci_j = two_center(i["b"], j["bc"], r, bar1)
+    cc = two_center(i["bc"], j["bc"], r, bar1)
+    pi_cj = one_center(j["b"], r, bar1)
+    pj_ci = one_center(i["b"], r, bar1)
+    pi_ccj = one_center(j["bc"], r, bar1)
+    pj_cci = one_center(i["bc"], r, bar1)
+    k = ("bar1", 1)
+    bar = (-i["z"] * (j["nc"] * pi_ccj[k] + j["n"] * pi_cj[k])
+           - j["z"] * (i["nc"] * pj_cci[k] + i["n"] * pj_ci[k])
+           + i["nc"] * j["nc"] * cc[k] + i["nc"] * j["n"] * ci_cj[k]
+           + i["n"] * j["nc"] * ci_j[k] + i["n"] * j["n"] * aa[k])
+    return i["q"] * j["q"] / r - bar
+
+
+def _elst_pairs_shells(r: Tensor, rhat: Tensor, i: dict, j: dict) -> Tensor:
+    """``elst_pairs`` with each site's multipoles on their own Slater shells
+    (``multipole_shells``): charges keep (z, nc/bc, n/b); every charge-multipole
+    and multipole-multipole kernel takes the multipole shell's exponent."""
+    energy = _monopole_energy(r, i, j)
+    cs = ((3, 2), (5, 3))
+    for mu, th, b in multipole_shells(j):  # i's charges vs j's multipoles
+        k = _charges_vs_shell(i, b, r, cs)
+        energy = energy - k[(3, 2)] * (mu * rhat).sum(-1) \
+            + k[(5, 3)] * _bilinear(rhat, th, rhat)
+    for mu, th, b in multipole_shells(i):  # j's charges vs i's multipoles
+        k = _charges_vs_shell(j, b, r, cs)
+        energy = energy + k[(3, 2)] * (mu * rhat).sum(-1) \
+            + k[(5, 3)] * _bilinear(rhat, th, rhat)
+    for mui, thi, bi in multipole_shells(i):
+        ui, ti = (mui * rhat).sum(-1), _bilinear(rhat, thi, rhat)
+        thi_r = torch.einsum("pab,pb->pa", thi, rhat)
+        for muj, thj, bj in multipole_shells(j):
+            aa = two_center(bi, bj, r, MM_SPECS)
+            uj, tj = (muj * rhat).sum(-1), _bilinear(rhat, thj, rhat)
+            thj_r = torch.einsum("pab,pb->pa", thj, rhat)
+            energy = energy - (3.0 * aa[(5, 3)] * ui * uj
+                               - aa[(3, 3)] * (mui * muj).sum(-1))
+            energy = energy + (5.0 * aa[(7, 4)] * ui * tj
+                               - 2.0 * aa[(5, 4)] * (mui * thj_r).sum(-1))
+            energy = energy - (5.0 * aa[(7, 4)] * uj * ti
+                               - 2.0 * aa[(5, 4)] * (muj * thi_r).sum(-1))
+            energy = energy + (35.0 / 3.0 * aa[(9, 5)] * ti * tj
+                               - 20.0 / 3.0 * aa[(7, 5)] * (thi_r * thj_r).sum(-1)
+                               + 2.0 / 3.0 * aa[(5, 5)] * (thi * thj).sum((-1, -2)))
+    return energy
+
+
 def elst_pairs(r: Tensor, rhat: Tensor, i: dict, j: dict) -> Tensor:
     """Exact Coulomb energy (E_h) of two-shell Eq. 7 densities, per pair.
 
     ``i`` and ``j`` hold per-pair tensors: ``z`` (full nuclear charge),
     ``nc``/``bc`` (frozen core electrons and exponent), ``n``/``b`` (active
     electrons and valence exponent), ``q`` (net charge), ``mu`` (3,), ``th``
-    (3, 3, traceless Buckingham).  ``rhat`` points from i to j.
+    (3, 3, traceless Buckingham).  ``rhat`` points from i to j.  Optional
+    ``b_def`` (the l = 1, 2 deformation exponent) and ``d_sr``/``Q_sr`` (a
+    zero-moment short-range shell) move the multipoles onto their own shells
+    (``multipole_shells``); without them this is the single-exponent Eq. 7.
     """
+    if _has_deformation(i) or _has_deformation(j):
+        return _elst_pairs_shells(r, rhat, i, j)
     aa = two_center(i["b"], j["b"], r, ELST_AA_SPECS)
     # i's charges seen by j's cloud moments, and vice versa.
     pi_cj = one_center(j["b"], r, CHARGE_SPECS)
@@ -245,8 +336,11 @@ FIELD_SPECS = ((3, 2), (5, 3), (3, 3), (7, 4), (5, 4))
 def permanent_field(r: Tensor, rhat: Tensor, beta_probe: Tensor, j: dict) -> Tensor:
     """Field (E_h/(e bohr)) of j's Eq. 7 density on a Slater(beta_probe) dipole.
 
-    ``rhat`` points from source j to the probe k.
+    ``rhat`` points from source j to the probe k.  With ``b_def`` (and
+    ``d_sr``/``Q_sr``) in ``j`` the moments' field uses their own shells.
     """
+    if _has_deformation(j):
+        return _permanent_field_shells(r, rhat, beta_probe, j)
     act = two_center(beta_probe, j["b"], r, FIELD_SPECS)
     core = two_center(beta_probe, j["bc"], r, ((3, 2),))
     nuc = one_center(beta_probe, r, ((3, 2),))
@@ -261,6 +355,26 @@ def permanent_field(r: Tensor, rhat: Tensor, beta_probe: Tensor, j: dict) -> Ten
         - act[(3, 3)][:, None] * mu
     field = field + 5.0 * act[(7, 4)][:, None] * tr[:, None] * rhat \
         - 2.0 * act[(5, 4)][:, None] * th_r
+    return field
+
+
+def _permanent_field_shells(r: Tensor, rhat: Tensor, beta_probe: Tensor,
+                            j: dict) -> Tensor:
+    act_0 = two_center(beta_probe, j["b"], r, ((3, 2),))
+    core = two_center(beta_probe, j["bc"], r, ((3, 2),))
+    nuc = one_center(beta_probe, r, ((3, 2),))
+    charge = (j["z"] * nuc[(3, 2)] - j["nc"] * core[(3, 2)]
+              - j["n"] * act_0[(3, 2)])
+    field = charge[:, None] * rhat
+    for mu, th, b in multipole_shells(j):
+        act = two_center(beta_probe, b, r, ((5, 3), (3, 3), (7, 4), (5, 4)))
+        ur = (mu * rhat).sum(-1)
+        tr = _bilinear(rhat, th, rhat)
+        th_r = torch.einsum("pab,pb->pa", th, rhat)
+        field = field + 3.0 * act[(5, 3)][:, None] * ur[:, None] * rhat \
+            - act[(3, 3)][:, None] * mu
+        field = field + 5.0 * act[(7, 4)][:, None] * tr[:, None] * rhat \
+            - 2.0 * act[(5, 4)][:, None] * th_r
     return field
 
 
