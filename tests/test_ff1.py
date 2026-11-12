@@ -735,12 +735,13 @@ def test_extended_model_symmetry_forces_and_gradients(device):
     h = 1e-4
     a, x_ = 4, 2
     vals = []
-    for kk in (-1, 1):
+    for kk in (-2, -1, 1, 2):
         R = R0.clone()
         R[a, x_] += kk * h
         with torch.no_grad():
             vals.append(float(ext(with_coordinates(batch, R))[0].sum()))
-    assert -(vals[1] - vals[0]) / (2 * h) == pytest.approx(float(f0[a, x_]), abs=1e-6)
+    fd = -(vals[0] - 8 * vals[1] + 8 * vals[2] - vals[3]) / (12 * h)
+    assert fd == pytest.approx(float(f0[a, x_]), rel=1e-8, abs=1e-7)
     pred, _ = ext(batch)
     grads = torch.autograd.grad(pred.sum(), list(ext.parameters()), allow_unused=True)
     assert all(g is None or torch.isfinite(g).all() for g in grads)
