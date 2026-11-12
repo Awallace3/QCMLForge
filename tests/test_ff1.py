@@ -337,6 +337,29 @@ def test_float32_kernel_gradients_are_finite(device):
             assert torch.isfinite(g).all(), key
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_float32_psi_is_finite_for_large_gamma(device):
+    """psi(f, gamma) in float32: finite values and gradients up to gamma = 10
+    (expm1 overflowed past gamma ~ 6, which the element prefit reached on the
+    full stores), within 1e-5 of float64, and exactly 0 at f = 0."""
+    from apnet_pt.ff1.model import psi
+
+    x64 = torch.tensor([0.0, 1e-9, 1e-6, 1e-4, 0.01, 0.3, 1.0, 1.7, 3.0],
+                       dtype=F64, device=device)
+    g64 = torch.tensor([0.5, 1.0, 1.85, 3.0, 6.0, 6.5, 8.0, 10.0], dtype=F64,
+                       device=device)
+    x64, g64 = (t.reshape(-1) for t in torch.meshgrid(x64, g64, indexing="ij"))
+    ref = psi(x64, g64)
+    x32 = x64.float().requires_grad_(True)
+    g32 = g64.float().requires_grad_(True)
+    val = psi(x32, g32)
+    assert torch.isfinite(val).all()
+    assert (val[x64 == 0] == 0).all()
+    assert torch.allclose(val.double(), ref, rtol=1e-5, atol=1e-30)
+    for grad in torch.autograd.grad(val.sum(), (x32, g32)):
+        assert torch.isfinite(grad).all()
+
+
 def _f32_pair(seed, scale, device):
     m64 = make_model(seed, device, scale)
     m32 = FF1Model(n_feat=32, n_chan=4, n_layers=2, n_rbf=8, trunk_dtype=F64,

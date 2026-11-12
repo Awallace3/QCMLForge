@@ -29,7 +29,7 @@ from torch import Tensor, nn
 
 from . import charges as ch
 from . import elements, gordon1, physics
-from .trunk import ANG2BOHR, FF1MonomerTrunk, f_cut, mlp, norm_cap
+from .trunk import ANG2BOHR, FF1MonomerTrunk, mlp, norm_cap
 
 H2KCAL = 627.5095
 THETA_MAX = 0.95
@@ -38,6 +38,7 @@ SIGMA_MIN = 0.05
 EPS_EL = 1e-2
 TAU_AUF = 1e-2
 EPS_N = 1e-6
+PSI_L_SPLIT = 20.0  # psi takes the direct power difference above this L
 EPS_ALPHA = 1e-12
 # bond-share logit g_ik in (-8, 4), starting at -6 (p ~ 0.2%: near-neutral prior)
 G_CENTER, G_HALF = -2.0, 6.0
@@ -66,9 +67,19 @@ def phi_tau(u: Tensor, tau: float = TAU_AUF) -> Tensor:
 
 
 def psi(x: Tensor, gamma: Tensor, eps: float = EPS_N) -> Tensor:
-    """(x^2 + eps^2)^(gamma/2) - eps^gamma: autograd-safe x^gamma, psi(0) = 0."""
-    # eps^g expm1((g/2) log1p(x^2/eps^2)): no cancellation, exactly 0 at x = 0
-    return eps**gamma * torch.expm1(0.5 * gamma * torch.log1p((x / eps) ** 2))
+    """(x^2 + eps^2)^(gamma/2) - eps^gamma: autograd-safe x^gamma, psi(0) = 0.
+
+    Near 0 it is eps^g expm1(L), L = (g/2) log1p(x^2/eps^2): no cancellation,
+    exactly 0 at x = 0.  expm1(L) alone overflows float32 once L > 88 (gamma
+    ~ 6 at x ~ 1, reachable by the element prefit) while eps^g stays finite,
+    so above PSI_L_SPLIT the difference of powers is taken directly; there
+    the cancellation is at most e^-PSI_L_SPLIT relative.  Each branch sees
+    only its own clamped L, so neither feeds inf into the other's gradient.
+    """
+    L = 0.5 * gamma * torch.log1p((x / eps) ** 2)
+    small = eps**gamma * torch.expm1(L.clamp(max=PSI_L_SPLIT))
+    large = torch.exp(0.5 * gamma * torch.log(x * x + eps * eps)) - eps**gamma
+    return torch.where(L <= PSI_L_SPLIT, small, large)
 
 
 class FF1Model(nn.Module):
