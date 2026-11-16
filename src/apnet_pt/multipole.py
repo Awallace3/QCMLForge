@@ -92,6 +92,51 @@ def ensure_traceless_qpole(qpole):
     return qpole
 
 
+def enforce_charge_conservation(
+    charge: torch.Tensor,
+    molecule_ind: torch.Tensor,
+    natom_per_mol: torch.Tensor,
+    total_charge: torch.Tensor,
+) -> torch.Tensor:
+    """Shift each molecule's charges uniformly so they sum to its total charge.
+
+    Parameters
+    ----------
+    charge : torch.Tensor
+        Raw atomic charges, shape ``[natom, 1]``.
+    molecule_ind : torch.Tensor
+        Molecule index of each atom, shape ``[natom]``.
+    natom_per_mol : torch.Tensor
+        Atom count of each molecule, shape ``[nmol]``.
+    total_charge : torch.Tensor
+        Formal charge of each molecule, ``nmol`` elements.
+
+    Returns
+    -------
+    torch.Tensor
+        Conserved charges with the dtype and shape of ``charge``.
+
+    Notes
+    -----
+    The sum, shift and subtraction run in float64. Raw charges carry an
+    arbitrary per-atom offset, so the raw sum is O(natom) and an FP32 sum
+    leaves a net-charge error that grows with molecule size and depends on
+    reduction order (threads, batch layout, device). Only the final cast
+    rounds to the input dtype, so each atom is off by at most half an ulp.
+    """
+    num_mols = natom_per_mol.size(0)
+    charge64 = charge.double()
+    total_charge_pred = scatter_sum_compile(
+        charge64, molecule_ind, num_mols, reduce="sum"
+    ).squeeze(-1)
+    shift = (total_charge_pred - total_charge.reshape(-1).double()) / (
+        natom_per_mol.double()
+    )
+    return (charge64 - shift.index_select(0, molecule_ind).unsqueeze(-1)).to(
+        charge.dtype
+    )
+
+
 def qpole_expand_and_traceless(qpole):
     """
     Convert a compact or redundant quadrupole representation into a full traceless 3x3 tensor.
