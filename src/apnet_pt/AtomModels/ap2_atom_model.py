@@ -440,18 +440,9 @@ class AtomMPNN(MessagePassing):
 
         molecule_ind.requires_grad_(False)
         molecule_ind = molecule_ind.long()
-        num_mols = natom_per_mol.size(0)
-        total_charge_pred = scatter_sum_compile(
-            charge, molecule_ind, num_mols, reduce="sum"
+        charge = multipole.enforce_charge_conservation(
+            charge, molecule_ind, natom_per_mol, total_charge
         )
-        # return charge, dipole, qpole, h_list
-
-        total_charge_pred = total_charge_pred.squeeze()
-        total_charge_err = total_charge_pred - total_charge
-        charge_err = torch.repeat_interleave(
-            total_charge_err / natom_per_mol.float(), natom_per_mol
-        ).unsqueeze(1)
-        charge = charge - charge_err
         # squeeze(-1), not squeeze(): a one-atom batch would otherwise collapse
         # to a 0-dim tensor and break the per-molecule slicing downstream.
         charge = charge.squeeze(-1)

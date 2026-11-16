@@ -394,18 +394,9 @@ class AtomHirshfeldMPNN(MessagePassing):
         charge[keep_mask] = filtered_charge
         molecule_ind.requires_grad_(False)
         molecule_ind = molecule_ind.long()
-        num_mols = natom_per_mol.size(0)
-        total_charge_pred = scatter_sum_compile(
-            charge, molecule_ind, num_mols, reduce="sum"
+        charge = multipole.enforce_charge_conservation(
+            charge, molecule_ind, natom_per_mol, total_charge
         )
-        # return charge, dipole, qpole, h_list
-
-        total_charge_pred = total_charge_pred.squeeze()
-        total_charge_err = total_charge_pred - total_charge
-        charge_err = torch.repeat_interleave(
-            total_charge_err / natom_per_mol.float(), natom_per_mol
-        ).unsqueeze(1)
-        charge = charge - charge_err
         charge = charge.squeeze()
         h_list = torch.stack(h_list, dim=1)
         volume_ratio[keep_mask] = torch.relu(filtered_volume_ratio) + 0.0001
