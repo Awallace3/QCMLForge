@@ -288,8 +288,9 @@ def test_compiled_fullgraph_matches_eager(device):
         ge = grads(eager, pe.sum())
         gc = grads(eager, pc.sum())
         for name, a in ge.items():
-            if a is not None:
-                assert torch.allclose(a, gc[name], rtol=1e-8,
-                                      atol=1e-10 * float(a.abs().max() + 1)), name
+            if a is not None:  # FF-1's element tables are float32 parameters
+                tol = 1e-8 if a.dtype == F64 else 1e-5
+                assert torch.allclose(a, gc[name], rtol=tol,
+                                      atol=tol * 1e-2 * float(a.abs().max() + 1)), name
     from torch._dynamo.utils import counters
     assert counters["stats"]["unique_graphs"] == 1
