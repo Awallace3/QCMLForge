@@ -4,6 +4,7 @@ import math
 
 import pytest
 import torch
+from torch._dynamo.utils import counters
 
 from apnet_pt.ff1 import FF1Model, gordon1
 from apnet_pt.ff2 import FF2Model, compile_ff2, ff2_loss
@@ -287,6 +288,7 @@ def test_float32_physics_tracks_float64(device):
 @pytest.mark.parametrize("device", DEVICES)
 def test_compiled_fullgraph_matches_eager(device):
     torch._dynamo.reset()
+    counters.clear()
     ff1 = make_ff1(8, device)
     eager = FF2Model.from_ff1(ff1)
     compiled = compile_ff2(eager)
@@ -305,5 +307,21 @@ def test_compiled_fullgraph_matches_eager(device):
                 tol = 1e-8 if a.dtype == F64 else 1e-5
                 assert torch.allclose(a, gc[name], rtol=tol,
                                       atol=tol * 1e-2 * float(a.abs().max() + 1)), name
-    from torch._dynamo.utils import counters
+    assert counters["stats"]["unique_graphs"] == 1
+
+
+@pytest.mark.skipif(not torch.backends.opt_einsum.is_available(),
+                    reason="opt_einsum not installed: nothing to specialize on")
+def test_compile_ignores_opt_einsum_paths():
+    # with opt_einsum on, FF-1's three-operand trunk einsums choose their path
+    # from the concrete atom count, guarding it; Phoenix job 15791285 then
+    # recompiled every chunk.  Dynamo's own backend traces the same guards.
+    torch._dynamo.reset()
+    counters.clear()
+    compiled = compile_ff2(FF2Model.from_ff1(make_ff1(9)), backend="eager")
+    with torch.backends.opt_einsum.flags(enabled=True):
+        for batch in (batch_from_dimers(dimers()),
+                      batch_from_dimers(dimers()[:3]),
+                      batch_from_dimers(dimers()[2:3] + dimers()[:1])):
+            compiled(batch)
     assert counters["stats"]["unique_graphs"] == 1

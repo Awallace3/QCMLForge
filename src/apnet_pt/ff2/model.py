@@ -312,7 +312,12 @@ class CompiledFF2(nn.Module):
       a model constant (3 coordinates, 4 invariants, ...) is not specialized;
     * ``backed_size_oblivious``, so a one-dimer chunk (n == 1, slots m == N
       atoms) does not specialize sizes to 1 or to each other -- on real store
-      batches every such chunk recompiled until the recompile limit.
+      batches every such chunk recompiled until the recompile limit;
+    * ``opt_einsum`` off: with it installed, ``torch.einsum`` with three or
+      more operands (FF-1's trunk invariants) picks its contraction path from
+      the concrete sizes, which guards the atom count to its traced value and
+      recompiles every new chunk.  Without it the operands contract left to
+      right.
 
     One graph then serves every chunk shape.  Parameters stay ``model``'s."""
 
@@ -324,7 +329,8 @@ class CompiledFF2(nn.Module):
 
     def forward(self, batch: dict):
         from torch.fx.experimental import _config as fx_config
-        with fx_config.patch(use_duck_shape=False, backed_size_oblivious=True):
+        with fx_config.patch(use_duck_shape=False, backed_size_oblivious=True), \
+                torch.backends.opt_einsum.flags(enabled=False):
             return self._compiled(batch)
 
 
