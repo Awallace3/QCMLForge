@@ -117,6 +117,18 @@ def test_from_ff1_reproduces_reduced_configurations(options):
     assert_parity(ff1, ff2, batch_from_dimers(dimers()))
 
 
+def test_parity_all_float64_and_independent_weights():
+    """An FF-1 cast to float64 throughout (element tables included) loads with
+    its dtypes, and the copy does not alias FF-1's parameters."""
+    ff1 = make_ff1(10).double()
+    ff2 = FF2Model.from_ff1(ff1)
+    assert all(p.dtype == F64 for p in ff2.parameters())
+    assert_parity(ff1, ff2, batch_from_dimers(dimers()), e_tol=1e-10, g_tol=1e-10)
+    with torch.no_grad():
+        ff2.gamma_raw.add_(1.0)
+    assert not torch.equal(ff2.gamma_raw, ff1.gamma_raw)
+
+
 def test_parity_with_s_cut():
     ff1 = make_ff1(4, s_cut=(3.0, 4.0))
     ff2 = FF2Model.from_ff1(ff1)
@@ -281,6 +293,7 @@ def test_compiled_fullgraph_matches_eager(device):
     # 3 dimers: a size equal to the coordinate axis must not specialize
     for batch in (batch_from_dimers(dimers(), device=device),
                   batch_from_dimers(dimers()[:3], device=device),
+                  batch_from_dimers(dimers()[1:2], device=device),  # m == N, n == 1
                   batch_from_dimers(dimers()[:3] + dimers()[:2], device=device)):
         pe, _ = eager(batch)
         pc, xc = compiled(batch)

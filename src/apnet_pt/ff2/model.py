@@ -106,13 +106,18 @@ class FF2Model(FF1Model):
                    physics_dtype=ff1.physics_dtype, s_cut=ff1.s_cut_window,
                    g0_init=ff1.g0_init)
         model = cls(**{**cfg, **options})
-        model.load_ff1_state_dict(ff1.state_dict())
+        model.load_ff1_state_dict(ff1.state_dict(), keep_dtype=True)
         return model.to(next(ff1.parameters()).device)
 
-    def load_ff1_state_dict(self, state: dict):
+    def load_ff1_state_dict(self, state: dict, keep_dtype: bool = False):
         """Load an FF-1 state dict; only the optional electrostatics heads may
-        be missing (they keep their zero-readout init)."""
-        missing, unexpected = self.load_state_dict(state, strict=False)
+        be missing (they keep their zero-readout init).  ``keep_dtype`` takes
+        each tensor's dtype from ``state`` (e.g. an FF-1 model cast to float64
+        throughout) instead of casting into this model's parameters."""
+        if keep_dtype:
+            state = {k: v.detach().clone() for k, v in state.items()}
+        missing, unexpected = self.load_state_dict(state, strict=False,
+                                                   assign=keep_dtype)
         bad = [k for k in missing if not k.startswith(OPTIONAL_FF1_KEYS)]
         if bad or unexpected:
             raise ValueError(f"not an FF-1 state dict: missing {bad}, "
@@ -301,10 +306,15 @@ class FF2Model(FF1Model):
 
 
 class CompiledFF2(nn.Module):
-    """``torch.compile(model, fullgraph=True, dynamic=True)`` with duck shaping
-    off while tracing, so a chunk whose dimer or atom count happens to equal a
-    model constant (3 coordinates, 4 invariants, ...) is not specialized into
-    a recompile.  Parameters stay those of ``model``."""
+    """``torch.compile(model, fullgraph=True, dynamic=True)`` traced with
+
+    * duck shaping off, so a chunk whose dimer or atom count happens to equal
+      a model constant (3 coordinates, 4 invariants, ...) is not specialized;
+    * ``backed_size_oblivious``, so a one-dimer chunk (n == 1, slots m == N
+      atoms) does not specialize sizes to 1 or to each other -- on real store
+      batches every such chunk recompiled until the recompile limit.
+
+    One graph then serves every chunk shape.  Parameters stay ``model``'s."""
 
     def __init__(self, model: FF2Model, **options):
         super().__init__()
@@ -314,7 +324,7 @@ class CompiledFF2(nn.Module):
 
     def forward(self, batch: dict):
         from torch.fx.experimental import _config as fx_config
-        with fx_config.patch(use_duck_shape=False):
+        with fx_config.patch(use_duck_shape=False, backed_size_oblivious=True):
             return self._compiled(batch)
 
 
