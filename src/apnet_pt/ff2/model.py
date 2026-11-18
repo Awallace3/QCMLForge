@@ -90,6 +90,10 @@ class FF2Model(FF1Model):
                             ("tensor_bound", TENSOR_HEADS)):
             self.register_buffer(name, torch.tensor(list(table.values()), dtype=pd),
                                  persistent=False)
+        # factor on E_CT's gradient (forward unchanged); a trainer schedules it
+        # in place, so the compiled graph reads the current value
+        self.register_buffer("ct_grad_scale", torch.tensor(1.0, dtype=pd),
+                             persistent=False)
 
     # -- construction from FF-1 ----------------------------------------------
     @classmethod
@@ -127,6 +131,20 @@ class FF2Model(FF1Model):
     def config(self) -> dict:
         return {**super().config(), "n_mu_iters": self.n_mu_iters,
                 "use_cholesky": self.use_cholesky}
+
+    def ct_parameter_slices(self) -> list[tuple[nn.Parameter, int, list[int]]]:
+        """``(parameter, dim, indices)`` of every entry that reaches the energy
+        only through E_CT: the D/C element offsets, the D/C/eta_B rows of the
+        scalar readout, the D/C rows of the vector and tensor readouts, and the
+        CT anisotropy weights.  The trunk and hidden layers are shared."""
+        g = [GUESS_NAMES.index(k) for k in ("D", "C")]
+        s = [list(SCALAR_HEADS).index(k) for k in ("D", "C", "eta_B")]
+        v = [1 + list(VECTOR_HEADS).index(k) for k in ("D", "C")]
+        t = [1 + list(TENSOR_HEADS).index(k) for k in ("D", "C")]
+        last = self.prop_head[-1]
+        return [(self.guess.weight, 1, g), (last.weight, 0, s), (last.bias, 0, s),
+                (self.vec_readout.weight, 0, v), (self.ten_readout.weight, 0, t),
+                (self.kappa_ct_raw, 0, list(range(self.kappa_ct_raw.numel())))]
 
     # -- forward -------------------------------------------------------------
     def forward(self, batch: dict, return_matrix: bool = False):
@@ -288,6 +306,8 @@ class FF2Model(FF1Model):
             r, exch, zf[i], zf[j], gamma_sum, at["eta_B"][i] * B_ij,
             at["eta_B"][j] * B_ji,
             eps_ct=1e-30 if pd == torch.float64 else 1e-15, s_cut=sc)
+        s = self.ct_grad_scale.to(pd)
+        ct = s * ct + (1.0 - s) * ct.detach()  # exactly ct at s = 1
         dg = self.dispersion_globals()
         disp, c6 = physics.dispersion_pairs(
             r, at["alpha_iso"][i], at["alpha_iso"][j], at["eta"][i], at["eta"][j],

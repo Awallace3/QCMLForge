@@ -325,3 +325,79 @@ def test_compile_ignores_opt_einsum_paths():
                       batch_from_dimers(dimers()[2:3] + dimers()[:1])):
             compiled(batch)
     assert counters["stats"]["unique_graphs"] == 1
+
+
+# --- delayed charge transfer -------------------------------------------------
+
+def ct_masks(model):
+    """{parameter name: bool mask} of the CT-only entries."""
+    params = dict(model.named_parameters())
+    names = {id(p): n for n, p in params.items()}
+    out = {}
+    for p, dim, idx in model.ct_parameter_slices():
+        mask = out.setdefault(names[id(p)], torch.zeros_like(p, dtype=torch.bool))
+        mask.index_fill_(dim, torch.as_tensor(idx, device=p.device), True)
+    return out
+
+
+def test_ct_slices_reach_only_induction():
+    model = FF2Model.from_ff1(make_ff1(11))
+    batch = batch_from_dimers(dimers())
+    p0, x0 = model(batch)
+    masks = ct_masks(model)
+    assert set(masks) == {"guess.weight", "prop_head.2.weight", "prop_head.2.bias",
+                          "vec_readout.weight", "ten_readout.weight", "kappa_ct_raw"}
+    torch.manual_seed(3)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name in masks:
+                p.add_(0.3 * torch.randn_like(p) * masks[name])
+    p1, x1 = model(batch)
+    assert torch.equal(p0[:, [0, 1, 3]], p1[:, [0, 1, 3]])
+    assert torch.equal(x0["e_pol"], x1["e_pol"])
+    assert float((x1["e_ct"] - x0["e_ct"]).abs().max()) > 1e-6
+
+
+def test_ct_grad_scale_gates_only_the_ct_gradient():
+    model = FF2Model.from_ff1(make_ff1(12))
+    batch = batch_from_dimers(dimers())
+    w = torch.arange(1, 5, dtype=F64)
+    p1, x1 = model(batch)
+    g1 = grads(model, (p1 * w).sum())
+    model.ct_grad_scale.fill_(0.0)
+    p0, x0 = model(batch)
+    assert torch.equal(p0, p1)
+    g0 = grads(model, (p0 * w).sum())
+    masks = ct_masks(model)
+    moved = 0
+    for name, g in g0.items():
+        if g is None:
+            continue
+        if name in masks:
+            assert float(g[masks[name]].abs().max()) == 0.0, name
+            moved += int(float(g1[name][masks[name]].abs().max()) > 0)
+    assert moved == len(masks)
+    # the shared trunk loses CT's share of its gradient
+    trunk = [n for n in g0 if n.startswith("trunk.") and g0[n] is not None]
+    assert any(not torch.allclose(g0[n], g1[n]) for n in trunk)
+    assert "ct_grad_scale" not in model.state_dict()
+
+
+@pytest.mark.slow
+def test_compiled_ct_grad_scale_needs_no_recompile():
+    torch._dynamo.reset()
+    counters.clear()
+    model = FF2Model.from_ff1(make_ff1(13))
+    compiled = compile_ff2(model)
+    batch = batch_from_dimers(dimers())
+    masks = ct_masks(model)
+    for s in (1.0, 0.0, 0.5):
+        model.ct_grad_scale.fill_(s)
+        pc, _ = compiled(batch)
+        pe, _ = model(batch)
+        gc, ge = grads(model, pc.sum()), grads(model, pe.sum())
+        for name, m in masks.items():
+            assert torch.allclose(gc[name][m], ge[name][m], rtol=1e-6, atol=1e-10), (s, name)
+            if s == 0.0:
+                assert float(gc[name][m].abs().max()) == 0.0, name
+    assert counters["stats"]["unique_graphs"] == 1
