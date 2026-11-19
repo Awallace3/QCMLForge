@@ -69,6 +69,16 @@ class FF2Model(FF1Model):
         Fixed Newton-bisection iterations of the one-mu solve.
     use_cholesky : bool
         Solve the SPD polarization system by Cholesky (else LU, as FF-1).
+    sr_shell, charge_transfer, transverse_invariants, alpha_anisotropy : bool
+        Ablation switches (default on = FF-2): the short-range multipole
+        shell ``d_sr``/``Q_sr``; the CT energy; the SO(2) invariants omega
+        in exchange and CT (``kappa . omega``); the anisotropic factor
+        ``exp(tau_alpha / 2)`` of sqrt(alpha).  Off removes the term from
+        the forward; its parameters stay in the state dict (unused).
+    element_alpha_eta : bool
+        Ablation (default off): ``alpha_iso = alpha_free[z] exp(delta_alpha)``
+        and ``eta = eta_free[z] exp(delta_eta)`` replace the population
+        (core/sub/valence psi) and cation-to-free interpolation models.
     """
 
     def __init__(self, n_feat: int = 128, n_chan: int = 16, n_layers: int = 3,
@@ -78,12 +88,19 @@ class FF2Model(FF1Model):
                  physics_dtype: torch.dtype = torch.float64,
                  s_cut: tuple[float, float] | None = None,
                  g0_init: float = G0_INIT, n_mu_iters: int = N_ITERS,
-                 use_cholesky: bool = True):
+                 use_cholesky: bool = True, sr_shell: bool = True,
+                 charge_transfer: bool = True, transverse_invariants: bool = True,
+                 alpha_anisotropy: bool = True, element_alpha_eta: bool = False):
         super().__init__(n_feat, n_chan, n_layers, n_rbf, r_cut, rho_tr,
                          element_init, trunk_dtype, physics_dtype, s_cut,
                          g0_init, elst_beta_def=True, elst_sr_shell=True)
         self.n_mu_iters = int(n_mu_iters)
         self.use_cholesky = bool(use_cholesky)
+        self.sr_shell = bool(sr_shell)
+        self.charge_transfer = bool(charge_transfer)
+        self.transverse_invariants = bool(transverse_invariants)
+        self.alpha_anisotropy = bool(alpha_anisotropy)
+        self.element_alpha_eta = bool(element_alpha_eta)
         pd = physics_dtype
         for name, table in (("scalar_bound", SCALAR_HEADS),
                             ("vector_bound", VECTOR_HEADS),
@@ -130,7 +147,14 @@ class FF2Model(FF1Model):
 
     def config(self) -> dict:
         return {**super().config(), "n_mu_iters": self.n_mu_iters,
-                "use_cholesky": self.use_cholesky}
+                "use_cholesky": self.use_cholesky, **self.ablations()}
+
+    def ablations(self) -> dict:
+        """The ablation switches (all at their FF-2 default = no ablation)."""
+        return {"sr_shell": self.sr_shell, "charge_transfer": self.charge_transfer,
+                "transverse_invariants": self.transverse_invariants,
+                "alpha_anisotropy": self.alpha_anisotropy,
+                "element_alpha_eta": self.element_alpha_eta}
 
     def ct_parameter_slices(self) -> list[tuple[nn.Parameter, int, list[int]]]:
         """``(parameter, dim, indices)`` of every entry that reaches the energy
@@ -229,16 +253,13 @@ class FF2Model(FF1Model):
         th = g_el[:, None, None] * ten[..., 0]
         vecs = norm_cap(vec[:, :, 1:], self.vector_bound.to(pd), (1,))
         tens = norm_cap(ten[..., 1:], self.tensor_bound.to(pd), (1, 2))
-        g_sub, g_val = self.gammas()
-        alpha_iso = (self.alpha_core[z].to(pd)
-                     + self.d_alpha_sub[z].to(pd) * psi(f_sub, g_sub[z].to(pd))
-                     + self.d_alpha_val[z].to(pd) * psi(f_val, g_val[z].to(pd))
-                     ) * torch.exp(delta["alpha"])
-        sqrt_alpha = (g_el * torch.sqrt(alpha_iso + EPS_ALPHA))[:, None, None] \
-            * physics.expm_sym(0.5 * tens[..., -1])
-        ft = torch.tanh(f_val / 2.0) / math.tanh(0.5)
-        e_cat, e_free = self.eta_cat[z].to(pd), self.eta_free[z].to(pd)
-        eta = e_cat * (e_free / e_cat) ** ft * torch.exp(delta["eta"])
+        alpha_iso, eta = self.alpha_eta(z, f_sub, f_val, delta["alpha"],
+                                        delta["eta"])
+        sqrt_alpha = (g_el * torch.sqrt(alpha_iso + EPS_ALPHA))[:, None, None]
+        if self.alpha_anisotropy:
+            sqrt_alpha = sqrt_alpha * physics.expm_sym(0.5 * tens[..., -1])
+        else:
+            sqrt_alpha = sqrt_alpha * torch.eye(3, dtype=pd, device=z.device)
 
         def amp(name):
             return torch.exp(getattr(self, f"log_{name}0")[z].to(pd) + gz[name]
@@ -248,11 +269,14 @@ class FF2Model(FF1Model):
         raw_def = self.beta_def_head(feats).to(pd)[:, 0]
         d_def = BETA_DEF_BOUND * torch.tanh(raw_def / BETA_DEF_BOUND)
         beta_def = beta * torch.exp(self.beta_def_guess(z).to(pd)[:, 0] + d_def)
-        cap = torch.tensor(SR_SHELL_CAP, dtype=pd, device=raw.device)
-        d_sr = g_el[:, None] * norm_cap(self.sr_vec_readout(u).to(pd), cap,
-                                        (1,))[..., 0]
-        Q_sr = g_el[:, None, None] * norm_cap(self.sr_ten_readout(Q).to(pd), cap,
-                                              (1, 2))[..., 0]
+        if self.sr_shell:
+            cap = torch.tensor(SR_SHELL_CAP, dtype=pd, device=raw.device)
+            d_sr = g_el[:, None] * norm_cap(self.sr_vec_readout(u).to(pd), cap,
+                                            (1,))[..., 0]
+            Q_sr = g_el[:, None, None] * norm_cap(self.sr_ten_readout(Q).to(pd),
+                                                  cap, (1, 2))[..., 0]
+        else:
+            d_sr, Q_sr = torch.zeros_like(mu), torch.zeros_like(th)
         return {"mu": mu, "th": th, "g_el": g_el, "alpha_iso": alpha_iso,
                 "sqrt_alpha": sqrt_alpha, "beta_pol": physics.beta_pol(alpha_iso),
                 "eta": eta, "beta": beta, "A": g_el * amp("A"), "B": amp("B"),
@@ -264,6 +288,23 @@ class FF2Model(FF1Model):
                 "shell_M": torch.stack([mu + d_sr, -d_sr], 1),
                 "shell_T": torch.stack([th + Q_sr, -Q_sr], 1),
                 "shell_b": torch.stack([beta_def, beta], 1)}
+
+    def alpha_eta(self, z: Tensor, f_sub: Tensor, f_val: Tensor, d_alpha: Tensor,
+                  d_eta: Tensor) -> tuple[Tensor, Tensor]:
+        """(alpha_iso, eta) per atom from the shell fillings and the bounded
+        head offsets; ``element_alpha_eta`` drops the filling dependence."""
+        pd = self.physics_dtype
+        if self.element_alpha_eta:
+            return (self.alpha_free[z].to(pd) * torch.exp(d_alpha),
+                    self.eta_free[z].to(pd) * torch.exp(d_eta))
+        g_sub, g_val = self.gammas()
+        alpha_iso = (self.alpha_core[z].to(pd)
+                     + self.d_alpha_sub[z].to(pd) * psi(f_sub, g_sub[z].to(pd))
+                     + self.d_alpha_val[z].to(pd) * psi(f_val, g_val[z].to(pd))
+                     ) * torch.exp(d_alpha)
+        ft = torch.tanh(f_val / 2.0) / math.tanh(0.5)
+        e_cat, e_free = self.eta_cat[z].to(pd), self.eta_free[z].to(pd)
+        return alpha_iso, e_cat * (e_free / e_cat) ** ft * torch.exp(d_eta)
 
     def _side(self, idx, zf, at):
         z, pd = zf.long()[idx], zf.dtype
@@ -294,8 +335,11 @@ class FF2Model(FF1Model):
         pre_j, b_j, _, d_j, c_j = xi_j.unbind(1)
         B_ij = at["B"][i] * torch.exp(b_i)
         B_ji = at["B"][j] * torch.exp(b_j)
-        omega = physics.transverse_invariants(rhat, vi[:, :, 2], ti[..., 2],
-                                              vj[:, :, 2], tj[..., 2])
+        if self.transverse_invariants:
+            omega = physics.transverse_invariants(rhat, vi[:, :, 2], ti[..., 2],
+                                                  vj[:, :, 2], tj[..., 2])
+        else:
+            omega = r.new_zeros((r.shape[0], 4))
         exch = physics.exchange_pairs(r, rhat, at["A"][i], at["A"][j], B_ij, B_ji,
                                       pre_i, pre_j, omega,
                                       torch.tanh(self.kappa_ex_raw).to(pd), sc)
@@ -308,6 +352,8 @@ class FF2Model(FF1Model):
             eps_ct=1e-30 if pd == torch.float64 else 1e-15, s_cut=sc)
         s = self.ct_grad_scale.to(pd)
         ct = s * ct + (1.0 - s) * ct.detach()  # exactly ct at s = 1
+        if not self.charge_transfer:
+            ct = torch.zeros_like(ct)
         dg = self.dispersion_globals()
         disp, c6 = physics.dispersion_pairs(
             r, at["alpha_iso"][i], at["alpha_iso"][j], at["eta"][i], at["eta"][j],

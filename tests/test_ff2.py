@@ -401,3 +401,102 @@ def test_compiled_ct_grad_scale_needs_no_recompile():
             if s == 0.0:
                 assert float(gc[name][m].abs().max()) == 0.0, name
     assert counters["stats"]["unique_graphs"] == 1
+
+
+# --- ablation switches (ff2-simp-v1) ------------------------------------------
+
+ABLATIONS = {"sr_shell": False, "charge_transfer": False,
+             "transverse_invariants": False, "alpha_anisotropy": False,
+             "element_alpha_eta": True}
+
+
+def ablated(ff1, **flags):
+    return FF2Model.from_ff1(ff1, **flags)
+
+
+def zeroed(model, *names, rows=None):
+    """``model`` with the named parameters (or rows of them) set to zero."""
+    params = dict(model.named_parameters())
+    with torch.no_grad():
+        for name in names:
+            if rows is None:
+                params[name].zero_()
+            else:
+                params[name][rows].zero_()
+    return model
+
+
+def test_ablation_defaults_are_ff2():
+    model = FF2Model(n_feat=32, n_chan=4, n_layers=2, n_rbf=8)
+    assert model.ablations() == {k: not v for k, v in ABLATIONS.items()}
+    assert set(ABLATIONS) <= set(model.config())
+    assert list(ablated(make_ff1(), **ABLATIONS).state_dict()) == \
+        list(model.state_dict())
+
+
+@pytest.mark.parametrize("flag, names, rows", [
+    ("sr_shell", ("sr_vec_readout.weight", "sr_ten_readout.weight"), None),
+    ("transverse_invariants", ("kappa_ex_raw", "kappa_ct_raw"), None),
+    ("alpha_anisotropy", ("ten_readout.weight",), -1),
+])
+def test_ablation_equals_zeroed_parameters(flag, names, rows):
+    """Switching a term off is the FF-2 model with that term's readout at zero."""
+    ff1 = make_ff1(21)
+    off = ablated(ff1, **{flag: False})
+    ref = zeroed(FF2Model.from_ff1(ff1), *names, rows=rows)
+    batch = batch_from_dimers(dimers())
+    p_off, x_off = off(batch)
+    p_ref, x_ref = ref(batch)
+    assert torch.allclose(p_off, p_ref, rtol=0, atol=1e-12)
+    p_on, _ = FF2Model.from_ff1(ff1)(batch)
+    assert float((p_on - p_off).abs().max()) > 1e-6  # the term was live
+    if flag == "sr_shell":
+        assert float(x_off["d_sr"].abs().max()) == 0.0
+        assert float(x_off["Q_sr"].abs().max()) == 0.0
+
+
+def test_no_charge_transfer_removes_only_ct():
+    ff1 = make_ff1(22)
+    batch = batch_from_dimers(dimers())
+    p_on, x_on = FF2Model.from_ff1(ff1)(batch)
+    model = ablated(ff1, charge_transfer=False)
+    p_off, x_off = model(batch)
+    assert float(x_off["e_ct"].abs().max()) == 0.0
+    assert float(x_on["e_ct"].abs().max()) > 1e-6
+    assert torch.equal(p_on[:, [0, 1, 3]], p_off[:, [0, 1, 3]])
+    assert torch.allclose(p_off[:, 2], x_on["e_pol"], rtol=0, atol=1e-12)
+    g = grads(model, p_off.sum())
+    assert g["kappa_ct_raw"] is None or float(g["kappa_ct_raw"].abs().max()) == 0.0
+
+
+def test_element_alpha_eta_drops_the_filling_dependence():
+    model = ablated(make_ff1(23), element_alpha_eta=True)
+    z = torch.tensor([1, 6, 8, 11, 12])
+    d_a = torch.linspace(-0.5, 0.5, 5, dtype=F64)
+    d_e = torch.linspace(0.3, -0.3, 5, dtype=F64)
+    a1, e1 = model.alpha_eta(z, torch.zeros(5, dtype=F64), torch.zeros(5, dtype=F64),
+                             d_a, d_e)
+    a2, e2 = model.alpha_eta(z, torch.ones(5, dtype=F64), torch.ones(5, dtype=F64),
+                             d_a, d_e)
+    assert torch.equal(a1, a2) and torch.equal(e1, e2)
+    assert torch.allclose(a1, model.alpha_free[z].to(F64) * d_a.exp())
+    assert torch.allclose(e1, model.eta_free[z].to(F64) * d_e.exp())
+    full = FF2Model.from_ff1(make_ff1(23))
+    a3, _ = full.alpha_eta(z, torch.zeros(5, dtype=F64), torch.zeros(5, dtype=F64),
+                           d_a, d_e)
+    assert not torch.allclose(a1, a3)  # the population model differs
+
+
+def test_all_ablations_compile_to_one_graph():
+    torch._dynamo.reset()
+    counters.clear()
+    model = ablated(make_ff1(24), **ABLATIONS)
+    compiled = compile_ff2(model, backend="eager")
+    for batch in (batch_from_dimers(dimers()), batch_from_dimers(dimers()[:3]),
+                  batch_from_dimers(dimers()[1:2])):
+        pe, xe = model(batch)
+        pc, _ = compiled(batch)
+        assert torch.allclose(pe, pc, rtol=0, atol=1e-10)
+        assert torch.isfinite(pe).all()
+        assert float(xe["e_ct"].abs().max()) == 0.0
+    assert counters["stats"]["unique_graphs"] == 1
