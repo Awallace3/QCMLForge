@@ -90,6 +90,9 @@ class FF2Model(FF1Model):
         # Slater kernels within point_x: "exact" (series) or "table" (cubic
         # Hermite in x, kernels.two_center_table)
         self.kernel_mode: str = "exact"
+        # polarization by block-Jacobi CG with this many steps (None: dense
+        # Cholesky / LU per use_cholesky)
+        self.pol_cg_iters: int | None = None
         pd = physics_dtype
         for name, table in (("scalar_bound", SCALAR_HEADS),
                             ("vector_bound", VECTOR_HEADS),
@@ -163,7 +166,8 @@ class FF2Model(FF1Model):
         pr = self._pairs(batch, R_b, at)
         e_pol, induced = physics.polarization(R_b, at["sqrt_alpha"], at["beta_pol"],
                                               pr["field"], batch, self.use_cholesky,
-                                              self.point_x, self.kernel_mode)
+                                              self.point_x, self.kernel_mode,
+                                              self.pol_cg_iters)
         pdim = batch["pair_dimer"]
         sums = R_b.new_zeros((n, 4)).index_add(
             0, pdim, torch.stack([pr["elst"], pr["exch"], pr["ct"], pr["disp"]], 1))

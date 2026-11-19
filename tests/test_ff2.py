@@ -668,3 +668,27 @@ def test_tables_build_under_no_grad():
         out = kernels.one_center_table(torch.tensor([[1.2]], dtype=F64),
                                        torch.tensor([[3.0]], dtype=F64), kernels.BAR1)
     assert bool(torch.isfinite(out).all())
+
+
+# --- speed paths: iterative polarization -------------------------------------
+
+
+def test_cg_solve_matches_cholesky_on_an_spd_batch():
+    g = torch.Generator().manual_seed(5)
+    M = torch.randn(2, 30, 30, generator=g, dtype=F64)
+    A = torch.eye(30, dtype=F64) + 0.02 * M @ M.transpose(1, 2)
+    rhs = torch.randn(2, 30, 1, generator=g, dtype=F64)
+    exact = torch.cholesky_solve(rhs, torch.linalg.cholesky(A))
+    x = physics.cg_solve(A, rhs, 30)
+    assert float((x - exact).norm() / exact.norm()) < 1e-12
+
+
+def test_cg_polarization_matches_cholesky_energy_and_forces():
+    exact, cg = md_model(), md_model()
+    cg.pol_cg_iters = 20
+    for far in (6.0, 12.0):
+        z, mon, q, x = three_monomers(far)
+        e_ref, f_ref = evaluate(FF2Energy(exact, z, mon, q), x)
+        e, f = evaluate(FF2Energy(cg, z, mon, q), x)
+        assert abs(float(e - e_ref)) <= 1e-9 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-8 * (1 + float(f_ref.abs().max())), far
