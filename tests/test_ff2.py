@@ -10,6 +10,7 @@ from apnet_pt.ff1 import FF1Model, gordon1
 from apnet_pt.ff2 import FF2Model, compile_ff2, ff2_loss
 from apnet_pt.ff2 import charges, kernels, physics
 from apnet_pt.ff2.batching import batch_from_dimers, monomer_batch, with_coordinates
+from apnet_pt.ff2.md import KCAL2KJ, FF2Energy, cluster_batch, trace_energy
 
 F64 = torch.float64
 DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
@@ -401,3 +402,135 @@ def test_compiled_ct_grad_scale_needs_no_recompile():
             if s == 0.0:
                 assert float(gc[name][m].abs().max()) == 0.0, name
     assert counters["stats"]["unique_graphs"] == 1
+
+
+# --- fixed-topology MD potential (OpenMM TorchForce) --------------------------
+
+
+def md_model(seed=9, **options):
+    return FF2Model.from_ff1(make_ff1(seed, **options)).eval()
+
+
+def layout(dimer):
+    na, nb = len(dimer["zA"]), len(dimer["zB"])
+    z = list(dimer["zA"]) + list(dimer["zB"])
+    x = torch.cat([torch.as_tensor(dimer["RA"], dtype=F64),
+                   torch.as_tensor(dimer["RB"], dtype=F64)]) / 10.0
+    return z, [0] * na + [1] * nb, [dimer.get("qA", 0), dimer.get("qB", 0)], x
+
+
+def reference(model, dimer, x):
+    """kJ/mol and forces from FF-2 on a batch built at ``x`` (nm)."""
+    na = len(dimer["zA"])
+    xr = x.clone().requires_grad_(True)
+    R = xr * 10.0
+    b = batch_from_dimers([{**dimer, "RA": R[:na].detach(), "RB": R[na:].detach()}],
+                          r_cut=model.trunk.r_cut)
+    b["R"] = R
+    e = model(b)[0].sum() * KCAL2KJ
+    (g,) = torch.autograd.grad(e, xr)
+    return e.detach(), -g
+
+
+def evaluate(module, x):
+    xr = x.clone().requires_grad_(True)
+    e = module(xr)
+    (g,) = torch.autograd.grad(e, xr)
+    return e.detach(), -g
+
+
+@pytest.mark.parametrize("k", range(4))
+def test_traced_energy_and_forces_match_ff2(k):
+    model, dimer = md_model(), dimers()[k]
+    z, mon, q, x0 = layout(dimer)
+    traced = trace_energy(model, z, mon, q, x0)
+    gen = torch.Generator().manual_seed(k)
+    for step in range(3):
+        x = x0 + 0.01 * step * torch.randn(x0.shape, generator=gen, dtype=F64)
+        e_ref, f_ref = reference(model, dimer, x)
+        e, f = evaluate(traced, x)
+        assert torch.allclose(e, e_ref, rtol=0, atol=1e-9 * (1 + e_ref.abs()))
+        assert torch.allclose(f, f_ref, rtol=0, atol=1e-8 * (1 + f_ref.abs().max()))
+
+
+def test_intramonomer_pair_crossing_r_cut_is_exact():
+    """A 2.5 Angstrom cutoff: stretch water's O-H through it."""
+    model = md_model(r_cut=2.5)
+    dimer = {"zA": [8, 1, 1], "RA": WATER, "zB": [7, 1, 1, 1],
+             "RB": shift(NH3, 0.3, 0.4, 3.0)}
+    z, mon, q, x0 = layout(dimer)
+    traced = trace_energy(model, z, mon, q, x0)
+    for h_x in (0.20, 0.249, 0.251, 0.28):   # nm: H1 in, at and past r_cut
+        x = x0.clone()
+        x[1, 0], x[1, 2] = h_x, 0.0
+        e_ref, f_ref = reference(model, dimer, x)
+        e, f = evaluate(traced, x)
+        assert torch.allclose(e, e_ref, rtol=0, atol=1e-9 * (1 + e_ref.abs()))
+        assert torch.allclose(f, f_ref, rtol=0, atol=1e-8 * (1 + f_ref.abs().max()))
+
+
+def test_traced_forces_match_finite_differences():
+    model, dimer = md_model(), dimers()[1]
+    z, mon, q, x0 = layout(dimer)
+    traced = trace_energy(model, z, mon, q, x0)
+    _, f = evaluate(traced, x0)
+    h = 1e-6
+    fd = torch.zeros_like(x0)
+    with torch.no_grad():
+        for a in range(x0.shape[0]):
+            for c in range(3):
+                vals = []
+                for s in (-2, -1, 1, 2):
+                    x = x0.clone()
+                    x[a, c] += s * h
+                    vals.append(traced(x))
+                fd[a, c] = -(vals[0] - 8 * vals[1] + 8 * vals[2] - vals[3]) / (12 * h)
+    assert torch.allclose(f, fd, rtol=1e-6, atol=1e-5)
+
+
+def test_saved_trace_round_trips(tmp_path):
+    model, dimer = md_model(), dimers()[2]
+    z, mon, q, x0 = layout(dimer)
+    path = tmp_path / "ff2.pt"
+    torch.jit.save(trace_energy(model, z, mon, q, x0), str(path))
+    loaded = torch.jit.load(str(path))
+    x = x0 + 0.005
+    assert torch.equal(loaded(x), trace_energy(model, z, mon, q, x0)(x))
+
+
+def test_float32_positions_are_promoted():
+    model, dimer = md_model(), dimers()[0]
+    z, mon, q, x0 = layout(dimer)
+    traced = trace_energy(model, z, mon, q, x0)
+    e64 = traced(x0.float().double())
+    e32 = traced(x0.float())
+    assert e32.dtype == F64 and torch.equal(e32, e64)
+
+
+def test_cluster_pair_terms_add_over_dimers():
+    """Three monomers: elst, exch, CT and dispersion are pairwise, so they sum
+    over the three dimers; only polarization is many-body."""
+    model = md_model()
+    monos = [([8, 1, 1], WATER), ([7, 1, 1, 1], shift(NH3, 0.3, 0.4, 3.0)),
+             ([8, 1, 1], shift(WATER, 3.1, -0.2, 1.0))]
+    z = sum((m[0] for m in monos), [])
+    mon = sum(([k] * len(m[0]) for k, m in enumerate(monos)), [])
+    x = torch.cat([torch.as_tensor(m[1], dtype=F64) for m in monos]) / 10.0
+    energy = FF2Energy(model, z, mon, [0, 0, 0])
+    with torch.no_grad():
+        pred, extras = model(energy.batch(x))
+        total = pred[0] - torch.tensor([0, 0, 1, 0], dtype=F64) * extras["e_pol"][0]
+        pairs = torch.zeros(4, dtype=F64)
+        for a, b in ((0, 1), (0, 2), (1, 2)):
+            d = {"zA": monos[a][0], "RA": monos[a][1],
+                 "zB": monos[b][0], "RB": monos[b][1]}
+            p, xd = model(batch_from_dimers([d]))
+            pairs += p[0] - torch.tensor([0, 0, 1, 0], dtype=F64) * xd["e_pol"][0]
+    assert torch.allclose(total, pairs, rtol=0, atol=1e-9)
+
+
+def test_cluster_batch_validates_monomer_labels():
+    with pytest.raises(ValueError):
+        cluster_batch([8, 1, 1], [0, 0, 2], [0.0, 0.0])
+    b = cluster_batch([8, 1, 1, 7], [0, 0, 0, 1], [0.0, 0.0])
+    assert b["edges"].shape == (2, 6) and b["ai"].numel() == 3
