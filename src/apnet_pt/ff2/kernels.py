@@ -103,6 +103,17 @@ def two_center(beta_i: Tensor, beta_j: Tensor, r: Tensor, specs) -> Tensor:
             ).sum(-2)
 
 
+def point(r: Tensor, shape, specs) -> Tensor:
+    """The large-separation limit of :func:`two_center` / :func:`one_center`:
+    ``R^-p`` for every spec and 0 for ``"bar1"``, broadcast to ``shape``.
+
+    Every Slater term decays as ``exp(-beta R)`` times a polynomial, so at
+    ``x = beta_min R >= 40`` the damped kernels equal this to ~6e-12 relative.
+    """
+    out = [torch.zeros_like(r) if n == "bar1" else r ** -p for n, p in specs]
+    return torch.stack(out, dim=-1).expand(*shape, len(specs))
+
+
 def safe_unit(vec: Tensor, eps: float = 1e-300) -> tuple[Tensor, Tensor]:
     """(|vec|, vec/|vec|), finite with finite gradients at vec = 0."""
     r2 = (vec * vec).sum(-1)

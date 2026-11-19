@@ -84,6 +84,9 @@ class FF2Model(FF1Model):
                          g0_init, elst_beta_def=True, elst_sr_shell=True)
         self.n_mu_iters = int(n_mu_iters)
         self.use_cholesky = bool(use_cholesky)
+        # beta_min R above which a pair's Slater kernels take their point-
+        # multipole limit (physics.by_range); None keeps every pair damped
+        self.point_x: float | None = None
         pd = physics_dtype
         for name, table in (("scalar_bound", SCALAR_HEADS),
                             ("vector_bound", VECTOR_HEADS),
@@ -156,7 +159,8 @@ class FF2Model(FF1Model):
         n = batch["n_dimer"].shape[0]
         pr = self._pairs(batch, R_b, at)
         e_pol, induced = physics.polarization(R_b, at["sqrt_alpha"], at["beta_pol"],
-                                              pr["field"], batch, self.use_cholesky)
+                                              pr["field"], batch, self.use_cholesky,
+                                              self.point_x)
         pdim = batch["pair_dimer"]
         sums = R_b.new_zeros((n, 4)).index_add(
             0, pdim, torch.stack([pr["elst"], pr["exch"], pr["ct"], pr["disp"]], 1))
@@ -273,6 +277,12 @@ class FF2Model(FF1Model):
                 "M": at["shell_M"][idx], "T": at["shell_T"][idx],
                 "bs": at["shell_b"][idx]}
 
+    @staticmethod
+    def _beta_min(side):
+        """Smallest Slater exponent a pair side's elst/field kernels use."""
+        return torch.minimum(torch.minimum(side["b"], side["bc"]),
+                             side["bs"].min(-1).values)
+
     def _pairs(self, batch, R_b, at):
         pd = self.physics_dtype
         z = batch["z"].long()
@@ -281,7 +291,8 @@ class FF2Model(FF1Model):
         r, rhat = safe_unit(R_b[j] - R_b[i])
         sc = self._s_cut(r)
         si, sj = self._side(i, zf, at), self._side(j, zf, at)
-        elst = physics.elst_pairs(r, rhat, si, sj)
+        elst = physics.by_range(physics.elst_pairs, r * torch.minimum(
+            self._beta_min(si), self._beta_min(sj)), self.point_x, r, rhat, si, sj)
         # heads: vector (pre, B, ex, D, C), tensor (pre, B, ex, D, C, alpha)
         vecs, tens = at["vecs"], at["tens"]
         vi, vj, ti, tj = vecs[i], vecs[j], tens[i], tens[j]
@@ -316,8 +327,10 @@ class FF2Model(FF1Model):
             dg["a1"].to(pd), dg["a2"].to(pd), dg["s8"].to(pd), s_cut=sc)
         # permanent fields: probes (i, j) <- sources (j, i), both in one call
         probe, source = torch.cat([i, j]), torch.cat([j, i])
-        f = physics.permanent_field(torch.cat([r, r]), torch.cat([-rhat, rhat]),
-                                    at["beta_pol"][probe], self._side(source, zf, at))
+        src, r2, bp = self._side(source, zf, at), torch.cat([r, r]), at["beta_pol"][probe]
+        f = physics.by_range(physics.permanent_field,
+                             r2 * torch.minimum(bp, self._beta_min(src)), self.point_x,
+                             r2, torch.cat([-rhat, rhat]), bp, src)
         if sc is not None:
             f = f * torch.cat([sc, sc])[:, None]
         field = R_b.new_zeros(R_b.shape).index_add(0, probe, f)

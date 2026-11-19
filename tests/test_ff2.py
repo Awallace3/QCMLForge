@@ -534,3 +534,62 @@ def test_cluster_batch_validates_monomer_labels():
         cluster_batch([8, 1, 1], [0, 0, 2], [0.0, 0.0])
     b = cluster_batch([8, 1, 1, 7], [0, 0, 0, 1], [0.0, 0.0])
     assert b["edges"].shape == (2, 6) and b["ai"].numel() == 3
+
+
+# --- speed paths: point-multipole far field ----------------------------------
+
+
+def test_point_kernel_is_the_large_separation_limit():
+    bi = torch.tensor([1.3, 2.0], dtype=F64)[:, None]
+    bj = torch.tensor([2.1, 1.1], dtype=F64)[:, None]
+    for x in (40.0, 60.0):
+        r = torch.full((2, 1), x / 1.1, dtype=F64)
+        for specs in (kernels.MM, kernels.CHARGE_SHELL, kernels.DIPOLE_T, kernels.BAR1):
+            exact = kernels.two_center(bi, bj, r, specs)
+            pt = kernels.point(r, exact.shape[:-1], specs)
+            tol = 1e-11 * pt.abs().max() + (1e-16 if specs == kernels.BAR1 else 0.0)
+            assert float((exact - pt).abs().max()) <= tol, (x, specs)
+
+
+def three_monomers(far=12.0):
+    """Water-ammonia close contact plus a second water ``far`` Angstrom off."""
+    z = [8, 1, 1, 7, 1, 1, 1, 8, 1, 1]
+    R = WATER + shift(NH3, 0.3, 0.4, 3.0) + shift(WATER, far, 0.5, 1.0)
+    return z, [0] * 3 + [1] * 4 + [2] * 3, [0, 0, 0], torch.tensor(R, dtype=F64) / 10
+
+
+@pytest.mark.parametrize("far", [6.0, 12.0, 25.0, 80.0])
+def test_point_x_split_matches_every_pair_damped(far):
+    model = md_model()
+    z, mon, q, x = three_monomers(far)
+    e_ref, f_ref = evaluate(FF2Energy(model, z, mon, q), x)
+    model.point_x = 40.0
+    e, f = evaluate(FF2Energy(model, z, mon, q), x)
+    if far == 80.0:  # pairs with the third water reach the point limit
+        b = cluster_batch(z, mon, q)
+        b["R"] = x * 10
+        with torch.no_grad():
+            R_b, at = model._forward_atoms(b)
+            i, j = b["ai"], b["aj"]
+            r = (R_b[j] - R_b[i]).norm(dim=-1)
+            zf = b["z"].to(F64)
+            xm = r * torch.minimum(model._beta_min(model._side(i, zf, at)),
+                                   model._beta_min(model._side(j, zf, at)))
+        assert 0 < int((xm > 40.0).sum()) < len(xm)  # both branches run
+    assert abs(float(e - e_ref)) <= 1e-9 * (1 + abs(float(e_ref)))
+    assert float((f - f_ref).abs().max()) <= 1e-8 * (1 + float(f_ref.abs().max()))
+
+
+def test_point_x_trace_follows_a_changing_partition():
+    """Traced with the third water far away, evaluated with it close."""
+    model = md_model()
+    model.point_x = 40.0
+    z, mon, q, x_far = three_monomers(25.0)
+    traced = trace_energy(model, z, mon, q, x_far)
+    exact = md_model()
+    for far in (25.0, 6.0):
+        x = three_monomers(far)[3]
+        e_ref, f_ref = evaluate(FF2Energy(exact, z, mon, q), x)
+        e, f = evaluate(traced, x)
+        assert abs(float(e - e_ref)) <= 1e-9 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-8 * (1 + float(f_ref.abs().max())), far
