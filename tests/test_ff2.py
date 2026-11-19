@@ -593,3 +593,51 @@ def test_point_x_trace_follows_a_changing_partition():
         e, f = evaluate(traced, x)
         assert abs(float(e - e_ref)) <= 1e-9 * (1 + abs(float(e_ref))), far
         assert float((f - f_ref).abs().max()) <= 1e-8 * (1 + float(f_ref.abs().max())), far
+
+
+# --- speed paths: tabulated reduced functions --------------------------------
+
+
+@pytest.mark.parametrize("specs", [kernels.MM, kernels.CHARGE_SHELL, kernels.DIPOLE_T,
+                                   kernels.SHELL_FIELD, kernels.BAR1])
+def test_tabulated_two_center_matches_series(specs):
+    g = torch.Generator().manual_seed(3)
+    bi = 1.0 + 14.0 * torch.rand(400, 1, generator=g, dtype=F64)
+    bj = 1.0 + 3.0 * torch.rand(400, 1, generator=g, dtype=F64)
+    r = 1.5 + 30.0 * torch.rand(400, 1, generator=g, dtype=F64)
+    exact = kernels.two_center(bi, bj, r, specs)
+    tab = kernels.two_center_table(bi, bj, r, specs)
+    scale = r[..., None] ** -torch.tensor([float(p) for _, p in specs], dtype=F64)
+    assert float(((tab - exact) / scale).abs().max()) < 1e-10
+
+
+@pytest.mark.parametrize("specs", [kernels.CHARGE_SHELL, kernels.CHARGE_FIELD,
+                                   kernels.BAR1])
+def test_tabulated_one_center_matches_series(specs):
+    b = torch.linspace(0.8, 16.0, 300, dtype=F64)[:, None]
+    r = torch.linspace(1.5, 30.0, 300, dtype=F64)[:, None]
+    exact = kernels.one_center(b, r, specs)
+    tab = kernels.one_center_table(b, r, specs)
+    scale = r[..., None] ** -torch.tensor([float(p) for _, p in specs], dtype=F64)
+    assert float(((tab - exact) / scale).abs().max()) < 1e-10
+
+
+@pytest.mark.parametrize("point_x", [None, 40.0])
+def test_table_mode_matches_exact_energy_and_forces(point_x):
+    exact = md_model()
+    fast = md_model()
+    fast.kernel_mode, fast.point_x = "table", point_x
+    for far in (6.0, 80.0):
+        z, mon, q, x = three_monomers(far)
+        e_ref, f_ref = evaluate(FF2Energy(exact, z, mon, q), x)
+        e, f = evaluate(FF2Energy(fast, z, mon, q), x)
+        assert abs(float(e - e_ref)) <= 1e-8 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-7 * (1 + float(f_ref.abs().max())), far
+
+
+def test_unknown_kernel_mode_is_rejected():
+    model = md_model()
+    model.kernel_mode = "fast"
+    z, mon, q, x = three_monomers()
+    with pytest.raises(ValueError, match="kernel mode"):
+        FF2Energy(model, z, mon, q)(x)

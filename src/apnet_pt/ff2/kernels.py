@@ -114,6 +114,73 @@ def point(r: Tensor, shape, specs) -> Tensor:
     return torch.stack(out, dim=-1).expand(*shape, len(specs))
 
 
+# ---- tabulated reduced functions (mode "table") -----------------------------
+X_TAB = 40.0      # beyond, the point limit (see point())
+H_TAB = 0.005     # cubic Hermite cell width in x
+_TABLES: dict = {}
+
+
+def _weight(x: Tensor, specs) -> Tensor:
+    """(1 + x)^p for each spec, x^p for "bar1" (its R^-1 is singular at 0)."""
+    return torch.stack([x ** p if n == "bar1" else (1.0 + x) ** p
+                        for n, p in specs], -1)
+
+
+def _table(specs, two_center: bool, dtype, device) -> Tensor:
+    """(n_cells, n_specs, 4) cubic Hermite coefficients of the weighted
+    reduced functions on [0, X_TAB], built once from :func:`_reduced` values
+    and autograd slopes in float64."""
+    key = (tuple(specs), two_center, dtype, device)
+    if key not in _TABLES:
+        n = int(round(X_TAB / H_TAB))
+        x = torch.linspace(0.0, X_TAB, n + 1, dtype=torch.float64).requires_grad_(True)
+        xs = x.clamp_min(1e-12)
+        g = _reduced(xs, specs, two_center) * _weight(xs, specs)
+        dg = torch.stack([torch.autograd.grad(g[:, k].sum(), x, retain_graph=True)[0]
+                          for k in range(len(specs))], -1)
+        g, dg = g.detach(), dg * H_TAB          # slopes per unit t
+        g0, g1, d0, d1 = g[:-1], g[1:], dg[:-1], dg[1:]
+        coef = torch.stack([g0, d0, 3 * (g1 - g0) - 2 * d0 - d1,
+                            2 * (g0 - g1) + d0 + d1], -1)
+        if not bool(torch.isfinite(coef).all()):
+            raise ValueError(f"non-finite reduced-function table for {specs}")
+        _TABLES[key] = coef.to(dtype=dtype, device=device)
+    return _TABLES[key]
+
+
+def _reduced_table(x: Tensor, specs, two_center: bool) -> Tensor:
+    """:func:`_reduced` from the cubic Hermite table (C1 in x), with the
+    point limit past X_TAB."""
+    tab = _table(specs, two_center, x.dtype, x.device)
+    xc = x.clamp(0.0, X_TAB)
+    s = xc / H_TAB
+    idx = s.detach().floor().clamp_max(tab.shape[0] - 1)
+    t = (s - idx)[..., None]
+    c = tab[idx.long()]                         # (..., n_specs, 4)
+    g = ((c[..., 3] * t + c[..., 2]) * t + c[..., 1]) * t + c[..., 0]
+    near = g / _weight(xc.clamp_min(1e-300), specs)
+    far = torch.stack([torch.zeros_like(x) if n == "bar1" else
+                       x.clamp_min(X_TAB) ** -p for n, p in specs], -1)
+    return torch.where((x > X_TAB)[..., None], far, near)
+
+
+def one_center_table(beta: Tensor, r: Tensor, specs) -> Tensor:
+    """:func:`one_center` with tabulated reduced functions."""
+    return _reduced_table(beta * r, specs, False) * _powers(beta, specs)
+
+
+def two_center_table(beta_i: Tensor, beta_j: Tensor, r: Tensor, specs) -> Tensor:
+    """:func:`two_center` with tabulated reduced functions (same quadrature)."""
+    v = torch.tensor(NODES, dtype=r.dtype, device=r.device)
+    w = torch.tensor(WEIGHTS, dtype=r.dtype, device=r.device)
+    bi, bj, rr = beta_i[..., None], beta_j[..., None], r[..., None]
+    u = (1.0 - v) * bi + v * bj
+    c = bi * bj / u
+    wt = 12.0 * w * u * (bi + u) * (bj + u) / (bi + bj) ** 3
+    return (wt[..., None] * _powers(c, specs) * _reduced_table(c * rr, specs, True)
+            ).sum(-2)
+
+
 def safe_unit(vec: Tensor, eps: float = 1e-300) -> tuple[Tensor, Tensor]:
     """(|vec|, vec/|vec|), finite with finite gradients at vec = 0."""
     r2 = (vec * vec).sum(-1)
