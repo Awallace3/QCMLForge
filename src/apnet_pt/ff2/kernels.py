@@ -50,10 +50,14 @@ def _reduced(x: Tensor, specs, two_center: bool) -> Tensor:
     poly, tail, bar = ((_EQ_POLY, _EQ_TAIL, _EQ_BAR1) if two_center
                        else (_1C_POLY, _1C_TAIL, _1C_BAR1))
     x = x.clamp_min(0.0)
-    xs = x.clamp_max(X_SWITCH)
-    xl = x.clamp_min(X_SWITCH)
-    ex, exl = torch.exp(-x), torch.exp(-xl)
     small_region = x <= X_SWITCH
+    # each branch's argument by where, not clamp: at x == X_SWITCH the slope
+    # must follow the branch evaluated there, and torch >= 2.15 gives clamp a
+    # zero gradient exactly at its bound (table nodes sit on X_SWITCH)
+    switch = torch.full_like(x, X_SWITCH)
+    xs = torch.where(small_region, x, switch)
+    xl = torch.where(small_region, switch, x)
+    ex, exl = torch.exp(-x), torch.exp(-xl)
     needs_tail = any(n != "bar1" for n, _ in specs)
     tails = _tails(xs) if needs_tail else None
     out = []

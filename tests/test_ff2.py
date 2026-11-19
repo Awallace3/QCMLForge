@@ -612,6 +612,19 @@ def test_tabulated_two_center_matches_series(specs):
     assert float(((tab - exact) / scale).abs().max()) < 1e-10
 
 
+@pytest.mark.parametrize("two_center", [True, False])
+def test_tabulated_reduced_functions_across_the_series_switch(two_center):
+    """A table node sits exactly on X_SWITCH, where _reduced changes branch;
+    its autograd slope must come from the branch that is evaluated there
+    (torch >= 2.15 gives clamp a zero gradient exactly at its bound)."""
+    specs = kernels.MM if two_center else kernels.CHARGE_SHELL
+    x = torch.linspace(kernels.X_SWITCH - 0.05, kernels.X_SWITCH + 0.05, 2001, dtype=F64)
+    ps = torch.tensor([float(p) for _, p in specs], dtype=F64)
+    d = (kernels._reduced_table(x, specs, two_center)
+         - kernels._reduced(x, specs, two_center)) * x[:, None] ** ps
+    assert float(d.abs().max()) < 1e-10
+
+
 @pytest.mark.parametrize("specs", [kernels.CHARGE_SHELL, kernels.CHARGE_FIELD,
                                    kernels.BAR1])
 def test_tabulated_one_center_matches_series(specs):
