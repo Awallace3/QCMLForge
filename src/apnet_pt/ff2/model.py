@@ -87,8 +87,10 @@ class FF2Model(FF1Model):
         # beta_min R above which a pair's Slater kernels take their point-
         # multipole limit (physics.by_range); None keeps every pair damped
         self.point_x: float | None = None
-        # Slater kernels within point_x: "exact" (series) or "table" (cubic
-        # Hermite in x, kernels.two_center_table)
+        # Slater kernels within point_x: "exact" (series), "table" (cubic
+        # Hermite in x, kernels.two_center_table) or "table2d" (bicubic
+        # Hermite in (beta_min R, beta_min / beta_max) replacing the whole
+        # quadrature, kernels.two_center_table2d)
         self.kernel_mode: str = "exact"
         # polarization by block-Jacobi CG with this many steps (None: dense
         # Cholesky / LU per use_cholesky)

@@ -636,6 +636,72 @@ def test_table_mode_matches_exact_energy_and_forces(point_x):
         assert float((f - f_ref).abs().max()) <= 1e-7 * (1 + float(f_ref.abs().max())), far
 
 
+@pytest.mark.parametrize("specs", [kernels.MM, kernels.CHARGE_SHELL, kernels.DIPOLE_T,
+                                   kernels.SHELL_FIELD, kernels.BAR1])
+def test_2d_table_two_center_matches_quadrature(specs):
+    """Exponent pairs in either order, ratios down to kernels.RHO_TAB, and
+    separations through the x = 40 point-limit switch."""
+    g = torch.Generator().manual_seed(4)
+    bi = 1.0 + 14.0 * torch.rand(600, 1, generator=g, dtype=F64)
+    bj = bi * torch.exp(torch.empty(600, 1, dtype=F64).uniform_(
+        math.log(kernels.RHO_TAB), -math.log(kernels.RHO_TAB), generator=g))
+    r = 0.1 + 40.0 * torch.rand(600, 1, generator=g, dtype=F64) ** 2
+    exact = kernels.two_center(bi, bj, r, specs)
+    tab = kernels.two_center_table2d(bi, bj, r, specs)
+    scale = r[..., None] ** -torch.tensor([float(p) for _, p in specs], dtype=F64)
+    assert float(((tab - exact) / scale).abs().max()) < 1e-8
+
+
+def test_2d_table_gradients_match_quadrature():
+    g = torch.Generator().manual_seed(6)
+    args = [(1.0 + 6.0 * torch.rand(300, 1, generator=g, dtype=F64)).requires_grad_(True),
+            (1.0 + 14.0 * torch.rand(300, 1, generator=g, dtype=F64)).requires_grad_(True),
+            (2.0 + 20.0 * torch.rand(300, 1, generator=g, dtype=F64)).requires_grad_(True)]
+    w = torch.randn(300, 1, len(kernels.MM), generator=g, dtype=F64)
+    ga = torch.autograd.grad((kernels.two_center(*args, kernels.MM) * w).sum(), args)
+    gb = torch.autograd.grad((kernels.two_center_table2d(*args, kernels.MM) * w).sum(), args)
+    for a, b in zip(ga, gb):
+        assert float((a - b).abs().max()) < 1e-7 * (1 + float(a.abs().max()))
+
+
+def test_2d_tables_build_under_no_grad():
+    kernels._TABLES.clear()
+    with torch.no_grad():
+        out = kernels.two_center_table2d(torch.tensor([[1.2]], dtype=F64),
+                                         torch.tensor([[3.0]], dtype=F64),
+                                         torch.tensor([[3.0]], dtype=F64), kernels.BAR1)
+    assert bool(torch.isfinite(out).all())
+
+
+@pytest.mark.parametrize("point_x", [None, 40.0])
+def test_table2d_mode_matches_exact_energy_and_forces(point_x):
+    exact = md_model()
+    fast = md_model()
+    fast.kernel_mode, fast.point_x = "table2d", point_x
+    for far in (6.0, 80.0):
+        z, mon, q, x = three_monomers(far)
+        e_ref, f_ref = evaluate(FF2Energy(exact, z, mon, q), x)
+        e, f = evaluate(FF2Energy(fast, z, mon, q), x)
+        assert abs(float(e - e_ref)) <= 1e-7 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-6 * (1 + float(f_ref.abs().max())), far
+
+
+@pytest.mark.parametrize("mode", ["table", "table2d"])
+def test_trace_holds_tables_as_constants(mode):
+    """A trace started with empty table caches must not record the table
+    build: OpenMM would rerun it every step."""
+    model = md_model()
+    model.kernel_mode = mode
+    z, mon, q, x = three_monomers(6.0)
+    kernels._TABLES.clear()
+    traced = trace_energy(model, z, mon, q, x)
+    assert "linspace" not in str(traced.inlined_graph)
+    e_ref, f_ref = evaluate(FF2Energy(model, z, mon, q), x)
+    e, f = evaluate(traced, x)
+    assert abs(float(e - e_ref)) <= 1e-10 * (1 + abs(float(e_ref)))
+    assert float((f - f_ref).abs().max()) <= 1e-9 * (1 + float(f_ref.abs().max()))
+
+
 def test_unknown_kernel_mode_is_rejected():
     model = md_model()
     model.kernel_mode = "fast"
@@ -648,7 +714,8 @@ def test_unknown_kernel_mode_is_rejected():
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("mode, point_x", [("table", None), ("table", 40.0)])
+@pytest.mark.parametrize("mode, point_x", [("table", None), ("table", 40.0),
+                                           ("table2d", 40.0)])
 def test_compiled_energy_matches_eager(mode, point_x):
     model = md_model()
     model.kernel_mode, model.point_x = mode, point_x

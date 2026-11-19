@@ -131,6 +131,8 @@ def trace_energy(model: FF2Model, z: Sequence[int], monomer: Sequence[int],
     for p in frozen.parameters():
         p.requires_grad_(False)
     module = FF2Energy(frozen, z, monomer, monomer_charge)
+    with torch.no_grad():  # build kernel tables now, so the trace holds them
+        module(positions.detach())  # as constants instead of recording the build
     with warnings.catch_warnings():
         # constant torch.tensor()s (quadrature nodes, bounds) and fixed-length
         # unpacking are exact for a fixed topology

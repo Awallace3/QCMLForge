@@ -36,23 +36,26 @@ def _mat_vec(T: Tensor, v: Tensor) -> Tensor:
     return (T * v[..., None, :]).sum(-1)
 
 
-MODES = ("exact", "table", "point")
+MODES = ("exact", "table", "table2d", "point")
 
 
 def _two(bi: Tensor, bj: Tensor, r: Tensor, specs, mode: str) -> Tensor:
-    """Two-center kernel: series ("exact"), tabulated ("table") or the
+    """Two-center kernel: series ("exact"), tabulated reduced functions
+    ("table"), one 2D lookup of the whole quadrature ("table2d") or the
     point-multipole limit ("point")."""
     if mode == "point":
         return K.point(r, torch.broadcast_shapes(bi.shape, bj.shape, r.shape), specs)
     if mode == "table":
         return K.two_center_table(bi, bj, r, specs)
+    if mode == "table2d":
+        return K.two_center_table2d(bi, bj, r, specs)
     return K.two_center(bi, bj, r, specs)
 
 
 def _one(b: Tensor, r: Tensor, specs, mode: str) -> Tensor:
     if mode == "point":
         return K.point(r, torch.broadcast_shapes(b.shape, r.shape), specs)
-    if mode == "table":
+    if mode in ("table", "table2d"):  # one-center has no quadrature
         return K.one_center_table(b, r, specs)
     return K.one_center(b, r, specs)
 

@@ -182,6 +182,102 @@ def two_center_table(beta_i: Tensor, beta_j: Tensor, r: Tensor, specs) -> Tensor
             ).sum(-2)
 
 
+# ---- 2D table of the whole two-center kernel (mode "table2d") ---------------
+# With b = min(beta_i, beta_j), rho = b / max(beta_i, beta_j) and x = b R, the
+# quadrature in two_center is b^p G(x, rho): every node argument c R is
+# b h_k(rho) R with h_k = 1 / (rho + v_k (1 - rho)).  G is tabulated, weighted
+# like the 1D table, by bicubic Hermite on u = log(1 + x) / log(1 + X_TAB)
+# and s = log(rho / RHO_TAB) / log(1 / RHO_TAB): the log in rho resolves the
+# rho ~ v_k structure of the small-node terms, the log in x the small-x one.
+# Error against two_center, times R^p: < 5e-9 for x >= 0.05 (bar1 reaches
+# ~3e-4 only below x = 0.05, i.e. R < 0.05 bohr).
+RHO_TAB = 0.02    # smallest beta_min / beta_max tabulated; smaller is clamped
+N_U2, N_S2 = 800, 192
+_LU, _LS = math.log1p(X_TAB), math.log(1.0 / RHO_TAB)
+
+
+def _g2(u: Tensor, s: Tensor, specs) -> Tensor:
+    """Weighted G at grid coordinates (u, s), float64, stacked on the last axis."""
+    v = torch.tensor(NODES, dtype=u.dtype, device=u.device)
+    w = torch.tensor(WEIGHTS, dtype=u.dtype, device=u.device)
+    x = torch.expm1(u * _LU).clamp_min(1e-12)
+    rho = RHO_TAB * torch.exp(s * _LS)
+    xn, rn = x[..., None], rho[..., None]
+    q = (1.0 - v) * rn + v                       # u / beta_max
+    wt = 12.0 * w * q * (rn + q) * (1.0 + q) / (rn + 1.0) ** 3
+    h = 1.0 / q
+    g = (wt[..., None] * _powers(h, specs) * _reduced(h * xn, specs, True)).sum(-2)
+    return g * _weight(x, specs)
+
+
+def _table2d(specs, dtype, device) -> Tensor:
+    """(N_U2 + 1, N_S2 + 1, n_specs, 4) node values and scaled derivatives
+    (g, g_u, g_s, g_us) of :func:`_g2`, by forward-mode AD in float64.  Built
+    once per spec set (about 30 s for MM on one core)."""
+    from torch.func import jvp
+
+    key = ("2d", tuple(specs), dtype, device)
+    if key not in _TABLES:
+        u = torch.linspace(0.0, 1.0, N_U2 + 1, dtype=torch.float64)
+        s = torch.linspace(0.0, 1.0, N_S2 + 1, dtype=torch.float64)
+        uu, ss = (t.clone() for t in torch.meshgrid(u, s, indexing="ij"))
+        one, zero = torch.ones_like(uu), torch.zeros_like(uu)
+
+        def g(a, b):
+            return _g2(a, b, specs)
+
+        def g_s(a, b):
+            return jvp(g, (a, b), (zero, one))[1]
+
+        val, gu = jvp(g, (uu, ss), (one, zero))
+        gs, gus = jvp(g_s, (uu, ss), (one, zero))
+        tab = torch.stack([val, gu / N_U2, gs / N_S2, gus / (N_U2 * N_S2)], -1)
+        if not bool(torch.isfinite(tab).all()):
+            raise ValueError(f"non-finite two-center table for {specs}")
+        _TABLES[key] = tab.to(dtype=dtype, device=device)
+    return _TABLES[key]
+
+
+def _hermite(t: Tensor) -> Tensor:
+    """Cubic Hermite basis (h00, h10, h01, h11) on a new last axis."""
+    t2 = t * t
+    t3 = t2 * t
+    return torch.stack([2 * t3 - 3 * t2 + 1, t3 - 2 * t2 + t, 3 * t2 - 2 * t3,
+                        t3 - t2], -1)
+
+
+def two_center_table2d(beta_i: Tensor, beta_j: Tensor, r: Tensor, specs) -> Tensor:
+    """:func:`two_center` by one bicubic lookup per pair instead of the 16-node
+    quadrature; past ``x = X_TAB`` the point limit, as :func:`point`.
+
+    ``beta_min / beta_max`` below :data:`RHO_TAB` is clamped to it, so the
+    kernel there is that of a ratio of ``RHO_TAB`` (FF-2's exponents stay
+    above ~0.07).
+    """
+    b = torch.minimum(beta_i, beta_j)
+    rho = (b / torch.maximum(beta_i, beta_j)).clamp_min(RHO_TAB)
+    b, rho, r = torch.broadcast_tensors(b, rho, r)
+    x = b * r
+    tab = _table2d(specs, x.dtype, x.device)
+    su = torch.log1p(x.clamp(0.0, X_TAB)) * (N_U2 / _LU)
+    ss = torch.log(rho / RHO_TAB) * (N_S2 / _LS)
+    iu = su.detach().floor().clamp(0, N_U2 - 1)
+    i_s = ss.detach().floor().clamp(0, N_S2 - 1)
+    hu, hs = _hermite(su - iu), _hermite(ss - i_s)
+    iu, i_s = iu.long(), i_s.long()
+    g = torch.zeros(x.shape + (len(specs),), dtype=x.dtype, device=x.device)
+    for du in (0, 1):
+        for ds in (0, 1):
+            c = tab[iu + du, i_s + ds]                     # (..., n_specs, 4)
+            fu, du_ = hu[..., 2 * du, None], hu[..., 2 * du + 1, None]
+            fs, ds_ = hs[..., 2 * ds, None], hs[..., 2 * ds + 1, None]
+            g = g + (fu * fs * c[..., 0] + du_ * fs * c[..., 1]
+                     + fu * ds_ * c[..., 2] + du_ * ds_ * c[..., 3])
+    near = g / _weight(x.clamp(1e-300, X_TAB), specs) * _powers(b, specs)
+    far = point(r, x.shape, specs)
+    return torch.where((x > X_TAB)[..., None], far, near)
+
+
 def safe_unit(vec: Tensor, eps: float = 1e-300) -> tuple[Tensor, Tensor]:
     """(|vec|, vec/|vec|), finite with finite gradients at vec = 0."""
     r2 = (vec * vec).sum(-1)
