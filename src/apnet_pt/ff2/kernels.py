@@ -133,11 +133,12 @@ def _table(specs, two_center: bool, dtype, device) -> Tensor:
     key = (tuple(specs), two_center, dtype, device)
     if key not in _TABLES:
         n = int(round(X_TAB / H_TAB))
-        x = torch.linspace(0.0, X_TAB, n + 1, dtype=torch.float64).requires_grad_(True)
-        xs = x.clamp_min(1e-12)
-        g = _reduced(xs, specs, two_center) * _weight(xs, specs)
-        dg = torch.stack([torch.autograd.grad(g[:, k].sum(), x, retain_graph=True)[0]
-                          for k in range(len(specs))], -1)
+        with torch.enable_grad():  # slopes by autograd, even under no_grad
+            x = torch.linspace(0.0, X_TAB, n + 1, dtype=torch.float64).requires_grad_(True)
+            xs = x.clamp_min(1e-12)
+            g = _reduced(xs, specs, two_center) * _weight(xs, specs)
+            dg = torch.stack([torch.autograd.grad(g[:, k].sum(), x, retain_graph=True)[0]
+                              for k in range(len(specs))], -1)
         g, dg = g.detach(), dg * H_TAB          # slopes per unit t
         g0, g1, d0, d1 = g[:-1], g[1:], dg[:-1], dg[1:]
         coef = torch.stack([g0, d0, 3 * (g1 - g0) - 2 * d0 - d1,

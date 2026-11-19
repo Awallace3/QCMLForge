@@ -139,5 +139,55 @@ def trace_energy(model: FF2Model, z: Sequence[int], monomer: Sequence[int],
         return torch.jit.trace(module, positions.detach(), check_trace=False)
 
 
-__all__ = ["FF2Energy", "KCAL2KJ", "NM2ANG", "cluster_batch",
-           "trace_energy"]
+class CompiledEnergy(nn.Module):
+    """:class:`FF2Energy` compiled by Inductor as one graph (forward and, via
+    AOTAutograd, its backward), for OpenMM's ``PythonForce`` or any Python
+    MD loop.  See :func:`compile_energy`."""
+
+    def __init__(self, module: FF2Energy, **options):
+        super().__init__()
+        self.module = module
+        # Only the four components are compiled.  With frozen parameters,
+        # table kernels and a grad-requiring input, torch 2.10's Inductor
+        # (CPU) returns a wrong ``components.sum() * KCAL2KJ`` (one 3-monomer
+        # case: -373.67 against -277.58 kJ/mol) while the components
+        # themselves are exact; the scalar epilogue stays eager.
+        self._compiled = torch.compile(module.components,
+                                       **{"fullgraph": True, "dynamic": False,
+                                          **options})
+
+    def forward(self, positions: Tensor) -> Tensor:
+        # the point_x split gathers a data-dependent number of near pairs
+        with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
+            return self._compiled(positions).sum() * KCAL2KJ
+
+    def energy_forces(self, positions: Tensor) -> tuple[Tensor, Tensor]:
+        """(kJ/mol, kJ/mol/nm (N, 3)) at ``positions`` (nm)."""
+        x = positions.detach().to(self.module.model.physics_dtype).requires_grad_(True)
+        e = self(x)
+        (g,) = torch.autograd.grad(e, x)
+        return e.detach(), -g
+
+
+def compile_energy(model: FF2Model, z: Sequence[int], monomer: Sequence[int],
+                   monomer_charge: Sequence[float], positions: Tensor,
+                   **options) -> CompiledEnergy:
+    """Inductor-compiled FF-2 energy of a fixed cluster.
+
+    Like :func:`trace_energy`, the model is deep-copied, put in eval mode and
+    frozen.  One eager call at ``positions`` (nm) first builds the kernel
+    tables (``kernel_mode = "table"``), which are module-level caches that
+    would otherwise break the graph.  The first compiled call compiles (about
+    two minutes on one CPU core).  ``options`` go to ``torch.compile``.
+    """
+    frozen = copy.deepcopy(model).eval()
+    for p in frozen.parameters():
+        p.requires_grad_(False)
+    module = FF2Energy(frozen, z, monomer, monomer_charge)
+    with torch.no_grad():
+        module(positions.detach())
+    return CompiledEnergy(module, **options)
+
+
+__all__ = ["CompiledEnergy", "FF2Energy", "KCAL2KJ", "NM2ANG", "cluster_batch",
+           "compile_energy", "trace_energy"]

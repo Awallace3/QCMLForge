@@ -10,7 +10,8 @@ from apnet_pt.ff1 import FF1Model, gordon1
 from apnet_pt.ff2 import FF2Model, compile_ff2, ff2_loss
 from apnet_pt.ff2 import charges, kernels, physics
 from apnet_pt.ff2.batching import batch_from_dimers, monomer_batch, with_coordinates
-from apnet_pt.ff2.md import KCAL2KJ, FF2Energy, cluster_batch, trace_energy
+from apnet_pt.ff2.md import (KCAL2KJ, FF2Energy, cluster_batch, compile_energy,
+                             trace_energy)
 
 F64 = torch.float64
 DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
@@ -641,3 +642,29 @@ def test_unknown_kernel_mode_is_rejected():
     z, mon, q, x = three_monomers()
     with pytest.raises(ValueError, match="kernel mode"):
         FF2Energy(model, z, mon, q)(x)
+
+
+# --- speed paths: Inductor-compiled energy -----------------------------------
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("mode, point_x", [("table", None), ("table", 40.0)])
+def test_compiled_energy_matches_eager(mode, point_x):
+    model = md_model()
+    model.kernel_mode, model.point_x = mode, point_x
+    z, mon, q, x = three_monomers(80.0)
+    compiled = compile_energy(model, z, mon, q, x)
+    for far in (80.0, 6.0):  # 6.0 changes the near/far partition
+        x = three_monomers(far)[3]
+        e_ref, f_ref = evaluate(FF2Energy(model, z, mon, q), x)
+        e, f = compiled.energy_forces(x)
+        assert abs(float(e - e_ref)) <= 1e-10 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-9 * (1 + float(f_ref.abs().max())), far
+
+
+def test_tables_build_under_no_grad():
+    kernels._TABLES.clear()
+    with torch.no_grad():
+        out = kernels.one_center_table(torch.tensor([[1.2]], dtype=F64),
+                                       torch.tensor([[3.0]], dtype=F64), kernels.BAR1)
+    assert bool(torch.isfinite(out).all())
