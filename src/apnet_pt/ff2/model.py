@@ -361,7 +361,13 @@ class CompiledFF2(nn.Module):
       more operands (FF-1's trunk invariants) picks its contraction path from
       the concrete sizes, which guards the atom count to its traced value and
       recompiles every new chunk.  Without it the operands contract left to
-      right.
+      right;
+    * ``specialize_float``: with ``dynamic=True``, torch 2.15's Dynamo lifts
+      every Python float the forward reads (module constants such as
+      ``X_SWITCH`` and ``H2KCAL``, default arguments such as ``psi``'s
+      ``eps``) to a 0-d tensor input, and Inductor then fails to lower the
+      resulting ``.item()`` (``KeyError: 'unbacked_bindings'``).  These floats
+      never change, so baking them in as constants is exact.
 
     One graph then serves every chunk shape.  Parameters stay ``model``'s."""
 
@@ -374,6 +380,7 @@ class CompiledFF2(nn.Module):
     def forward(self, batch: dict):
         from torch.fx.experimental import _config as fx_config
         with fx_config.patch(use_duck_shape=False, backed_size_oblivious=True), \
+                torch._dynamo.config.patch(specialize_float=True), \
                 torch.backends.opt_einsum.flags(enabled=False):
             return self._compiled(batch)
 

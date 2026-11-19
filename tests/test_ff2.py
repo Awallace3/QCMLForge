@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 from torch._dynamo.utils import counters
+from torch.torch_version import TorchVersion
 
 from apnet_pt.ff1 import FF1Model, gordon1
 from apnet_pt.ff2 import FF2Model, compile_ff2, ff2_loss
@@ -12,6 +13,8 @@ from apnet_pt.ff2 import charges, kernels, physics
 from apnet_pt.ff2.batching import batch_from_dimers, monomer_batch, with_coordinates
 from apnet_pt.ff2.md import (KCAL2KJ, FF2Energy, cluster_batch, compile_energy,
                              trace_energy)
+
+TORCH_GE_215 = TorchVersion(torch.__version__) >= (2, 15)
 
 F64 = torch.float64
 DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
@@ -309,7 +312,9 @@ def test_compiled_fullgraph_matches_eager(device):
                 tol = 1e-8 if a.dtype == F64 else 1e-5
                 assert torch.allclose(a, gc[name], rtol=tol,
                                       atol=tol * 1e-2 * float(a.abs().max() + 1)), name
-    assert counters["stats"]["unique_graphs"] == 1
+    # torch 2.15's Inductor lowering guards 2 <= n_dimer, so the one-dimer
+    # batch compiles a second graph once; the five-dimer batch reuses the first
+    assert counters["stats"]["unique_graphs"] == (2 if TORCH_GE_215 else 1)
 
 
 @pytest.mark.skipif(not torch.backends.opt_einsum.is_available(),

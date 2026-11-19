@@ -17,6 +17,17 @@ The topology is fixed once, at construction:
   sums over the other monomers, and polarization couples every atom pair.
   For two monomers this is exactly FF-2's dimer energy.
 
+Two routes into OpenMM:
+
+* :func:`compile_energy` (preferred): Inductor-compiled energy and forces,
+  driven through OpenMM 8.5's ``PythonForce`` (a Python callback returning
+  kJ/mol and kJ/mol/nm).  The callback bridge costs about 0.05 ms per step;
+  the step time is the model's.  This is the route on torch 2.15, where
+  TorchScript is deprecated and openmm-torch has no build (its newest,
+  1.5.1, links libtorch 2.12).
+* :func:`trace_energy`: a TorchScript graph for openmm-torch's
+  ``TorchForce``, for environments on torch <= 2.12.
+
 openmm-torch (1.5) loads TorchScript only.  ``FF2Model.forward`` does not
 script (dict expansion, closures, heterogeneous kernel-spec tuples,
 ``getattr`` by name), but it has no host syncs and no data-dependent branches,
@@ -153,7 +164,9 @@ class CompiledEnergy(nn.Module):
         # table kernels and a grad-requiring input, torch 2.10's Inductor
         # (CPU) returns a wrong ``components.sum() * KCAL2KJ`` (one 3-monomer
         # case: -373.67 against -277.58 kJ/mol) while the components
-        # themselves are exact; the scalar epilogue stays eager.
+        # themselves are exact; the scalar epilogue stays eager.  torch 2.15
+        # compiles the whole energy correctly, but the eager epilogue costs
+        # microseconds and keeps older environments right.
         self._compiled = torch.compile(module.components,
                                        **{"fullgraph": True, "dynamic": False,
                                           **options})
