@@ -79,6 +79,12 @@ class FF2Model(FF1Model):
         Ablation (default off): ``alpha_iso = alpha_free[z] exp(delta_alpha)``
         and ``eta = eta_free[z] exp(delta_eta)`` replace the population
         (core/sub/valence psi) and cation-to-free interpolation models.
+    atomic_dipoles, atomic_quadrupoles : bool
+        Ablation switches (default on): the atomic dipole ``mu`` and the
+        traceless quadrupole ``Theta``.  Off sets that moment to zero in the
+        electrostatics and in the permanent field, together with its
+        short-range partner (``d_sr`` / ``Q_sr``) when ``sr_shell`` is on;
+        the charges are unchanged.
     """
 
     def __init__(self, n_feat: int = 128, n_chan: int = 16, n_layers: int = 3,
@@ -90,7 +96,8 @@ class FF2Model(FF1Model):
                  g0_init: float = G0_INIT, n_mu_iters: int = N_ITERS,
                  use_cholesky: bool = True, sr_shell: bool = True,
                  charge_transfer: bool = True, transverse_invariants: bool = True,
-                 alpha_anisotropy: bool = True, element_alpha_eta: bool = False):
+                 alpha_anisotropy: bool = True, element_alpha_eta: bool = False,
+                 atomic_dipoles: bool = True, atomic_quadrupoles: bool = True):
         super().__init__(n_feat, n_chan, n_layers, n_rbf, r_cut, rho_tr,
                          element_init, trunk_dtype, physics_dtype, s_cut,
                          g0_init, elst_beta_def=True, elst_sr_shell=True)
@@ -101,6 +108,8 @@ class FF2Model(FF1Model):
         self.transverse_invariants = bool(transverse_invariants)
         self.alpha_anisotropy = bool(alpha_anisotropy)
         self.element_alpha_eta = bool(element_alpha_eta)
+        self.atomic_dipoles = bool(atomic_dipoles)
+        self.atomic_quadrupoles = bool(atomic_quadrupoles)
         pd = physics_dtype
         for name, table in (("scalar_bound", SCALAR_HEADS),
                             ("vector_bound", VECTOR_HEADS),
@@ -154,7 +163,9 @@ class FF2Model(FF1Model):
         return {"sr_shell": self.sr_shell, "charge_transfer": self.charge_transfer,
                 "transverse_invariants": self.transverse_invariants,
                 "alpha_anisotropy": self.alpha_anisotropy,
-                "element_alpha_eta": self.element_alpha_eta}
+                "element_alpha_eta": self.element_alpha_eta,
+                "atomic_dipoles": self.atomic_dipoles,
+                "atomic_quadrupoles": self.atomic_quadrupoles}
 
     def ct_parameter_slices(self) -> list[tuple[nn.Parameter, int, list[int]]]:
         """``(parameter, dim, indices)`` of every entry that reaches the energy
@@ -277,6 +288,10 @@ class FF2Model(FF1Model):
                                                   cap, (1, 2))[..., 0]
         else:
             d_sr, Q_sr = torch.zeros_like(mu), torch.zeros_like(th)
+        if not self.atomic_dipoles:
+            mu, d_sr = torch.zeros_like(mu), torch.zeros_like(d_sr)
+        if not self.atomic_quadrupoles:
+            th, Q_sr = torch.zeros_like(th), torch.zeros_like(Q_sr)
         return {"mu": mu, "th": th, "g_el": g_el, "alpha_iso": alpha_iso,
                 "sqrt_alpha": sqrt_alpha, "beta_pol": physics.beta_pol(alpha_iso),
                 "eta": eta, "beta": beta, "A": g_el * amp("A"), "B": amp("B"),

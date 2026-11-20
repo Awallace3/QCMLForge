@@ -407,7 +407,8 @@ def test_compiled_ct_grad_scale_needs_no_recompile():
 
 ABLATIONS = {"sr_shell": False, "charge_transfer": False,
              "transverse_invariants": False, "alpha_anisotropy": False,
-             "element_alpha_eta": True}
+             "element_alpha_eta": True, "atomic_dipoles": False,
+             "atomic_quadrupoles": False}
 
 
 def ablated(ff1, **flags):
@@ -453,6 +454,41 @@ def test_ablation_equals_zeroed_parameters(flag, names, rows):
     if flag == "sr_shell":
         assert float(x_off["d_sr"].abs().max()) == 0.0
         assert float(x_off["Q_sr"].abs().max()) == 0.0
+
+
+@pytest.mark.parametrize("flags, rows", [
+    ({"atomic_quadrupoles": False}, {"ten_readout.weight": 0}),
+    ({"atomic_dipoles": False, "atomic_quadrupoles": False},
+     {"ten_readout.weight": 0, "vec_readout.weight": 0}),
+])
+def test_no_atomic_multipoles_equals_zeroed_readouts(flags, rows):
+    """Dropping Theta (or mu and Theta) is the SR-free model with that
+    multipole readout row at zero; the charges are untouched."""
+    ff1 = make_ff1(25)
+    off = ablated(ff1, sr_shell=False, **flags)
+    ref = FF2Model.from_ff1(ff1, sr_shell=False)
+    for name, row in rows.items():
+        zeroed(ref, name, rows=row)
+    batch = batch_from_dimers(dimers())
+    p_off, x_off = off(batch)
+    p_ref, x_ref = ref(batch)
+    assert torch.allclose(p_off, p_ref, rtol=0, atol=1e-12)
+    assert float(x_off["th"].abs().max()) == 0.0
+    if "atomic_dipoles" in flags:
+        assert float(x_off["mu"].abs().max()) == 0.0
+    else:
+        assert float(x_off["mu"].abs().max()) > 1e-6
+    p_on, x_on = FF2Model.from_ff1(ff1, sr_shell=False)(batch)
+    assert torch.equal(x_on["q"], x_off["q"])
+    assert float((p_on[:, 0] - p_off[:, 0]).abs().max()) > 1e-6  # elst moved
+
+
+def test_no_atomic_multipoles_also_drops_the_sr_shell_moments():
+    """With the SR shell on, dropping a multipole drops its SR partner too."""
+    off = ablated(make_ff1(26), atomic_dipoles=False, atomic_quadrupoles=False)
+    _, x = off(batch_from_dimers(dimers()))
+    for key in ("mu", "th", "d_sr", "Q_sr"):
+        assert float(x[key].abs().max()) == 0.0, key
 
 
 def test_no_charge_transfer_removes_only_ct():
