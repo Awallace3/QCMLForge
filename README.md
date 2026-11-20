@@ -49,14 +49,14 @@ Tests marked `gpu` also run on CUDA and are skipped when no GPU is available.
 ### Common Issues
 QCMLForge supports PyTorch 2.14 and 2.15. `environment.yml` (CPU and CI)
 installs the 2.15 CPU wheel with pip, since conda-forge does not package 2.15.
-`environment-gpu.yml` uses conda-forge's torch 2.14 CUDA 12.9 build, because
+`environment-gpu.yml` installs PyTorch's torch 2.14 CUDA 12.6 wheel, because
 every torch 2.15 CUDA build targets CUDA 13, which no longer supports V100s
 (sm_70). To install by hand:
 ```bash
 # CPU
 pip install torch==2.15.* --extra-index-url https://download.pytorch.org/whl/cpu
 # CUDA on any GPU, including V100
-conda install -c conda-forge "pytorch=2.14.*=cuda129*" cuda-version=12.9
+pip install torch==2.14.* --extra-index-url https://download.pytorch.org/whl/cu126
 # CUDA 13.2 on sm_75+ GPUs only (RTX 30xx, A100, H100, H200)
 pip install torch==2.15.*
 ```
