@@ -16,7 +16,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch>=2.15,<2.16",
+    "torch>=2.14,<2.16",
     "qm_tools_aw",
     "numpy>=2.2.0",
     "qcelemental>=0.29.0",

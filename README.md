@@ -47,13 +47,17 @@ need pretrained models still run normally.
 Tests marked `gpu` also run on CUDA and are skipped when no GPU is available.
 
 ### Common Issues
-QCMLForge requires PyTorch 2.15. conda-forge does not package it yet, so the
-environment files install torch with pip: the CPU wheel in `environment.yml`
-and PyPI's CUDA 13.2 wheel in `environment-gpu.yml`. To install by hand:
+QCMLForge supports PyTorch 2.14 and 2.15. `environment.yml` (CPU and CI)
+installs the 2.15 CPU wheel with pip, since conda-forge does not package 2.15.
+`environment-gpu.yml` uses conda-forge's torch 2.14 CUDA 12.9 build, because
+every torch 2.15 CUDA build targets CUDA 13, which no longer supports V100s
+(sm_70). To install by hand:
 ```bash
 # CPU
 pip install torch==2.15.* --extra-index-url https://download.pytorch.org/whl/cpu
-# CUDA (PyPI's Linux wheel is built against CUDA 13.2)
+# CUDA on any GPU, including V100
+conda install -c conda-forge "pytorch=2.14.*=cuda129*" cuda-version=12.9
+# CUDA 13.2 on sm_75+ GPUs only (RTX 30xx, A100, H100, H200)
 pip install torch==2.15.*
 ```
 

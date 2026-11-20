@@ -6,7 +6,7 @@ scatter into such an output was miscompiled on CUDA: the per-molecule charge
 sum came back as zero (charges not neutralized) and single-dimer APNet2
 energies came back as NaN. Eager runs were unaffected. The same size-1
 specialization also broke the compiled AtomMPNN backward on CPU (wrong
-parameter gradients); torch 2.15 fixes that.
+parameter gradients); torch 2.14 and later fix that.
 """
 
 import copy
@@ -85,7 +85,7 @@ def test_compiled_atom_model_single_molecule_gradients_match_eager(use_gpu):
 
     On torch 2.10 the backward of the dynamic-shape compiled AtomMPNN was
     miscompiled on CPU for a one-molecule batch: parameter gradients were off
-    by ~10% relative while larger batches matched to 1e-6. Fixed in 2.15.
+    by ~10% relative while larger batches matched to 1e-6. Fixed by 2.14.
     """
     torch.manual_seed(0)
     harness = AtomModel(ds_root=None, ignore_database_null=True, use_GPU=use_gpu)
