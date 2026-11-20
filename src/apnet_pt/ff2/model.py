@@ -37,10 +37,13 @@ from ..ff1.trunk import ANG2BOHR, EPS_U
 from . import physics
 from .charges import N_ITERS, monomer_populations
 from .kernels import safe_unit
+from .trunk import FF3MonomerTrunk, identity_init_layer
 
 G0_INIT = -2.5
 OPTIONAL_FF1_KEYS = ("beta_def_guess.", "beta_def_head.", "sr_vec_readout.",
                      "sr_ten_readout.")
+# FF3Layer modules that FF1Layer lacks (identity at init)
+GATE_MODULES = ("wq", "wk", "filt1", "filt2", "w_ev")
 
 
 def norm_cap(x: Tensor, rho: Tensor, dims: tuple[int, ...]) -> Tensor:
@@ -85,6 +88,16 @@ class FF2Model(FF1Model):
         electrostatics and in the permanent field, together with its
         short-range partner (``d_sr`` / ``Q_sr``) when ``sr_shell`` is on;
         the charges are unchanged.
+    charge_embedding, attention, euclidean_variables : bool
+        FF-3 backbone arms (default off; :mod:`apnet_pt.ff2.trunk`): the
+        SO3LR total-charge embedding (E), the So3krates attention gate on
+        the trunk messages (A) and the l = 1..4 Euclidean-variable
+        descriptor (A-ev).  Each starts as an exact identity, and the
+        trunk's FF-1 weights are those the default model would draw.
+    n_identity_layers : int
+        FF-3 capacity arm (CAP): the last ``n_identity_layers`` of the
+        ``n_layers`` trunk layers start with every update path at zero, so
+        they only re-apply the norm cap to ``u`` and ``Q`` (near-identity).
     """
 
     def __init__(self, n_feat: int = 128, n_chan: int = 16, n_layers: int = 3,
@@ -97,7 +110,9 @@ class FF2Model(FF1Model):
                  use_cholesky: bool = True, sr_shell: bool = True,
                  charge_transfer: bool = True, transverse_invariants: bool = True,
                  alpha_anisotropy: bool = True, element_alpha_eta: bool = False,
-                 atomic_dipoles: bool = True, atomic_quadrupoles: bool = True):
+                 atomic_dipoles: bool = True, atomic_quadrupoles: bool = True,
+                 charge_embedding: bool = False, attention: bool = False,
+                 euclidean_variables: bool = False, n_identity_layers: int = 0):
         super().__init__(n_feat, n_chan, n_layers, n_rbf, r_cut, rho_tr,
                          element_init, trunk_dtype, physics_dtype, s_cut,
                          g0_init, elst_beta_def=True, elst_sr_shell=True)
@@ -120,6 +135,48 @@ class FF2Model(FF1Model):
         # in place, so the compiled graph reads the current value
         self.register_buffer("ct_grad_scale", torch.tensor(1.0, dtype=pd),
                              persistent=False)
+        self._build_backbone(charge_embedding, attention, euclidean_variables,
+                             n_identity_layers)
+
+    def _build_backbone(self, charge_embedding, attention, euclidean_variables,
+                        n_identity_layers):
+        """The FF-3 trunk options; all off leaves FF-1's trunk untouched."""
+        self.charge_embedding = bool(charge_embedding)
+        self.attention = bool(attention)
+        self.euclidean_variables = bool(euclidean_variables)
+        self.n_identity_layers = int(n_identity_layers)
+        base = self.trunk
+        if not 0 <= self.n_identity_layers <= len(base.layers):
+            raise ValueError(f"n_identity_layers {n_identity_layers} not in "
+                             f"[0, n_layers = {len(base.layers)}]")
+        if self.charge_embedding or self.attention or self.euclidean_variables:
+            trunk = FF3MonomerTrunk(
+                base.n_feat, base.n_chan, len(base.layers), base.rbf.centers.numel(),
+                base.r_cut, base.layers[0].rho, base.embed.num_embeddings,
+                charge_embedding, attention, euclidean_variables)
+            trunk.to(self.trunk_dtype)
+            missing, unexpected = trunk.load_state_dict(base.state_dict(), strict=False)
+            assert not unexpected and all(
+                ("trunk." + k) in self.identity_init_keys(trunk) for k in missing)
+            self.trunk = trunk
+        for layer in self.trunk.layers[len(self.trunk.layers) - self.n_identity_layers:]:
+            identity_init_layer(layer)
+
+    def identity_init_keys(self, trunk: nn.Module | None = None) -> list[str]:
+        """State-dict keys that start at identity init and that an FF-1 (or
+        MBIS) state dict of ``n_layers - n_identity_layers`` layers lacks: the
+        charge embedding, every layer's gate/EV modules and the identity
+        layers."""
+        trunk = self.trunk if trunk is None else trunk
+        n_base = len(trunk.layers) - self.n_identity_layers
+        out = []
+        for key in trunk.state_dict():
+            parts = key.split(".")
+            if parts[0] == "charge_embed" or (
+                    parts[0] == "layers" and (int(parts[1]) >= n_base
+                                              or parts[2] in GATE_MODULES)):
+                out.append("trunk." + key)
+        return out
 
     # -- construction from FF-1 ----------------------------------------------
     @classmethod
@@ -140,15 +197,18 @@ class FF2Model(FF1Model):
         return model.to(next(ff1.parameters()).device)
 
     def load_ff1_state_dict(self, state: dict, keep_dtype: bool = False):
-        """Load an FF-1 state dict; only the optional electrostatics heads may
-        be missing (they keep their zero-readout init).  ``keep_dtype`` takes
+        """Load an FF-1 state dict; only the optional electrostatics heads and
+        the FF-3 identity-init keys (:meth:`identity_init_keys`) may be
+        missing (they keep their init).  ``keep_dtype`` takes
         each tensor's dtype from ``state`` (e.g. an FF-1 model cast to float64
         throughout) instead of casting into this model's parameters."""
         if keep_dtype:
             state = {k: v.detach().clone() for k, v in state.items()}
         missing, unexpected = self.load_state_dict(state, strict=False,
                                                    assign=keep_dtype)
-        bad = [k for k in missing if not k.startswith(OPTIONAL_FF1_KEYS)]
+        new = set(self.identity_init_keys())
+        bad = [k for k in missing if not k.startswith(OPTIONAL_FF1_KEYS)
+               and k not in new]
         if bad or unexpected:
             raise ValueError(f"not an FF-1 state dict: missing {bad}, "
                              f"unexpected {unexpected}")
@@ -156,7 +216,15 @@ class FF2Model(FF1Model):
 
     def config(self) -> dict:
         return {**super().config(), "n_mu_iters": self.n_mu_iters,
-                "use_cholesky": self.use_cholesky, **self.ablations()}
+                "use_cholesky": self.use_cholesky, **self.ablations(),
+                **self.backbone()}
+
+    def backbone(self) -> dict:
+        """The FF-3 trunk options (all off = FF-2's trunk)."""
+        return {"charge_embedding": self.charge_embedding,
+                "attention": self.attention,
+                "euclidean_variables": self.euclidean_variables,
+                "n_identity_layers": self.n_identity_layers}
 
     def ablations(self) -> dict:
         """The ablation switches (all at their FF-2 default = no ablation)."""
@@ -214,7 +282,11 @@ class FF2Model(FF1Model):
     def _forward_atoms(self, batch: dict):
         z = batch["z"].long()
         R = batch["R"]
-        h, u, Q, geo = self.trunk(z, R.to(self.trunk_dtype), batch["edges"])
+        if self.charge_embedding:
+            h, u, Q, geo = self.trunk(z, R.to(self.trunk_dtype), batch["edges"],
+                                      batch["monomer"], batch["monomer_charge"])
+        else:
+            h, u, Q, geo = self.trunk(z, R.to(self.trunk_dtype), batch["edges"])
         atoms = self._charges(batch, z, h, geo)
         atoms.update(self._properties(z, h, u, Q, atoms, geo))
         return R.to(self.physics_dtype) * ANG2BOHR, atoms

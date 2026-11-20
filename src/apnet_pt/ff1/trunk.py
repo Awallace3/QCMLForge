@@ -97,10 +97,11 @@ class FF1Layer(nn.Module):
         q3 = torch.einsum("nabc,nbac->nc", q2, Q)
         return torch.cat([nu, nq, uqu, q3], dim=1)
 
-    def forward(self, h, u, Q, src, dst, rt, rbf, fc):
-        n = h.shape[0]
-        ui, uk, Qi, Qk = u[src], u[dst], Q[src], Q[dst]
-        inv = torch.cat([
+    @staticmethod
+    def edge_invariants(ui: Tensor, uk: Tensor, Qi: Tensor, Qk: Tensor,
+                        rt: Tensor) -> Tensor:
+        """(E, 10C) invariants of the endpoint states along ``rt``."""
+        return torch.cat([
             eps_norm(ui, (1,)), eps_norm(uk, (1,)),
             eps_norm(Qi, (1, 2)), eps_norm(Qk, (1, 2)),
             torch.einsum("eac,ea->ec", ui, rt), torch.einsum("eac,ea->ec", uk, rt),
@@ -109,10 +110,11 @@ class FF1Layer(nn.Module):
             torch.einsum("ea,eabc,eb->ec", rt, Qk, rt),
             (Qi * Qk).sum((1, 2)),
         ], dim=1)
-        m = self.message(torch.cat([h[src], h[dst], rbf, inv], dim=1))
-        phi = self.phi(torch.nn.functional.silu(m)) * fc[:, None]
+
+    def update_uq(self, u, Q, uk, Qk, rt, pu, pq, src, n):
+        """Capped ``(u, Q)`` after the edge messages ``pu``/``pq`` and the
+        on-site couplings."""
         C = self.C
-        ph, pu, pq = phi[:, :-6 * C], phi[:, -6 * C:-3 * C], phi[:, -3 * C:]
         qr = torch.einsum("eabc,eb->eac", Qk, rt)
         du_e = (pu[:, None, :C] * rt[:, :, None] + pu[:, None, C:2 * C] * uk
                 + pu[:, None, 2 * C:] * qr)
@@ -120,15 +122,24 @@ class FF1Layer(nn.Module):
         ur = sym0(uk[:, :, None, :] * rt[:, None, :, None])
         dq_e = (pq[:, None, None, :C] * rr[..., None] + pq[:, None, None, C:2 * C] * ur
                 + pq[:, None, None, 2 * C:] * Qk)
-        dh = scatter_sum(ph, src, n) + self.psi_h(
-            torch.cat([h, self.self_invariants(u, Q)], dim=1))
         du = scatter_sum(du_e, src, n) + self.w_uq(torch.einsum("nabc,nbc->nac", Q, u))
         a, b = self.w_q1(u), self.w_q2v(u)
         dq = (scatter_sum(dq_e, src, n) + self.w_qlin(Q)
               + self.w_q2 * sym0(torch.einsum("nabc,nbdc->nadc", Q, Q))
               + sym0(a[:, :, None, :] * b[:, None, :, :]))
-        u = norm_cap(u + du, self.rho, (1,))
-        Q = norm_cap(Q + dq, self.rho, (1, 2))
+        return norm_cap(u + du, self.rho, (1,)), norm_cap(Q + dq, self.rho, (1, 2))
+
+    def forward(self, h, u, Q, src, dst, rt, rbf, fc):
+        n = h.shape[0]
+        ui, uk, Qi, Qk = u[src], u[dst], Q[src], Q[dst]
+        inv = self.edge_invariants(ui, uk, Qi, Qk, rt)
+        m = self.message(torch.cat([h[src], h[dst], rbf, inv], dim=1))
+        phi = self.phi(torch.nn.functional.silu(m)) * fc[:, None]
+        C = self.C
+        ph, pu, pq = phi[:, :-6 * C], phi[:, -6 * C:-3 * C], phi[:, -3 * C:]
+        dh = scatter_sum(ph, src, n) + self.psi_h(
+            torch.cat([h, self.self_invariants(u, Q)], dim=1))
+        u, Q = self.update_uq(u, Q, uk, Qk, rt, pu, pq, src, n)
         return h + dh, u, Q
 
 
