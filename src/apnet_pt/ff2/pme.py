@@ -549,7 +549,60 @@ class _FF2LongRangeCore(nn.Module):
 
         return e_elst_sr, e_exch, e_ct, e_disp_sr, field_sr
 
-    def forward(
+    def _eval_pol_coeff_chunk(
+        self, bk: Tensor, bl: Tensor, rr: Tensor, wp: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Evaluate real-space dipole-tensor coefficients ``(l33_sr, l53_sr)``
+        for one polarization pair chunk."""
+        model = self.model
+        lam_c = physics.by_range(
+            lambda a, b_, r_, mode: physics._two(a, b_, r_, K.DIPOLE_T, mode),
+            rr * torch.minimum(bk, bl),
+            model.point_x,
+            model.kernel_mode,
+            bk,
+            bl,
+            rr,
+        )
+        c33, c53 = lam_c[:, 0], lam_c[:, 1]
+        if self.pbc:
+            assert self.elst_pme is not None
+            e33, e53 = dipole_tensor_coeffs(
+                rr, ewald_boys_erf(rr, self.elst_pme.alpha)
+            )
+            return (c33 - e33) * wp, (c53 - e53) * wp
+        return c33 * wp, c53 * wp
+
+    @staticmethod
+    def _pad_inter_chunk(
+        ai: Tensor, aj: Tensor, shift: Tensor, mask: Tensor, chunk_size: int
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        pad = chunk_size - int(ai.shape[0])
+        if pad <= 0:
+            return ai, aj, shift, mask
+        dev = ai.device
+        return (
+            torch.cat([ai, torch.zeros(pad, dtype=ai.dtype, device=dev)]),
+            torch.cat([aj, torch.zeros(pad, dtype=aj.dtype, device=dev)]),
+            torch.cat([shift, torch.zeros((pad, 3), dtype=shift.dtype, device=dev)]),
+            torch.cat([mask, torch.zeros(pad, dtype=mask.dtype, device=dev)]),
+        )
+
+    @staticmethod
+    def _pad_pol_chunk(
+        bk: Tensor, bl: Tensor, rr: Tensor, wp: Tensor, chunk_size: int
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        pad = chunk_size - int(bk.shape[0])
+        if pad <= 0:
+            return bk, bl, rr, wp
+        return (
+            torch.cat([bk, bk.new_ones(pad)]),
+            torch.cat([bl, bl.new_ones(pad)]),
+            torch.cat([rr, rr.new_full((pad,), 10.0)]),
+            torch.cat([wp, wp.new_zeros(pad)]),
+        )
+
+    def _forward_impl(
         self,
         positions_nm: Tensor,
         cell_nm: Tensor | None,
@@ -561,6 +614,8 @@ class _FF2LongRangeCore(nn.Module):
         pol_l: Tensor,
         pol_shift: Tensor,
         pol_mask: Tensor,
+        inter_chunk_fn=None,
+        pol_chunk_fn=None,
     ) -> Tensor:
         """Compute ``(4,)`` FF-2 components ``[elst, exch, ind, disp]`` in kcal/mol."""
         model = self.model
@@ -599,7 +654,7 @@ class _FF2LongRangeCore(nn.Module):
         )
 
         # 2. Real-space intermolecular pairs (optionally gradient-checkpointed
-        # in chunks to bound peak activation memory on large >10k-atom boxes)
+        # in static-size chunks to bound peak activation memory on large boxes)
         common_args = (
             R_b,
             cell_b,
@@ -629,7 +684,10 @@ class _FF2LongRangeCore(nn.Module):
             s8,
         )
         n_inter = inter_ai.shape[0]
-        if self.pair_chunk_size is not None and n_inter > self.pair_chunk_size:
+        fn_inter = self._eval_inter_chunk if inter_chunk_fn is None else inter_chunk_fn
+        if self.pair_chunk_size is not None and (
+            inter_chunk_fn is not None or n_inter > self.pair_chunk_size
+        ):
             from torch.utils.checkpoint import checkpoint
 
             e_elst_sr = R_b.new_zeros(())
@@ -638,15 +696,24 @@ class _FF2LongRangeCore(nn.Module):
             e_disp_sr = R_b.new_zeros(())
             field = R_b.new_zeros(R_b.shape)
             step = self.pair_chunk_size
+            pad_static = inter_chunk_fn is not None
             for s in range(0, n_inter, step):
                 e_idx = min(s + step, n_inter)
+                ai_c = inter_ai[s:e_idx]
+                aj_c = inter_aj[s:e_idx]
+                sh_c = inter_shift[s:e_idx]
+                mk_c = inter_mask[s:e_idx]
+                if pad_static:
+                    ai_c, aj_c, sh_c, mk_c = self._pad_inter_chunk(
+                        ai_c, aj_c, sh_c, mk_c, step
+                    )
                 c_out = checkpoint(
-                    self._eval_inter_chunk,
+                    fn_inter,
                     *common_args,
-                    inter_ai[s:e_idx],
-                    inter_aj[s:e_idx],
-                    inter_shift[s:e_idx],
-                    inter_mask[s:e_idx],
+                    ai_c,
+                    aj_c,
+                    sh_c,
+                    mk_c,
                     use_reentrant=False,
                 )
                 e_elst_sr = e_elst_sr + c_out[0]
@@ -655,7 +722,7 @@ class _FF2LongRangeCore(nn.Module):
                 e_disp_sr = e_disp_sr + c_out[3]
                 field = field + c_out[4]
         else:
-            e_elst_sr, exch, ct, e_disp_sr, field = self._eval_inter_chunk(
+            e_elst_sr, exch, ct, e_disp_sr, field = fn_inter(
                 *common_args, inter_ai, inter_aj, inter_shift, inter_mask
             )
 
@@ -753,64 +820,40 @@ class _FF2LongRangeCore(nn.Module):
 
         bp = at["beta_pol"]
         n_pol = pol_k.shape[0]
-        if self.pair_chunk_size is not None and n_pol > self.pair_chunk_size:
+        fn_pol = self._eval_pol_coeff_chunk if pol_chunk_fn is None else pol_chunk_fn
+        if self.pair_chunk_size is not None and (
+            pol_chunk_fn is not None or n_pol > self.pair_chunk_size
+        ):
             from torch.utils.checkpoint import checkpoint
 
-            def _pol_coeff_chunk(bk, bl, rr, wp):
-                lam_c = physics.by_range(
-                    lambda a, b_, r_, mode: physics._two(a, b_, r_, K.DIPOLE_T, mode),
-                    rr * torch.minimum(bk, bl),
-                    model.point_x,
-                    model.kernel_mode,
-                    bk,
-                    bl,
-                    rr,
-                )
-                c33, c53 = lam_c[:, 0], lam_c[:, 1]
-                if self.pbc:
-                    assert self.elst_pme is not None
-                    e33, e53 = dipole_tensor_coeffs(
-                        rr, ewald_boys_erf(rr, self.elst_pme.alpha)
-                    )
-                    return (c33 - e33) * wp, (c53 - e53) * wp
-                return c33 * wp, c53 * wp
-
             l33_parts, l53_parts = [], []
-            for s in range(0, n_pol, self.pair_chunk_size):
-                e_idx = min(s + self.pair_chunk_size, n_pol)
+            step = self.pair_chunk_size
+            pad_static = pol_chunk_fn is not None
+            for s in range(0, n_pol, step):
+                e_idx = min(s + step, n_pol)
+                n_loc = e_idx - s
+                bk_c = bp[pol_k[s:e_idx]]
+                bl_c = bp[pol_l[s:e_idx]]
+                rr_c = r_p[s:e_idx]
+                wp_c = w_pol[s:e_idx]
+                if pad_static:
+                    bk_c, bl_c, rr_c, wp_c = self._pad_pol_chunk(
+                        bk_c, bl_c, rr_c, wp_c, step
+                    )
                 c33, c53 = checkpoint(
-                    _pol_coeff_chunk,
-                    bp[pol_k[s:e_idx]],
-                    bp[pol_l[s:e_idx]],
-                    r_p[s:e_idx],
-                    w_pol[s:e_idx],
+                    fn_pol,
+                    bk_c,
+                    bl_c,
+                    rr_c,
+                    wp_c,
                     use_reentrant=False,
                 )
-                l33_parts.append(c33)
-                l53_parts.append(c53)
+                l33_parts.append(c33[:n_loc])
+                l53_parts.append(c53[:n_loc])
             l33_sr = torch.cat(l33_parts)
             l53_sr = torch.cat(l53_parts)
         else:
-            lam = physics.by_range(
-                lambda bk, bl, rr, mode: physics._two(bk, bl, rr, K.DIPOLE_T, mode),
-                r_p * torch.minimum(bp[pol_k], bp[pol_l]),
-                model.point_x,
-                model.kernel_mode,
-                bp[pol_k],
-                bp[pol_l],
-                r_p,
-            )
-            l33, l53 = lam[:, 0], lam[:, 1]
-            if self.pbc:
-                assert self.elst_pme is not None
-                l33_erf, l53_erf = dipole_tensor_coeffs(
-                    r_p, ewald_boys_erf(r_p, self.elst_pme.alpha)
-                )
-                l33_sr = (l33 - l33_erf) * w_pol
-                l53_sr = (l53 - l53_erf) * w_pol
-            else:
-                l33_sr = l33 * w_pol
-                l53_sr = l53 * w_pol
+            l33_sr, l53_sr = fn_pol(bp[pol_k], bp[pol_l], r_p, w_pol)
 
         S = at["sqrt_alpha"]
         rhs = _mat_vec(S, field)
@@ -840,6 +883,33 @@ class _FF2LongRangeCore(nn.Module):
             e_pol = e_pol + self.elst_pme.reciprocal_dipole_energy(p_ind, spme_state)
 
         return torch.stack([elst, exch, e_pol + ct, disp]) * H2KCAL
+
+    def forward(
+        self,
+        positions_nm: Tensor,
+        cell_nm: Tensor | None,
+        inter_ai: Tensor,
+        inter_aj: Tensor,
+        inter_shift: Tensor,
+        inter_mask: Tensor,
+        pol_k: Tensor,
+        pol_l: Tensor,
+        pol_shift: Tensor,
+        pol_mask: Tensor,
+    ) -> Tensor:
+        """Compute ``(4,)`` FF-2 components ``[elst, exch, ind, disp]`` in kcal/mol."""
+        return self._forward_impl(
+            positions_nm,
+            cell_nm,
+            inter_ai,
+            inter_aj,
+            inter_shift,
+            inter_mask,
+            pol_k,
+            pol_l,
+            pol_shift,
+            pol_mask,
+        )
 
 
 class FF2LongRangeEnergy(nn.Module):
@@ -1077,14 +1147,32 @@ class FF2LongRangeEnergy(nn.Module):
 
 class CompiledLongRangeEnergy(nn.Module):
     """Inductor-compiled :class:`FF2LongRangeEnergy` with zero recompiles
-    across neighbor-list rebuilds of the same static capacity."""
+    across neighbor-list rebuilds of the same static capacity.
+
+    When ``module.core.pair_chunk_size`` is set, compiles the fixed-size
+    intermolecular and polarization chunk kernels once (static shape
+    ``(pair_chunk_size,)``) and runs the gradient-checkpointed chunk loop
+    outside ``torch.compile`` so peak activation memory stays ``O(C) + O(N)``
+    while every chunk executes fused Inductor kernels with constant compile
+    time independent of system size.
+    """
 
     def __init__(self, module: FF2LongRangeEnergy, **options):
         super().__init__()
         self.module = module
-        self._compiled_core = torch.compile(
-            module.core, **{"fullgraph": True, "dynamic": False, **options}
-        )
+        opts = {"fullgraph": True, "dynamic": False, **options}
+        if module.core.pair_chunk_size is not None:
+            self._compiled_core = None
+            self._compiled_inter_chunk = torch.compile(
+                module.core._eval_inter_chunk, **opts
+            )
+            self._compiled_pol_chunk = torch.compile(
+                module.core._eval_pol_coeff_chunk, **opts
+            )
+        else:
+            self._compiled_core = torch.compile(module.core, **opts)
+            self._compiled_inter_chunk = None
+            self._compiled_pol_chunk = None
 
     def components(
         self, positions_nm: Tensor, cell_nm: Tensor | None = None
@@ -1092,7 +1180,20 @@ class CompiledLongRangeEnergy(nn.Module):
         cell = self.module._resolve_cell(cell_nm, positions_nm)
         inter_buf, all_buf = self.module._neighbors(positions_nm, cell)
         with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
-            return self._compiled_core(
+            if self._compiled_core is not None:
+                return self._compiled_core(
+                    positions_nm,
+                    cell,
+                    inter_buf.ai,
+                    inter_buf.aj,
+                    inter_buf.shift,
+                    inter_buf.mask,
+                    all_buf.ai,
+                    all_buf.aj,
+                    all_buf.shift,
+                    all_buf.mask,
+                )
+            return self.module.core._forward_impl(
                 positions_nm,
                 cell,
                 inter_buf.ai,
@@ -1103,6 +1204,8 @@ class CompiledLongRangeEnergy(nn.Module):
                 all_buf.aj,
                 all_buf.shift,
                 all_buf.mask,
+                inter_chunk_fn=self._compiled_inter_chunk,
+                pol_chunk_fn=self._compiled_pol_chunk,
             )
 
     def forward(

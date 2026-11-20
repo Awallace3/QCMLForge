@@ -755,3 +755,56 @@ def test_pair_chunk_size_matches_unchunked(pbc):
     assert abs(float(e_ch - e_ref)) < 1e-11
     assert float((f_ch - f_ref).abs().max()) < 1e-10
 
+
+@pytest.mark.slow
+def test_compiled_pair_chunk_size_matches_eager_and_no_recompile():
+    """compile_long_range_energy(..., pair_chunk_size=C) compiles ONE static
+    chunk kernel with zero recompiles across chunks and NL rebuilds."""
+    model = _small_ff2(seed=11)
+    model.kernel_mode = "table"
+    z, mon, q, x_p, box_nm = _periodic_water_nh3_box()
+
+    counters.clear()
+    eager = FF2LongRangeEnergy(
+        model,
+        z,
+        mon,
+        q,
+        r_cut=10.0,
+        skin=1.5,
+        cell=box_nm,
+        pbc=True,
+        accuracy=1e-6,
+        pol_cg_iters=15,
+    )
+    comp_ch = compile_long_range_energy(
+        model,
+        z,
+        mon,
+        q,
+        x_p,
+        cell_nm=box_nm,
+        r_cut=10.0,
+        skin=1.5,
+        pbc=True,
+        accuracy=1e-6,
+        pol_cg_iters=15,
+        pair_chunk_size=64,
+    )
+    e1, f1 = comp_ch.energy_forces(x_p, box_nm)
+    frames_1 = counters["frames"]["total"]
+    er1, fr1 = eager.energy_forces(x_p, box_nm)
+    assert abs(float(e1 - er1)) < 1e-8
+    assert float((f1 - fr1).abs().max()) < 1e-7
+
+    gen = torch.Generator().manual_seed(123)
+    x_p2 = x_p + 0.09 * torch.randn(x_p.shape, generator=gen, dtype=F64)
+    e2, f2 = comp_ch.energy_forces(x_p2, box_nm)
+    frames_2 = counters["frames"]["total"]
+    er2, fr2 = eager.energy_forces(x_p2, box_nm)
+    assert comp_ch.module.neighbor_list.n_rebuilds >= 2
+    assert frames_2 == frames_1
+    assert abs(float(e2 - er2)) < 1e-8
+    assert float((f2 - fr2).abs().max()) < 1e-7
+
+
