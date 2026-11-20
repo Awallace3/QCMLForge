@@ -47,15 +47,24 @@ def batch_from_dimers(dimers: Sequence[dict], r_cut: float = 5.0,
             "pair_dimer": torch.cat(pdim).to(device), "n": len(dimers)}
 
 
+# optional per-atom inputs a store batch may carry (cached backbone features,
+# apnet_pt.ff2.so3lr_backbone); passed through unchanged when present
+OPTIONAL_ATOM_KEYS = ("so3lr_x", "so3lr_ev")
+
+
 def batch_from_store(batch: dict) -> dict:
     """A mastiff-classical ``ClassicalStore.batch`` in FF-1's format."""
     g = batch["graph"]
-    return {"z": batch["atoms"]["z"].long(), "R": batch["atoms"]["R"],
-            "edges": g.edge_index, "monomer": g.molecule_ind.long(),
-            "monomer_charge": g.total_charge,
-            "atom_dimer": g.molecule_ind.long() // 2,
-            "ai": batch["ai"], "aj": batch["aj"], "pair_dimer": batch["pair_dimer"],
-            "n": batch["n"]}
+    out = {"z": batch["atoms"]["z"].long(), "R": batch["atoms"]["R"],
+           "edges": g.edge_index, "monomer": g.molecule_ind.long(),
+           "monomer_charge": g.total_charge,
+           "atom_dimer": g.molecule_ind.long() // 2,
+           "ai": batch["ai"], "aj": batch["aj"], "pair_dimer": batch["pair_dimer"],
+           "n": batch["n"]}
+    for key in OPTIONAL_ATOM_KEYS:
+        if key in batch["atoms"]:
+            out[key] = batch["atoms"][key]
+    return out
 
 
 def with_coordinates(batch: dict, R: Tensor) -> dict:

@@ -37,6 +37,7 @@ from ..ff1.trunk import ANG2BOHR, EPS_U
 from . import physics
 from .charges import N_ITERS, monomer_populations
 from .kernels import safe_unit
+from .so3lr_backbone import BACKBONES, SO3LRFeatureTrunk
 from .trunk import FF3MonomerTrunk, identity_init_layer
 
 G0_INIT = -2.5
@@ -99,6 +100,13 @@ class FF2Model(FF1Model):
         ``n_layers`` trunk layers start with every update path at zero and
         cap their increments, ``u + G_rho(du)``, instead of their state, so
         they are an exact identity at init and stay bounded (``2 rho``).
+    so3lr_backbone : str
+        FF-3 frozen-backbone arms (default ``""`` = FF-1's trunk;
+        :mod:`apnet_pt.ff2.so3lr_backbone`): ``"tl-linear"`` (C) or
+        ``"tl-adapter"`` (D) replace the trunk by maps of cached SO3LR-T-L
+        features (batch keys ``so3lr_x``, ``so3lr_ev``), D with one FF1Layer
+        adapter.  ``n_layers`` is then unused, and an FF-1 state dict does not
+        load (the trunk keys differ); the heads are unchanged.
     """
 
     def __init__(self, n_feat: int = 128, n_chan: int = 16, n_layers: int = 3,
@@ -113,7 +121,8 @@ class FF2Model(FF1Model):
                  alpha_anisotropy: bool = True, element_alpha_eta: bool = False,
                  atomic_dipoles: bool = True, atomic_quadrupoles: bool = True,
                  charge_embedding: bool = False, attention: bool = False,
-                 euclidean_variables: bool = False, n_identity_layers: int = 0):
+                 euclidean_variables: bool = False, n_identity_layers: int = 0,
+                 so3lr_backbone: str = ""):
         super().__init__(n_feat, n_chan, n_layers, n_rbf, r_cut, rho_tr,
                          element_init, trunk_dtype, physics_dtype, s_cut,
                          g0_init, elst_beta_def=True, elst_sr_shell=True)
@@ -137,11 +146,26 @@ class FF2Model(FF1Model):
         self.register_buffer("ct_grad_scale", torch.tensor(1.0, dtype=pd),
                              persistent=False)
         self._build_backbone(charge_embedding, attention, euclidean_variables,
-                             n_identity_layers)
+                             n_identity_layers, so3lr_backbone)
 
     def _build_backbone(self, charge_embedding, attention, euclidean_variables,
-                        n_identity_layers):
+                        n_identity_layers, so3lr_backbone=""):
         """The FF-3 trunk options; all off leaves FF-1's trunk untouched."""
+        self.so3lr_backbone = str(so3lr_backbone or "")
+        if self.so3lr_backbone:
+            if self.so3lr_backbone not in BACKBONES:
+                raise ValueError(f"so3lr_backbone {so3lr_backbone!r} not in {BACKBONES}")
+            if charge_embedding or attention or euclidean_variables or n_identity_layers:
+                raise ValueError("so3lr_backbone replaces the FF-1 trunk; it does not "
+                                 "combine with the FF-3 trunk options")
+            base = self.trunk
+            self.charge_embedding = self.attention = self.euclidean_variables = False
+            self.n_identity_layers = 0
+            self.trunk = SO3LRFeatureTrunk(
+                base.n_feat, base.n_chan, base.rbf.centers.numel(), base.r_cut,
+                base.layers[0].rho, adapter=self.so3lr_backbone == "tl-adapter"
+            ).to(self.trunk_dtype)
+            return
         self.charge_embedding = bool(charge_embedding)
         self.attention = bool(attention)
         self.euclidean_variables = bool(euclidean_variables)
@@ -169,6 +193,8 @@ class FF2Model(FF1Model):
         charge embedding, every layer's gate/EV modules and the identity
         layers."""
         trunk = self.trunk if trunk is None else trunk
+        if self.so3lr_backbone:
+            return []
         n_base = len(trunk.layers) - self.n_identity_layers
         out = []
         for key in trunk.state_dict():
@@ -225,7 +251,8 @@ class FF2Model(FF1Model):
         return {"charge_embedding": self.charge_embedding,
                 "attention": self.attention,
                 "euclidean_variables": self.euclidean_variables,
-                "n_identity_layers": self.n_identity_layers}
+                "n_identity_layers": self.n_identity_layers,
+                "so3lr_backbone": self.so3lr_backbone}
 
     def ablations(self) -> dict:
         """The ablation switches (all at their FF-2 default = no ablation)."""
@@ -277,13 +304,17 @@ class FF2Model(FF1Model):
 
     def forward_monomers(self, batch: dict):
         """Monomer-only forward ``(R in bohr, atoms)``; ``batch`` needs ``z``,
-        ``R``, ``edges``, ``monomer`` and ``monomer_charge`` only."""
+        ``R``, ``edges``, ``monomer`` and ``monomer_charge`` only (plus
+        ``so3lr_x``/``so3lr_ev`` with ``so3lr_backbone``)."""
         return self._forward_atoms(batch)
 
     def _forward_atoms(self, batch: dict):
         z = batch["z"].long()
         R = batch["R"]
-        if self.charge_embedding:
+        if self.so3lr_backbone:
+            h, u, Q, geo = self.trunk(z, R.to(self.trunk_dtype), batch["edges"],
+                                      batch["so3lr_x"], batch["so3lr_ev"])
+        elif self.charge_embedding:
             h, u, Q, geo = self.trunk(z, R.to(self.trunk_dtype), batch["edges"],
                                       batch["monomer"], batch["monomer_charge"])
         else:
@@ -483,6 +514,12 @@ class CompiledFF2(nn.Module):
 
     def forward(self, batch: dict):
         from torch.fx.experimental import _config as fx_config
+        if self.model.so3lr_backbone:
+            # FF-3 C/D: ``edges`` as a (2, E) view of an (E, 2) buffer, strides
+            # (1, 2) for every E.  With the contiguous (E, 1) layout the
+            # inductor backward of these arms (torch 2.10) baked the first
+            # chunk's stride and failed on the next edge count.
+            batch = {**batch, "edges": batch["edges"].t().contiguous().t()}
         with fx_config.patch(use_duck_shape=False, backed_size_oblivious=True), \
                 torch.backends.opt_einsum.flags(enabled=False):
             return self._compiled(batch)

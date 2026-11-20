@@ -77,7 +77,8 @@ def test_default_config_is_ff2():
     model = FF2Model(n_feat=32, n_chan=4, n_layers=2, n_rbf=8)
     assert type(model.trunk) is FF1MonomerTrunk
     assert model.backbone() == {"charge_embedding": False, "attention": False,
-                                "euclidean_variables": False, "n_identity_layers": 0}
+                                "euclidean_variables": False, "n_identity_layers": 0,
+                                "so3lr_backbone": ""}
     assert model.identity_init_keys() == []
     assert list(model.state_dict()) == list(make_ff1().state_dict())
 
