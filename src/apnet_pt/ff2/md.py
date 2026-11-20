@@ -204,5 +204,10 @@ def compile_energy(model: FF2Model, z: Sequence[int], monomer: Sequence[int],
     return CompiledEnergy(module, **options)
 
 
-__all__ = ["CompiledEnergy", "FF2Energy", "KCAL2KJ", "NM2ANG", "cluster_batch",
-           "compile_energy", "trace_energy"]
+from .pme import (CompiledLongRangeEnergy, FF2LongRangeEnergy,
+                  compile_long_range_energy, openmm_python_force)
+
+__all__ = ["CompiledEnergy", "CompiledLongRangeEnergy", "FF2Energy",
+           "FF2LongRangeEnergy", "KCAL2KJ", "NM2ANG", "cluster_batch",
+           "compile_energy", "compile_long_range_energy",
+           "openmm_python_force", "trace_energy"]
