@@ -47,19 +47,22 @@ need pretrained models still run normally.
 Tests marked `gpu` also run on CUDA and are skipped when no GPU is available.
 
 ### Common Issues
-If you get an OS.Error when running qcml related to torch-geometric, you likely need
-to install a specific version through the following example:
+QCMLForge requires PyTorch 2.15. conda-forge does not package it yet, so the
+environment files install torch with pip: the CPU wheel in `environment.yml`
+and PyPI's CUDA 13.2 wheel in `environment-gpu.yml`. To install by hand:
 ```bash
-# If you want the CUDA version
-pip uninstall torch-geometric
-export TORCH=2.10.0
-export CUDA=cu126 # for cuda version 12.6
-pip install torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
+# CPU
+pip install torch==2.15.* --extra-index-url https://download.pytorch.org/whl/cpu
+# CUDA (PyPI's Linux wheel is built against CUDA 13.2)
+pip install torch==2.15.*
+```
 
-# If you want the CPU version
+torch-geometric is pure Python and QCMLForge uses none of its compiled
+extensions. If you get an OSError related to torch-geometric, reinstall it
+without any extension wheels:
+```bash
 pip uninstall torch-geometric
-export TORCH=2.10.0
-pip install torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-${TORCH}+cpu.html
+pip install torch-geometric==2.7.0
 ```
 
 ## Usage Workshop Demo

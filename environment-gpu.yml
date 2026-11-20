@@ -7,10 +7,12 @@
 #
 # The CPU-only environment (and CI) stays in environment.yml.
 #
-# cuda-version pins the CUDA 12.9 toolkit packages; it needs an NVIDIA driver
-# that supports CUDA >= 12.9 (``nvidia-smi`` "CUDA Version"). To solve on a
-# machine without a GPU driver (e.g. a login node), prefix the create command
-# with CONDA_OVERRIDE_CUDA=12.9.
+# conda-forge has no pytorch 2.15 build, so torch comes from PyPI, whose 2.15.0
+# Linux wheel is built against CUDA 13.2 and brings its own runtime libraries.
+# cuda-version pins the matching CUDA 13.2 headers that torch.compile needs; it
+# needs an NVIDIA driver that supports CUDA >= 13.2 (``nvidia-smi`` "CUDA
+# Version"). To solve on a machine without a GPU driver (e.g. a login node),
+# prefix the create command with CONDA_OVERRIDE_CUDA=13.2.
 name: qcml-gpu
 channels:
   - conda-forge
@@ -21,9 +23,7 @@ dependencies:
   - pytest=7.4.4
   - pytest-cov
   - python=3.12.8
-  - cuda-version=12.9
-  # Force the CUDA build instead of relying on driver detection.
-  - pytorch=2.10.*=cuda*
+  - cuda-version=13.2
   # torch.compile on CUDA compiles a launcher with Triton at runtime; that
   # needs the CUDA headers and a C/C++ compiler inside the environment.
   - cuda-cudart-dev
@@ -39,11 +39,12 @@ dependencies:
   - tqdm
   - h5py
   - pip:
+      - torch==2.15.*
       - qcelemental==0.29.0
       # pint 0.26.2 breaks qcelemental 0.29.0's unit registry at import.
       - pint<0.26.2
       - qm-tools-aw==1.4.5
-      # Pure-Python wheel; works with the CUDA pytorch build above.
+      # Pure-Python wheel; works with the CUDA torch build above.
       - torch-geometric==2.7.0
       - waitress==3.0.2
       - yarl==1.18.3

@@ -24,8 +24,9 @@ jobs:
     - name: Install PyTorch Geometric packages
       shell: bash -l {0}
       run: |
-        # Install torch-geometric from pre-built wheels (CPU version for CI)
-        pip install torch-geometric==2.7.0 huggingface_hub -f https://data.pyg.org/whl/torch-2.10.0+cpu.html
+        # torch-geometric is pure Python; QCMLForge needs none of the compiled
+        # PyG extensions, so no data.pyg.org wheel index is required.
+        pip install torch-geometric==2.7.0 huggingface_hub
     
     - name: Install package
       shell: bash -l {0}
