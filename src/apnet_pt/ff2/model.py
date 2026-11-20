@@ -96,8 +96,9 @@ class FF2Model(FF1Model):
         trunk's FF-1 weights are those the default model would draw.
     n_identity_layers : int
         FF-3 capacity arm (CAP): the last ``n_identity_layers`` of the
-        ``n_layers`` trunk layers start with every update path at zero, so
-        they only re-apply the norm cap to ``u`` and ``Q`` (near-identity).
+        ``n_layers`` trunk layers start with every update path at zero and
+        cap their increments, ``u + G_rho(du)``, instead of their state, so
+        they are an exact identity at init and stay bounded (``2 rho``).
     """
 
     def __init__(self, n_feat: int = 128, n_chan: int = 16, n_layers: int = 3,

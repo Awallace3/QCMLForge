@@ -91,9 +91,14 @@ def rms(x: Tensor) -> Tensor:
 
 
 def identity_init_layer(layer: FF1Layer) -> None:
-    """Zero the update paths of an FF1Layer: ``phi``, ``psi_h``'s last layer,
-    ``w_uq``, ``w_qlin``, ``w_q1`` (``w_q2`` starts at 0).  The layer then
-    changes nothing but re-applies the norm cap to ``u`` and ``Q``."""
+    """Make an FF1Layer an exact identity: zero its update paths (``phi``,
+    ``psi_h``'s last layer, ``w_uq``, ``w_qlin``, ``w_q1``; ``w_q2`` starts
+    at 0) and cap its increments rather than its state
+    (``u + G_rho(du)``, ``G_rho(0) = 0``), so it never re-caps ``u``/``Q``.
+    Trained, the layer stays bounded: ``|u|``, ``|Q|`` per channel grow by
+    at most ``rho`` (``<= 2 rho`` after one identity layer on a capped
+    trunk)."""
+    layer.cap_increment = True
     with torch.no_grad():
         for lin in (layer.phi, layer.psi_h[-1]):
             lin.weight.zero_()

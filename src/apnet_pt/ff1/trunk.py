@@ -73,7 +73,14 @@ class GaussianRBF(nn.Module):
 
 
 class FF1Layer(nn.Module):
-    """One message-passing update of (h, u, Q) (Eq. 3)."""
+    """One message-passing update of (h, u, Q) (Eq. 3).
+
+    ``cap_increment`` (static, default False) caps the update instead of the
+    state, ``u + G_rho(du)``: a zero update is then an exact identity and
+    ``|u|`` grows by at most ``rho`` per such layer (FF-3 identity layers).
+    """
+
+    cap_increment: bool = False
 
     def __init__(self, n_feat: int, n_chan: int, n_rbf: int, rho: float):
         super().__init__()
@@ -113,7 +120,7 @@ class FF1Layer(nn.Module):
 
     def update_uq(self, u, Q, uk, Qk, rt, pu, pq, src, n):
         """Capped ``(u, Q)`` after the edge messages ``pu``/``pq`` and the
-        on-site couplings."""
+        on-site couplings (the increments capped with ``cap_increment``)."""
         C = self.C
         qr = torch.einsum("eabc,eb->eac", Qk, rt)
         du_e = (pu[:, None, :C] * rt[:, :, None] + pu[:, None, C:2 * C] * uk
@@ -127,6 +134,9 @@ class FF1Layer(nn.Module):
         dq = (scatter_sum(dq_e, src, n) + self.w_qlin(Q)
               + self.w_q2 * sym0(torch.einsum("nabc,nbdc->nadc", Q, Q))
               + sym0(a[:, :, None, :] * b[:, None, :, :]))
+        if self.cap_increment:
+            return (u + norm_cap(du, self.rho, (1,)),
+                    Q + norm_cap(dq, self.rho, (1, 2)))
         return norm_cap(u + du, self.rho, (1,)), norm_cap(Q + dq, self.rho, (1, 2))
 
     def forward(self, h, u, Q, src, dst, rt, rbf, fc):

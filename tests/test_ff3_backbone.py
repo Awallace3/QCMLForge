@@ -32,7 +32,7 @@ ARMS = {"E": {"charge_embedding": True},
         "A": {"attention": True},
         "A-ev": {"attention": True, "euclidean_variables": True},
         "CAP": {"n_identity_layers": 1}}
-EXACT_ARMS = ("E", "A", "A-ev")
+EXACT_ARMS = ("E", "A", "A-ev", "CAP")
 MBIS_M3 = os.environ.get("QCML_MBIS_M3")
 
 
@@ -159,21 +159,28 @@ def max_diff(base, model, b):
 def test_exact_arms_reproduce_ff2_at_init(arm):
     ff1 = make_ff1(11).double()
     base = FF2Model.from_ff1(ff1)
-    model = FF2Model.from_ff1(ff1, **ARMS[arm])
+    model = FF2Model.from_ff1(ff1, **arm_options(arm, 2))
     b = batch_from_dimers(dimers() + edge_case_dimers())
     diff, _ = max_diff(base, model, b)
     assert max(diff.values()) <= 1e-10, diff
+    h0, u0, Q0 = trunk_out(base, b)
+    h1, u1, Q1 = trunk_out(model, b)
+    assert torch.equal(h0, h1) and torch.equal(u0, u1) and torch.equal(Q0, Q1)
 
 
-def test_cap_is_near_identity_at_init():
-    ff1 = make_ff1(11).double()
-    base = FF2Model.from_ff1(ff1)
-    model = FF2Model.from_ff1(ff1, **arm_options("CAP", 2))
-    b = batch_from_dimers(dimers() + edge_case_dimers())
-    diff, p0 = max_diff(base, model, b)
-    print(f"CAP step-0 diff (random FF-1 weights): {diff}, |pred| max "
-          f"{float(p0.abs().max()):.3g}")
-    assert 0.0 < diff["pred"] < 0.1 * float(p0.abs().max())
+def test_cap_identity_layer_caps_increments_and_stays_bounded():
+    """The identity layer caps its update, not its state: trained (all
+    weights perturbed), each channel moves by at most rho, so |u|, |Q| <=
+    2 rho after it; the default layers keep the state cap."""
+    model = perturbed(FF2Model(n_feat=32, n_chan=4, n_rbf=8, trunk_dtype=F64,
+                               **arm_options("CAP", 2)), scale=2.0)
+    flags = [layer.cap_increment for layer in model.trunk.layers]
+    assert flags == [False, False, True]
+    rho = model.trunk.layers[-1].rho
+    _, u, Q = trunk_out(model, batch_from_dimers(dimers() + edge_case_dimers()))
+    nu, nq = u.norm(dim=1), Q.norm(dim=(1, 2))
+    assert float(nu.max()) <= 2 * rho + 1e-12 and float(nq.max()) <= 2 * rho + 1e-12
+    assert float(nu.max()) > rho or float(nq.max()) > rho  # the bound is not rho
 
 
 def mbis_model(**options):
@@ -193,13 +200,13 @@ def mbis_model(**options):
 @pytest.mark.skipif(not MBIS_M3, reason="QCML_MBIS_M3 not set")
 def test_mbis_m3_identity_at_init():
     """The real MBIS M3 weights (FF-2-lite switches, float64 throughout):
-    E and A-ev reproduce FF-2-lite to 1e-10; CAP's difference is reported."""
+    E, A-ev and CAP reproduce FF-2-lite exactly (difference 0.0)."""
     base, _ = mbis_model()
     b = batch_from_dimers(dimers() + edge_case_dimers())
     for arm in ("E", "A-ev", "CAP"):
         opts = dict(ARMS[arm])
         if arm == "CAP":
-            opts = {"extra_layers": 1, "n_identity_layers": 1}
+            opts = {"extra_layers": 1, "n_identity_layers": 1}  # 4 layers
         model, missing = mbis_model(**opts)
         assert set(missing) - set(model.identity_init_keys()) <= {
             k for k in missing if k.startswith(("beta_def", "sr_"))}
@@ -210,8 +217,8 @@ def test_mbis_m3_identity_at_init():
                "Q": float((Q1 - Q0).norm() / Q0.norm()),
                "h": float((h1 - h0).norm() / h0.norm())}
         print(f"MBIS M3 step-0 {arm}: max|d| {diff}; trunk rel {rel}")
-        if arm != "CAP":
-            assert max(diff.values()) <= 1e-10, (arm, diff)
+        assert max(diff.values()) == 0.0, (arm, diff)
+        assert max(rel.values()) == 0.0, (arm, rel)
 
 
 # --- gradients at step 0 -------------------------------------------------------
