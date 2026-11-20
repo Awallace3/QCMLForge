@@ -7,9 +7,6 @@ dependencies:
   - pip
   - pytest=7.4.4
   - python=3.12.8
-  # conda-forge picks a CUDA build when an NVIDIA driver is present and a CPU
-  # build otherwise; the CUDA build pulls in the runtime libraries it needs.
-  - pytorch=2.10.*
   - requests=2.32.3
   - setuptools=72.1.0
   - matplotlib
@@ -18,15 +15,18 @@ dependencies:
   - tqdm
   - h5py
   - pip:
+      # conda-forge has no pytorch 2.15 build, so torch comes from the PyTorch
+      # CPU wheel index (2.15.0+cpu outranks PyPI's CUDA 2.15.0). For CUDA use
+      # environment-gpu.yml.
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch==2.15.*
       - qcelemental==0.29.0
       # pint 0.26.2 breaks qcelemental 0.29.0's unit registry at import.
       - pint<0.26.2
       - qm-tools-aw==1.4.5
-      # Install optional PyG wheels after env creation when you need them.
-      # CPU example:
-      #   pip install torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-2.10.0+cpu.html
-      # CUDA 12.6 example:
-      #   pip install torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-2.10.0+cu126.html
+      # Pure-Python wheel; QCMLForge uses none of the compiled PyG extensions
+      # (pyg-lib, torch-scatter, ...), which have no torch-2.15 wheels yet.
+      - torch-geometric==2.7.0
       - waitress==3.0.2
       - yarl==1.18.3
       - pytorch-minimize
