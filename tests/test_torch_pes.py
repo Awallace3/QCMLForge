@@ -808,3 +808,132 @@ def test_compiled_pair_chunk_size_matches_eager_and_no_recompile():
     assert float((f2 - fr2).abs().max()) < 1e-7
 
 
+def test_ff2_mixed_precision_accuracy_and_nve_drift():
+    """Mixed precision (fp64 state/PME/CG/sums + fp32 pair kernels) produces
+    float64 conservative forces with tight fp64 parity and O(dt^2) NVE stability."""
+    openmm = pytest.importorskip("openmm")
+    import numpy as np
+    import openmm as mm
+
+    model = _small_ff2(seed=13)
+    model.kernel_mode = "table"
+    z, mon, q, x_p, box_nm = _periodic_water_nh3_box()
+
+    lr64 = FF2LongRangeEnergy(
+        model, z, mon, q, r_cut=10.0, skin=1.0, cell=box_nm, pbc=True,
+        accuracy=1e-6, pol_cg_iters=15, precision="fp64",
+    )
+    lr_mix = FF2LongRangeEnergy(
+        model, z, mon, q, r_cut=10.0, skin=1.0, cell=box_nm, pbc=True,
+        accuracy=1e-6, pol_cg_iters=15, precision="mixed",
+    )
+    lr32 = FF2LongRangeEnergy(
+        model, z, mon, q, r_cut=10.0, skin=1.0, cell=box_nm, pbc=True,
+        accuracy=1e-6, pol_cg_iters=15, precision="fp32",
+    )
+
+    e64, f64 = lr64.energy_forces(x_p, box_nm)
+    e_mix, f_mix = lr_mix.energy_forces(x_p, box_nm)
+    e32, f32 = lr32.energy_forces(x_p, box_nm)
+    assert e_mix.dtype == F64 and f_mix.dtype == F64
+    assert abs(float(e_mix - e64)) < 1e-3
+    assert float((f_mix - f64).abs().max()) < 5e-2
+    # Mixed precision should be at least as accurate as pure fp32 on energy
+    assert abs(float(e_mix - e64)) <= abs(float(e32 - e64)) + 1e-4
+
+    # OpenMM periodic NVE conservation check for mixed precision
+    r0, th0 = 0.09572, 1.8242
+    water_eq = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [r0 * math.sin(th0 / 2.0), 0.0, r0 * math.cos(th0 / 2.0)],
+            [-r0 * math.sin(th0 / 2.0), 0.0, r0 * math.cos(th0 / 2.0)],
+        ]
+    )
+    z_w, mon_w, q_w, pos_w = [], [], [], []
+    shifts = [[0.2, 0.2, 0.2], [0.2, 0.85, 0.85], [0.85, 0.2, 0.85], [0.85, 0.85, 0.2]]
+    for m_idx, sh in enumerate(shifts):
+        z_w.extend([8, 1, 1])
+        mon_w.extend([m_idx] * 3)
+        q_w.append(0.0)
+        pos_w.extend((water_eq + np.array(sh)).tolist())
+    box_w = torch.diag(torch.tensor([1.3, 1.3, 1.3], dtype=F64))
+
+    lr_nve = FF2LongRangeEnergy(
+        model, z_w, mon_w, q_w, r_cut=5.5, skin=1.0, cell=box_w, pbc=True,
+        accuracy=1e-6, pol_cg_iters=15, precision="mixed",
+    )
+    system = mm.System()
+    system.setDefaultPeriodicBoxVectors([1.3, 0, 0], [0, 1.3, 0], [0, 0, 1.3])
+    for atomic_num in z_w:
+        system.addParticle(15.999 if atomic_num == 8 else 1.008)
+    hb = mm.HarmonicBondForce()
+    hb.setUsesPeriodicBoundaryConditions(True)
+    ha = mm.HarmonicAngleForce()
+    ha.setUsesPeriodicBoundaryConditions(True)
+    for m_idx in range(4):
+        o = 3 * m_idx
+        hb.addBond(o, o + 1, 0.09572, 462750.4)
+        hb.addBond(o, o + 2, 0.09572, 462750.4)
+        ha.addAngle(o + 1, o, o + 2, 1.824218, 836.8)
+    system.addForce(hb)
+    system.addForce(ha)
+    system.addForce(openmm_python_force(lr_nve, force_group=1))
+
+    stds = []
+    for dt in (0.0005, 0.00025):
+        integ = mm.VerletIntegrator(dt)
+        ctx = mm.Context(
+            system, integ, mm.Platform.getPlatformByName("CPU"), {"Threads": "1"}
+        )
+        ctx.setPositions(np.array(pos_w))
+        ctx.setVelocitiesToTemperature(150.0, 42)
+        n_steps = int(round(0.015 / dt))
+        etots = []
+        for _ in range(n_steps):
+            st = ctx.getState(getEnergy=True)
+            etots.append(st.getPotentialEnergy()._value + st.getKineticEnergy()._value)
+            integ.step(1)
+        stds.append(float(np.std(etots)))
+    assert stds[0] < 0.2
+    assert stds[1] < 0.05
+    assert stds[0] / stds[1] > 3.0
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("chunk", [None, 64])
+def test_ff2_mixed_precision_compiled(chunk):
+    """compile_long_range_energy(..., precision='mixed') compiles cleanly with
+    zero recompiles for both unchunked and static-chunked paths."""
+    model = _small_ff2(seed=14)
+    model.kernel_mode = "table"
+    z, mon, q, x_p, box_nm = _periodic_water_nh3_box()
+
+    counters.clear()
+    eager = FF2LongRangeEnergy(
+        model, z, mon, q, r_cut=10.0, skin=1.5, cell=box_nm, pbc=True,
+        accuracy=1e-6, pol_cg_iters=15, precision="mixed",
+    )
+    comp = compile_long_range_energy(
+        model, z, mon, q, x_p, cell_nm=box_nm, r_cut=10.0, skin=1.5, pbc=True,
+        accuracy=1e-6, pol_cg_iters=15, precision="mixed", pair_chunk_size=chunk,
+    )
+    e1, f1 = comp.energy_forces(x_p, box_nm)
+    frames_1 = counters["frames"]["total"]
+    er1, fr1 = eager.energy_forces(x_p, box_nm)
+    assert e1.dtype == F64 and f1.dtype == F64
+    assert abs(float(e1 - er1)) < 1e-4
+    assert float((f1 - fr1).abs().max()) < 1e-3
+
+    gen = torch.Generator().manual_seed(202)
+    x_p2 = x_p + 0.09 * torch.randn(x_p.shape, generator=gen, dtype=F64)
+    e2, f2 = comp.energy_forces(x_p2, box_nm)
+    frames_2 = counters["frames"]["total"]
+    er2, fr2 = eager.energy_forces(x_p2, box_nm)
+    assert comp.module.neighbor_list.n_rebuilds >= 2
+    assert frames_2 == frames_1
+    assert abs(float(e2 - er2)) < 1e-4
+    assert float((f2 - fr2).abs().max()) < 1e-3
+
+
+

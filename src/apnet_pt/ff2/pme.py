@@ -255,6 +255,8 @@ class _FF2LongRangeCore(nn.Module):
         cutoff_switch: str,
         switch_width_bohr: float,
         pair_chunk_size: int | None = None,
+        state_dtype: torch.dtype = torch.float64,
+        pair_dtype: torch.dtype = torch.float64,
     ):
         super().__init__()
         self.model = model
@@ -270,6 +272,8 @@ class _FF2LongRangeCore(nn.Module):
         self.pair_chunk_size = (
             None if pair_chunk_size is None else int(pair_chunk_size)
         )
+        self.state_dtype = state_dtype
+        self.pair_dtype = pair_dtype
         for k, v in topo.items():
             self.register_buffer(f"topo_{k}", v)
 
@@ -332,13 +336,15 @@ class _FF2LongRangeCore(nn.Module):
         eps_q = 1e-6
         af = self.model.alpha_free[z].to(pd)
         r42 = self.model.r42[z].to(pd)
+        a_iso = at["alpha_iso"].to(pd)
+        eta_v = at["eta"].to(pd)
         scale = math.sqrt(3.0) * r42 * (
-            (at["alpha_iso"] + eps_q) / (af + eps_q)
+            (a_iso + eps_q) / (af + eps_q)
         ) ** (1.0 / 3.0)
         if self.disp_pme is not None:
-            fac = self.disp_pme.factors(at["alpha_iso"], at["eta"])
+            fac = self.disp_pme.factors(a_iso, eta_v)
         else:
-            fac = (at["alpha_iso"] * torch.sqrt(at["eta"]))[:, None]
+            fac = (a_iso * torch.sqrt(eta_v))[:, None]
         # sum_{i,j} C8_ij ~ || sum_i (scale_i * fac_i) ||^2
         c8_vec = (scale[:, None] * fac).sum(dim=0)
         c8_sum = (c8_vec * c8_vec).sum()
@@ -384,63 +390,78 @@ class _FF2LongRangeCore(nn.Module):
         mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Evaluate all real-space intermolecular pair terms on one chunk
-        ``(ai, aj, shift, mask)``, returning ``(elst_sr, exch, ct, disp_sr, field_sr)``."""
+        ``(ai, aj, shift, mask)``, returning ``(elst_sr, exch, ct, disp_sr, field_sr)``.
+
+        In mixed precision (``state_dtype=float64``, ``pair_dtype=float32``),
+        pair geometry ``(r, rhat)``, Ewald ``erf`` subtractions, and all
+        reductions stay in ``float64`` while the heavy short-range pair
+        kernels (``table2d``, exchange, CT, BJ dispersion) execute in
+        ``float32``.
+        """
         model = self.model
-        pd = model.physics_dtype
+        sd = self.state_dtype
+        kd = self.pair_dtype
         is_group = (not self.pbc) and (self.cutoff_switch == "group")
         r, rhat, active = self._pair_vectors(
             R_b, cell_b, ai, aj, shift, mask, apply_rcut=not is_group
         )
-        w_active = active.to(pd)
+        w_active = active.to(sd)
         if is_group:
-            w_pair = self._group_weights(R_b, ai, aj, mask, pd)
+            w_pair = self._group_weights(R_b, ai, aj, mask, sd)
         elif not self.pbc and self.cutoff_switch == "smooth":
             r_on = max(self.r_cut_bohr - self.switch_width_bohr, 0.0)
             w_pair = w_active * _quintic_switch(r, r_on, self.r_cut_bohr)
         else:
             w_pair = w_active
 
+        # Heavy short-range pair kernels execute in pair_dtype (kd)
+        r_k = r.to(kd)
+        rhat_k = rhat.to(kd)
+        zf_k = zf.to(kd)
         at_view = {
-            "n_act": n_act,
-            "beta": beta,
-            "q": q_tot,
-            "shell_M": shell_M,
-            "shell_T": shell_T,
-            "shell_b": shell_b,
+            "n_act": n_act.to(kd),
+            "beta": beta.to(kd),
+            "q": q_tot.to(kd),
+            "shell_M": shell_M.to(kd),
+            "shell_T": shell_T.to(kd),
+            "shell_b": shell_b.to(kd),
         }
-        si = model._side(ai, zf, at_view)
-        sj = model._side(aj, zf, at_view)
-        sc = model._s_cut(r)
+        si = model._side(ai, zf_k, at_view)
+        sj = model._side(aj, zf_k, at_view)
+        sc = model._s_cut(r_k)
 
         elst_slater = physics.by_range(
             physics.elst_pairs,
-            r * torch.minimum(model._beta_min(si), model._beta_min(sj)),
+            r_k * torch.minimum(model._beta_min(si), model._beta_min(sj)),
             model.point_x,
             model.kernel_mode,
-            r,
-            rhat,
+            r_k,
+            rhat_k,
             si,
             sj,
-        )
+        ).to(sd)
 
         probe = torch.cat([ai, aj])
         source = torch.cat([aj, ai])
-        src_both = model._side(source, zf, at_view)
+        src_both = model._side(source, zf_k, at_view)
         r2_both = torch.cat([r, r])
         rhat_both = torch.cat([-rhat, rhat])
-        bp_probe = beta_pol[probe]
+        r2_both_k = torch.cat([r_k, r_k])
+        rhat_both_k = torch.cat([-rhat_k, rhat_k])
+        bp_probe_k = beta_pol.to(kd)[probe]
         f_slater = physics.by_range(
             physics.permanent_field,
-            r2_both * torch.minimum(bp_probe, model._beta_min(src_both)),
+            r2_both_k * torch.minimum(bp_probe_k, model._beta_min(src_both)),
             model.point_x,
             model.kernel_mode,
-            r2_both,
-            rhat_both,
-            bp_probe,
+            r2_both_k,
+            rhat_both_k,
+            bp_probe_k,
             src_both,
         )
         if sc is not None:
             f_slater = f_slater * torch.cat([sc, sc])[:, None]
+        f_slater = f_slater.to(sd)
 
         if self.pbc:
             assert self.elst_pme is not None
@@ -473,71 +494,81 @@ class _FF2LongRangeCore(nn.Module):
             w_both = torch.cat([w_pair, w_pair])[:, None]
             field_sr = R_b.new_zeros(R_b.shape).index_add(0, probe, f_slater * w_both)
 
-        # Exchange & charge transfer
-        vi, vj, ti, tj = vecs[ai], vecs[aj], tens[ai], tens[aj]
-        rq = rhat[:, :, None, None] * rhat[:, None, :, None]
+        # Exchange & charge transfer in pair_dtype (kd), summed in state_dtype (sd)
+        vecs_k, tens_k = vecs.to(kd), tens.to(kd)
+        A_k, B_k, D_k, C_k, eta_B_k = (
+            A_at.to(kd),
+            B_at.to(kd),
+            D_at.to(kd),
+            C_at.to(kd),
+            eta_B.to(kd),
+        )
+        vi, vj, ti, tj = vecs_k[ai], vecs_k[aj], tens_k[ai], tens_k[aj]
+        rq = rhat_k[:, :, None, None] * rhat_k[:, None, :, None]
         quad_i = (ti[..., :5] * rq).sum((1, 2))
         quad_j = (tj[..., :5] * rq).sum((1, 2))
-        lin_i = (vi * rhat[:, :, None]).sum(1)
-        lin_j = (vj * rhat[:, :, None]).sum(1)
+        lin_i = (vi * rhat_k[:, :, None]).sum(1)
+        lin_j = (vj * rhat_k[:, :, None]).sum(1)
         xi_i, xi_j = lin_i + quad_i, quad_j - lin_j
         pre_i, b_i, _, d_i, c_i = xi_i.unbind(1)
         pre_j, b_j, _, d_j, c_j = xi_j.unbind(1)
-        B_ij = B_at[ai] * torch.exp(b_i)
-        B_ji = B_at[aj] * torch.exp(b_j)
+        B_ij = B_k[ai] * torch.exp(b_i)
+        B_ji = B_k[aj] * torch.exp(b_j)
         omega = physics.transverse_invariants(
-            rhat, vi[:, :, 2], ti[..., 2], vj[:, :, 2], tj[..., 2]
+            rhat_k, vi[:, :, 2], ti[..., 2], vj[:, :, 2], tj[..., 2]
         )
         exch_pair = physics.exchange_pairs(
-            r,
-            rhat,
-            A_at[ai],
-            A_at[aj],
+            r_k,
+            rhat_k,
+            A_k[ai],
+            A_k[aj],
             B_ij,
             B_ji,
             pre_i,
             pre_j,
             omega,
-            torch.tanh(model.kappa_ex_raw).to(pd),
+            torch.tanh(model.kappa_ex_raw).to(kd),
             sc,
         )
-        w_ct = torch.exp((omega * torch.tanh(model.kappa_ct_raw).to(pd)).sum(-1))
+        w_ct = torch.exp((omega * torch.tanh(model.kappa_ct_raw).to(kd)).sum(-1))
         gamma_sum = (
-            D_at[ai] * torch.exp(d_i) * C_at[aj] * torch.exp(c_j)
-            + D_at[aj] * torch.exp(d_j) * C_at[ai] * torch.exp(c_i)
+            D_k[ai] * torch.exp(d_i) * C_k[aj] * torch.exp(c_j)
+            + D_k[aj] * torch.exp(d_j) * C_k[ai] * torch.exp(c_i)
         ) * w_ct
         ct_pair = physics.charge_transfer_pairs(
-            r,
+            r_k,
             exch_pair,
-            zf[ai],
-            zf[aj],
+            zf_k[ai],
+            zf_k[aj],
             gamma_sum,
-            eta_B[ai] * B_ij,
-            eta_B[aj] * B_ji,
-            eps_ct=1e-30 if pd == torch.float64 else 1e-15,
+            eta_B_k[ai] * B_ij,
+            eta_B_k[aj] * B_ji,
+            eps_ct=1e-30 if kd == torch.float64 else 1e-15,
             s_cut=sc,
         )
-        s_gate = model.ct_grad_scale.to(pd)
+        s_gate = model.ct_grad_scale.to(kd)
         ct_pair = s_gate * ct_pair + (1.0 - s_gate) * ct_pair.detach()
-        e_exch = (exch_pair * w_pair).sum()
-        e_ct = (ct_pair * w_pair).sum()
+        e_exch = (exch_pair.to(sd) * w_pair).sum()
+        e_ct = (ct_pair.to(sd) * w_pair).sum()
 
-        # Dispersion real space
+        # Dispersion real space in pair_dtype (kd), Ewald correction & sum in sd
+        alpha_k, eta_k = alpha_iso.to(kd), eta.to(kd)
         disp_pair, _ = physics.dispersion_pairs(
-            r,
-            alpha_iso[ai],
-            alpha_iso[aj],
-            eta[ai],
-            eta[aj],
-            model.r42[z[ai]].to(pd),
-            model.r42[z[aj]].to(pd),
-            model.alpha_free[z[ai]].to(pd),
-            model.alpha_free[z[aj]].to(pd),
-            a1,
-            a2,
-            s8,
+            r_k,
+            alpha_k[ai],
+            alpha_k[aj],
+            eta_k[ai],
+            eta_k[aj],
+            model.r42[z[ai]].to(kd),
+            model.r42[z[aj]].to(kd),
+            model.alpha_free[z[ai]].to(kd),
+            model.alpha_free[z[aj]].to(kd),
+            a1.to(kd),
+            a2.to(kd),
+            s8.to(kd),
             s_cut=sc,
         )
+        disp_pair = disp_pair.to(sd)
         if self.pbc and self.disp_pme is not None:
             assert disp_factors is not None
             disp_corr = self.disp_pme.real_space_correction(r, disp_factors, ai, aj)
@@ -555,16 +586,19 @@ class _FF2LongRangeCore(nn.Module):
         """Evaluate real-space dipole-tensor coefficients ``(l33_sr, l53_sr)``
         for one polarization pair chunk."""
         model = self.model
+        sd = self.state_dtype
+        kd = self.pair_dtype
+        bk_k, bl_k, rr_k = bk.to(kd), bl.to(kd), rr.to(kd)
         lam_c = physics.by_range(
             lambda a, b_, r_, mode: physics._two(a, b_, r_, K.DIPOLE_T, mode),
-            rr * torch.minimum(bk, bl),
+            rr_k * torch.minimum(bk_k, bl_k),
             model.point_x,
             model.kernel_mode,
-            bk,
-            bl,
-            rr,
+            bk_k,
+            bl_k,
+            rr_k,
         )
-        c33, c53 = lam_c[:, 0], lam_c[:, 1]
+        c33, c53 = lam_c[:, 0].to(sd), lam_c[:, 1].to(sd)
         if self.pbc:
             assert self.elst_pme is not None
             e33, e53 = dipole_tensor_coeffs(
@@ -619,7 +653,7 @@ class _FF2LongRangeCore(nn.Module):
     ) -> Tensor:
         """Compute ``(4,)`` FF-2 components ``[elst, exch, ind, disp]`` in kcal/mol."""
         model = self.model
-        pd = model.physics_dtype
+        pd = self.state_dtype
         z = self.topo_z
         zf = z.to(pd)
         R_ang = positions_nm.to(pd) * NM2ANG
@@ -639,16 +673,17 @@ class _FF2LongRangeCore(nn.Module):
             "monomer_charge": self.topo_monomer_charge,
         }
         R_mono_b, at = model._forward_atoms(mono_batch)
+        R_mono_b = R_mono_b.to(pd)
         R_b = R_ang * ANG2BOHR
         cell_b = None if cell_ang is None else cell_ang * ANG2BOHR
 
         q_tot = at["q"].to(pd)
-        mu_tot = at["mu"]
-        th_tot = at["th"]
+        mu_tot = at["mu"].to(pd)
+        th_tot = at["th"].to(pd)
         dg = model.dispersion_globals()
         a1, a2, s8 = dg["a1"].to(pd), dg["a2"].to(pd), dg["s8"].to(pd)
         disp_factors = (
-            self.disp_pme.factors(at["alpha_iso"], at["eta"])
+            self.disp_pme.factors(at["alpha_iso"].to(pd), at["eta"].to(pd))
             if (self.pbc and self.disp_pme is not None)
             else None
         )
@@ -790,7 +825,7 @@ class _FF2LongRangeCore(nn.Module):
         elif self.pbc and self.disp_mode == "tail":
             assert cell_b is not None
             vol = torch.abs(torch.linalg.det(cell_b))
-            c_g = at["alpha_iso"] * torch.sqrt(at["eta"])
+            c_g = at["alpha_iso"].to(pd) * torch.sqrt(at["eta"].to(pd))
             c6_sum = c_g.sum() ** 2
             disp = e_disp_sr + homogeneous_tail_correction(
                 vol, self.r_cut_bohr, c6_sum
@@ -818,7 +853,7 @@ class _FF2LongRangeCore(nn.Module):
             r_on = max(self.r_cut_bohr - self.switch_width_bohr, 0.0)
             w_pol = w_pol * _quintic_switch(r_p, r_on, self.r_cut_bohr)
 
-        bp = at["beta_pol"]
+        bp = at["beta_pol"].to(pd)
         n_pol = pol_k.shape[0]
         fn_pol = self._eval_pol_coeff_chunk if pol_chunk_fn is None else pol_chunk_fn
         if self.pair_chunk_size is not None and (
@@ -855,7 +890,7 @@ class _FF2LongRangeCore(nn.Module):
         else:
             l33_sr, l53_sr = fn_pol(bp[pol_k], bp[pol_l], r_p, w_pol)
 
-        S = at["sqrt_alpha"]
+        S = at["sqrt_alpha"].to(pd)
         rhs = _mat_vec(S, field)
         with torch.no_grad():
             w_star = _sparse_cg_solve(
@@ -970,6 +1005,21 @@ class FF2LongRangeEnergy(nn.Module):
     switch_width : float
         Switching window width in **Angstrom** for non-periodic smooth/group
         mode (default ``2.0`` Å).
+    pair_chunk_size : int, optional
+        If set, evaluate real-space intermolecular and polarization pairs in
+        gradient-checkpointed chunks of this size to bound peak activation
+        memory to ``O(C) + O(N)``.
+    precision : {"fp64", "mixed", "fp32"}, optional
+        Precision policy:
+        - ``None`` (default): follow ``model.physics_dtype`` everywhere.
+        - ``"fp64"``: ``float64`` throughout physics, SPME, and CG.
+        - ``"mixed"``: ``float64`` coordinates, displacements, Ewald ``erf``
+          subtractions, global reductions, reciprocal SPME, and CG polarization
+          around ``float32`` short-range pair kernels (``table2d``, exchange,
+          CT, dispersion, dipole tensor) — mirrors SO3LR/OpenMM mixed precision
+          to preserve NVE stability at near-``fp32`` speed and VRAM.
+        - ``"fp32"``: ``float32`` throughout physics, SPME, and CG (one-mu
+          monomer charges always remain ``float64``).
     """
 
     def __init__(
@@ -996,9 +1046,28 @@ class FF2LongRangeEnergy(nn.Module):
         cutoff_switch: str = "group",
         switch_width: float = 2.0,
         pair_chunk_size: int | None = None,
+        precision: str | None = None,
     ):
         super().__init__()
         self.model = model
+        if precision is None:
+            state_dtype = model.physics_dtype
+            pair_dtype = model.physics_dtype
+            self.precision = "fp32" if state_dtype == torch.float32 else "fp64"
+        elif precision == "fp64":
+            state_dtype, pair_dtype = torch.float64, torch.float64
+            self.precision = "fp64"
+        elif precision == "mixed":
+            state_dtype, pair_dtype = torch.float64, torch.float32
+            self.precision = "mixed"
+        elif precision == "fp32":
+            state_dtype, pair_dtype = torch.float32, torch.float32
+            self.precision = "fp32"
+        else:
+            raise ValueError(
+                f"precision must be None, 'fp64', 'mixed', or 'fp32', got {precision!r}"
+            )
+
         self.pbc = (cell is not None) if pbc is None else bool(pbc)
         if self.pbc and cell is None and (elst_alpha is None or elst_mesh is None):
             raise ValueError(
@@ -1077,6 +1146,8 @@ class FF2LongRangeEnergy(nn.Module):
             cutoff_switch=cutoff_switch,
             switch_width_bohr=float(switch_width) * ANG2BOHR,
             pair_chunk_size=pair_chunk_size,
+            state_dtype=state_dtype,
+            pair_dtype=pair_dtype,
         )
         self.neighbor_list = NeighborList(
             r_cut=self.r_cut_nm,
@@ -1087,7 +1158,7 @@ class FF2LongRangeEnergy(nn.Module):
         if cell is not None:
             self.register_buffer(
                 "default_cell_nm",
-                cell.detach().to(dtype=model.physics_dtype, device=device),
+                cell.detach().to(dtype=state_dtype, device=device),
             )
         else:
             self.default_cell_nm = None
@@ -1137,7 +1208,7 @@ class FF2LongRangeEnergy(nn.Module):
         device = self.core.topo_z.device
         x = (
             positions_nm.detach()
-            .to(device=device, dtype=self.model.physics_dtype)
+            .to(device=device, dtype=self.core.state_dtype)
             .requires_grad_(True)
         )
         e = self(x, cell_nm)
@@ -1219,7 +1290,7 @@ class CompiledLongRangeEnergy(nn.Module):
         device = self.module.core.topo_z.device
         x = (
             positions_nm.detach()
-            .to(device=device, dtype=self.module.model.physics_dtype)
+            .to(device=device, dtype=self.module.core.state_dtype)
             .requires_grad_(True)
         )
         e = self(x, cell_nm)
@@ -1246,11 +1317,16 @@ def compile_long_range_energy(
     frozen = copy.deepcopy(model).eval()
     for p in frozen.parameters():
         p.requires_grad_(False)
+    prec = kwargs.get("precision")
+    if prec in ("fp64", "mixed"):
+        frozen.physics_dtype = torch.float64
+    elif prec == "fp32":
+        frozen.physics_dtype = torch.float32
     module = FF2LongRangeEnergy(
         frozen, z, monomer, monomer_charge, cell=cell_nm, **kwargs
     )
     device = module.core.topo_z.device
-    pos_w = positions_nm.detach().to(device=device, dtype=frozen.physics_dtype)
+    pos_w = positions_nm.detach().to(device=device, dtype=module.core.state_dtype)
     # Warm up kernel tables & neighbor-list buffers eagerly before compiling
     with torch.no_grad():
         module(pos_w, cell_nm)
