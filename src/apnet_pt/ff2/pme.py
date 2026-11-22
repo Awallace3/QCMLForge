@@ -257,9 +257,11 @@ class _FF2LongRangeCore(nn.Module):
         pair_chunk_size: int | None = None,
         state_dtype: torch.dtype = torch.float64,
         pair_dtype: torch.dtype = torch.float64,
+        atom_params: nn.Module | None = None,
     ):
         super().__init__()
         self.model = model
+        self.atom_params = atom_params
         self.r_cut_bohr = float(r_cut_bohr)
         self.pbc = bool(pbc)
         self.pol_cg_iters = int(pol_cg_iters)
@@ -672,7 +674,10 @@ class _FF2LongRangeCore(nn.Module):
             "monomer": self.topo_monomer,
             "monomer_charge": self.topo_monomer_charge,
         }
-        R_mono_b, at = model._forward_atoms(mono_batch)
+        if self.atom_params is not None:  # e.g. ff2.frozen.FrozenAtoms
+            R_mono_b, at = self.atom_params(R_mono_ang)
+        else:
+            R_mono_b, at = model._forward_atoms(mono_batch)
         R_mono_b = R_mono_b.to(pd)
         R_b = R_ang * ANG2BOHR
         cell_b = None if cell_ang is None else cell_ang * ANG2BOHR
@@ -1020,6 +1025,12 @@ class FF2LongRangeEnergy(nn.Module):
           to preserve NVE stability at near-``fp32`` speed and VRAM.
         - ``"fp32"``: ``float32`` throughout physics, SPME, and CG (one-mu
           monomer charges always remain ``float64``).
+    atom_params : nn.Module, optional
+        Replaces ``model._forward_atoms`` for the per-atom parameters:
+        ``atom_params(R_ang) -> (R_bohr, atoms)`` on unwrapped monomers, e.g.
+        :class:`apnet_pt.ff2.frozen.FrozenAtoms` (parameters frozen at a
+        reference geometry and rotated with each atom's local frame).  The
+        default (``None``) recomputes them from each step's geometry.
     """
 
     def __init__(
@@ -1047,6 +1058,7 @@ class FF2LongRangeEnergy(nn.Module):
         switch_width: float = 2.0,
         pair_chunk_size: int | None = None,
         precision: str | None = None,
+        atom_params: nn.Module | None = None,
     ):
         super().__init__()
         self.model = model
@@ -1148,6 +1160,7 @@ class FF2LongRangeEnergy(nn.Module):
             pair_chunk_size=pair_chunk_size,
             state_dtype=state_dtype,
             pair_dtype=pair_dtype,
+            atom_params=atom_params,
         )
         self.neighbor_list = NeighborList(
             r_cut=self.r_cut_nm,
