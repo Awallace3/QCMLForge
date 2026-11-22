@@ -20,9 +20,10 @@ conda activate qcml
 pip install -e .
 ```
 
-For NVIDIA GPUs, use `environment-gpu.yml` instead. It pins a CUDA 12.9 build of
-PyTorch and includes the CUDA headers and compilers that `torch.compile` needs
-on the GPU (driver must support CUDA >= 12.9):
+For NVIDIA GPUs, use `environment-gpu.yml` instead. It pins PyTorch's CUDA 12.6
+build of torch 2.14 (which still runs on V100s) and includes the CUDA headers
+and compilers that `torch.compile` needs on the GPU (driver must support
+CUDA >= 12.6):
 
 ```bash
 conda env create -f environment-gpu.yml
@@ -47,19 +48,26 @@ need pretrained models still run normally.
 Tests marked `gpu` also run on CUDA and are skipped when no GPU is available.
 
 ### Common Issues
-If you get an OS.Error when running qcml related to torch-geometric, you likely need
-to install a specific version through the following example:
+QCMLForge supports PyTorch 2.14 and 2.15. `environment.yml` (CPU and CI)
+installs the 2.15 CPU wheel with pip, since conda-forge does not package 2.15.
+`environment-gpu.yml` installs PyTorch's torch 2.14 CUDA 12.6 wheel, because
+every torch 2.15 CUDA build targets CUDA 13, which no longer supports V100s
+(sm_70). To install by hand:
 ```bash
-# If you want the CUDA version
-pip uninstall torch-geometric
-export TORCH=2.10.0
-export CUDA=cu126 # for cuda version 12.6
-pip install torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
+# CPU
+pip install torch==2.15.* --extra-index-url https://download.pytorch.org/whl/cpu
+# CUDA on any GPU, including V100
+pip install torch==2.14.1+cu126 --extra-index-url https://download.pytorch.org/whl/cu126
+# CUDA 13.2 on sm_75+ GPUs only (RTX 30xx, A100, H100, H200)
+pip install torch==2.15.*
+```
 
-# If you want the CPU version
-pip uninstall torch-geometric
-export TORCH=2.10.0
-pip install torch-geometric==2.7.0 -f https://data.pyg.org/whl/torch-${TORCH}+cpu.html
+torch-geometric is pure Python and QCMLForge uses none of its compiled
+extensions. If you get an OSError related to torch-geometric, reinstall it
+without any extension wheels:
+```bash
+pip uninstall -y torch-geometric pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv
+pip install torch-geometric==2.7.0
 ```
 
 ## Usage Workshop Demo

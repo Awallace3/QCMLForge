@@ -4,7 +4,9 @@ or dimer.
 Inductor specializes a dimension of size 1, and on torch 2.10 an atomic-add
 scatter into such an output was miscompiled on CUDA: the per-molecule charge
 sum came back as zero (charges not neutralized) and single-dimer APNet2
-energies came back as NaN. Eager runs were unaffected.
+energies came back as NaN. Eager runs were unaffected. The same size-1
+specialization also broke the compiled AtomMPNN backward on CPU (wrong
+parameter gradients); torch 2.14 and later fix that.
 """
 
 import copy
@@ -70,6 +72,45 @@ def test_compiled_atom_model_neutralizes_single_molecule_batch(use_gpu):
                 q_compiled.cpu().numpy(), q_eager.cpu().numpy(), atol=1e-5
             )
             assert abs(q_compiled.sum().item()) < 1e-5
+
+
+def _parameter_grads(model):
+    return torch.cat(
+        [p.grad.flatten() for p in model.parameters() if p.grad is not None]
+    )
+
+
+def test_compiled_atom_model_single_molecule_gradients_match_eager(use_gpu):
+    """Compiled training must see the same gradients as eager training.
+
+    On torch 2.10 the backward of the dynamic-shape compiled AtomMPNN was
+    miscompiled on CPU for a one-molecule batch: parameter gradients were off
+    by ~10% relative while larger batches matched to 1e-6. Fixed by 2.14.
+    """
+    torch.manual_seed(0)
+    harness = AtomModel(ds_root=None, ignore_database_null=True, use_GPU=use_gpu)
+    harness.model.to(harness.device)
+    eager = copy.deepcopy(harness.model).train()
+    harness.compile_model()
+    compiled = harness.model.train()
+
+    # A multi-molecule batch first so the one-molecule batch hits an
+    # already-compiled dynamic graph, as the remainder of an epoch does.
+    for n_mol in (3, 1):
+        batch = _atom_batch(n_mol, harness.device)
+        for model in (eager, compiled):
+            model.zero_grad()
+            charge, dipole, qpole = model(batch)[:3]
+            loss = (
+                (charge.double() ** 2).sum()
+                + (dipole.double() ** 2).sum()
+                + (qpole.double() ** 2).sum()
+            )
+            loss.backward()
+        g_eager = _parameter_grads(eager)
+        g_compiled = _parameter_grads(compiled)
+        rel = (g_compiled - g_eager).abs().max() / g_eager.abs().max()
+        assert rel.item() < 1e-4, f"n_mol={n_mol}: relative grad error {rel.item()}"
 
 
 def test_compiled_apnet2_single_dimer_matches_eager(use_gpu):

@@ -1019,16 +1019,9 @@ class InducedDipoleMPNN(torch.nn.Module):
             h_list = torch.stack(h_list, dim=1)
             molecule_ind.requires_grad_(False)
             molecule_ind = molecule_ind.long()
-            num_mols = natom_per_mol.size(0)
-            total_charge_pred = scatter_sum_compile(
-                charge, molecule_ind, num_mols, reduce="sum"
+            charge = multipole.enforce_charge_conservation(
+                charge, molecule_ind, natom_per_mol, total_charge
             )
-            total_charge_pred = total_charge_pred.squeeze(-1)
-            total_charge_err = total_charge_pred - total_charge
-            charge_err = torch.repeat_interleave(
-                total_charge_err / natom_per_mol.float(), natom_per_mol
-            ).unsqueeze(1)
-            charge = charge - charge_err
             return charge, dipole, qpole, h_list
 
         # Conditional hfvr/vw retrieval based on precompute_hfvr flag
@@ -1158,18 +1151,9 @@ class InducedDipoleMPNN(torch.nn.Module):
         charge[keep_mask] = filtered_charge
         molecule_ind.requires_grad_(False)
         molecule_ind = molecule_ind.long()
-        num_mols = natom_per_mol.size(0)
-        total_charge_pred = scatter_sum_compile(
-            charge, molecule_ind, num_mols, reduce="sum"
+        charge = multipole.enforce_charge_conservation(
+            charge, molecule_ind, natom_per_mol, total_charge
         )
-        # return charge, dipole, qpole, h_list
-
-        total_charge_pred = total_charge_pred.squeeze(-1)
-        total_charge_err = total_charge_pred - total_charge
-        charge_err = torch.repeat_interleave(
-            total_charge_err / natom_per_mol.float(), natom_per_mol
-        ).unsqueeze(1)
-        charge = charge - charge_err
         charge = charge.squeeze(-1)
         # changed to dim=0 from dim=1 for usage in Param fitting # AMW 8/20/25
         # Breaks test_apnet2_train_qcel_molecules_in_memory_transfer test,
