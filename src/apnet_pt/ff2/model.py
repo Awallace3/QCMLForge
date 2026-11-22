@@ -502,7 +502,11 @@ class CompiledFF2(nn.Module):
       more operands (FF-1's trunk invariants) picks its contraction path from
       the concrete sizes, which guards the atom count to its traced value and
       recompiles every new chunk.  Without it the operands contract left to
-      right.
+      right;
+    * ``specialize_float``: Python float constants (``psi``'s ``eps`` in
+      ``eps ** gamma``) stay graph constants.  Unspecialized, torch 2.14 lifts
+      them to a symbolic-float input whose ``.item()`` inductor fails to lower
+      (``KeyError: 'unbacked_bindings'``); torch 2.10 compiled the same graph.
 
     One graph then serves every chunk shape.  Parameters stay ``model``'s."""
 
@@ -521,6 +525,7 @@ class CompiledFF2(nn.Module):
             # chunk's stride and failed on the next edge count.
             batch = {**batch, "edges": batch["edges"].t().contiguous().t()}
         with fx_config.patch(use_duck_shape=False, backed_size_oblivious=True), \
+                torch._dynamo.config.patch(specialize_float=True), \
                 torch.backends.opt_einsum.flags(enabled=False):
             return self._compiled(batch)
 
