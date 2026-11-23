@@ -79,6 +79,18 @@ def test_frozen_atoms_reproduce_live_parameters_under_rigid_motion():
                                        msg=k)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_frozen_atoms_build_on_the_model_device():
+    model = small_ff2(seed=1).cuda()
+    z, mon, q, R = cluster()
+    fa = FrozenAtoms(model, z, mon, q, R, bonds_of(R, np.asarray(mon)))
+    _, frozen = fa(torch.as_tensor(R, dtype=F64, device="cuda"))
+    live = live_atoms(small_ff2(seed=1), z, mon, q, R)
+    for k in (*SCALARS, *ORIENTED):
+        torch.testing.assert_close(frozen[k].cpu(), live[k].to(F64), rtol=0, atol=1e-10,
+                                   msg=k)
+
+
 def test_frozen_atoms_ignore_internal_distortion():
     model = small_ff2(seed=1)
     z, mon, q, R = cluster()

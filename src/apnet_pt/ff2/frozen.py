@@ -101,13 +101,15 @@ class FrozenAtoms(nn.Module):
         mon = np.asarray(monomer)
         if (mon[bonds[:, 0]] != mon[bonds[:, 1]]).any():
             raise ValueError("a bond joins two monomers")
-        kz, kx, ko = (torch.as_tensor(a, dtype=torch.long) for a in frame_indices(z, bonded))
+        dev = next(model.parameters()).device
+        kz, kx, ko = (torch.as_tensor(a, dtype=torch.long, device=dev)
+                      for a in frame_indices(z, bonded))
         self.register_buffer("kz", kz)
         self.register_buffer("kx", kx)
         self.register_buffer("ko", ko)
         self.physics_dtype = model.physics_dtype
-        b = cluster_batch(z, monomer, monomer_charge)
-        Rr = torch.as_tensor(np.asarray(R_ref), dtype=torch.float64)
+        b = cluster_batch(z, monomer, monomer_charge, device=dev)
+        Rr = torch.as_tensor(np.asarray(R_ref), dtype=torch.float64, device=dev)
         with torch.no_grad():
             _, at = model._forward_atoms({"z": b["z"], "R": Rr, "edges": b["edges"],
                                           "monomer": b["monomer"],
