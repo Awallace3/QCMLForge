@@ -15,6 +15,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!src/torch_pes/lib/
 lib64/
 parts/
 sdist/

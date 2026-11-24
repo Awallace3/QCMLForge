@@ -23,7 +23,8 @@ from . import kernels as K
 
 __all__ = ["beta_pol", "charge_transfer_pairs", "dispersion_pairs",
            "exchange_pairs", "elst_pairs", "permanent_field",
-           "transverse_invariants", "polarization", "expm_sym"]
+           "transverse_invariants", "polarization", "polarization_system",
+           "cg_solve", "by_range", "expm_sym"]
 
 
 def _dot(a: Tensor, b: Tensor) -> Tensor:
@@ -35,7 +36,58 @@ def _mat_vec(T: Tensor, v: Tensor) -> Tensor:
     return (T * v[..., None, :]).sum(-1)
 
 
-def elst_pairs(r: Tensor, rhat: Tensor, i: dict, j: dict) -> Tensor:
+MODES = ("exact", "table", "table2d", "point")
+
+
+def _two(bi: Tensor, bj: Tensor, r: Tensor, specs, mode: str) -> Tensor:
+    """Two-center kernel: series ("exact"), tabulated reduced functions
+    ("table"), one 2D lookup of the whole quadrature ("table2d") or the
+    point-multipole limit ("point")."""
+    if mode == "point":
+        return K.point(r, torch.broadcast_shapes(bi.shape, bj.shape, r.shape), specs)
+    if mode == "table":
+        return K.two_center_table(bi, bj, r, specs)
+    if mode == "table2d":
+        return K.two_center_table2d(bi, bj, r, specs)
+    return K.two_center(bi, bj, r, specs)
+
+
+def _one(b: Tensor, r: Tensor, specs, mode: str) -> Tensor:
+    if mode == "point":
+        return K.point(r, torch.broadcast_shapes(b.shape, r.shape), specs)
+    if mode in ("table", "table2d"):  # one-center has no quadrature
+        return K.one_center_table(b, r, specs)
+    return K.one_center(b, r, specs)
+
+
+def _take(x, idx: Tensor):
+    return {k: v[idx] for k, v in x.items()} if isinstance(x, dict) else x[idx]
+
+
+def by_range(fn, x_min: Tensor, point_x, mode: str, *args):
+    """``fn(*args, mode=mode)`` per pair, with pairs whose smallest Slater
+    argument ``x_min = beta_min R`` exceeds ``point_x`` evaluated in the
+    point-multipole limit (``fn(..., mode="point")``) instead.
+
+    Every ``args`` entry is a per-pair tensor (or a dict of them) indexed on
+    axis 0.  ``point_x=None`` runs every pair damped (exact).  The split is a
+    data-dependent gather, so the cost of the damped kernels scales with the
+    number of near pairs."""
+    if mode not in MODES:
+        raise ValueError(f"kernel mode {mode!r} not in {MODES}")
+    if point_x is None:
+        return fn(*args, mode=mode)
+    far = x_min > point_x
+    near_i = torch.nonzero(~far).squeeze(-1)
+    far_i = torch.nonzero(far).squeeze(-1)
+    a = fn(*[_take(v, near_i) for v in args], mode=mode)
+    b = fn(*[_take(v, far_i) for v in args], mode="point")
+    out = a.new_zeros((x_min.shape[0],) + a.shape[1:])
+    return out.index_put((near_i,), a).index_put((far_i,), b)
+
+
+def elst_pairs(r: Tensor, rhat: Tensor, i: dict, j: dict,
+               mode: str = "exact") -> Tensor:
     """Exact Coulomb energy (E_h) of two two-shell Eq. 7 densities, per pair.
 
     ``i``/``j``: ``z``, ``nc``, ``bc``, ``n``, ``b``, ``q`` (P,) and the
@@ -43,11 +95,11 @@ def elst_pairs(r: Tensor, rhat: Tensor, i: dict, j: dict) -> Tensor:
     """
     rc = r[:, None]
     # monopole: q_i q_j / R minus the decaying complements
-    tc = K.two_center(torch.stack([i["b"], i["bc"], i["b"], i["bc"]], 1),
-                      torch.stack([j["b"], j["b"], j["bc"], j["bc"]], 1),
-                      rc, K.BAR1)[..., 0]
-    oc = K.one_center(torch.stack([j["b"], i["b"], j["bc"], i["bc"]], 1),
-                      rc, K.BAR1)[..., 0]
+    tc = _two(torch.stack([i["b"], i["bc"], i["b"], i["bc"]], 1),
+              torch.stack([j["b"], j["b"], j["bc"], j["bc"]], 1),
+              rc, K.BAR1, mode)[..., 0]
+    oc = _one(torch.stack([j["b"], i["b"], j["bc"], i["bc"]], 1),
+              rc, K.BAR1, mode)[..., 0]
     bar = (-i["z"] * (j["nc"] * oc[:, 2] + j["n"] * oc[:, 0])
            - j["z"] * (i["nc"] * oc[:, 3] + i["n"] * oc[:, 1])
            + i["nc"] * j["nc"] * tc[:, 3] + i["nc"] * j["n"] * tc[:, 1]
@@ -63,9 +115,9 @@ def elst_pairs(r: Tensor, rhat: Tensor, i: dict, j: dict) -> Tensor:
     shell_T = torch.stack([j["T"], i["T"]], 1)                   # (P, 2, 2, 3, 3)
     clouds = torch.stack([two("bc"), two("b")], 2)               # (P, 2, 2)
     r4 = r[:, None, None, None]
-    cloud = K.two_center(clouds[..., None], shell_b[:, :, None, :], r4,
-                         K.CHARGE_SHELL)                         # (P, 2, 2c, 2s, 2)
-    nuc = K.one_center(shell_b, r[:, None, None], K.CHARGE_SHELL)  # (P, 2, 2s, 2)
+    cloud = _two(clouds[..., None], shell_b[:, :, None, :], r4,
+                 K.CHARGE_SHELL, mode)                          # (P, 2, 2c, 2s, 2)
+    nuc = _one(shell_b, r[:, None, None], K.CHARGE_SHELL, mode)  # (P, 2, 2s, 2)
     k = (two("z")[:, :, None, None] * nuc
          - two("nc")[:, :, None, None] * cloud[:, :, 0]
          - two("n")[:, :, None, None] * cloud[:, :, 1])
@@ -76,8 +128,8 @@ def elst_pairs(r: Tensor, rhat: Tensor, i: dict, j: dict) -> Tensor:
     energy = energy + (sign * k[..., 0] * u + k[..., 1] * t).sum((1, 2))
 
     # multipole-multipole over the 2 x 2 shell combinations
-    a = K.two_center(i["bs"][:, :, None], j["bs"][:, None, :], r[:, None, None],
-                     K.MM)                                       # (P, 2, 2, 7)
+    a = _two(i["bs"][:, :, None], j["bs"][:, None, :], r[:, None, None],
+             K.MM, mode)                                        # (P, 2, 2, 7)
     a53, a33, a74, a54, a95, a75, a55 = a.unbind(-1)
     rv = rhat[:, None, :]
     ui, uj = _dot(i["M"], rv), _dot(j["M"], rv)                  # (P, 2)
@@ -94,15 +146,16 @@ def elst_pairs(r: Tensor, rhat: Tensor, i: dict, j: dict) -> Tensor:
     return energy + mm.sum((1, 2))
 
 
-def permanent_field(r: Tensor, rhat: Tensor, beta_probe: Tensor, src: dict) -> Tensor:
+def permanent_field(r: Tensor, rhat: Tensor, beta_probe: Tensor, src: dict,
+                    mode: str = "exact") -> Tensor:
     """Field (E_h/(e bohr)) of ``src``'s two-shell density on a
     Slater(beta_probe) dipole; ``rhat`` points from the source to the probe."""
     rc = r[:, None]
-    tc = K.two_center(beta_probe[:, None], torch.stack([src["bc"], src["b"]], 1),
-                      rc, K.CHARGE_FIELD)[..., 0]
-    nuc = K.one_center(beta_probe, r, K.CHARGE_FIELD)[..., 0]
+    tc = _two(beta_probe[:, None], torch.stack([src["bc"], src["b"]], 1),
+              rc, K.CHARGE_FIELD, mode)[..., 0]
+    nuc = _one(beta_probe, r, K.CHARGE_FIELD, mode)[..., 0]
     charge = src["z"] * nuc - src["nc"] * tc[:, 0] - src["n"] * tc[:, 1]
-    act = K.two_center(beta_probe[:, None], src["bs"], rc, K.SHELL_FIELD)
+    act = _two(beta_probe[:, None], src["bs"], rc, K.SHELL_FIELD, mode)
     a53, a33, a74, a54 = act.unbind(-1)                          # (P, 2)
     rv = rhat[:, None, :]
     ur = _dot(src["M"], rv)
@@ -152,8 +205,61 @@ def expm_sym(A: Tensor, degree: int = 14) -> Tensor:
     return P
 
 
+def cg_solve(A: Tensor, rhs: Tensor, n_iter: int) -> Tensor:
+    """``A^-1 rhs`` for a batch of SPD matrices ``A`` (n, d, d), ``rhs``
+    (n, d, 1), by ``n_iter`` steps of conjugate gradients preconditioned with
+    the 3 x 3 diagonal blocks (one per atom).  The step count is fixed (no
+    early exit), so a traced or compiled graph runs the same solve at every
+    geometry; a residual too small to divide by ends the update."""
+    n, d, _ = A.shape
+    blocks = A.reshape(n, d // 3, 3, d // 3, 3).diagonal(dim1=1, dim2=3)
+    P = torch.linalg.inv(blocks.permute(0, 3, 1, 2))          # (n, d/3, 3, 3)
+
+    def precond(v):
+        return (P @ v.reshape(n, d // 3, 3, 1)).reshape(n, d, 1)
+
+    x = precond(rhs)
+    r = rhs - A @ x
+    z = precond(r)
+    p, rz = z, (r * z).sum(1, keepdim=True)
+    tiny = torch.finfo(A.dtype).tiny
+    for _ in range(n_iter):
+        Ap = A @ p
+        alpha = rz / (p * Ap).sum(1, keepdim=True).clamp_min(tiny)
+        x = x + alpha * p
+        r = r - alpha * Ap
+        z = precond(r)
+        rz_new = (r * z).sum(1, keepdim=True)
+        p = z + rz_new / rz.clamp_min(tiny) * p
+        rz = rz_new
+    return x
+
+
+def polarization_system(sqrt_alpha: Tensor, rhat: Tensor, l33: Tensor, l53: Tensor,
+                        rhs: Tensor, b: dict) -> tuple[Tensor, Tensor]:
+    """The dense whitened system ``A = I + K`` (n, 3m, 3m) and its right-hand
+    side (n, 3m, 1) on the slot layout, from the per-pair dipole kernels
+    ``l33``, ``l53`` and per-atom ``rhs = S F`` (all detached here)."""
+    k, l, d = b["pol_k"], b["pol_l"], b["pol_dimer"]
+    lk, ll, local, adim = b["pol_lk"], b["pol_ll"], b["atom_local"], b["atom_dimer"]
+    n, m = b["slots"].shape
+    S_k, S_l = sqrt_alpha[k].detach(), sqrt_alpha[l].detach()
+    sk, sl = _mat_vec(S_k, rhat.detach()), _mat_vec(S_l, rhat.detach())
+    SS = (S_k[..., :, :, None] * S_l[..., None, :, :]).sum(-2)
+    Kkl = (l33.detach()[:, None, None] * SS
+           - 3.0 * l53.detach()[:, None, None] * sk[:, :, None] * sl[:, None, :])
+    blocks = rhs.new_zeros((n, m, m, 3, 3))
+    blocks = blocks.index_put((d, lk, ll), Kkl).index_put((d, ll, lk),
+                                                           Kkl.transpose(1, 2))
+    A = blocks.permute(0, 1, 3, 2, 4).reshape(n, 3 * m, 3 * m)
+    A = A + torch.eye(3 * m, dtype=A.dtype, device=A.device)
+    rhs_dense = rhs.new_zeros((n, m, 3)).index_put((adim, local), rhs.detach())
+    return A, rhs_dense.reshape(n, 3 * m, 1)
+
+
 def polarization(R_b: Tensor, sqrt_alpha: Tensor, beta_p: Tensor, field: Tensor,
-                 b: dict, use_cholesky: bool = True):
+                 b: dict, use_cholesky: bool = True, point_x=None,
+                 mode: str = "exact", cg_iters=None):
     """Variational Gordon1-whitened polarization per dimer (E_h, <= 0).
 
     Solves ``(I + K) w = S F`` per dimer on the dense slot layout
@@ -161,29 +267,24 @@ def polarization(R_b: Tensor, sqrt_alpha: Tensor, beta_p: Tensor, field: Tensor,
     ``U = 1/2 |w|^2 + sum_{k<l} p_k T_kl p_l - p . F`` with ``p = S w*`` and
     ``w*`` held fixed (envelope theorem: exact forces and parameter
     gradients, FF-1's ``polarization``), so the dense matrix is never
-    differentiated.  Returns ``(energy (n,), induced dipoles p (N, 3))``.
+    differentiated.  ``point_x``, ``mode``: see :func:`by_range`.
+    ``cg_iters``: solve by :func:`cg_solve` instead of a factorization.
+    Returns ``(energy (n,), induced dipoles p (N, 3))``.
     """
     k, l, d = b["pol_k"], b["pol_l"], b["pol_dimer"]
-    lk, ll, local, adim = b["pol_lk"], b["pol_ll"], b["atom_local"], b["atom_dimer"]
+    local, adim = b["atom_local"], b["atom_dimer"]
     n, m = b["slots"].shape
     r, rhat = K.safe_unit(R_b[k] - R_b[l])
-    lam = K.two_center(beta_p[k], beta_p[l], r, K.DIPOLE_T)
+    lam = by_range(lambda bk, bl, rr, mode: _two(bk, bl, rr, K.DIPOLE_T, mode),
+                   r * torch.minimum(beta_p[k], beta_p[l]), point_x, mode,
+                   beta_p[k], beta_p[l], r)
     l33, l53 = lam[:, 0], lam[:, 1]
     rhs = _mat_vec(sqrt_alpha, field)                            # (N, 3)
     with torch.no_grad():
-        S_k, S_l = sqrt_alpha[k].detach(), sqrt_alpha[l].detach()
-        sk, sl = _mat_vec(S_k, rhat.detach()), _mat_vec(S_l, rhat.detach())
-        SS = (S_k[..., :, :, None] * S_l[..., None, :, :]).sum(-2)
-        Kkl = (l33.detach()[:, None, None] * SS
-               - 3.0 * l53.detach()[:, None, None] * sk[:, :, None] * sl[:, None, :])
-        blocks = R_b.new_zeros((n, m, m, 3, 3))
-        blocks = blocks.index_put((d, lk, ll), Kkl).index_put((d, ll, lk),
-                                                               Kkl.transpose(1, 2))
-        A = blocks.permute(0, 1, 3, 2, 4).reshape(n, 3 * m, 3 * m)
-        A = A + torch.eye(3 * m, dtype=A.dtype, device=A.device)
-        rhs_dense = R_b.new_zeros((n, m, 3)).index_put((adim, local), rhs.detach())
-        rhs_dense = rhs_dense.reshape(n, 3 * m, 1)
-        if use_cholesky:
+        A, rhs_dense = polarization_system(sqrt_alpha, rhat, l33, l53, rhs, b)
+        if cg_iters is not None:
+            w = cg_solve(A, rhs_dense, int(cg_iters))
+        elif use_cholesky:
             L, _ = torch.linalg.cholesky_ex(A)
             w = torch.cholesky_solve(rhs_dense, L)
         else:

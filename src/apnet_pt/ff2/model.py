@@ -135,6 +135,17 @@ class FF2Model(FF1Model):
         self.element_alpha_eta = bool(element_alpha_eta)
         self.atomic_dipoles = bool(atomic_dipoles)
         self.atomic_quadrupoles = bool(atomic_quadrupoles)
+        # beta_min R above which a pair's Slater kernels take their point-
+        # multipole limit (physics.by_range); None keeps every pair damped
+        self.point_x: float | None = None
+        # Slater kernels within point_x: "exact" (series), "table" (cubic
+        # Hermite in x, kernels.two_center_table) or "table2d" (bicubic
+        # Hermite in (beta_min R, beta_min / beta_max) replacing the whole
+        # quadrature, kernels.two_center_table2d)
+        self.kernel_mode: str = "exact"
+        # polarization by block-Jacobi CG with this many steps (None: dense
+        # Cholesky / LU per use_cholesky)
+        self.pol_cg_iters: int | None = None
         pd = physics_dtype
         for name, table in (("scalar_bound", SCALAR_HEADS),
                             ("vector_bound", VECTOR_HEADS),
@@ -287,7 +298,9 @@ class FF2Model(FF1Model):
         n = batch["n_dimer"].shape[0]
         pr = self._pairs(batch, R_b, at)
         e_pol, induced = physics.polarization(R_b, at["sqrt_alpha"], at["beta_pol"],
-                                              pr["field"], batch, self.use_cholesky)
+                                              pr["field"], batch, self.use_cholesky,
+                                              self.point_x, self.kernel_mode,
+                                              self.pol_cg_iters)
         pdim = batch["pair_dimer"]
         sums = R_b.new_zeros((n, 4)).index_add(
             0, pdim, torch.stack([pr["elst"], pr["exch"], pr["ct"], pr["disp"]], 1))
@@ -433,6 +446,12 @@ class FF2Model(FF1Model):
                 "M": at["shell_M"][idx], "T": at["shell_T"][idx],
                 "bs": at["shell_b"][idx]}
 
+    @staticmethod
+    def _beta_min(side):
+        """Smallest Slater exponent a pair side's elst/field kernels use."""
+        return torch.minimum(torch.minimum(side["b"], side["bc"]),
+                             side["bs"].min(-1).values)
+
     def _pairs(self, batch, R_b, at):
         pd = self.physics_dtype
         z = batch["z"].long()
@@ -441,7 +460,9 @@ class FF2Model(FF1Model):
         r, rhat = safe_unit(R_b[j] - R_b[i])
         sc = self._s_cut(r)
         si, sj = self._side(i, zf, at), self._side(j, zf, at)
-        elst = physics.elst_pairs(r, rhat, si, sj)
+        elst = physics.by_range(physics.elst_pairs, r * torch.minimum(
+            self._beta_min(si), self._beta_min(sj)), self.point_x, self.kernel_mode,
+            r, rhat, si, sj)
         # heads: vector (pre, B, ex, D, C), tensor (pre, B, ex, D, C, alpha)
         vecs, tens = at["vecs"], at["tens"]
         vi, vj, ti, tj = vecs[i], vecs[j], tens[i], tens[j]
@@ -481,8 +502,11 @@ class FF2Model(FF1Model):
             dg["a1"].to(pd), dg["a2"].to(pd), dg["s8"].to(pd), s_cut=sc)
         # permanent fields: probes (i, j) <- sources (j, i), both in one call
         probe, source = torch.cat([i, j]), torch.cat([j, i])
-        f = physics.permanent_field(torch.cat([r, r]), torch.cat([-rhat, rhat]),
-                                    at["beta_pol"][probe], self._side(source, zf, at))
+        src, r2, bp = self._side(source, zf, at), torch.cat([r, r]), at["beta_pol"][probe]
+        f = physics.by_range(physics.permanent_field,
+                             r2 * torch.minimum(bp, self._beta_min(src)),
+                             self.point_x, self.kernel_mode,
+                             r2, torch.cat([-rhat, rhat]), bp, src)
         if sc is not None:
             f = f * torch.cat([sc, sc])[:, None]
         field = R_b.new_zeros(R_b.shape).index_add(0, probe, f)
@@ -503,10 +527,11 @@ class CompiledFF2(nn.Module):
       the concrete sizes, which guards the atom count to its traced value and
       recompiles every new chunk.  Without it the operands contract left to
       right;
-    * ``specialize_float``: Python float constants (``psi``'s ``eps`` in
-      ``eps ** gamma``) stay graph constants.  Unspecialized, torch 2.14 lifts
-      them to a symbolic-float input whose ``.item()`` inductor fails to lower
-      (``KeyError: 'unbacked_bindings'``); torch 2.10 compiled the same graph.
+    * ``specialize_float``: with ``dynamic=True``, torch >= 2.14 Dynamo lifts
+      Python float constants (such as ``X_SWITCH``, ``H2KCAL``, and ``psi``'s
+      ``eps``) to symbolic-float / 0-d tensor inputs whose ``.item()`` Inductor
+      fails to lower (``KeyError: 'unbacked_bindings'``).  These floats never
+      change, so baking them in as constants is exact.
 
     One graph then serves every chunk shape.  Parameters stay ``model``'s."""
 

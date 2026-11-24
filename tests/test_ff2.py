@@ -5,11 +5,16 @@ import math
 import pytest
 import torch
 from torch._dynamo.utils import counters
+from torch.torch_version import TorchVersion
 
 from apnet_pt.ff1 import FF1Model, gordon1
 from apnet_pt.ff2 import FF2Model, compile_ff2, ff2_loss
 from apnet_pt.ff2 import charges, kernels, physics
 from apnet_pt.ff2.batching import batch_from_dimers, monomer_batch, with_coordinates
+from apnet_pt.ff2.md import (KCAL2KJ, FF2Energy, cluster_batch, compile_energy,
+                             trace_energy)
+
+TORCH_GE_215 = TorchVersion(torch.__version__) >= (2, 15)
 
 F64 = torch.float64
 DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
@@ -307,7 +312,9 @@ def test_compiled_fullgraph_matches_eager(device):
                 tol = 1e-8 if a.dtype == F64 else 1e-5
                 assert torch.allclose(a, gc[name], rtol=tol,
                                       atol=tol * 1e-2 * float(a.abs().max() + 1)), name
-    assert counters["stats"]["unique_graphs"] == 1
+    # torch 2.15's Inductor lowering guards 2 <= n_dimer, so the one-dimer
+    # batch compiles a second graph once; the five-dimer batch reuses the first
+    assert counters["stats"]["unique_graphs"] == (2 if TORCH_GE_215 else 1)
 
 
 @pytest.mark.skipif(not torch.backends.opt_einsum.is_available(),
@@ -536,3 +543,372 @@ def test_all_ablations_compile_to_one_graph():
         assert torch.isfinite(pe).all()
         assert float(xe["e_ct"].abs().max()) == 0.0
     assert counters["stats"]["unique_graphs"] == 1
+
+
+# --- fixed-topology MD potential (OpenMM TorchForce) --------------------------
+
+
+def md_model(seed=9, **options):
+    return FF2Model.from_ff1(make_ff1(seed, **options)).eval()
+
+
+def layout(dimer):
+    na, nb = len(dimer["zA"]), len(dimer["zB"])
+    z = list(dimer["zA"]) + list(dimer["zB"])
+    x = torch.cat([torch.as_tensor(dimer["RA"], dtype=F64),
+                   torch.as_tensor(dimer["RB"], dtype=F64)]) / 10.0
+    return z, [0] * na + [1] * nb, [dimer.get("qA", 0), dimer.get("qB", 0)], x
+
+
+def reference(model, dimer, x):
+    """kJ/mol and forces from FF-2 on a batch built at ``x`` (nm)."""
+    na = len(dimer["zA"])
+    xr = x.clone().requires_grad_(True)
+    R = xr * 10.0
+    b = batch_from_dimers([{**dimer, "RA": R[:na].detach(), "RB": R[na:].detach()}],
+                          r_cut=model.trunk.r_cut)
+    b["R"] = R
+    e = model(b)[0].sum() * KCAL2KJ
+    (g,) = torch.autograd.grad(e, xr)
+    return e.detach(), -g
+
+
+def evaluate(module, x):
+    xr = x.clone().requires_grad_(True)
+    e = module(xr)
+    (g,) = torch.autograd.grad(e, xr)
+    return e.detach(), -g
+
+
+@pytest.mark.parametrize("k", range(4))
+def test_traced_energy_and_forces_match_ff2(k):
+    model, dimer = md_model(), dimers()[k]
+    z, mon, q, x0 = layout(dimer)
+    traced = trace_energy(model, z, mon, q, x0)
+    gen = torch.Generator().manual_seed(k)
+    for step in range(3):
+        x = x0 + 0.01 * step * torch.randn(x0.shape, generator=gen, dtype=F64)
+        e_ref, f_ref = reference(model, dimer, x)
+        e, f = evaluate(traced, x)
+        assert torch.allclose(e, e_ref, rtol=0, atol=1e-9 * (1 + e_ref.abs()))
+        assert torch.allclose(f, f_ref, rtol=0, atol=1e-8 * (1 + f_ref.abs().max()))
+
+
+def test_intramonomer_pair_crossing_r_cut_is_exact():
+    """A 2.5 Angstrom cutoff: stretch water's O-H through it."""
+    model = md_model(r_cut=2.5)
+    dimer = {"zA": [8, 1, 1], "RA": WATER, "zB": [7, 1, 1, 1],
+             "RB": shift(NH3, 0.3, 0.4, 3.0)}
+    z, mon, q, x0 = layout(dimer)
+    traced = trace_energy(model, z, mon, q, x0)
+    for h_x in (0.20, 0.249, 0.251, 0.28):   # nm: H1 in, at and past r_cut
+        x = x0.clone()
+        x[1, 0], x[1, 2] = h_x, 0.0
+        e_ref, f_ref = reference(model, dimer, x)
+        e, f = evaluate(traced, x)
+        assert torch.allclose(e, e_ref, rtol=0, atol=1e-9 * (1 + e_ref.abs()))
+        assert torch.allclose(f, f_ref, rtol=0, atol=1e-8 * (1 + f_ref.abs().max()))
+
+
+def test_traced_forces_match_finite_differences():
+    model, dimer = md_model(), dimers()[1]
+    z, mon, q, x0 = layout(dimer)
+    traced = trace_energy(model, z, mon, q, x0)
+    _, f = evaluate(traced, x0)
+    h = 1e-6
+    fd = torch.zeros_like(x0)
+    with torch.no_grad():
+        for a in range(x0.shape[0]):
+            for c in range(3):
+                vals = []
+                for s in (-2, -1, 1, 2):
+                    x = x0.clone()
+                    x[a, c] += s * h
+                    vals.append(traced(x))
+                fd[a, c] = -(vals[0] - 8 * vals[1] + 8 * vals[2] - vals[3]) / (12 * h)
+    assert torch.allclose(f, fd, rtol=1e-6, atol=1e-5)
+
+
+def test_saved_trace_round_trips(tmp_path):
+    model, dimer = md_model(), dimers()[2]
+    z, mon, q, x0 = layout(dimer)
+    path = tmp_path / "ff2.pt"
+    torch.jit.save(trace_energy(model, z, mon, q, x0), str(path))
+    loaded = torch.jit.load(str(path))
+    x = x0 + 0.005
+    assert torch.equal(loaded(x), trace_energy(model, z, mon, q, x0)(x))
+
+
+def test_float32_positions_are_promoted():
+    model, dimer = md_model(), dimers()[0]
+    z, mon, q, x0 = layout(dimer)
+    traced = trace_energy(model, z, mon, q, x0)
+    e64 = traced(x0.float().double())
+    e32 = traced(x0.float())
+    assert e32.dtype == F64 and torch.equal(e32, e64)
+
+
+def test_cluster_pair_terms_add_over_dimers():
+    """Three monomers: elst, exch, CT and dispersion are pairwise, so they sum
+    over the three dimers; only polarization is many-body."""
+    model = md_model()
+    monos = [([8, 1, 1], WATER), ([7, 1, 1, 1], shift(NH3, 0.3, 0.4, 3.0)),
+             ([8, 1, 1], shift(WATER, 3.1, -0.2, 1.0))]
+    z = sum((m[0] for m in monos), [])
+    mon = sum(([k] * len(m[0]) for k, m in enumerate(monos)), [])
+    x = torch.cat([torch.as_tensor(m[1], dtype=F64) for m in monos]) / 10.0
+    energy = FF2Energy(model, z, mon, [0, 0, 0])
+    with torch.no_grad():
+        pred, extras = model(energy.batch(x))
+        total = pred[0] - torch.tensor([0, 0, 1, 0], dtype=F64) * extras["e_pol"][0]
+        pairs = torch.zeros(4, dtype=F64)
+        for a, b in ((0, 1), (0, 2), (1, 2)):
+            d = {"zA": monos[a][0], "RA": monos[a][1],
+                 "zB": monos[b][0], "RB": monos[b][1]}
+            p, xd = model(batch_from_dimers([d]))
+            pairs += p[0] - torch.tensor([0, 0, 1, 0], dtype=F64) * xd["e_pol"][0]
+    assert torch.allclose(total, pairs, rtol=0, atol=1e-9)
+
+
+def test_cluster_batch_validates_monomer_labels():
+    with pytest.raises(ValueError):
+        cluster_batch([8, 1, 1], [0, 0, 2], [0.0, 0.0])
+    b = cluster_batch([8, 1, 1, 7], [0, 0, 0, 1], [0.0, 0.0])
+    assert b["edges"].shape == (2, 6) and b["ai"].numel() == 3
+
+
+# --- speed paths: point-multipole far field ----------------------------------
+
+
+def test_point_kernel_is_the_large_separation_limit():
+    bi = torch.tensor([1.3, 2.0], dtype=F64)[:, None]
+    bj = torch.tensor([2.1, 1.1], dtype=F64)[:, None]
+    for x in (40.0, 60.0):
+        r = torch.full((2, 1), x / 1.1, dtype=F64)
+        for specs in (kernels.MM, kernels.CHARGE_SHELL, kernels.DIPOLE_T, kernels.BAR1):
+            exact = kernels.two_center(bi, bj, r, specs)
+            pt = kernels.point(r, exact.shape[:-1], specs)
+            tol = 1e-11 * pt.abs().max() + (1e-16 if specs == kernels.BAR1 else 0.0)
+            assert float((exact - pt).abs().max()) <= tol, (x, specs)
+
+
+def three_monomers(far=12.0):
+    """Water-ammonia close contact plus a second water ``far`` Angstrom off."""
+    z = [8, 1, 1, 7, 1, 1, 1, 8, 1, 1]
+    R = WATER + shift(NH3, 0.3, 0.4, 3.0) + shift(WATER, far, 0.5, 1.0)
+    return z, [0] * 3 + [1] * 4 + [2] * 3, [0, 0, 0], torch.tensor(R, dtype=F64) / 10
+
+
+@pytest.mark.parametrize("far", [6.0, 12.0, 25.0, 80.0])
+def test_point_x_split_matches_every_pair_damped(far):
+    model = md_model()
+    z, mon, q, x = three_monomers(far)
+    e_ref, f_ref = evaluate(FF2Energy(model, z, mon, q), x)
+    model.point_x = 40.0
+    e, f = evaluate(FF2Energy(model, z, mon, q), x)
+    if far == 80.0:  # pairs with the third water reach the point limit
+        b = cluster_batch(z, mon, q)
+        b["R"] = x * 10
+        with torch.no_grad():
+            R_b, at = model._forward_atoms(b)
+            i, j = b["ai"], b["aj"]
+            r = (R_b[j] - R_b[i]).norm(dim=-1)
+            zf = b["z"].to(F64)
+            xm = r * torch.minimum(model._beta_min(model._side(i, zf, at)),
+                                   model._beta_min(model._side(j, zf, at)))
+        assert 0 < int((xm > 40.0).sum()) < len(xm)  # both branches run
+    assert abs(float(e - e_ref)) <= 1e-9 * (1 + abs(float(e_ref)))
+    assert float((f - f_ref).abs().max()) <= 1e-8 * (1 + float(f_ref.abs().max()))
+
+
+def test_point_x_trace_follows_a_changing_partition():
+    """Traced with the third water far away, evaluated with it close."""
+    model = md_model()
+    model.point_x = 40.0
+    z, mon, q, x_far = three_monomers(25.0)
+    traced = trace_energy(model, z, mon, q, x_far)
+    exact = md_model()
+    for far in (25.0, 6.0):
+        x = three_monomers(far)[3]
+        e_ref, f_ref = evaluate(FF2Energy(exact, z, mon, q), x)
+        e, f = evaluate(traced, x)
+        assert abs(float(e - e_ref)) <= 1e-9 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-8 * (1 + float(f_ref.abs().max())), far
+
+
+# --- speed paths: tabulated reduced functions --------------------------------
+
+
+@pytest.mark.parametrize("specs", [kernels.MM, kernels.CHARGE_SHELL, kernels.DIPOLE_T,
+                                   kernels.SHELL_FIELD, kernels.BAR1])
+def test_tabulated_two_center_matches_series(specs):
+    g = torch.Generator().manual_seed(3)
+    bi = 1.0 + 14.0 * torch.rand(400, 1, generator=g, dtype=F64)
+    bj = 1.0 + 3.0 * torch.rand(400, 1, generator=g, dtype=F64)
+    r = 1.5 + 30.0 * torch.rand(400, 1, generator=g, dtype=F64)
+    exact = kernels.two_center(bi, bj, r, specs)
+    tab = kernels.two_center_table(bi, bj, r, specs)
+    scale = r[..., None] ** -torch.tensor([float(p) for _, p in specs], dtype=F64)
+    assert float(((tab - exact) / scale).abs().max()) < 1e-10
+
+
+@pytest.mark.parametrize("two_center", [True, False])
+def test_tabulated_reduced_functions_across_the_series_switch(two_center):
+    """A table node sits exactly on X_SWITCH, where _reduced changes branch;
+    its autograd slope must come from the branch that is evaluated there
+    (torch >= 2.15 gives clamp a zero gradient exactly at its bound)."""
+    specs = kernels.MM if two_center else kernels.CHARGE_SHELL
+    x = torch.linspace(kernels.X_SWITCH - 0.05, kernels.X_SWITCH + 0.05, 2001, dtype=F64)
+    ps = torch.tensor([float(p) for _, p in specs], dtype=F64)
+    d = (kernels._reduced_table(x, specs, two_center)
+         - kernels._reduced(x, specs, two_center)) * x[:, None] ** ps
+    assert float(d.abs().max()) < 1e-10
+
+
+@pytest.mark.parametrize("specs", [kernels.CHARGE_SHELL, kernels.CHARGE_FIELD,
+                                   kernels.BAR1])
+def test_tabulated_one_center_matches_series(specs):
+    b = torch.linspace(0.8, 16.0, 300, dtype=F64)[:, None]
+    r = torch.linspace(1.5, 30.0, 300, dtype=F64)[:, None]
+    exact = kernels.one_center(b, r, specs)
+    tab = kernels.one_center_table(b, r, specs)
+    scale = r[..., None] ** -torch.tensor([float(p) for _, p in specs], dtype=F64)
+    assert float(((tab - exact) / scale).abs().max()) < 1e-10
+
+
+@pytest.mark.parametrize("point_x", [None, 40.0])
+def test_table_mode_matches_exact_energy_and_forces(point_x):
+    exact = md_model()
+    fast = md_model()
+    fast.kernel_mode, fast.point_x = "table", point_x
+    for far in (6.0, 80.0):
+        z, mon, q, x = three_monomers(far)
+        e_ref, f_ref = evaluate(FF2Energy(exact, z, mon, q), x)
+        e, f = evaluate(FF2Energy(fast, z, mon, q), x)
+        assert abs(float(e - e_ref)) <= 1e-8 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-7 * (1 + float(f_ref.abs().max())), far
+
+
+@pytest.mark.parametrize("specs", [kernels.MM, kernels.CHARGE_SHELL, kernels.DIPOLE_T,
+                                   kernels.SHELL_FIELD, kernels.BAR1])
+def test_2d_table_two_center_matches_quadrature(specs):
+    """Exponent pairs in either order, ratios down to kernels.RHO_TAB, and
+    separations through the x = 40 point-limit switch."""
+    g = torch.Generator().manual_seed(4)
+    bi = 1.0 + 14.0 * torch.rand(600, 1, generator=g, dtype=F64)
+    bj = bi * torch.exp(torch.empty(600, 1, dtype=F64).uniform_(
+        math.log(kernels.RHO_TAB), -math.log(kernels.RHO_TAB), generator=g))
+    r = 0.1 + 40.0 * torch.rand(600, 1, generator=g, dtype=F64) ** 2
+    exact = kernels.two_center(bi, bj, r, specs)
+    tab = kernels.two_center_table2d(bi, bj, r, specs)
+    scale = r[..., None] ** -torch.tensor([float(p) for _, p in specs], dtype=F64)
+    assert float(((tab - exact) / scale).abs().max()) < 1e-8
+
+
+def test_2d_table_gradients_match_quadrature():
+    g = torch.Generator().manual_seed(6)
+    args = [(1.0 + 6.0 * torch.rand(300, 1, generator=g, dtype=F64)).requires_grad_(True),
+            (1.0 + 14.0 * torch.rand(300, 1, generator=g, dtype=F64)).requires_grad_(True),
+            (2.0 + 20.0 * torch.rand(300, 1, generator=g, dtype=F64)).requires_grad_(True)]
+    w = torch.randn(300, 1, len(kernels.MM), generator=g, dtype=F64)
+    ga = torch.autograd.grad((kernels.two_center(*args, kernels.MM) * w).sum(), args)
+    gb = torch.autograd.grad((kernels.two_center_table2d(*args, kernels.MM) * w).sum(), args)
+    for a, b in zip(ga, gb):
+        assert float((a - b).abs().max()) < 1e-7 * (1 + float(a.abs().max()))
+
+
+def test_2d_tables_build_under_no_grad():
+    kernels._TABLES.clear()
+    with torch.no_grad():
+        out = kernels.two_center_table2d(torch.tensor([[1.2]], dtype=F64),
+                                         torch.tensor([[3.0]], dtype=F64),
+                                         torch.tensor([[3.0]], dtype=F64), kernels.BAR1)
+    assert bool(torch.isfinite(out).all())
+
+
+@pytest.mark.parametrize("point_x", [None, 40.0])
+def test_table2d_mode_matches_exact_energy_and_forces(point_x):
+    exact = md_model()
+    fast = md_model()
+    fast.kernel_mode, fast.point_x = "table2d", point_x
+    for far in (6.0, 80.0):
+        z, mon, q, x = three_monomers(far)
+        e_ref, f_ref = evaluate(FF2Energy(exact, z, mon, q), x)
+        e, f = evaluate(FF2Energy(fast, z, mon, q), x)
+        assert abs(float(e - e_ref)) <= 1e-7 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-6 * (1 + float(f_ref.abs().max())), far
+
+
+@pytest.mark.parametrize("mode", ["table", "table2d"])
+def test_trace_holds_tables_as_constants(mode):
+    """A trace started with empty table caches must not record the table
+    build: OpenMM would rerun it every step."""
+    model = md_model()
+    model.kernel_mode = mode
+    z, mon, q, x = three_monomers(6.0)
+    kernels._TABLES.clear()
+    traced = trace_energy(model, z, mon, q, x)
+    assert "linspace" not in str(traced.inlined_graph)
+    e_ref, f_ref = evaluate(FF2Energy(model, z, mon, q), x)
+    e, f = evaluate(traced, x)
+    assert abs(float(e - e_ref)) <= 1e-10 * (1 + abs(float(e_ref)))
+    assert float((f - f_ref).abs().max()) <= 1e-9 * (1 + float(f_ref.abs().max()))
+
+
+def test_unknown_kernel_mode_is_rejected():
+    model = md_model()
+    model.kernel_mode = "fast"
+    z, mon, q, x = three_monomers()
+    with pytest.raises(ValueError, match="kernel mode"):
+        FF2Energy(model, z, mon, q)(x)
+
+
+# --- speed paths: Inductor-compiled energy -----------------------------------
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("mode, point_x", [("table", None), ("table", 40.0),
+                                           ("table2d", 40.0)])
+def test_compiled_energy_matches_eager(mode, point_x):
+    model = md_model()
+    model.kernel_mode, model.point_x = mode, point_x
+    z, mon, q, x = three_monomers(80.0)
+    compiled = compile_energy(model, z, mon, q, x)
+    for far in (80.0, 6.0):  # 6.0 changes the near/far partition
+        x = three_monomers(far)[3]
+        e_ref, f_ref = evaluate(FF2Energy(model, z, mon, q), x)
+        e, f = compiled.energy_forces(x)
+        assert abs(float(e - e_ref)) <= 1e-10 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-9 * (1 + float(f_ref.abs().max())), far
+
+
+def test_tables_build_under_no_grad():
+    kernels._TABLES.clear()
+    with torch.no_grad():
+        out = kernels.one_center_table(torch.tensor([[1.2]], dtype=F64),
+                                       torch.tensor([[3.0]], dtype=F64), kernels.BAR1)
+    assert bool(torch.isfinite(out).all())
+
+
+# --- speed paths: iterative polarization -------------------------------------
+
+
+def test_cg_solve_matches_cholesky_on_an_spd_batch():
+    g = torch.Generator().manual_seed(5)
+    M = torch.randn(2, 30, 30, generator=g, dtype=F64)
+    A = torch.eye(30, dtype=F64) + 0.02 * M @ M.transpose(1, 2)
+    rhs = torch.randn(2, 30, 1, generator=g, dtype=F64)
+    exact = torch.cholesky_solve(rhs, torch.linalg.cholesky(A))
+    x = physics.cg_solve(A, rhs, 30)
+    assert float((x - exact).norm() / exact.norm()) < 1e-12
+
+
+def test_cg_polarization_matches_cholesky_energy_and_forces():
+    exact, cg = md_model(), md_model()
+    cg.pol_cg_iters = 20
+    for far in (6.0, 12.0):
+        z, mon, q, x = three_monomers(far)
+        e_ref, f_ref = evaluate(FF2Energy(exact, z, mon, q), x)
+        e, f = evaluate(FF2Energy(cg, z, mon, q), x)
+        assert abs(float(e - e_ref)) <= 1e-9 * (1 + abs(float(e_ref))), far
+        assert float((f - f_ref).abs().max()) <= 1e-8 * (1 + float(f_ref.abs().max())), far
