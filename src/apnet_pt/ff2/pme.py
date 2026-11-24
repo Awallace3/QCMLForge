@@ -445,22 +445,43 @@ class _FF2LongRangeCore(nn.Module):
 
         probe = torch.cat([ai, aj])
         source = torch.cat([aj, ai])
-        src_both = model._side(source, zf_k, at_view)
         r2_both = torch.cat([r, r])
         rhat_both = torch.cat([-rhat, rhat])
         r2_both_k = torch.cat([r_k, r_k])
         rhat_both_k = torch.cat([-rhat_k, rhat_k])
-        bp_probe_k = beta_pol.to(kd)[probe]
-        f_slater = physics.by_range(
-            physics.permanent_field,
-            r2_both_k * torch.minimum(bp_probe_k, model._beta_min(src_both)),
-            model.point_x,
-            model.kernel_mode,
-            r2_both_k,
-            rhat_both_k,
-            bp_probe_k,
-            src_both,
-        )
+        if model.pol_field == "net_multipole":
+            c_dir = model.pol_field_scale()
+            if isinstance(c_dir, Tensor):
+                c_dir = c_dir.to(kd)
+            bp_f_k = beta_pol.to(kd) * c_dir
+            bp_probe_k = bp_f_k[probe]
+            bp_src_k = bp_f_k[source]
+            f_slater = physics.by_range(
+                physics.permanent_field_net,
+                r2_both_k * torch.minimum(bp_probe_k, bp_src_k),
+                model.point_x,
+                model.kernel_mode,
+                r2_both_k,
+                rhat_both_k,
+                bp_probe_k,
+                bp_src_k,
+                q_tot.to(kd)[source],
+                mu_tot.to(kd)[source],
+                th_tot.to(kd)[source],
+            )
+        else:
+            src_both = model._side(source, zf_k, at_view)
+            bp_probe_k = beta_pol.to(kd)[probe]
+            f_slater = physics.by_range(
+                physics.permanent_field,
+                r2_both_k * torch.minimum(bp_probe_k, model._beta_min(src_both)),
+                model.point_x,
+                model.kernel_mode,
+                r2_both_k,
+                rhat_both_k,
+                bp_probe_k,
+                src_both,
+            )
         if sc is not None:
             f_slater = f_slater * torch.cat([sc, sc])[:, None]
         f_slater = f_slater.to(sd)
@@ -516,9 +537,12 @@ class _FF2LongRangeCore(nn.Module):
         pre_j, b_j, _, d_j, c_j = xi_j.unbind(1)
         B_ij = B_k[ai] * torch.exp(b_i)
         B_ji = B_k[aj] * torch.exp(b_j)
-        omega = physics.transverse_invariants(
-            rhat_k, vi[:, :, 2], ti[..., 2], vj[:, :, 2], tj[..., 2]
-        )
+        if model.transverse_invariants:
+            omega = physics.transverse_invariants(
+                rhat_k, vi[:, :, 2], ti[..., 2], vj[:, :, 2], tj[..., 2]
+            )
+        else:
+            omega = r_k.new_zeros((r_k.shape[0], 4))
         exch_pair = physics.exchange_pairs(
             r_k,
             rhat_k,
@@ -550,6 +574,8 @@ class _FF2LongRangeCore(nn.Module):
         )
         s_gate = model.ct_grad_scale.to(kd)
         ct_pair = s_gate * ct_pair + (1.0 - s_gate) * ct_pair.detach()
+        if not model.charge_transfer:
+            ct_pair = torch.zeros_like(ct_pair)
         e_exch = (exch_pair.to(sd) * w_pair).sum()
         e_ct = (ct_pair.to(sd) * w_pair).sum()
 

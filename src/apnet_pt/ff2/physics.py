@@ -17,14 +17,14 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ..ff1.physics import (beta_pol, charge_transfer_pairs, dispersion_pairs,
-                           exchange_pairs)
+from ..ff1.physics import (A_POL, beta_pol, charge_transfer_pairs,
+                           dispersion_pairs, exchange_pairs)
 from . import kernels as K
 
-__all__ = ["beta_pol", "charge_transfer_pairs", "dispersion_pairs",
+__all__ = ["A_POL", "beta_pol", "charge_transfer_pairs", "dispersion_pairs",
            "exchange_pairs", "elst_pairs", "permanent_field",
-           "transverse_invariants", "polarization", "polarization_system",
-           "cg_solve", "by_range", "expm_sym"]
+           "permanent_field_net", "transverse_invariants", "polarization",
+           "polarization_system", "cg_solve", "by_range", "expm_sym"]
 
 
 def _dot(a: Tensor, b: Tensor) -> Tensor:
@@ -164,6 +164,21 @@ def permanent_field(r: Tensor, rhat: Tensor, beta_probe: Tensor, src: dict,
     shells = ((3.0 * a53 * ur + 5.0 * a74 * tr)[..., None] * rv
               - a33[..., None] * src["M"] - 2.0 * a54[..., None] * th_r)
     return charge[:, None] * rhat + shells.sum(1)
+
+
+def permanent_field_net(r: Tensor, rhat: Tensor, beta_probe: Tensor,
+                        beta_src: Tensor, q: Tensor, mu: Tensor, th: Tensor,
+                        mode: str = "exact") -> Tensor:
+    """Field (E_h/(e bohr)) of a source's net permanent multipoles ``(q, mu, th)``
+    on a Slater(``beta_probe``) probe, damped by a single two-center Gordon1
+    kernel ``G1(beta_probe, beta_src)``; ``rhat`` points from source to probe."""
+    a = _two(beta_probe, beta_src, r, K.FIELD_SPECS, mode)
+    a32, a53, a33, a74, a54 = a.unbind(-1)
+    ur = _dot(mu, rhat)
+    th_r = _mat_vec(th, rhat)
+    tr = _dot(th_r, rhat)
+    return ((a32 * q + 3.0 * a53 * ur + 5.0 * a74 * tr)[:, None] * rhat
+            - a33[:, None] * mu - 2.0 * a54[:, None] * th_r)
 
 
 def transverse_invariants(rhat: Tensor, ui: Tensor, Qi: Tensor, uj: Tensor,

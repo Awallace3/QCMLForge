@@ -42,9 +42,13 @@ from .trunk import FF3MonomerTrunk, identity_init_layer
 
 G0_INIT = -2.5
 OPTIONAL_FF1_KEYS = ("beta_def_guess.", "beta_def_head.", "sr_vec_readout.",
-                     "sr_ten_readout.")
+                     "sr_ten_readout.", "a_pol_field_raw")
 # FF3Layer modules that FF1Layer lacks (identity at init)
 GATE_MODULES = ("wq", "wk", "filt1", "filt2", "w_ev")
+POL_FIELD_MODES = ("charge_penetration", "net_multipole")
+A_POL_FIELD_MIN = 0.15
+A_POL_FIELD_MAX = 2.50
+A_POL_FIELD_INIT = 0.70
 
 
 def norm_cap(x: Tensor, rho: Tensor, dims: tuple[int, ...]) -> Tensor:
@@ -122,10 +126,19 @@ class FF2Model(FF1Model):
                  atomic_dipoles: bool = True, atomic_quadrupoles: bool = True,
                  charge_embedding: bool = False, attention: bool = False,
                  euclidean_variables: bool = False, n_identity_layers: int = 0,
-                 so3lr_backbone: str = ""):
+                 so3lr_backbone: str = "",
+                 pol_field: str = "charge_penetration",
+                 learnable_a_pol_field: bool = False,
+                 a_pol_field_init: float | None = None):
         super().__init__(n_feat, n_chan, n_layers, n_rbf, r_cut, rho_tr,
                          element_init, trunk_dtype, physics_dtype, s_cut,
                          g0_init, elst_beta_def=True, elst_sr_shell=True)
+        if pol_field not in POL_FIELD_MODES:
+            raise ValueError(f"pol_field {pol_field!r} not in {POL_FIELD_MODES}")
+        if learnable_a_pol_field and pol_field != "net_multipole":
+            raise ValueError("learnable_a_pol_field requires pol_field='net_multipole'")
+        if pol_field != "net_multipole" and a_pol_field_init is not None:
+            raise ValueError("a_pol_field_init requires pol_field='net_multipole'")
         self.n_mu_iters = int(n_mu_iters)
         self.use_cholesky = bool(use_cholesky)
         self.sr_shell = bool(sr_shell)
@@ -135,6 +148,25 @@ class FF2Model(FF1Model):
         self.element_alpha_eta = bool(element_alpha_eta)
         self.atomic_dipoles = bool(atomic_dipoles)
         self.atomic_quadrupoles = bool(atomic_quadrupoles)
+        self.pol_field = pol_field
+        self.learnable_a_pol_field = bool(learnable_a_pol_field)
+        if self.pol_field == "net_multipole":
+            init_val = (A_POL_FIELD_INIT if self.learnable_a_pol_field else physics.A_POL) \
+                if a_pol_field_init is None else float(a_pol_field_init)
+            if self.learnable_a_pol_field:
+                if not (A_POL_FIELD_MIN < init_val < A_POL_FIELD_MAX):
+                    raise ValueError(
+                        f"a_pol_field_init {init_val} must lie strictly in "
+                        f"({A_POL_FIELD_MIN}, {A_POL_FIELD_MAX})")
+                p0 = (init_val - A_POL_FIELD_MIN) / (A_POL_FIELD_MAX - A_POL_FIELD_MIN)
+                logit0 = math.log(p0 / (1.0 - p0))
+                self.a_pol_field_raw = nn.Parameter(
+                    torch.tensor(logit0, dtype=torch.float64))
+            elif init_val <= 0.0:
+                raise ValueError(f"a_pol_field_init must be > 0, got {init_val}")
+            self.a_pol_field_init: float | None = init_val
+        else:
+            self.a_pol_field_init = None
         # beta_min R above which a pair's Slater kernels take their point-
         # multipole limit (physics.by_range); None keeps every pair damped
         self.point_x: float | None = None
@@ -253,9 +285,42 @@ class FF2Model(FF1Model):
         return missing
 
     def config(self) -> dict:
-        return {**super().config(), "n_mu_iters": self.n_mu_iters,
-                "use_cholesky": self.use_cholesky, **self.ablations(),
-                **self.backbone()}
+        out = {**super().config(), "n_mu_iters": self.n_mu_iters,
+               "use_cholesky": self.use_cholesky, **self.ablations(),
+               **self.backbone(), "pol_field": self.pol_field,
+               "learnable_a_pol_field": self.learnable_a_pol_field}
+        if self.a_pol_field_init is not None:
+            out["a_pol_field_init"] = self.a_pol_field_init
+        return out
+
+    def a_pol_field(self) -> Tensor | None:
+        """Direct permanent-field damping constant ``a_d`` (matched to Thole
+        damping; mutual polarization keeps ``A_POL = 0.385`` fixed for SPD)."""
+        if self.pol_field != "net_multipole":
+            return None
+        if self.learnable_a_pol_field:
+            return (A_POL_FIELD_MIN
+                    + (A_POL_FIELD_MAX - A_POL_FIELD_MIN)
+                    * torch.sigmoid(self.a_pol_field_raw)).to(self.physics_dtype)
+        assert self.a_pol_field_init is not None
+        return torch.tensor(self.a_pol_field_init, dtype=self.physics_dtype,
+                            device=self.disp_raw.device)
+
+    def pol_field_scale(self) -> Tensor | float:
+        """Scalar multiplier ``c_dir = (a_pol_field / A_POL)^(1/3)`` applied to
+        ``beta_pol`` inside ``permanent_field_net``."""
+        if self.learnable_a_pol_field:
+            a = self.a_pol_field()
+            assert a is not None
+            return (a / physics.A_POL) ** (1.0 / 3.0)
+        assert self.a_pol_field_init is not None
+        return (self.a_pol_field_init / physics.A_POL) ** (1.0 / 3.0)
+
+    def element_parameters(self) -> list[nn.Parameter]:
+        out = super().element_parameters()
+        if self.learnable_a_pol_field:
+            out.append(self.a_pol_field_raw)
+        return out
 
     def backbone(self) -> dict:
         """The FF-3 trunk options (all off = FF-2's trunk)."""
@@ -502,11 +567,24 @@ class FF2Model(FF1Model):
             dg["a1"].to(pd), dg["a2"].to(pd), dg["s8"].to(pd), s_cut=sc)
         # permanent fields: probes (i, j) <- sources (j, i), both in one call
         probe, source = torch.cat([i, j]), torch.cat([j, i])
-        src, r2, bp = self._side(source, zf, at), torch.cat([r, r]), at["beta_pol"][probe]
-        f = physics.by_range(physics.permanent_field,
-                             r2 * torch.minimum(bp, self._beta_min(src)),
-                             self.point_x, self.kernel_mode,
-                             r2, torch.cat([-rhat, rhat]), bp, src)
+        r2, rh2 = torch.cat([r, r]), torch.cat([-rhat, rhat])
+        if self.pol_field == "net_multipole":
+            c_dir = self.pol_field_scale()
+            bp_f = at["beta_pol"] * c_dir
+            bp_p, bp_s = bp_f[probe], bp_f[source]
+            f = physics.by_range(
+                physics.permanent_field_net,
+                r2 * torch.minimum(bp_p, bp_s),
+                self.point_x, self.kernel_mode,
+                r2, rh2, bp_p, bp_s,
+                at["q"][source].to(pd), at["mu"][source], at["th"][source],
+            )
+        else:
+            src, bp = self._side(source, zf, at), at["beta_pol"][probe]
+            f = physics.by_range(physics.permanent_field,
+                                 r2 * torch.minimum(bp, self._beta_min(src)),
+                                 self.point_x, self.kernel_mode,
+                                 r2, rh2, bp, src)
         if sc is not None:
             f = f * torch.cat([sc, sc])[:, None]
         field = R_b.new_zeros(R_b.shape).index_add(0, probe, f)

@@ -912,3 +912,113 @@ def test_cg_polarization_matches_cholesky_energy_and_forces():
         e, f = evaluate(FF2Energy(cg, z, mon, q), x)
         assert abs(float(e - e_ref)) <= 1e-9 * (1 + abs(float(e_ref))), far
         assert float((f - f_ref).abs().max()) <= 1e-8 * (1 + float(f_ref.abs().max())), far
+
+
+# --- net-multipole permanent field & learnable a_pol_field -------------------
+
+
+def test_net_multipole_field_short_range_finite_and_grad():
+    r = torch.tensor([0.2, 0.5, 1.0, 4.0], dtype=F64, requires_grad=True)
+    rhat = torch.tensor([[1.0, 0.0, 0.0]] * 4, dtype=F64)
+    bp = torch.full((4,), 2.2, dtype=F64)
+    bs = torch.full((4,), 1.6, dtype=F64)
+    q = torch.full((4,), -0.6, dtype=F64)
+    mu = torch.zeros((4, 3), dtype=F64)
+    th = torch.zeros((4, 3, 3), dtype=F64)
+    f_ex = physics.permanent_field_net(r, rhat, bp, bs, q, mu, th, mode="exact")
+    # charge field keeps sign of q (never flips from an unscreened nucleus) and vanishes as r -> 0
+    assert (f_ex[:, 0] < 0.0).all()
+    assert abs(float(f_ex[0, 0].detach())) < abs(float(f_ex[2, 0].detach()))
+    f_ex.sum().backward()
+    assert torch.isfinite(r.grad).all()
+    # table2d matches exact
+    f_t2d = physics.permanent_field_net(r.detach(), rhat, bp, bs, q, mu, th, mode="table2d")
+    assert torch.allclose(f_ex.detach(), f_t2d, rtol=1e-5, atol=1e-7)
+
+
+def test_ff2_net_multipole_learnable_a_pol_field_compile_and_pme():
+    from torch._dynamo.utils import counters
+    from apnet_pt.ff2.frozen import FrozenAtoms
+    from apnet_pt.ff2.pme import FF2LongRangeEnergy
+
+    torch.manual_seed(17)
+    model = FF2Model(
+        n_feat=32, n_chan=4, n_layers=2, sr_shell=False,
+        transverse_invariants=False, alpha_anisotropy=False,
+        so3lr_backbone="tl-adapter", pol_field="net_multipole",
+        learnable_a_pol_field=True, a_pol_field_init=0.70,
+    )
+    assert abs(float(model.a_pol_field().detach()) - 0.70) < 1e-12
+    assert any(p is model.a_pol_field_raw for p in model.element_parameters())
+
+    # Single-graph torch.compile (eager backend) across variable chunk sizes with tl-adapter
+    ds = dimers()
+    def with_tl(b):
+        n = b["z"].shape[0]
+        g = torch.Generator().manual_seed(100 + n)
+        return {**b, "so3lr_x": torch.randn(n, 256, generator=g),
+                "so3lr_ev": torch.randn(n, 48, generator=g)}
+
+    counters.clear()
+    compiled = compile_ff2(model, backend="eager")
+    for sub in (ds, ds[:3], ds[1:2]):
+        b = with_tl(batch_from_dimers(sub))
+        pe, _ = model(b)
+        pc, _ = compiled(b)
+        assert torch.allclose(pe, pc, rtol=0, atol=1e-10)
+    assert counters["stats"]["unique_graphs"] == 1
+
+    # Gradient reaches a_pol_field_raw
+    b0 = with_tl(batch_from_dimers(ds[:2]))
+    model.zero_grad()
+    pred, _ = model(b0)
+    pred[:, 2].sum().backward()
+    assert model.a_pol_field_raw.grad is not None
+    assert abs(float(model.a_pol_field_raw.grad)) > 0.0
+
+    # FrozenAtoms(extra_batch=...) + FF2LongRangeEnergy matches FF2Model.forward exactly
+    model.eval()
+    d0 = ds[0]
+    z = list(d0["zA"]) + list(d0["zB"])
+    na, nb = len(d0["zA"]), len(d0["zB"])
+    mon = [0] * na + [1] * nb
+    q = [float(d0.get("qA", 0)), float(d0.get("qB", 0))]
+    R = torch.tensor(list(d0["RA"]) + list(d0["RB"]), dtype=F64)
+    # water (0-1, 0-2) + NH3 (3-4, 3-5, 3-6)
+    bonds = [[0, 1], [0, 2], [3, 4], [3, 5], [3, 6]]
+    g = torch.Generator().manual_seed(77)
+    extra = {"so3lr_x": torch.randn(len(z), 256, generator=g),
+             "so3lr_ev": torch.randn(len(z), 48, generator=g)}
+    fa = FrozenAtoms(model, z, mon, q, R.numpy(), bonds, extra_batch=extra)
+    eng = FF2LongRangeEnergy(model, z, mon, q, cell=None, cutoff_switch="none",
+                             r_cut=50.0, atom_params=fa)
+    comp_pme = eng.components(R / 10.0, None)
+    b1 = {**batch_from_dimers([d0]), **extra}
+    with torch.no_grad():
+        comp_ref, _ = model(b1)
+    assert torch.allclose(comp_pme, comp_ref[0], rtol=1e-7, atol=1e-8)
+
+    # Autograd vs central finite differences on FF2LongRangeEnergy (both non-periodic & periodic SPME)
+    for cell, r_cut, mode in (
+        (None, 50.0, "exact"),
+        (torch.diag(torch.tensor([3.0, 3.0, 3.0], dtype=F64)), 12.0, "table2d"),
+    ):
+        model.kernel_mode = mode
+        e_mod = FF2LongRangeEnergy(
+            model, z, mon, q, cell=cell, r_cut=r_cut,
+            cutoff_switch="none" if cell is None else "cosine",
+            atom_params=fa,
+        )
+        pos_nm = R / 10.0
+        _, f_ag = e_mod.energy_forces(pos_nm, cell)
+        eps = 1e-6
+        f_fd = torch.zeros_like(f_ag)
+        for idx in range(len(z)):
+            for ax in range(3):
+                Rp = pos_nm.clone(); Rp[idx, ax] += eps
+                Rm = pos_nm.clone(); Rm[idx, ax] -= eps
+                ep = e_mod.energy_forces(Rp, cell)[0]
+                em = e_mod.energy_forces(Rm, cell)[0]
+                f_fd[idx, ax] = -(ep - em) / (2 * eps)
+        assert torch.allclose(f_ag, f_fd, rtol=1e-4, atol=1e-4), (mode, (f_ag - f_fd).abs().max())
+    model.kernel_mode = "exact"

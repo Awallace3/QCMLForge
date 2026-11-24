@@ -89,7 +89,8 @@ class FrozenAtoms(nn.Module):
     """
 
     def __init__(self, model, z: Sequence[int], monomer: Sequence[int],
-                 monomer_charge: Sequence[float], R_ref, bonds):
+                 monomer_charge: Sequence[float], R_ref, bonds,
+                 extra_batch: dict | None = None):
         super().__init__()
         from .md import cluster_batch
 
@@ -110,10 +111,14 @@ class FrozenAtoms(nn.Module):
         self.physics_dtype = model.physics_dtype
         b = cluster_batch(z, monomer, monomer_charge, device=dev)
         Rr = torch.as_tensor(np.asarray(R_ref), dtype=torch.float64, device=dev)
+        mono_in = {"z": b["z"], "R": Rr, "edges": b["edges"],
+                   "monomer": b["monomer"],
+                   "monomer_charge": b["monomer_charge"]}
+        if extra_batch is not None:
+            for k, v in extra_batch.items():
+                mono_in[k] = torch.as_tensor(v, device=dev)
         with torch.no_grad():
-            _, at = model._forward_atoms({"z": b["z"], "R": Rr, "edges": b["edges"],
-                                          "monomer": b["monomer"],
-                                          "monomer_charge": b["monomer_charge"]})
+            _, at = model._forward_atoms(mono_in)
         F = frames(Rr, kz, kx, ko)                       # lab -> local
         for key in SCALARS:
             self.register_buffer(f"at_{key}", at[key].detach().clone())
