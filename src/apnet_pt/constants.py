@@ -31,6 +31,8 @@ elem_to_z = {
     'K'  : 19,
     'CA' : 20,
     'Ca' : 20,
+    'ZN' : 30,
+    'Zn' : 30,
     'Br' : 35, 
 }
 
@@ -49,6 +51,7 @@ z_to_elem = {
     17 : 'Cl', 
     19 : 'K',
     20 : 'Ca',
+    30 : 'Zn',
     35 : 'Br', 
 }
 
@@ -69,6 +72,9 @@ z_to_ind = {
     12 : 12,
     19 : 13,
     20 : 14,
+    # Zn: inference-only (MIPC benchmark); no training data, so element-indexed
+    # rows (sized by max Z) keep their initial values in existing checkpoints
+    30 : 15,
 }
 
 pol_free = {

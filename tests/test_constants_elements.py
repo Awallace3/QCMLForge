@@ -15,9 +15,17 @@ def test_alkali_alkaline_earth_elements_are_allowed():
     assert sorted(constants.z_to_ind.values()) == list(range(len(constants.z_to_elem)))
 
 
+def test_zinc_is_allowed_and_indices_are_unchanged():
+    assert constants.z_to_elem[30] == "Zn"
+    assert constants.elem_to_z["Zn"] == constants.elem_to_z["ZN"] == 30
+    assert 30 in constants.ALLOWED_ELEMENTS
+    assert constants.z_to_ind[30] == 15
+    assert [constants.z_to_ind[z] for z in (3, 12, 19, 20)] == [11, 12, 13, 14]
+
+
 def test_load_dimer_dataset_keeps_metal_ion_rows(tmp_path):
     rows = []
-    for zion, q in ((3, 1), (12, 2), (19, 1), (20, 2), (11, 1)):
+    for zion, q in ((3, 1), (12, 2), (19, 1), (20, 2), (11, 1), (30, 2)):
         rows.append({
             "RA": np.zeros((1, 3)), "RB": np.array([[0.0, 0.0, 2.5], [0.0, 0.96, 2.8], [0.0, -0.96, 2.8]]),
             "ZA": np.array([zion]), "ZB": np.array([8, 1, 1]),
@@ -27,4 +35,4 @@ def test_load_dimer_dataset_keeps_metal_ion_rows(tmp_path):
     path = tmp_path / "ions.pkl"
     pd.DataFrame(rows).to_pickle(path)
     out = util.load_dimer_dataset(str(path), columns=["Elst_aug", "Exch_aug", "Ind_aug", "Disp_aug"])
-    assert len(out[0]) == 5
+    assert len(out[0]) == 6
