@@ -1116,6 +1116,40 @@ def test_ff2_covalent_bond_flow_and_so3lr_qeq_compile():
         assert torch.allclose(q_tot, b["monomer_charge"].double(), atol=1e-12)
     assert counters["stats"]["unique_graphs"] == 1
 
+    # 2b. charge_prior="so3lr_qeq" with rho_nu=0.0 & qeq_flow_cap=0.40 strictly
+    # conserves each disconnected covalent fragment's SO3LR QEq charge (zero leakage!)
+    m_nu0 = FF2Model(n_feat=32, n_chan=4, n_layers=2, sr_shell=False,
+                     transverse_invariants=False, alpha_anisotropy=False,
+                     so3lr_backbone="tl-adapter", pol_field="net_multipole",
+                     learnable_a_pol_field=True, covalent_bond_flow=True,
+                     charge_prior="so3lr_qeq", rho_nu=0.0, qeq_flow_cap=0.40)
+    assert m_nu0.config()["rho_nu"] == 0.0
+    assert abs(m_nu0.config()["qeq_flow_cap"] - 0.40) < 1e-12
+    with torch.no_grad():
+        m_nu0.edge_head[-1].weight.fill_(0.25)
+        m_nu0.edge_head[-1].bias.fill_(1.5)
+        m_nu0.charge_head[-1].bias.fill_(3.0)  # must be completely ignored when rho_nu=0
+    # Two-fragment monomer A: water 1 has q=+0.8, water 2 has q=-0.8 (monomer total 0)
+    b_tf_q = with_tlq(b_tf)
+    q_f = torch.tensor([0.2, 0.3, 0.3, -0.4, -0.2, -0.2, -0.4, 0.2, 0.2], dtype=torch.float32)
+    b_tf_q["so3lr_q"] = q_f
+    p_nu0, ex_nu0 = m_nu0(b_tf_q)
+    assert torch.allclose(ex_nu0["nu"], torch.zeros_like(ex_nu0["nu"]), atol=1e-12)
+    # Intra-fragment charges moved (not identical to q_f), yet fragment totals are exact!
+    assert not torch.allclose(ex_nu0["q"][:3], q_f[:3].double(), atol=1e-3)
+    assert abs(float(ex_nu0["q"][:3].sum()) - 0.8) < 1e-6
+    assert abs(float(ex_nu0["q"][3:6].sum()) - (-0.8)) < 1e-6
+    assert abs(float(ex_nu0["q"][6:9].sum()) - 0.0) < 1e-6
+    # Compiles cleanly into 1 graph and produces finite gradients on edge_head
+    counters.clear()
+    comp_nu0 = compile_ff2(m_nu0, backend="eager")
+    p_nu0_c, _ = comp_nu0(b_tf_q)
+    assert torch.allclose(p_nu0, p_nu0_c, rtol=0, atol=1e-10)
+    assert counters["stats"]["unique_graphs"] == 1
+    p_nu0.sum().backward()
+    assert torch.isfinite(m_nu0.edge_head[-1].weight.grad).all()
+    assert float(m_nu0.edge_head[-1].weight.grad.abs().sum()) > 0.0
+
     # 3. Weighted ff1_loss matches unweighted when weights == 1
     p = torch.randn(6, 4, dtype=F64)
     t = torch.randn(6, 4, dtype=F64)

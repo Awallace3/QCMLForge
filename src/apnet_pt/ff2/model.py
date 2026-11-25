@@ -48,6 +48,7 @@ GATE_MODULES = ("wq", "wk", "filt1", "filt2", "w_ev")
 POL_FIELD_MODES = ("charge_penetration", "net_multipole")
 CHARGE_PRIORS = ("bond_flow", "so3lr_qeq")
 QEQ_N_FLOOR = 0.05
+QEQ_FLOW_CAP = 0.20
 A_POL_FIELD_MIN = 0.15
 A_POL_FIELD_MAX = 2.50
 A_POL_FIELD_INIT = 0.70
@@ -134,7 +135,8 @@ class FF2Model(FF1Model):
                  a_pol_field_init: float | None = None,
                  covalent_bond_flow: bool = False,
                  charge_prior: str = "bond_flow",
-                 rho_nu: float = RHO_NU):
+                 rho_nu: float = RHO_NU,
+                 qeq_flow_cap: float = QEQ_FLOW_CAP):
         super().__init__(n_feat, n_chan, n_layers, n_rbf, r_cut, rho_tr,
                          element_init, trunk_dtype, physics_dtype, s_cut,
                          g0_init, elst_beta_def=True, elst_sr_shell=True)
@@ -144,6 +146,10 @@ class FF2Model(FF1Model):
             raise ValueError(f"charge_prior {charge_prior!r} not in {CHARGE_PRIORS}")
         if charge_prior == "so3lr_qeq" and not so3lr_backbone:
             raise ValueError("charge_prior='so3lr_qeq' requires so3lr_backbone")
+        if rho_nu < 0.0:
+            raise ValueError(f"rho_nu must be >= 0, got {rho_nu}")
+        if not (0.0 < qeq_flow_cap < 0.5):
+            raise ValueError(f"qeq_flow_cap must lie in (0, 0.5), got {qeq_flow_cap}")
         if learnable_a_pol_field and pol_field != "net_multipole":
             raise ValueError("learnable_a_pol_field requires pol_field='net_multipole'")
         if pol_field != "net_multipole" and a_pol_field_init is not None:
@@ -160,6 +166,7 @@ class FF2Model(FF1Model):
         self.covalent_bond_flow = bool(covalent_bond_flow)
         self.charge_prior = str(charge_prior)
         self.rho_nu = float(rho_nu)
+        self.qeq_flow_cap = float(qeq_flow_cap)
         self.pol_field = pol_field
         self.learnable_a_pol_field = bool(learnable_a_pol_field)
         if self.pol_field == "net_multipole":
@@ -309,6 +316,8 @@ class FF2Model(FF1Model):
             out["charge_prior"] = self.charge_prior
         if self.rho_nu != RHO_NU:
             out["rho_nu"] = self.rho_nu
+        if self.qeq_flow_cap != QEQ_FLOW_CAP:
+            out["qeq_flow_cap"] = self.qeq_flow_cap
         return out
 
     def a_pol_field(self) -> Tensor | None:
@@ -446,7 +455,7 @@ class FF2Model(FF1Model):
             deg = torch.zeros_like(zact).index_add(0, src, mask).clamp_min(1.0)
             cap = torch.minimum(n_start[src], n_start[dst])
             scale = torch.minimum(1.0 / deg[src], 1.0 / deg[dst])
-            flow = 0.20 * mask * torch.tanh(raw_g) * cap * scale
+            flow = self.qeq_flow_cap * mask * torch.tanh(raw_g) * cap * scale
             n_bond = n_start - torch.zeros_like(zact).index_add(0, src, flow) \
                 + torch.zeros_like(zact).index_add(0, dst, flow)
         else:
@@ -465,10 +474,15 @@ class FF2Model(FF1Model):
             flow = zact[src] * (THETA_MAX * w / den[src])
             n_bond = zact - torch.zeros_like(zact).index_add(0, src, flow) \
                 + torch.zeros_like(zact).index_add(0, dst, flow)
-        raw = self.charge_head(h).to(pd)
-        nu = self.rho_nu * torch.tanh(raw[:, 0] / self.rho_nu)
-        s_pos = SIGMA_MIN + torch.nn.functional.softplus(raw[:, 1])
-        s_neg = SIGMA_MIN + torch.nn.functional.softplus(raw[:, 2])
+        if self.rho_nu == 0.0:
+            nu = torch.zeros_like(zact)
+            s_pos = torch.ones_like(zact)
+            s_neg = torch.ones_like(zact)
+        else:
+            raw = self.charge_head(h).to(pd)
+            nu = self.rho_nu * torch.tanh(raw[:, 0] / self.rho_nu)
+            s_pos = SIGMA_MIN + torch.nn.functional.softplus(raw[:, 1])
+            s_neg = SIGMA_MIN + torch.nn.functional.softplus(raw[:, 2])
         target = q_mon.new_zeros(q_mon.shape).index_add(0, mon, zact) - q_mon
         n0 = n_bond * torch.exp(nu)
         n_act, mu_m, resid = monomer_populations(
