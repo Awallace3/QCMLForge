@@ -427,25 +427,44 @@ class FF2Model(FF1Model):
         zact = self.z_act[z]
         raw_g = self.edge_head(
             torch.cat([h[src], h[dst], geo["rbf"]], dim=1)).squeeze(-1).to(pd)
-        g = G_CENTER + G_HALF * torch.tanh((raw_g - self.g_shift) / G_HALF)
-        w = geo["fc"].to(pd) * torch.exp(g)
-        if self.covalent_bond_flow:
-            same = batch.get("edge_same_frag")
-            if same is None:
-                from ..ff1 import charges as _ff1_ch
-                bonded = (geo["r"].detach().to(pd)
-                          < 1.25 * (self.r_cov[z[src]] + self.r_cov[z[dst]]))
-                frag = _ff1_ch.connected_components(len(z), batch["edges"][:, bonded])
-                same = frag[src] == frag[dst]
-            w = w * same.to(pd)
         if self.charge_prior == "so3lr_qeq":
+            # Start from SO3LR-T-L QEq populations; edge_head is a bounded,
+            # strictly conservative residual flux that is identically 0 when
+            # edge_head[-1] is zeroed (so step 0 matches q_so3lr to round-off)
+            # and guarantees n_bond >= 0.60 * n_start > 0 without clamping.
             n_start = (zact - batch["so3lr_q"].to(pd)).clamp_min(QEQ_N_FLOOR)
+            mask = geo["fc"].to(pd)
+            if self.covalent_bond_flow:
+                same = batch.get("edge_same_frag")
+                if same is None:
+                    from ..ff1 import charges as _ff1_ch
+                    bonded = (geo["r"].detach().to(pd)
+                              < 1.25 * (self.r_cov[z[src]] + self.r_cov[z[dst]]))
+                    frag = _ff1_ch.connected_components(len(z), batch["edges"][:, bonded])
+                    same = frag[src] == frag[dst]
+                mask = mask * same.to(pd)
+            deg = torch.zeros_like(zact).index_add(0, src, mask).clamp_min(1.0)
+            cap = torch.minimum(n_start[src], n_start[dst])
+            scale = torch.minimum(1.0 / deg[src], 1.0 / deg[dst])
+            flow = 0.20 * mask * torch.tanh(raw_g) * cap * scale
+            n_bond = n_start - torch.zeros_like(zact).index_add(0, src, flow) \
+                + torch.zeros_like(zact).index_add(0, dst, flow)
         else:
-            n_start = zact
-        den = 1.0 + torch.zeros_like(zact).index_add(0, src, w)
-        flow = n_start[src] * (THETA_MAX * w / den[src])
-        n_bond = n_start - torch.zeros_like(zact).index_add(0, src, flow) \
-            + torch.zeros_like(zact).index_add(0, dst, flow)
+            g = G_CENTER + G_HALF * torch.tanh((raw_g - self.g_shift) / G_HALF)
+            w = geo["fc"].to(pd) * torch.exp(g)
+            if self.covalent_bond_flow:
+                same = batch.get("edge_same_frag")
+                if same is None:
+                    from ..ff1 import charges as _ff1_ch
+                    bonded = (geo["r"].detach().to(pd)
+                              < 1.25 * (self.r_cov[z[src]] + self.r_cov[z[dst]]))
+                    frag = _ff1_ch.connected_components(len(z), batch["edges"][:, bonded])
+                    same = frag[src] == frag[dst]
+                w = w * same.to(pd)
+            den = 1.0 + torch.zeros_like(zact).index_add(0, src, w)
+            flow = zact[src] * (THETA_MAX * w / den[src])
+            n_bond = zact - torch.zeros_like(zact).index_add(0, src, flow) \
+                + torch.zeros_like(zact).index_add(0, dst, flow)
         raw = self.charge_head(h).to(pd)
         nu = self.rho_nu * torch.tanh(raw[:, 0] / self.rho_nu)
         s_pos = SIGMA_MIN + torch.nn.functional.softplus(raw[:, 1])

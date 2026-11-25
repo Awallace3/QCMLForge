@@ -1092,7 +1092,19 @@ def test_ff2_covalent_bond_flow_and_so3lr_qeq_compile():
                 "so3lr_ev": torch.randn(n, 48, generator=g),
                 "so3lr_q": q_so3}
 
-    # With zero-init charge heads, step 0 reproduces q_so3lr up to the tiny g0_init bond flow
+    # With zero-init edge_head & charge_head, step 0 reproduces q_so3lr EXACTLY (to 1e-12)
+    with torch.no_grad():
+        for layer in (m_qeq.edge_head[-1], m_qeq.charge_head[-1]):
+            torch.nn.init.zeros_(layer.weight)
+            torch.nn.init.zeros_(layer.bias)
+    b_check = with_tlq(batch_from_dimers(ds[:2]))
+    with torch.no_grad():
+        _, ex0 = m_qeq(b_check)
+    assert torch.allclose(ex0["q"], b_check["so3lr_q"].double(), atol=1e-12)
+
+    # Non-zero edge_head still conserves charge and compiles into 1 graph
+    with torch.no_grad():
+        m_qeq.edge_head[-1].weight.fill_(0.05)
     counters.clear()
     compiled = compile_ff2(m_qeq, backend="eager")
     for sub in (ds, ds[:3], ds[1:2]):
