@@ -434,11 +434,12 @@ class _FF2LongRangeCore(nn.Module):
         sj = model._side(aj, zf_k, at_view)
         sc = model._s_cut(r_k)
 
-        elst_fn = (
-            physics.elst_pairs if model.sr_shell else physics.elst_pairs_single
-        )
+        # Keep two-shell elst_pairs here even when sr_shell=False: on V100
+        # (sm_70, torch 2.14 Inductor), flattening MM to (P,) lets Inductor
+        # over-fuse elst + field + exch + disp into one register-spilling
+        # mega-kernel (+20% slower, job 16135764: 98.0 vs 81.4 ms/step).
         elst_slater = physics.by_range(
-            elst_fn,
+            physics.elst_pairs,
             r_k * torch.minimum(model._beta_min(si), model._beta_min(sj)),
             model.point_x,
             model.kernel_mode,
