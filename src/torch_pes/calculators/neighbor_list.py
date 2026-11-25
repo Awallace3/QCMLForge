@@ -120,7 +120,9 @@ def _build_allpairs_periodic(
     pos_w = frac_w @ cell
 
     heights = 1.0 / torch.linalg.norm(inv_cell, dim=0)
-    n_img = [int(math.ceil(r_list / float(h))) + 1 for h in heights]
+    # Wrapped fractional diffs lie in (-1, 1)^3, so any shift with |s_a| >
+    # floor(r_list / h_a) + 1 has perpendicular distance > r_list.
+    n_img = [int(math.floor(r_list / float(h))) + 1 for h in heights]
 
     # Build half-space of lattice shifts: (0,0,0) with i<j, plus positive half-space
     # (first nonzero entry > 0) with ALL (i, j) including i == j!
@@ -383,6 +385,8 @@ class NeighborList:
 
         self._ref_positions: Tensor | None = None
         self._ref_cell: Tensor | None = None
+        self._ref_inv_cell: Tensor | None = None
+        self._ref_frac: Tensor | None = None
         self._all_cap: int = 0
         self._inter_cap: int = 0
         self._all_buf: NeighborBuffers | None = None
@@ -397,8 +401,20 @@ class NeighborList:
         if (cell is None) != (self._ref_cell is None):
             return True
         if cell is not None and self._ref_cell is not None:
-            if float((cell.detach() - self._ref_cell).abs().max().item()) > self.cell_tol:
-                return True
+            cell_d = cell.detach()
+            if float((cell_d - self._ref_cell).abs().max().item()) > 1e-12:
+                # Exact affine-aware triclinic skin criterion for NPT barostats:
+                # any excluded pair had ||d_ref|| >= r_list; under cell_d = ref_cell @ F,
+                # ||d_cur|| >= sigma_min(F) * r_list - 2 * max_i ||pos_i - ref_frac_i @ cell_d||.
+                assert self._ref_inv_cell is not None and self._ref_frac is not None
+                F = self._ref_inv_cell @ cell_d
+                s_min = float(torch.linalg.svdvals(F).min().item())
+                margin = min(s_min * self.r_list - self.r_cut, self.skin) - 1e-9
+                if margin <= 0.0:
+                    return True
+                delta = positions.detach() - self._ref_frac @ cell_d
+                max_disp2 = float((delta * delta).sum(dim=-1).max().item())
+                return max_disp2 > (0.5 * margin) ** 2
         max_disp2 = float(
             ((positions.detach() - self._ref_positions) ** 2).sum(dim=-1).max().item()
         )
@@ -528,7 +544,14 @@ class NeighborList:
             self._inter_buf = self._all_buf
 
         self._ref_positions = pos_d.clone()
-        self._ref_cell = None if cell_d is None else cell_d.clone()
+        if cell_d is not None:
+            self._ref_cell = cell_d.clone()
+            self._ref_inv_cell = torch.linalg.inv(cell_d)
+            self._ref_frac = pos_d @ self._ref_inv_cell
+        else:
+            self._ref_cell = None
+            self._ref_inv_cell = None
+            self._ref_frac = None
         self.n_rebuilds += 1
         return self._inter_buf, self._all_buf
 

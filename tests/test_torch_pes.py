@@ -399,9 +399,30 @@ def test_neighbor_list_cell_matches_brute_force_and_skin_caching():
     pos_small = pos + 0.1 * torch.randn(120, 3, generator=gen, dtype=F64)
     nl.update(pos_small, cell)
     assert nl.n_rebuilds == 1
-    pos_large = pos + 1.0 * torch.randn(120, 3, generator=gen, dtype=F64)
-    nl.update(pos_large, cell)
+    # Small NPT barostat scaling (0.5% contraction) skips rebuild while keeping all pairs < r_cut exact
+    cell_npt = cell * 0.995
+    pos_npt = pos * 0.995 + 0.05 * torch.randn(120, 3, generator=gen, dtype=F64)
+    _, buf_npt = nl.update(pos_npt, cell_npt)
+    assert nl.n_rebuilds == 1
+    m_npt = buf_npt.mask
+    d_npt_all = torch.linalg.norm(
+        pos_npt[buf_npt.aj[m_npt]] - pos_npt[buf_npt.ai[m_npt]] + buf_npt.shift[m_npt] @ cell_npt,
+        dim=-1,
+    )
+    d_npt = d_npt_all[d_npt_all < 8.0].sort().values
+    ai_n, aj_n, sh_n = _build_allpairs_periodic(pos_npt, cell_npt, 8.0)
+    d_npt_ref = torch.linalg.norm(
+        pos_npt[aj_n] - pos_npt[ai_n] + sh_n @ cell_npt, dim=-1
+    ).sort().values
+    assert d_npt.shape == d_npt_ref.shape
+    assert torch.allclose(d_npt, d_npt_ref, atol=1e-12)
+    # Large box contraction (> skin/r_list) triggers rebuild
+    cell_shrink = cell * 0.80
+    nl.update(pos * 0.80, cell_shrink)
     assert nl.n_rebuilds == 2
+    pos_large = pos * 0.80 + 1.0 * torch.randn(120, 3, generator=gen, dtype=F64)
+    nl.update(pos_large, cell_shrink)
+    assert nl.n_rebuilds == 3
 
     # Non-periodic 500 atoms exercises cell-list branch
     pos_np = torch.randn(500, 3, generator=gen, dtype=F64) * 18.0
