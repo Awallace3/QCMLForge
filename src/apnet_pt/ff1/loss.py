@@ -15,18 +15,26 @@ def _huber(x: Tensor, delta: float) -> Tensor:
 
 
 def ff1_loss(pred: Tensor, target: Tensor, nu: Tensor | None = None,
-             **options) -> tuple[Tensor, dict]:
+             weights: Tensor | None = None, **options) -> tuple[Tensor, dict]:
     """Eq. 22 averaged over dimers; ``pred``/``target`` are (n, 4) kcal/mol
-    in [elst, exch, ind, disp] order.  Returns (loss, per-term values)."""
+    in [elst, exch, ind, disp] order.  Optional ``weights`` (n,) weight each
+    dimer's component/total/relative Huber terms (normalized by caller or mean).
+    Returns (loss, per-term values)."""
     o = {**DEFAULTS, **options}
     target = target.to(pred.dtype)
     n = pred.shape[0]
-    comp = _huber(pred - target, o["delta_e"]).sum(1).mean()
-    total = o["w_tot"] * _huber(pred.sum(1) - target.sum(1), o["delta_e"]).mean()
+    w = None if weights is None else weights.to(pred.dtype)
+    if w is None:
+        comp = _huber(pred - target, o["delta_e"]).sum(1).mean()
+        total = o["w_tot"] * _huber(pred.sum(1) - target.sum(1), o["delta_e"]).mean()
+    else:
+        comp = (w * _huber(pred - target, o["delta_e"]).sum(1)).mean()
+        total = o["w_tot"] * (w * _huber(pred.sum(1) - target.sum(1), o["delta_e"])).mean()
     rel = pred.new_zeros(())
     for col, key in ((2, "ind"), (3, "disp")):
         r = (pred[:, col] - target[:, col]) / (target[:, col].abs() + o[f"tau_{key}"])
-        rel = rel + o[f"w_{key}_rel"] * _huber(r, o["delta_rel"]).mean()
+        hr = _huber(r, o["delta_rel"])
+        rel = rel + o[f"w_{key}_rel"] * (hr.mean() if w is None else (w * hr).mean())
     reg = pred.new_zeros(())
     if nu is not None:
         reg = o["w_nu"] * nu.to(pred.dtype).square().sum() / n

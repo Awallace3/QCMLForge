@@ -49,7 +49,7 @@ def batch_from_dimers(dimers: Sequence[dict], r_cut: float = 5.0,
 
 # optional per-atom inputs a store batch may carry (cached backbone features,
 # apnet_pt.ff2.so3lr_backbone); passed through unchanged when present
-OPTIONAL_ATOM_KEYS = ("so3lr_x", "so3lr_ev")
+OPTIONAL_ATOM_KEYS = ("so3lr_x", "so3lr_ev", "so3lr_q")
 
 
 def batch_from_store(batch: dict) -> dict:

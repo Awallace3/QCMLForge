@@ -46,6 +46,8 @@ OPTIONAL_FF1_KEYS = ("beta_def_guess.", "beta_def_head.", "sr_vec_readout.",
 # FF3Layer modules that FF1Layer lacks (identity at init)
 GATE_MODULES = ("wq", "wk", "filt1", "filt2", "w_ev")
 POL_FIELD_MODES = ("charge_penetration", "net_multipole")
+CHARGE_PRIORS = ("bond_flow", "so3lr_qeq")
+QEQ_N_FLOOR = 0.05
 A_POL_FIELD_MIN = 0.15
 A_POL_FIELD_MAX = 2.50
 A_POL_FIELD_INIT = 0.70
@@ -129,12 +131,19 @@ class FF2Model(FF1Model):
                  so3lr_backbone: str = "",
                  pol_field: str = "charge_penetration",
                  learnable_a_pol_field: bool = False,
-                 a_pol_field_init: float | None = None):
+                 a_pol_field_init: float | None = None,
+                 covalent_bond_flow: bool = False,
+                 charge_prior: str = "bond_flow",
+                 rho_nu: float = RHO_NU):
         super().__init__(n_feat, n_chan, n_layers, n_rbf, r_cut, rho_tr,
                          element_init, trunk_dtype, physics_dtype, s_cut,
                          g0_init, elst_beta_def=True, elst_sr_shell=True)
         if pol_field not in POL_FIELD_MODES:
             raise ValueError(f"pol_field {pol_field!r} not in {POL_FIELD_MODES}")
+        if charge_prior not in CHARGE_PRIORS:
+            raise ValueError(f"charge_prior {charge_prior!r} not in {CHARGE_PRIORS}")
+        if charge_prior == "so3lr_qeq" and not so3lr_backbone:
+            raise ValueError("charge_prior='so3lr_qeq' requires so3lr_backbone")
         if learnable_a_pol_field and pol_field != "net_multipole":
             raise ValueError("learnable_a_pol_field requires pol_field='net_multipole'")
         if pol_field != "net_multipole" and a_pol_field_init is not None:
@@ -148,6 +157,9 @@ class FF2Model(FF1Model):
         self.element_alpha_eta = bool(element_alpha_eta)
         self.atomic_dipoles = bool(atomic_dipoles)
         self.atomic_quadrupoles = bool(atomic_quadrupoles)
+        self.covalent_bond_flow = bool(covalent_bond_flow)
+        self.charge_prior = str(charge_prior)
+        self.rho_nu = float(rho_nu)
         self.pol_field = pol_field
         self.learnable_a_pol_field = bool(learnable_a_pol_field)
         if self.pol_field == "net_multipole":
@@ -291,6 +303,12 @@ class FF2Model(FF1Model):
                "learnable_a_pol_field": self.learnable_a_pol_field}
         if self.a_pol_field_init is not None:
             out["a_pol_field_init"] = self.a_pol_field_init
+        if self.covalent_bond_flow:
+            out["covalent_bond_flow"] = True
+        if self.charge_prior != "bond_flow":
+            out["charge_prior"] = self.charge_prior
+        if self.rho_nu != RHO_NU:
+            out["rho_nu"] = self.rho_nu
         return out
 
     def a_pol_field(self) -> Tensor | None:
@@ -373,7 +391,7 @@ class FF2Model(FF1Model):
         pred = torch.stack([elst, exch, e_pol + ct, disp], dim=1) * H2KCAL
         extras = {**{k: at[k] for k in ("q", "mu", "th", "alpha_iso", "nu", "n_act",
                                          "beta", "g_el", "cn", "beta_def", "d_sr",
-                                         "Q_sr", "mu_residual")},
+                                         "Q_sr", "mu_residual", "n0", "s_pos", "s_neg")},
                   "e_pol": e_pol * H2KCAL, "e_ct": ct * H2KCAL,
                   "c6_pair": pr["c6"], "exch_pair": pr["exch"] * H2KCAL,
                   "disp_pair": pr["disp"] * H2KCAL, "ct_pair": pr["ct"] * H2KCAL,
@@ -411,20 +429,34 @@ class FF2Model(FF1Model):
             torch.cat([h[src], h[dst], geo["rbf"]], dim=1)).squeeze(-1).to(pd)
         g = G_CENTER + G_HALF * torch.tanh((raw_g - self.g_shift) / G_HALF)
         w = geo["fc"].to(pd) * torch.exp(g)
+        if self.covalent_bond_flow:
+            same = batch.get("edge_same_frag")
+            if same is None:
+                from ..ff1 import charges as _ff1_ch
+                bonded = (geo["r"].detach().to(pd)
+                          < 1.25 * (self.r_cov[z[src]] + self.r_cov[z[dst]]))
+                frag = _ff1_ch.connected_components(len(z), batch["edges"][:, bonded])
+                same = frag[src] == frag[dst]
+            w = w * same.to(pd)
+        if self.charge_prior == "so3lr_qeq":
+            n_start = (zact - batch["so3lr_q"].to(pd)).clamp_min(QEQ_N_FLOOR)
+        else:
+            n_start = zact
         den = 1.0 + torch.zeros_like(zact).index_add(0, src, w)
-        flow = zact[src] * (THETA_MAX * w / den[src])
-        n_bond = zact - torch.zeros_like(zact).index_add(0, src, flow) \
+        flow = n_start[src] * (THETA_MAX * w / den[src])
+        n_bond = n_start - torch.zeros_like(zact).index_add(0, src, flow) \
             + torch.zeros_like(zact).index_add(0, dst, flow)
         raw = self.charge_head(h).to(pd)
-        nu = RHO_NU * torch.tanh(raw[:, 0] / RHO_NU)
+        nu = self.rho_nu * torch.tanh(raw[:, 0] / self.rho_nu)
         s_pos = SIGMA_MIN + torch.nn.functional.softplus(raw[:, 1])
         s_neg = SIGMA_MIN + torch.nn.functional.softplus(raw[:, 2])
         target = q_mon.new_zeros(q_mon.shape).index_add(0, mon, zact) - q_mon
+        n0 = n_bond * torch.exp(nu)
         n_act, mu_m, resid = monomer_populations(
-            n_bond * torch.exp(nu), s_pos, s_neg, mon, target, self.n_mu_iters)
+            n0, s_pos, s_neg, mon, target, self.n_mu_iters)
         cn = torch.zeros_like(zact).index_add(0, src, geo["fc"].to(pd))
         return {"q": zact - n_act, "n_act": n_act, "nu": nu, "mu_m": mu_m,
-                "mu_residual": resid, "cn": cn}
+                "mu_residual": resid, "cn": cn, "n0": n0, "s_pos": s_pos, "s_neg": s_neg}
 
     def _properties(self, z, h, u, Q, atoms, geo):
         pd = self.physics_dtype

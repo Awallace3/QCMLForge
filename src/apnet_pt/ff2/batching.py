@@ -26,8 +26,33 @@ import torch
 from torch import Tensor
 
 from ..ff1 import batching as ff1_batching
+from ..ff1 import charges as ff1_charges
+from ..ff1 import elements as ff1_elements
 
 with_coordinates = ff1_batching.with_coordinates
+
+_R_COV_CACHE: dict[torch.device, Tensor] = {}
+
+
+def _r_cov_table(device: torch.device) -> Tensor:
+    t = _R_COV_CACHE.get(device)
+    if t is None:
+        t = torch.tensor(ff1_elements.table("r_cov"), dtype=torch.float64, device=device)
+        _R_COV_CACHE[device] = t
+    return t
+
+
+@torch.no_grad()
+def edge_same_fragment(z: Tensor, R: Tensor, edges: Tensor) -> Tensor:
+    """Bool mask (E,) true iff both endpoints lie in the same covalent connected component."""
+    if edges.numel() == 0:
+        return torch.ones((0,), dtype=torch.bool, device=z.device)
+    src, dst = edges
+    r_cov = _r_cov_table(z.device)
+    r = (R[dst].double() - R[src].double()).norm(dim=-1)
+    bonded = r < 1.25 * (r_cov[z[src]] + r_cov[z[dst]])
+    frag = ff1_charges.connected_components(len(z), edges[:, bonded])
+    return frag[src] == frag[dst]
 
 
 def dimer_layout(atom_dimer: Tensor, n_dimer: int) -> dict:
@@ -53,10 +78,16 @@ def prepare(batch: dict) -> dict:
     """An FF-1 batch (``batch_from_dimers``/``batch_from_store`` format) in
     FF-2's format; idempotent."""
     if "slots" in batch:
+        if "R" in batch and "edge_same_frag" not in batch:
+            return {**batch, "edge_same_frag": edge_same_fragment(
+                batch["z"].long(), batch["R"], batch["edges"])}
         return batch
     out = {k: v for k, v in batch.items()
            if k not in ("fragment", "fragment_charge")}
     out.update(dimer_layout(batch["atom_dimer"], int(batch["n"])))
+    if "R" in batch:
+        out["edge_same_frag"] = edge_same_fragment(
+            batch["z"].long(), batch["R"], batch["edges"])
     return out
 
 

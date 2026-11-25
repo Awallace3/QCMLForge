@@ -1022,3 +1022,94 @@ def test_ff2_net_multipole_learnable_a_pol_field_compile_and_pme():
                 f_fd[idx, ax] = -(ep - em) / (2 * eps)
         assert torch.allclose(f_ag, f_fd, rtol=1e-4, atol=1e-4), (mode, (f_ag - f_fd).abs().max())
     model.kernel_mode = "exact"
+
+
+def test_ff2_covalent_bond_flow_and_so3lr_qeq_compile():
+    from torch._dynamo.utils import counters
+    from apnet_pt.ff1.loss import ff1_loss
+
+    torch.manual_seed(23)
+    ds = dimers()
+
+    # 1. covalent_bond_flow blocks non-bonded inter-fragment bond flow (< 5 A)
+    m_all = FF2Model(n_feat=32, n_chan=4, n_layers=2, sr_shell=False,
+                     transverse_invariants=False, alpha_anisotropy=False,
+                     pol_field="net_multipole", learnable_a_pol_field=True,
+                     covalent_bond_flow=False)
+    m_cov = FF2Model(n_feat=32, n_chan=4, n_layers=2, sr_shell=False,
+                     transverse_invariants=False, alpha_anisotropy=False,
+                     pol_field="net_multipole", learnable_a_pol_field=True,
+                     covalent_bond_flow=True)
+    m_cov.load_state_dict(m_all.state_dict(), strict=True)
+    with torch.no_grad():
+        m_all.edge_head[-1].bias.fill_(2.0)
+        m_cov.edge_head[-1].bias.fill_(2.0)
+    # Build a 2-fragment monomer A (two waters 3.0 A apart, inside r_cut=5.0 A) + water B
+    d_twofrag = {
+        "zA": [8, 1, 1, 8, 1, 1],
+        "RA": [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0],
+               [3.0, 0.0, 0.0], [3.96, 0.0, 0.0], [2.76, 0.93, 0.0]],
+        "zB": [8, 1, 1],
+        "RB": [[0.0, 4.0, 0.0], [0.96, 4.0, 0.0], [-0.24, 4.93, 0.0]],
+        "qA": 0.0, "qB": 0.0,
+    }
+    b_tf = batch_from_dimers([d_twofrag])
+    with torch.no_grad():
+        _, ex_all = m_all(b_tf)
+        _, ex_cov = m_cov(b_tf)
+    # With zero charge_head nu, covalent_bond_flow keeps each neutral water fragment strictly neutral
+    assert abs(float(ex_cov["q"][:3].sum())) < 1e-12
+    assert abs(float(ex_cov["q"][3:6].sum())) < 1e-12
+    # And on a single-fragment molecule, covalent_bond_flow matches unmasked identically
+    b_sf = batch_from_dimers(ds[:1])
+    with torch.no_grad():
+        p_all_sf, _ = m_all(b_sf)
+        p_cov_sf, _ = m_cov(b_sf)
+    assert torch.allclose(p_all_sf, p_cov_sf, atol=1e-12)
+    assert "n0" in ex_cov and "s_pos" in ex_cov and "s_neg" in ex_cov
+
+    # 2. charge_prior="so3lr_qeq" + covalent_bond_flow compiles into 1 graph and conserves charge
+    m_qeq = FF2Model(n_feat=32, n_chan=4, n_layers=2, sr_shell=False,
+                     transverse_invariants=False, alpha_anisotropy=False,
+                     so3lr_backbone="tl-adapter", pol_field="net_multipole",
+                     learnable_a_pol_field=True, covalent_bond_flow=True,
+                     charge_prior="so3lr_qeq", rho_nu=0.15)
+    assert m_qeq.config()["covalent_bond_flow"] is True
+    assert m_qeq.config()["charge_prior"] == "so3lr_qeq"
+    assert abs(m_qeq.config()["rho_nu"] - 0.15) < 1e-12
+
+    def with_tlq(b):
+        n = b["z"].shape[0]
+        g = torch.Generator().manual_seed(200 + n)
+        # Generate zero-sum per-monomer synthetic QEq charges matching monomer_charge
+        raw_q = 0.2 * torch.randn(n, generator=g, dtype=F64)
+        mon = b["monomer"]
+        qm = b["monomer_charge"].double()
+        qsum = torch.zeros_like(qm).index_add(0, mon, raw_q)
+        cnt = torch.zeros_like(qm).index_add(0, mon, torch.ones_like(raw_q))
+        q_so3 = (raw_q - ((qsum - qm) / cnt)[mon]).float()
+        return {**b, "so3lr_x": torch.randn(n, 256, generator=g),
+                "so3lr_ev": torch.randn(n, 48, generator=g),
+                "so3lr_q": q_so3}
+
+    # With zero-init charge heads, step 0 reproduces q_so3lr up to the tiny g0_init bond flow
+    counters.clear()
+    compiled = compile_ff2(m_qeq, backend="eager")
+    for sub in (ds, ds[:3], ds[1:2]):
+        b = with_tlq(batch_from_dimers(sub))
+        pe, ex = m_qeq(b)
+        pc, _ = compiled(b)
+        assert torch.allclose(pe, pc, rtol=0, atol=1e-10)
+        q_tot = torch.zeros_like(b["monomer_charge"]).index_add(0, b["monomer"], ex["q"])
+        assert torch.allclose(q_tot, b["monomer_charge"].double(), atol=1e-12)
+    assert counters["stats"]["unique_graphs"] == 1
+
+    # 3. Weighted ff1_loss matches unweighted when weights == 1
+    p = torch.randn(6, 4, dtype=F64)
+    t = torch.randn(6, 4, dtype=F64)
+    nu = torch.randn(18, dtype=F64)
+    l_unw, _ = ff1_loss(p, t, nu=nu)
+    l_one, _ = ff1_loss(p, t, nu=nu, weights=torch.ones(6, dtype=F64))
+    assert torch.allclose(l_unw, l_one, atol=1e-12)
+    l_hi, _ = ff1_loss(p, t, nu=nu, weights=torch.tensor([2.0, 2.0, 0.5, 0.5, 0.5, 0.5], dtype=F64))
+    assert not torch.allclose(l_unw, l_hi)
