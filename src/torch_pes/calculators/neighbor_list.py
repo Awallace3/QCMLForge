@@ -57,13 +57,21 @@ def _pad_pairs(
     capacity: int,
     dtype: torch.dtype,
     device: torch.device,
+    n_atoms: int = 1,
 ) -> NeighborBuffers:
     n_valid = int(ai.shape[0])
     cap = max(capacity, n_valid, 1)
     pad = cap - n_valid
     if pad > 0:
-        ai = torch.cat([ai, torch.zeros(pad, dtype=torch.long, device=device)])
-        aj = torch.cat([aj, torch.zeros(pad, dtype=torch.long, device=device)])
+        # Distribute padded (mask=False) indices across atoms rather than
+        # piling all zeros onto atom 0, avoiding serialized GPU atomicAdd
+        # contention in masked index_add / autograd reductions.
+        if n_atoms > 1:
+            pad_idx = torch.arange(pad, dtype=torch.long, device=device) % n_atoms
+        else:
+            pad_idx = torch.zeros(pad, dtype=torch.long, device=device)
+        ai = torch.cat([ai, pad_idx])
+        aj = torch.cat([aj, pad_idx])
         shift = torch.cat(
             [shift.to(dtype), torch.zeros((pad, 3), dtype=dtype, device=device)]
         )
@@ -460,10 +468,13 @@ class NeighborList:
                 ai, aj = ai_i, aj_i
             shift = torch.zeros((ai.shape[0], 3), dtype=dtype, device=device)
 
+            n_atoms = int(pos_d.shape[0])
             n_all = int(ai.shape[0])
             if n_all > self._all_cap or self._all_cap == 0:
                 self._all_cap = max(int(math.ceil(n_all * self.capacity_factor)), 1)
-            self._all_buf = _pad_pairs(ai, aj, shift, self._all_cap, dtype, device)
+            self._all_buf = _pad_pairs(
+                ai, aj, shift, self._all_cap, dtype, device, n_atoms=n_atoms
+            )
 
             n_inter = int(ai_i.shape[0])
             if n_inter > self._inter_cap or self._inter_cap == 0:
@@ -471,7 +482,7 @@ class NeighborList:
                     int(math.ceil(n_inter * self.capacity_factor)), 1
                 )
             self._inter_buf = _pad_pairs(
-                ai_i, aj_i, sh_i, self._inter_cap, dtype, device
+                ai_i, aj_i, sh_i, self._inter_cap, dtype, device, n_atoms=n_atoms
             )
             self._ref_positions = pos_d.clone()
             self._ref_cell = None
@@ -479,11 +490,14 @@ class NeighborList:
             return self._inter_buf, self._all_buf
 
         ai, aj, shift = _build_cell_list(pos_d, cell_d, self.r_list)
+        n_atoms = int(pos_d.shape[0])
 
         n_all = int(ai.shape[0])
         if n_all > self._all_cap or self._all_cap == 0:
             self._all_cap = max(int(math.ceil(n_all * self.capacity_factor)), 1)
-        self._all_buf = _pad_pairs(ai, aj, shift, self._all_cap, dtype, device)
+        self._all_buf = _pad_pairs(
+            ai, aj, shift, self._all_cap, dtype, device, n_atoms=n_atoms
+        )
 
         if self.monomer is not None:
             mon = self.monomer.to(device=device)
@@ -508,7 +522,7 @@ class NeighborList:
             if n_inter > self._inter_cap or self._inter_cap == 0:
                 self._inter_cap = max(int(math.ceil(n_inter * self.capacity_factor)), 1)
             self._inter_buf = _pad_pairs(
-                ai_i, aj_i, sh_i, self._inter_cap, dtype, device
+                ai_i, aj_i, sh_i, self._inter_cap, dtype, device, n_atoms=n_atoms
             )
         else:
             self._inter_buf = self._all_buf

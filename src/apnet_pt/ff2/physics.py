@@ -22,9 +22,10 @@ from ..ff1.physics import (A_POL, beta_pol, charge_transfer_pairs,
 from . import kernels as K
 
 __all__ = ["A_POL", "beta_pol", "charge_transfer_pairs", "dispersion_pairs",
-           "exchange_pairs", "elst_pairs", "permanent_field",
-           "permanent_field_net", "transverse_invariants", "polarization",
-           "polarization_system", "cg_solve", "by_range", "expm_sym"]
+           "exchange_pairs", "elst_pairs", "elst_pairs_single",
+           "permanent_field", "permanent_field_net", "permanent_field_net_pair",
+           "transverse_invariants", "polarization", "polarization_system",
+           "cg_solve", "by_range", "expm_sym"]
 
 
 def _dot(a: Tensor, b: Tensor) -> Tensor:
@@ -146,6 +147,65 @@ def elst_pairs(r: Tensor, rhat: Tensor, i: dict, j: dict,
     return energy + mm.sum((1, 2))
 
 
+def elst_pairs_single(r: Tensor, rhat: Tensor, i: dict, j: dict,
+                      mode: str = "exact") -> Tensor:
+    """Exact single-shell Coulomb energy (E_h) when ``sr_shell=False``
+    (shell 1 moments ``M[:, 1]`` and ``T[:, 1]`` are identically zero).
+
+    Mathematically identical to :func:`elst_pairs` for ``sr_shell=False``,
+    eliminating 3/4 of the two-center ``MM`` kernel evaluations and 1/2 of
+    the ``CHARGE_SHELL`` evaluations.
+    """
+    rc = r[:, None]
+    tc = _two(torch.stack([i["b"], i["bc"], i["b"], i["bc"]], 1),
+              torch.stack([j["b"], j["b"], j["bc"], j["bc"]], 1),
+              rc, K.BAR1, mode)[..., 0]
+    oc = _one(torch.stack([j["b"], i["b"], j["bc"], i["bc"]], 1),
+              rc, K.BAR1, mode)[..., 0]
+    bar = (-i["z"] * (j["nc"] * oc[:, 2] + j["n"] * oc[:, 0])
+           - j["z"] * (i["nc"] * oc[:, 3] + i["n"] * oc[:, 1])
+           + i["nc"] * j["nc"] * tc[:, 3] + i["nc"] * j["n"] * tc[:, 1]
+           + i["n"] * j["nc"] * tc[:, 2] + i["n"] * j["n"] * tc[:, 0])
+    energy = i["q"] * j["q"] / r - bar
+
+    def two(key):
+        return torch.stack([i[key], j[key]], 1)
+
+    bi0, bj0 = i["bs"][:, 0], j["bs"][:, 0]
+    Mi, Mj = i["M"][:, 0], j["M"][:, 0]
+    Ti, Tj = i["T"][:, 0], j["T"][:, 0]
+
+    # charges of one side (axis 1: i, j) vs the other side's single shell
+    shell_b = torch.stack([bj0, bi0], 1)                         # (P, 2)
+    shell_M = torch.stack([Mj, Mi], 1)                           # (P, 2, 3)
+    shell_T = torch.stack([Tj, Ti], 1)                           # (P, 2, 3, 3)
+    clouds = torch.stack([two("bc"), two("b")], 2)               # (P, 2, 2)
+    cloud = _two(clouds, shell_b[:, :, None], r[:, None, None],
+                 K.CHARGE_SHELL, mode)                           # (P, 2, 2c, 2)
+    nuc = _one(shell_b, r[:, None], K.CHARGE_SHELL, mode)        # (P, 2, 2)
+    k = (two("z")[:, :, None] * nuc
+         - two("nc")[:, :, None] * cloud[:, :, 0]
+         - two("n")[:, :, None] * cloud[:, :, 1])
+    rh = rhat[:, None, :]
+    u = _dot(shell_M, rh)                                        # (P, 2)
+    t = _dot(_mat_vec(shell_T, rh), rh)
+    sign = torch.tensor([-1.0, 1.0], dtype=r.dtype, device=r.device)
+    energy = energy + (sign * k[..., 0] * u + k[..., 1] * t).sum(1)
+
+    # single-shell multipole-multipole (1 x 1 instead of 2 x 2)
+    a = _two(bi0, bj0, r, K.MM, mode)                            # (P, 7)
+    a53, a33, a74, a54, a95, a75, a55 = a.unbind(-1)
+    ui, uj = _dot(Mi, rhat), _dot(Mj, rhat)
+    Ri, Rj = _mat_vec(Ti, rhat), _mat_vec(Tj, rhat)
+    ti, tj = _dot(Ri, rhat), _dot(Rj, rhat)
+    mm = (-(3.0 * a53 * ui * uj - a33 * _dot(Mi, Mj))
+          + (5.0 * a74 * ui * tj - 2.0 * a54 * _dot(Mi, Rj))
+          - (5.0 * a74 * uj * ti - 2.0 * a54 * _dot(Mj, Ri))
+          + (35.0 / 3.0 * a95 * ti * tj - 20.0 / 3.0 * a75 * _dot(Ri, Rj)
+             + 2.0 / 3.0 * a55 * (Ti * Tj).sum((-1, -2))))
+    return energy + mm
+
+
 def permanent_field(r: Tensor, rhat: Tensor, beta_probe: Tensor, src: dict,
                     mode: str = "exact") -> Tensor:
     """Field (E_h/(e bohr)) of ``src``'s two-shell density on a
@@ -179,6 +239,49 @@ def permanent_field_net(r: Tensor, rhat: Tensor, beta_probe: Tensor,
     tr = _dot(th_r, rhat)
     return ((a32 * q + 3.0 * a53 * ur + 5.0 * a74 * tr)[:, None] * rhat
             - a33[:, None] * mu - 2.0 * a54[:, None] * th_r)
+
+
+def permanent_field_net_pair(
+    r: Tensor,
+    rhat: Tensor,
+    beta_i: Tensor,
+    beta_j: Tensor,
+    qi: Tensor,
+    mui: Tensor,
+    thi: Tensor,
+    qj: Tensor,
+    muj: Tensor,
+    thj: Tensor,
+    mode: str = "exact",
+) -> Tensor:
+    """Symmetric pair evaluation of :func:`permanent_field_net` for both
+    directions ``(i <- j, j <- i)`` sharing one symmetric two-center kernel call.
+
+    ``rhat`` points from ``i`` to ``j``. Returns shape ``(P, 2, 3)`` where
+    ``[:, 0]`` is the field on ``i`` due to ``j`` (source-to-probe ``-rhat``)
+    and ``[:, 1]`` is the field on ``j`` due to ``i`` (source-to-probe ``+rhat``).
+    """
+    a = _two(beta_i, beta_j, r, K.FIELD_SPECS, mode)
+    a32, a53, a33, a74, a54 = a.unbind(-1)
+
+    ur_j = _dot(muj, rhat)
+    th_r_j = _mat_vec(thj, rhat)
+    tr_j = _dot(th_r_j, rhat)
+    f_on_i = (
+        (-a32 * qj + 3.0 * a53 * ur_j - 5.0 * a74 * tr_j)[:, None] * rhat
+        - a33[:, None] * muj
+        + 2.0 * a54[:, None] * th_r_j
+    )
+
+    ur_i = _dot(mui, rhat)
+    th_r_i = _mat_vec(thi, rhat)
+    tr_i = _dot(th_r_i, rhat)
+    f_on_j = (
+        (a32 * qi + 3.0 * a53 * ur_i + 5.0 * a74 * tr_i)[:, None] * rhat
+        - a33[:, None] * mui
+        - 2.0 * a54[:, None] * th_r_i
+    )
+    return torch.stack([f_on_i, f_on_j], dim=1)
 
 
 def transverse_invariants(rhat: Tensor, ui: Tensor, Qi: Tensor, uj: Tensor,

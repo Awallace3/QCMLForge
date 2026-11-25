@@ -936,4 +936,88 @@ def test_ff2_mixed_precision_compiled(chunk):
     assert float((f2 - fr2).abs().max()) < 1e-3
 
 
+def test_ff2_fast_paths_exact_equivalence():
+    """Verify exact numerical equivalence of single-shell elst_pairs_single,
+    symmetric permanent_field_net_pair, isotropic CG, distributed padding, and
+    tighter skin/capacity_factor against the general two-shell path."""
+    z, mon, q, x_p, box_nm = _periodic_water_nh3_box()
+    torch.manual_seed(21)
+    ff1 = FF1Model(
+        n_feat=32, n_chan=4, n_layers=2, n_rbf=8,
+        trunk_dtype=F64, physics_dtype=F64, g0_init=-2.5,
+        elst_beta_def=True, elst_sr_shell=True,
+    )
+    with torch.no_grad():
+        for prm in ff1.parameters():
+            prm.add_(0.10 * torch.randn_like(prm))
+    m_fast = FF2Model.from_ff1(
+        ff1, sr_shell=False, alpha_anisotropy=False,
+        pol_field="net_multipole", learnable_a_pol_field=True,
+    ).eval()
+    m_fast.kernel_mode = "table"
+
+    # Reference model with sr_shell=True but zeroed sr-shell heads (identical physics!)
+    m_ref = FF2Model.from_ff1(
+        ff1, sr_shell=True, alpha_anisotropy=True,
+        pol_field="net_multipole", learnable_a_pol_field=True,
+    ).eval()
+    with torch.no_grad():
+        m_ref.a_pol_field_raw.copy_(m_fast.a_pol_field_raw)
+        for p_sr in (*m_ref.sr_vec_readout.parameters(), *m_ref.sr_ten_readout.parameters()):
+            p_sr.zero_()
+        # Zero alpha-anisotropy tensor slice so expm_sym(0) == I_3
+        m_ref.ten_readout.weight[-1].zero_()
+    m_ref.kernel_mode = "table"
+
+    # 1. Direct kernel checks (elst_pairs_single vs elst_pairs, permanent_field_net_pair vs permanent_field_net)
+    R_b, at = m_fast.forward_monomers({
+        "z": torch.tensor(z), "R": x_p * 10.0,
+        "edges": torch.zeros((2, 0), dtype=torch.long),
+        "monomer": torch.tensor(mon), "monomer_charge": torch.tensor(q, dtype=F64),
+    })
+    ai = torch.arange(0, 12)
+    aj = torch.arange(12, 24)
+    diff = (R_b[aj] - R_b[ai]).detach().requires_grad_(True)
+    r = diff.norm(dim=-1)
+    rhat = diff / r[:, None]
+    zf = torch.tensor(z, dtype=F64)
+    si, sj = m_fast._side(ai, zf, at), m_fast._side(aj, zf, at)
+    e_single = physics.elst_pairs_single(r, rhat, si, sj, mode="table")
+    e_two = physics.elst_pairs(r, rhat, si, sj, mode="table")
+    assert float((e_single - e_two).abs().max()) < 1e-14
+    (g_single,) = torch.autograd.grad(e_single.sum(), diff, retain_graph=True)
+    (g_two,) = torch.autograd.grad(e_two.sum(), diff, retain_graph=True)
+    assert float((g_single - g_two).abs().max()) < 1e-13
+
+    bp = at["beta_pol"] * m_fast.pol_field_scale()
+    fp_sym = physics.permanent_field_net_pair(
+        r, rhat, bp[ai], bp[aj],
+        at["q"][ai], at["mu"][ai], at["th"][ai],
+        at["q"][aj], at["mu"][aj], at["th"][aj], mode="table",
+    )
+    fp_i_ref = physics.permanent_field_net(
+        r, -rhat, bp[ai], bp[aj], at["q"][aj], at["mu"][aj], at["th"][aj], mode="table",
+    )
+    fp_j_ref = physics.permanent_field_net(
+        r, rhat, bp[aj], bp[ai], at["q"][ai], at["mu"][ai], at["th"][ai], mode="table",
+    )
+    assert float((fp_sym[:, 0] - fp_i_ref).abs().max()) < 1e-14
+    assert float((fp_sym[:, 1] - fp_j_ref).abs().max()) < 1e-14
+
+    # 2. Full periodic FF2LongRangeEnergy equivalence (fast vs ref, and skin=0.8/cap=1.08 vs skin=1.5/cap=1.25)
+    lr_ref = FF2LongRangeEnergy(
+        m_ref, z, mon, q, r_cut=6.0, skin=1.5, capacity_factor=1.25,
+        cell=box_nm, pbc=True, accuracy=1e-6, pol_cg_iters=15, precision="fp64",
+    )
+    lr_fast = FF2LongRangeEnergy(
+        m_fast, z, mon, q, r_cut=6.0, skin=0.8, capacity_factor=1.08,
+        cell=box_nm, pbc=True, accuracy=1e-6, pol_cg_iters=15, precision="fp64",
+    )
+    e_ref, f_ref = lr_ref.energy_forces(x_p, box_nm)
+    e_fast, f_fast = lr_fast.energy_forces(x_p, box_nm)
+    assert abs(float(e_fast - e_ref)) < 1e-10
+    assert float((f_fast - f_ref).abs().max()) < 1e-9
+
+
+
 

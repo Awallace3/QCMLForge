@@ -185,6 +185,7 @@ def _sparse_cg_solve(
     n_iter: int,
     pme: MultipolePME | None = None,
     spme_state: SPMEState | None = None,
+    isotropic: bool = False,
 ) -> Tensor:
     """Fixed-step CG solve of ``(I + S T_pol S) w = rhs`` with ZERO dense
     ``(3N, 3N)`` matrices.
@@ -193,6 +194,7 @@ def _sparse_cg_solve(
     identically ``I_3``, so unpreconditioned CG is already block-Jacobi scaled.
     """
     S = sqrt_alpha.detach()
+    s_iso = S[:, 0, 0] if isotropic else None
     r_h = rhat.detach()
     c33 = l33_sr.detach()
     c53 = l53_sr.detach()
@@ -214,11 +216,11 @@ def _sparse_cg_solve(
         )
 
     def matvec(v: Tensor) -> Tensor:
-        p_vec = _mat_vec(S, v)
+        p_vec = (s_iso[:, None] * v) if s_iso is not None else _mat_vec(S, v)
         tp = _sparse_dipole_matvec(p_vec, pk, pl, r_h, c33, c53)
         if pme is not None and st_det is not None:
             tp = tp + pme.reciprocal_dipole_matvec(p_vec, st_det)
-        return v + _mat_vec(S, tp)
+        return v + ((s_iso[:, None] * tp) if s_iso is not None else _mat_vec(S, tp))
 
     w = b.clone()
     r = b - matvec(w)
@@ -432,8 +434,11 @@ class _FF2LongRangeCore(nn.Module):
         sj = model._side(aj, zf_k, at_view)
         sc = model._s_cut(r_k)
 
+        elst_fn = (
+            physics.elst_pairs if model.sr_shell else physics.elst_pairs_single
+        )
         elst_slater = physics.by_range(
-            physics.elst_pairs,
+            elst_fn,
             r_k * torch.minimum(model._beta_min(si), model._beta_min(sj)),
             model.point_x,
             model.kernel_mode,
@@ -443,33 +448,73 @@ class _FF2LongRangeCore(nn.Module):
             sj,
         ).to(sd)
 
-        probe = torch.cat([ai, aj])
-        source = torch.cat([aj, ai])
-        r2_both = torch.cat([r, r])
-        rhat_both = torch.cat([-rhat, rhat])
-        r2_both_k = torch.cat([r_k, r_k])
-        rhat_both_k = torch.cat([-rhat_k, rhat_k])
         if model.pol_field == "net_multipole":
             c_dir = model.pol_field_scale()
             if isinstance(c_dir, Tensor):
                 c_dir = c_dir.to(kd)
             bp_f_k = beta_pol.to(kd) * c_dir
-            bp_probe_k = bp_f_k[probe]
-            bp_src_k = bp_f_k[source]
-            f_slater = physics.by_range(
-                physics.permanent_field_net,
-                r2_both_k * torch.minimum(bp_probe_k, bp_src_k),
+            bp_i_k, bp_j_k = bp_f_k[ai], bp_f_k[aj]
+            q_k, mu_k, th_k = q_tot.to(kd), mu_tot.to(kd), th_tot.to(kd)
+            f_pair = physics.by_range(
+                physics.permanent_field_net_pair,
+                r_k * torch.minimum(bp_i_k, bp_j_k),
                 model.point_x,
                 model.kernel_mode,
-                r2_both_k,
-                rhat_both_k,
-                bp_probe_k,
-                bp_src_k,
-                q_tot.to(kd)[source],
-                mu_tot.to(kd)[source],
-                th_tot.to(kd)[source],
+                r_k,
+                rhat_k,
+                bp_i_k,
+                bp_j_k,
+                q_k[ai],
+                mu_k[ai],
+                th_k[ai],
+                q_k[aj],
+                mu_k[aj],
+                th_k[aj],
             )
+            if sc is not None:
+                f_pair = f_pair * sc[:, None, None]
+            f_pair = f_pair.to(sd)
+            f_slater_i, f_slater_j = f_pair[:, 0], f_pair[:, 1]
+            if self.pbc:
+                assert self.elst_pme is not None
+                boys_erf = ewald_boys_erf(r, self.elst_pme.alpha)
+                elst_erf = multipole_pair_energy(
+                    r,
+                    rhat,
+                    q_tot[ai],
+                    mu_tot[ai],
+                    th_tot[ai],
+                    q_tot[aj],
+                    mu_tot[aj],
+                    th_tot[aj],
+                    boys_erf,
+                )
+                e_elst_sr = ((elst_slater - elst_erf) * w_active).sum()
+                f_erf_i = multipole_pair_field(
+                    r, -rhat, q_tot[aj], mu_tot[aj], th_tot[aj], boys_erf
+                )
+                f_erf_j = multipole_pair_field(
+                    r, rhat, q_tot[ai], mu_tot[ai], th_tot[ai], boys_erf
+                )
+                field_sr = (
+                    R_b.new_zeros(R_b.shape)
+                    .index_add(0, ai, (f_slater_i - f_erf_i) * w_active[:, None])
+                    .index_add(0, aj, (f_slater_j - f_erf_j) * w_active[:, None])
+                )
+            else:
+                e_elst_sr = (elst_slater * w_pair).sum()
+                field_sr = (
+                    R_b.new_zeros(R_b.shape)
+                    .index_add(0, ai, f_slater_i * w_pair[:, None])
+                    .index_add(0, aj, f_slater_j * w_pair[:, None])
+                )
         else:
+            probe = torch.cat([ai, aj])
+            source = torch.cat([aj, ai])
+            r2_both = torch.cat([r, r])
+            rhat_both = torch.cat([-rhat, rhat])
+            r2_both_k = torch.cat([r_k, r_k])
+            rhat_both_k = torch.cat([-rhat_k, rhat_k])
             src_both = model._side(source, zf_k, at_view)
             bp_probe_k = beta_pol.to(kd)[probe]
             f_slater = physics.by_range(
@@ -482,40 +527,40 @@ class _FF2LongRangeCore(nn.Module):
                 bp_probe_k,
                 src_both,
             )
-        if sc is not None:
-            f_slater = f_slater * torch.cat([sc, sc])[:, None]
-        f_slater = f_slater.to(sd)
+            if sc is not None:
+                f_slater = f_slater * torch.cat([sc, sc])[:, None]
+            f_slater = f_slater.to(sd)
 
-        if self.pbc:
-            assert self.elst_pme is not None
-            boys_erf = ewald_boys_erf(r, self.elst_pme.alpha)
-            elst_erf = multipole_pair_energy(
-                r,
-                rhat,
-                q_tot[ai],
-                mu_tot[ai],
-                th_tot[ai],
-                q_tot[aj],
-                mu_tot[aj],
-                th_tot[aj],
-                boys_erf,
-            )
-            e_elst_sr = ((elst_slater - elst_erf) * w_active).sum()
-            boys_erf_both = tuple(torch.cat([b, b]) for b in boys_erf)
-            f_erf = multipole_pair_field(
-                r2_both,
-                rhat_both,
-                q_tot[source],
-                mu_tot[source],
-                th_tot[source],
-                boys_erf_both,
-            )
-            f_sr_pair = (f_slater - f_erf) * torch.cat([w_active, w_active])[:, None]
-            field_sr = R_b.new_zeros(R_b.shape).index_add(0, probe, f_sr_pair)
-        else:
-            e_elst_sr = (elst_slater * w_pair).sum()
-            w_both = torch.cat([w_pair, w_pair])[:, None]
-            field_sr = R_b.new_zeros(R_b.shape).index_add(0, probe, f_slater * w_both)
+            if self.pbc:
+                assert self.elst_pme is not None
+                boys_erf = ewald_boys_erf(r, self.elst_pme.alpha)
+                elst_erf = multipole_pair_energy(
+                    r,
+                    rhat,
+                    q_tot[ai],
+                    mu_tot[ai],
+                    th_tot[ai],
+                    q_tot[aj],
+                    mu_tot[aj],
+                    th_tot[aj],
+                    boys_erf,
+                )
+                e_elst_sr = ((elst_slater - elst_erf) * w_active).sum()
+                boys_erf_both = tuple(torch.cat([b, b]) for b in boys_erf)
+                f_erf = multipole_pair_field(
+                    r2_both,
+                    rhat_both,
+                    q_tot[source],
+                    mu_tot[source],
+                    th_tot[source],
+                    boys_erf_both,
+                )
+                f_sr_pair = (f_slater - f_erf) * torch.cat([w_active, w_active])[:, None]
+                field_sr = R_b.new_zeros(R_b.shape).index_add(0, probe, f_sr_pair)
+            else:
+                e_elst_sr = (elst_slater * w_pair).sum()
+                w_both = torch.cat([w_pair, w_pair])[:, None]
+                field_sr = R_b.new_zeros(R_b.shape).index_add(0, probe, f_slater * w_both)
 
         # Exchange & charge transfer in pair_dtype (kd), summed in state_dtype (sd)
         vecs_k, tens_k = vecs.to(kd), tens.to(kd)
@@ -922,7 +967,9 @@ class _FF2LongRangeCore(nn.Module):
             l33_sr, l53_sr = fn_pol(bp[pol_k], bp[pol_l], r_p, w_pol)
 
         S = at["sqrt_alpha"].to(pd)
-        rhs = _mat_vec(S, field)
+        iso_pol = not model.alpha_anisotropy
+        s_iso = S[:, 0, 0] if iso_pol else None
+        rhs = (s_iso[:, None] * field) if s_iso is not None else _mat_vec(S, field)
         with torch.no_grad():
             w_star = _sparse_cg_solve(
                 S,
@@ -935,9 +982,10 @@ class _FF2LongRangeCore(nn.Module):
                 self.pol_cg_iters,
                 pme=self.elst_pme if self.pbc else None,
                 spme_state=spme_state if self.pbc else None,
+                isotropic=iso_pol,
             )
 
-        p_ind = _mat_vec(S, w_star)
+        p_ind = (s_iso[:, None] * w_star) if s_iso is not None else _mat_vec(S, w_star)
         pk_v, pl_v = p_ind[pol_k], p_ind[pol_l]
         e_pol_pair = (
             l33_sr * _dot(pk_v, pl_v)
@@ -1085,6 +1133,7 @@ class FF2LongRangeEnergy(nn.Module):
         pair_chunk_size: int | None = None,
         precision: str | None = None,
         atom_params: nn.Module | None = None,
+        capacity_factor: float = 1.25,
     ):
         super().__init__()
         self.model = model
@@ -1192,6 +1241,7 @@ class FF2LongRangeEnergy(nn.Module):
             r_cut=self.r_cut_nm,
             skin=self.skin_nm,
             monomer=topo["monomer"],
+            capacity_factor=capacity_factor,
             group_cutoff=(not self.pbc) and (cutoff_switch == "group"),
         )
         if cell is not None:
