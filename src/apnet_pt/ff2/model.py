@@ -29,6 +29,8 @@ import math
 import torch
 from torch import Tensor, nn
 
+from pathlib import Path
+
 from ..ff1.model import (BETA_DEF_BOUND, EPS_ALPHA, EPS_EL, G_CENTER, G_HALF,
                          GUESS_NAMES, H2KCAL, RHO_NU, SCALAR_HEADS,
                          SIGMA_MIN, SR_SHELL_CAP, TENSOR_HEADS, THETA_MAX,
@@ -37,7 +39,8 @@ from ..ff1.trunk import ANG2BOHR, EPS_U
 from . import physics
 from .charges import N_ITERS, monomer_populations
 from .kernels import safe_unit
-from .so3lr_backbone import BACKBONES, SO3LRFeatureTrunk
+from .so3lr_backbone import BACKBONE_SPECS, BACKBONES, SO3LRFeatureTrunk
+from .so3lr_trunk import SO3LRTrunk
 from .trunk import FF3MonomerTrunk, identity_init_layer
 
 G0_INIT = -2.5
@@ -47,6 +50,7 @@ OPTIONAL_FF1_KEYS = ("beta_def_guess.", "beta_def_head.", "sr_vec_readout.",
 GATE_MODULES = ("wq", "wk", "filt1", "filt2", "w_ev")
 POL_FIELD_MODES = ("charge_penetration", "net_multipole")
 CHARGE_PRIORS = ("bond_flow", "so3lr_qeq")
+CHARGE_EQUILIBRATIONS = ("monomer", "fragment_qeq")
 QEQ_N_FLOOR = 0.05
 QEQ_FLOW_CAP = 0.20
 A_POL_FIELD_MIN = 0.15
@@ -130,11 +134,13 @@ class FF2Model(FF1Model):
                  charge_embedding: bool = False, attention: bool = False,
                  euclidean_variables: bool = False, n_identity_layers: int = 0,
                  so3lr_backbone: str = "",
+                 embed_so3lr_trunk: bool = False,
                  pol_field: str = "charge_penetration",
                  learnable_a_pol_field: bool = False,
                  a_pol_field_init: float | None = None,
                  covalent_bond_flow: bool = False,
                  charge_prior: str = "bond_flow",
+                 charge_equilibration: str = "monomer",
                  rho_nu: float = RHO_NU,
                  qeq_flow_cap: float = QEQ_FLOW_CAP):
         super().__init__(n_feat, n_chan, n_layers, n_rbf, r_cut, rho_tr,
@@ -146,6 +152,15 @@ class FF2Model(FF1Model):
             raise ValueError(f"charge_prior {charge_prior!r} not in {CHARGE_PRIORS}")
         if charge_prior == "so3lr_qeq" and not so3lr_backbone:
             raise ValueError("charge_prior='so3lr_qeq' requires so3lr_backbone")
+        if charge_equilibration not in CHARGE_EQUILIBRATIONS:
+            raise ValueError(
+                f"charge_equilibration {charge_equilibration!r} not in "
+                f"{CHARGE_EQUILIBRATIONS}")
+        if charge_equilibration == "fragment_qeq" and not so3lr_backbone:
+            raise ValueError(
+                "charge_equilibration='fragment_qeq' requires so3lr_backbone")
+        if embed_so3lr_trunk and not so3lr_backbone:
+            raise ValueError("embed_so3lr_trunk=True requires so3lr_backbone")
         if rho_nu < 0.0:
             raise ValueError(f"rho_nu must be >= 0, got {rho_nu}")
         if not (0.0 < qeq_flow_cap < 0.5):
@@ -165,6 +180,7 @@ class FF2Model(FF1Model):
         self.atomic_quadrupoles = bool(atomic_quadrupoles)
         self.covalent_bond_flow = bool(covalent_bond_flow)
         self.charge_prior = str(charge_prior)
+        self.charge_equilibration = str(charge_equilibration)
         self.rho_nu = float(rho_nu)
         self.qeq_flow_cap = float(qeq_flow_cap)
         self.pol_field = pol_field
@@ -208,25 +224,33 @@ class FF2Model(FF1Model):
         self.register_buffer("ct_grad_scale", torch.tensor(1.0, dtype=pd),
                              persistent=False)
         self._build_backbone(charge_embedding, attention, euclidean_variables,
-                             n_identity_layers, so3lr_backbone)
+                             n_identity_layers, so3lr_backbone, embed_so3lr_trunk)
 
     def _build_backbone(self, charge_embedding, attention, euclidean_variables,
-                        n_identity_layers, so3lr_backbone=""):
+                        n_identity_layers, so3lr_backbone="",
+                        embed_so3lr_trunk: bool = False):
         """The FF-3 trunk options; all off leaves FF-1's trunk untouched."""
         self.so3lr_backbone = str(so3lr_backbone or "")
+        self.so3lr_trunk: SO3LRTrunk | None = None
         if self.so3lr_backbone:
             if self.so3lr_backbone not in BACKBONES:
                 raise ValueError(f"so3lr_backbone {so3lr_backbone!r} not in {BACKBONES}")
             if charge_embedding or attention or euclidean_variables or n_identity_layers:
                 raise ValueError("so3lr_backbone replaces the FF-1 trunk; it does not "
                                  "combine with the FF-3 trunk options")
+            spec = BACKBONE_SPECS[self.so3lr_backbone]
             base = self.trunk
             self.charge_embedding = self.attention = self.euclidean_variables = False
             self.n_identity_layers = 0
             self.trunk = SO3LRFeatureTrunk(
                 base.n_feat, base.n_chan, base.rbf.centers.numel(), base.r_cut,
-                base.layers[0].rho, adapter=self.so3lr_backbone == "tl-adapter"
+                base.layers[0].rho, adapter=spec["adapter"],
+                x_dim=spec["x_dim"], degrees=spec["degrees"],
             ).to(self.trunk_dtype)
+            if embed_so3lr_trunk:
+                trunk = SO3LRTrunk.from_preset(spec["preset"]).to(self.trunk_dtype)
+                trunk.requires_grad_(False)
+                self.so3lr_trunk = trunk
             return
         self.charge_embedding = bool(charge_embedding)
         self.attention = bool(attention)
@@ -314,11 +338,55 @@ class FF2Model(FF1Model):
             out["covalent_bond_flow"] = True
         if self.charge_prior != "bond_flow":
             out["charge_prior"] = self.charge_prior
+        if self.charge_equilibration != "monomer":
+            out["charge_equilibration"] = self.charge_equilibration
         if self.rho_nu != RHO_NU:
             out["rho_nu"] = self.rho_nu
         if self.qeq_flow_cap != QEQ_FLOW_CAP:
             out["qeq_flow_cap"] = self.qeq_flow_cap
+        if self.so3lr_trunk is not None:
+            out["embed_so3lr_trunk"] = True
         return out
+
+    def attach_so3lr_trunk(
+        self,
+        trunk_or_dir: SO3LRTrunk | str | Path,
+        *,
+        freeze: bool = True,
+    ) -> "FF2Model":
+        """Fuse a pure-PyTorch :class:`SO3LRTrunk` into this model for standalone
+        inference without pre-cached ``so3lr_x``/``so3lr_ev``/``so3lr_q``.
+
+        Parameters
+        ----------
+        trunk_or_dir : SO3LRTrunk or path
+            Either an existing :class:`SO3LRTrunk` or a SO3LR model directory
+            containing ``params.pkl`` (loaded via :meth:`SO3LRTrunk.from_so3lr_dir`).
+        freeze : bool
+            Freeze the attached trunk's parameters (default True).
+        """
+        if not self.so3lr_backbone:
+            raise ValueError("attach_so3lr_trunk requires a model with so3lr_backbone")
+        spec = BACKBONE_SPECS[self.so3lr_backbone]
+        if isinstance(trunk_or_dir, SO3LRTrunk):
+            trunk = trunk_or_dir
+        else:
+            trunk = SO3LRTrunk.from_so3lr_dir(
+                trunk_or_dir, dtype=self.trunk_dtype, freeze=freeze
+            )
+        if trunk.num_features != spec["x_dim"] or trunk.degrees != spec["degrees"]:
+            raise ValueError(
+                f"SO3LRTrunk (features={trunk.num_features}, degrees={trunk.degrees}) "
+                f"does not match so3lr_backbone={self.so3lr_backbone!r} "
+                f"(expected features={spec['x_dim']}, degrees={spec['degrees']})"
+            )
+        dev = next(self.parameters()).device
+        trunk = trunk.to(device=dev, dtype=self.trunk_dtype)
+        if freeze:
+            trunk.requires_grad_(False)
+            trunk.eval()
+        self.so3lr_trunk = trunk
+        return self
 
     def a_pol_field(self) -> Tensor | None:
         """Direct permanent-field damping constant ``a_d`` (matched to Thole
@@ -416,19 +484,35 @@ class FF2Model(FF1Model):
     def _forward_atoms(self, batch: dict):
         z = batch["z"].long()
         R = batch["R"]
+        so3lr_q = None
         if self.so3lr_backbone:
+            if "so3lr_x" in batch:
+                so3lr_x, so3lr_ev = batch["so3lr_x"], batch["so3lr_ev"]
+                so3lr_q = batch.get("so3lr_q")
+            elif self.so3lr_trunk is not None:
+                so3lr_x, so3lr_ev, so3lr_q = self.so3lr_trunk(
+                    z, R.to(self.trunk_dtype), batch["edges"],
+                    batch["monomer"], batch["monomer_charge"],
+                    batch.get("num_unpaired_electrons"),
+                )
+            else:
+                raise KeyError(
+                    "batch is missing 'so3lr_x'/'so3lr_ev' and no embedded "
+                    "so3lr_trunk is attached (call model.attach_so3lr_trunk(...) "
+                    "or construct with embed_so3lr_trunk=True)"
+                )
             h, u, Q, geo = self.trunk(z, R.to(self.trunk_dtype), batch["edges"],
-                                      batch["so3lr_x"], batch["so3lr_ev"])
+                                      so3lr_x, so3lr_ev)
         elif self.charge_embedding:
             h, u, Q, geo = self.trunk(z, R.to(self.trunk_dtype), batch["edges"],
                                       batch["monomer"], batch["monomer_charge"])
         else:
             h, u, Q, geo = self.trunk(z, R.to(self.trunk_dtype), batch["edges"])
-        atoms = self._charges(batch, z, h, geo)
+        atoms = self._charges(batch, z, h, geo, so3lr_q=so3lr_q)
         atoms.update(self._properties(z, h, u, Q, atoms, geo))
         return R.to(self.physics_dtype) * ANG2BOHR, atoms
 
-    def _charges(self, batch, z, h, geo):
+    def _charges(self, batch, z, h, geo, so3lr_q: Tensor | None = None):
         pd = torch.float64
         src, dst = batch["edges"]
         mon = batch["monomer"]
@@ -437,11 +521,12 @@ class FF2Model(FF1Model):
         raw_g = self.edge_head(
             torch.cat([h[src], h[dst], geo["rbf"]], dim=1)).squeeze(-1).to(pd)
         if self.charge_prior == "so3lr_qeq":
-            # Start from SO3LR-T-L QEq populations; edge_head is a bounded,
+            # Start from SO3LR-Tauri QEq populations; edge_head is a bounded,
             # strictly conservative residual flux that is identically 0 when
             # edge_head[-1] is zeroed (so step 0 matches q_so3lr to round-off)
-            # and guarantees n_bond >= 0.60 * n_start > 0 without clamping.
-            n_start = (zact - batch["so3lr_q"].to(pd)).clamp_min(QEQ_N_FLOOR)
+            # and guarantees n_bond >= (1 - 2*qeq_flow_cap) * n_start > 0.
+            q_prior = so3lr_q if so3lr_q is not None else batch["so3lr_q"]
+            n_start = (zact - q_prior.to(pd)).clamp_min(QEQ_N_FLOOR)
             mask = geo["fc"].to(pd)
             if self.covalent_bond_flow:
                 same = batch.get("edge_same_frag")
@@ -483,10 +568,44 @@ class FF2Model(FF1Model):
             nu = self.rho_nu * torch.tanh(raw[:, 0] / self.rho_nu)
             s_pos = SIGMA_MIN + torch.nn.functional.softplus(raw[:, 1])
             s_neg = SIGMA_MIN + torch.nn.functional.softplus(raw[:, 2])
-        target = q_mon.new_zeros(q_mon.shape).index_add(0, mon, zact) - q_mon
         n0 = n_bond * torch.exp(nu)
-        n_act, mu_m, resid = monomer_populations(
-            n0, s_pos, s_neg, mon, target, self.n_mu_iters)
+        if self.charge_equilibration == "fragment_qeq":
+            # Equilibrate each covalent fragment independently to its monomer-
+            # conserved SO3LR QEq target charge, preventing unphysical through-
+            # space charge transfer across disconnected residues in protein
+            # pockets while staying identical to monomer mode on single-fragment
+            # molecules and keeping full IFT coordinate differentiability.
+            q_prior = so3lr_q if so3lr_q is not None else batch.get("so3lr_q")
+            if q_prior is None:
+                raise KeyError(
+                    "charge_equilibration='fragment_qeq' requires 'so3lr_q' in "
+                    "batch (or an attached so3lr_trunk)"
+                )
+            q_s = q_prior.to(pd)
+            q_sum = torch.zeros_like(q_mon).index_add(0, mon, q_s)
+            cnt = torch.zeros_like(q_mon).index_add(
+                0, mon, torch.ones_like(q_s)).clamp_min(1.0)
+            q_s = q_s - ((q_sum - q_mon) / cnt)[mon]
+            frag = batch.get("atom_frag")
+            if frag is not None and "n_frag" in batch:
+                nf = batch["n_frag"].shape[0]
+            else:
+                if frag is None:
+                    from ..ff1 import charges as _ff1_ch
+                    bonded = (geo["r"].detach().to(pd)
+                              < 1.25 * (self.r_cov[z[src]] + self.r_cov[z[dst]]))
+                    frag = _ff1_ch.connected_components(
+                        len(z), batch["edges"][:, bonded])
+                nf = int(frag.max()) + 1 if len(z) else 0
+            q_frag_tgt = q_mon.new_zeros((nf,)).index_add(0, frag, q_s)
+            zact_frag = q_mon.new_zeros((nf,)).index_add(0, frag, zact)
+            target = (zact_frag - q_frag_tgt).clamp_min(0.0)
+            n_act, mu_m, resid = monomer_populations(
+                n0, s_pos, s_neg, frag, target, self.n_mu_iters)
+        else:
+            target = q_mon.new_zeros(q_mon.shape).index_add(0, mon, zact) - q_mon
+            n_act, mu_m, resid = monomer_populations(
+                n0, s_pos, s_neg, mon, target, self.n_mu_iters)
         cn = torch.zeros_like(zact).index_add(0, src, geo["fc"].to(pd))
         return {"q": zact - n_act, "n_act": n_act, "nu": nu, "mu_m": mu_m,
                 "mu_residual": resid, "cn": cn, "n0": n0, "s_pos": s_pos, "s_neg": s_neg}

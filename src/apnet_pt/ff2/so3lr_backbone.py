@@ -52,9 +52,27 @@ N1 = math.sqrt(3 / (4 * math.pi))
 C2 = 0.5 * math.sqrt(15 / math.pi)
 D2 = 0.25 * math.sqrt(5 / math.pi)
 E2 = 0.25 * math.sqrt(15 / math.pi)
+TS_DEGREES = (1, 2, 3, 4)
+TS_X_DIM = 128
+TM_DEGREES = (1, 2, 3, 4)
+TM_X_DIM = 128
 TL_DEGREES = (1, 1, 2, 2, 3, 3, 4, 4)
 TL_X_DIM = 256
-BACKBONES = ("tl-linear", "tl-adapter")
+BACKBONE_SPECS = {
+    "ts-linear": {"preset": "so3lr-tauri-s-2606", "adapter": False,
+                  "x_dim": TS_X_DIM, "degrees": TS_DEGREES},
+    "ts-adapter": {"preset": "so3lr-tauri-s-2606", "adapter": True,
+                   "x_dim": TS_X_DIM, "degrees": TS_DEGREES},
+    "tm-linear": {"preset": "so3lr-tauri-m-2606", "adapter": False,
+                  "x_dim": TM_X_DIM, "degrees": TM_DEGREES},
+    "tm-adapter": {"preset": "so3lr-tauri-m-2606", "adapter": True,
+                   "x_dim": TM_X_DIM, "degrees": TM_DEGREES},
+    "tl-linear": {"preset": "so3lr-tauri-l-2606", "adapter": False,
+                  "x_dim": TL_X_DIM, "degrees": TL_DEGREES},
+    "tl-adapter": {"preset": "so3lr-tauri-l-2606", "adapter": True,
+                   "x_dim": TL_X_DIM, "degrees": TL_DEGREES},
+}
+BACKBONES = tuple(BACKBONE_SPECS)
 FEATURE_KEYS = ("so3lr_x", "so3lr_ev")
 
 

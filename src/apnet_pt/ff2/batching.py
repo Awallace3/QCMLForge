@@ -43,16 +43,32 @@ def _r_cov_table(device: torch.device) -> Tensor:
 
 
 @torch.no_grad()
-def edge_same_fragment(z: Tensor, R: Tensor, edges: Tensor) -> Tensor:
-    """Bool mask (E,) true iff both endpoints lie in the same covalent connected component."""
+def covalent_fragments(z: Tensor, R: Tensor, edges: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Covalent connected components of the atoms in a batch.
+
+    Returns ``(edge_same_frag, atom_frag, n_frag)`` where ``edge_same_frag``
+    is ``(E,)`` bool, ``atom_frag`` is ``(N,)`` long in ``0 .. nf - 1``, and
+    ``n_frag`` is ``(nf,)`` zeros carrying ``nf`` as a tensor shape for
+    ``torch.compile``.
+    """
+    n = len(z)
     if edges.numel() == 0:
-        return torch.ones((0,), dtype=torch.bool, device=z.device)
+        frag = torch.arange(n, dtype=torch.long, device=z.device)
+        return (torch.ones((0,), dtype=torch.bool, device=z.device),
+                frag, torch.zeros(n, dtype=torch.long, device=z.device))
     src, dst = edges
     r_cov = _r_cov_table(z.device)
     r = (R[dst].double() - R[src].double()).norm(dim=-1)
     bonded = r < 1.25 * (r_cov[z[src]] + r_cov[z[dst]])
-    frag = ff1_charges.connected_components(len(z), edges[:, bonded])
-    return frag[src] == frag[dst]
+    frag = ff1_charges.connected_components(n, edges[:, bonded])
+    nf = int(frag.max()) + 1 if n > 0 else 0
+    return frag[src] == frag[dst], frag, torch.zeros(nf, dtype=torch.long, device=z.device)
+
+
+@torch.no_grad()
+def edge_same_fragment(z: Tensor, R: Tensor, edges: Tensor) -> Tensor:
+    """Bool mask (E,) true iff both endpoints lie in the same covalent connected component."""
+    return covalent_fragments(z, R, edges)[0]
 
 
 def dimer_layout(atom_dimer: Tensor, n_dimer: int) -> dict:
@@ -78,16 +94,22 @@ def prepare(batch: dict) -> dict:
     """An FF-1 batch (``batch_from_dimers``/``batch_from_store`` format) in
     FF-2's format; idempotent."""
     if "slots" in batch:
-        if "R" in batch and "edge_same_frag" not in batch:
-            return {**batch, "edge_same_frag": edge_same_fragment(
-                batch["z"].long(), batch["R"], batch["edges"])}
+        if "R" in batch and ("edge_same_frag" not in batch or "atom_frag" not in batch
+                             or "n_frag" not in batch):
+            same, frag, n_frag = covalent_fragments(
+                batch["z"].long(), batch["R"], batch["edges"])
+            return {**batch, "edge_same_frag": same, "atom_frag": frag,
+                    "n_frag": n_frag}
         return batch
     out = {k: v for k, v in batch.items()
            if k not in ("fragment", "fragment_charge")}
     out.update(dimer_layout(batch["atom_dimer"], int(batch["n"])))
     if "R" in batch:
-        out["edge_same_frag"] = edge_same_fragment(
+        same, frag, n_frag = covalent_fragments(
             batch["z"].long(), batch["R"], batch["edges"])
+        out["edge_same_frag"] = same
+        out["atom_frag"] = frag
+        out["n_frag"] = n_frag
     return out
 
 

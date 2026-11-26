@@ -1159,3 +1159,120 @@ def test_ff2_covalent_bond_flow_and_so3lr_qeq_compile():
     assert torch.allclose(l_unw, l_one, atol=1e-12)
     l_hi, _ = ff1_loss(p, t, nu=nu, weights=torch.tensor([2.0, 2.0, 0.5, 0.5, 0.5, 0.5], dtype=F64))
     assert not torch.allclose(l_unw, l_hi)
+
+
+def test_ff2_charge_equilibration_fragment_qeq():
+    """charge_equilibration='fragment_qeq' matches 'monomer' on single-fragment
+    molecules, conserves per-fragment SO3LR QEq charge on multi-fragment
+    monomers even when nu != 0, differentiates cleanly w.r.t. coordinates and
+    so3lr_q, round-trips config(), and compiles to 1 fullgraph."""
+    from torch._dynamo.utils import counters
+
+    torch.manual_seed(29)
+    with pytest.raises(ValueError, match="charge_equilibration"):
+        FF2Model(n_feat=32, n_chan=4, n_layers=2, charge_equilibration="bad")
+    with pytest.raises(ValueError, match="so3lr_backbone"):
+        FF2Model(n_feat=32, n_chan=4, n_layers=2, charge_equilibration="fragment_qeq")
+
+    m_mon = FF2Model(
+        n_feat=32, n_chan=4, n_layers=2, sr_shell=False,
+        transverse_invariants=False, alpha_anisotropy=False,
+        so3lr_backbone="tm-adapter", pol_field="net_multipole",
+        learnable_a_pol_field=True, covalent_bond_flow=True,
+        charge_prior="so3lr_qeq", charge_equilibration="monomer", rho_nu=0.15,
+    )
+    m_fq = FF2Model(
+        n_feat=32, n_chan=4, n_layers=2, sr_shell=False,
+        transverse_invariants=False, alpha_anisotropy=False,
+        so3lr_backbone="tm-adapter", pol_field="net_multipole",
+        learnable_a_pol_field=True, covalent_bond_flow=True,
+        charge_prior="so3lr_qeq", charge_equilibration="fragment_qeq", rho_nu=0.15,
+    )
+    m_fq.load_state_dict(m_mon.state_dict(), strict=True)
+    assert "charge_equilibration" not in m_mon.config()
+    assert m_fq.config()["charge_equilibration"] == "fragment_qeq"
+    with torch.no_grad():
+        m_mon.edge_head[-1].weight.fill_(0.1)
+        m_mon.charge_head[-1].weight.fill_(0.2)
+        m_mon.charge_head[-1].bias.copy_(torch.tensor([1.0, 0.2, -0.1]))
+        m_fq.load_state_dict(m_mon.state_dict(), strict=True)
+
+    def with_tmq(b, seed_off=300):
+        n = b["z"].shape[0]
+        g = torch.Generator().manual_seed(seed_off + n)
+        raw_q = 0.2 * torch.randn(n, generator=g, dtype=F64)
+        mon = b["monomer"]
+        qm = b["monomer_charge"].double()
+        qsum = torch.zeros_like(qm).index_add(0, mon, raw_q)
+        cnt = torch.zeros_like(qm).index_add(0, mon, torch.ones_like(raw_q))
+        q_so3 = (raw_q - ((qsum - qm) / cnt)[mon]).float()
+        return {**b, "so3lr_x": torch.randn(n, 128, generator=g),
+                "so3lr_ev": torch.randn(n, 24, generator=g),
+                "so3lr_q": q_so3}
+
+    # 1. Exact parity on single-fragment molecules (dimers()[:3] are all single-fragment)
+    ds = dimers()
+    b_sf = with_tmq(batch_from_dimers(ds[:3]))
+    with torch.no_grad():
+        p_m, ex_m = m_mon(b_sf)
+        p_f, ex_f = m_fq(b_sf)
+    assert torch.allclose(p_m, p_f, rtol=0, atol=1e-11)
+    assert torch.allclose(ex_m["q"], ex_f["q"], rtol=0, atol=1e-12)
+
+    # 2. Multi-fragment monomer (two waters 3.0 A apart, nonzero nu!):
+    #    fragment_qeq strictly conserves each covalent fragment's SO3LR QEq sum,
+    #    while monomer mode leaks charge across fragments via nu.
+    d_twofrag = {
+        "zA": [8, 1, 1, 8, 1, 1],
+        "RA": [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0],
+               [3.0, 0.0, 0.0], [3.96, 0.0, 0.0], [2.76, 0.93, 0.0]],
+        "zB": [8, 1, 1],
+        "RB": [[0.0, 4.0, 0.0], [0.96, 4.0, 0.0], [-0.24, 4.93, 0.0]],
+        "qA": 0.0, "qB": 0.0,
+    }
+    b_tf = with_tmq(batch_from_dimers([d_twofrag]))
+    q_f = torch.tensor([0.2, 0.3, 0.3, -0.4, -0.2, -0.2, -0.4, 0.2, 0.2], dtype=torch.float32)
+    b_tf["so3lr_q"] = q_f
+    with torch.no_grad():
+        _, ex_tf_m = m_mon(b_tf)
+        _, ex_tf_f = m_fq(b_tf)
+    assert abs(float(ex_tf_f["nu"].abs().max())) > 1e-3  # nu is genuinely active
+    assert abs(float(ex_tf_f["q"][:3].sum()) - 0.8) < 1e-6
+    assert abs(float(ex_tf_f["q"][3:6].sum()) - (-0.8)) < 1e-6
+    assert abs(float(ex_tf_f["q"][6:9].sum()) - 0.0) < 1e-6
+    assert abs(float(ex_tf_m["q"][:3].sum()) - 0.8) > 1e-3  # monomer mode leaks
+
+    # 3. Eager fallback works when atom_frag / n_frag are absent (e.g. forward_monomers)
+    b_nof = {k: v for k, v in b_tf.items() if k not in ("atom_frag", "n_frag")}
+    with torch.no_grad():
+        _, at_nof = m_fq.forward_monomers(b_nof)
+    assert torch.allclose(at_nof["q"], ex_tf_f["q"], atol=1e-12)
+
+    # 4. Autograd forces & dE/d(so3lr_q) match central finite differences
+    R0 = b_tf["R"].clone().requires_grad_(True)
+    q0 = q_f.double().clone().requires_grad_(True)
+    b_grad = {**with_coordinates(b_tf, R0), "so3lr_q": q0}
+    pred_g, _ = m_fq(b_grad)
+    gR, gq = torch.autograd.grad(pred_g.sum(), (R0, q0))
+    assert torch.isfinite(gR).all() and torch.isfinite(gq).all()
+    h = 1e-5
+    with torch.no_grad():
+        fd_q = torch.zeros_like(q0)
+        for i in range(len(q0)):
+            qp, qm_ = q0.detach().clone(), q0.detach().clone()
+            qp[i] += h; qm_[i] -= h
+            ep = m_fq({**b_tf, "so3lr_q": qp})[0].sum()
+            em = m_fq({**b_tf, "so3lr_q": qm_})[0].sum()
+            fd_q[i] = (ep - em) / (2 * h)
+    assert torch.allclose(gq, fd_q, rtol=1e-5, atol=1e-5)
+
+    # 5. Compiles cleanly into 1 fullgraph across variable dimer & fragment counts
+    torch._dynamo.reset()
+    counters.clear()
+    comp = compile_ff2(m_fq, backend="eager")
+    for sub in (ds, ds[:3], [d_twofrag], ds[1:2]):
+        b = with_tmq(batch_from_dimers(sub))
+        pe, _ = m_fq(b)
+        pc, _ = comp(b)
+        assert torch.allclose(pe, pc, rtol=0, atol=1e-10)
+    assert counters["stats"]["unique_graphs"] == 1
